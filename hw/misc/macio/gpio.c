@@ -56,7 +56,13 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
         new_reg |= IN_DATA;
     }
 
-    if (new_reg == s->gpio_regs[gpio]) {
+    /*
+     * CPU reset lines (GPIO 3, 4, 15, 16) must always propagate, even if the
+     * register value doesn't change, so that repeated assert/deassert
+     * writes from the guest reliably kick the reset IRQ line.
+     */
+    if (gpio != 3 && gpio != 4 && gpio != 15 && gpio != 16 &&
+        new_reg == s->gpio_regs[gpio]) {
         return;
     }
 
@@ -71,7 +77,15 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 
     switch (gpio) {
     case 1:
-        /* Level low */
+    case 3:
+    case 4:
+    case 15:
+    case 16:
+        /*
+         * Level low: GPIO 1 is the machine's own reset/interrupt line;
+         * GPIO 3/4/15/16 are the KeyLargo CPU0-3 soft-reset lines used to
+         * hold secondary CPUs in reset and release them for SMP.
+         */
         if (!state) {
             trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
@@ -120,7 +134,15 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
             ibit = s->gpio_regs[addr] & IN_DATA;
         }
 
-        s->gpio_regs[addr] = value | ibit;
+        if (addr == (KL_GPIO_RESET_CPU1 - KEYLARGO_GPIO_EXTINT_0)) {
+            macio_set_gpio(s, 4, !(value & OUT_ENABLE) || (ibit != 0));
+        } else if (addr == (KL_GPIO_RESET_CPU2 - KEYLARGO_GPIO_EXTINT_0)) {
+            macio_set_gpio(s, 15, !(value & OUT_ENABLE) || (ibit != 0));
+        } else if (addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
+            macio_set_gpio(s, 16, !(value & OUT_ENABLE) || (ibit != 0));
+        } else {
+            s->gpio_regs[addr] = value | ibit;
+        }
     }
 }
 
@@ -160,7 +182,7 @@ static void macio_gpio_init(Object *obj)
     MacIOGPIOState *s = MACIO_GPIO(obj);
     int i;
 
-    for (i = 0; i < 10; i++) {
+    for (i = 0; i < KEYLARGO_GPIO_EXTINT_CNT; i++) {
         sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
     }
 
@@ -186,6 +208,14 @@ static void macio_gpio_reset(DeviceState *dev)
 
     /* GPIO 1 is up by default */
     macio_set_gpio(s, 1, true);
+
+    /*
+     * GPIO 3 (CPU0 soft-reset) is up by default. GPIO 4/15/16 (CPU1-3
+     * soft-reset) are intentionally left low/asserted here: secondary
+     * CPUs stay held in reset until the guest OS deasserts them to
+     * start each one up (see hw/ppc/mac_newworld.c cpu_kick()).
+     */
+    macio_set_gpio(s, 3, true);
 }
 
 static void macio_gpio_nmi(NMIState *n)
