@@ -74,6 +74,8 @@
 #include "kvm_ppc.h"
 #include "hw/usb/usb.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
+#include "hw/core/cpu.h"
 #include "trace.h"
 
 #define MAX_IDE_BUS 2
@@ -123,10 +125,59 @@ static uint64_t translate_kernel_address(void *opaque, uint64_t addr)
 static void ppc_core99_reset(void *opaque)
 {
     PowerPCCPU *cpu = opaque;
+    CPUState *cs = CPU(cpu);
 
-    cpu_reset(CPU(cpu));
+    cpu_reset(cs);
     /* 970 CPUs want to get their initial IP as part of their boot protocol */
     cpu->env.nip = PROM_BASE + 0x100;
+
+    /*
+     * Secondary CPUs are held in reset until the guest OS releases them
+     * via the KeyLargo GPIO soft-reset lines (see cpu_kick() below).
+     */
+    if (cs->cpu_index > 0) {
+        cs->halted = 1;
+    }
+}
+
+/*
+ * Called when a KeyLargo GPIO soft-reset line for a secondary CPU changes
+ * level. The lines are active low: level == 0 means the reset is
+ * deasserted and the CPU should start running.
+ */
+static void cpu_kick(void *opaque, int n, int level)
+{
+    PowerPCCPU *cpu = opaque;
+    CPUState *cs = CPU(cpu);
+    CPUState *first_cs = first_cpu;
+
+    if (level || !cs->halted) {
+        return;
+    }
+
+    /*
+     * Re-sync this CPU's timebase offset with the primary CPU's before
+     * starting it, in case of any drift while it was halted.
+     */
+    if (first_cs && first_cs != cs) {
+        PowerPCCPU *first = POWERPC_CPU(first_cs);
+
+        cpu->env.tb_env->tb_offset = first->env.tb_env->tb_offset;
+        cpu->env.tb_env->atb_offset = first->env.tb_env->atb_offset;
+    }
+
+    /*
+     * The reset vector spin loop the firmware places at 0x100 reads a
+     * mailbox to find its real entry point, matching real hardware's
+     * secondary-CPU boot protocol.
+     */
+    cpu->env.excp_prefix = 0;
+    cpu->env.nip = 0x100;
+    cpu->env.msr = 0;
+
+    cs->halted = 0;
+    cs->exception_index = -1;
+    qemu_cpu_kick(cs);
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -134,10 +185,11 @@ static void ppc_core99_init(MachineState *machine)
 {
     Core99MachineState *core99_machine = CORE99_MACHINE(machine);
     MachineClass *mc = MACHINE_GET_CLASS(machine);
-    PowerPCCPU *cpu = NULL;
+    PowerPCCPU **cpus;
     CPUPPCState *env = NULL;
     char *filename;
     IrqLines *openpic_irqs;
+    qemu_irq cpu_kick_irq;
     int i, j, k, ppc_boot_device, machine_arch, bios_size = -1;
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
     MemoryRegion *bios = g_new(MemoryRegion, 1);
@@ -158,14 +210,31 @@ static void ppc_core99_init(MachineState *machine)
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
 
     /* init CPUs */
+    cpus = g_new0(PowerPCCPU *, machine->smp.cpus);
     for (i = 0; i < machine->smp.cpus; i++) {
-        cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
-        env = &cpu->env;
+        cpus[i] = POWERPC_CPU(cpu_create(machine->cpu_type));
 
         /* Set time-base frequency to 100 Mhz */
-        cpu_ppc_tb_init(env, TBFREQ);
-        qemu_register_reset(ppc_core99_reset, cpu);
+        cpu_ppc_tb_init(&cpus[i]->env, TBFREQ);
+
+        /*
+         * Secondary CPUs share the primary's timebase offset: real
+         * hardware has one timebase counter shared by all CPUs, each
+         * with its own decrementer.
+         */
+        if (i > 0) {
+            cpus[i]->env.tb_env->tb_offset = cpus[0]->env.tb_env->tb_offset;
+            cpus[i]->env.tb_env->atb_offset = cpus[0]->env.tb_env->atb_offset;
+        }
+
+        qemu_register_reset(ppc_core99_reset, cpus[i]);
+
+        /* Secondary CPUs start halted; they are kicked via GPIO */
+        if (i > 0) {
+            CPU(cpus[i])->halted = 1;
+        }
     }
+    env = &cpus[0]->env;
 
     /* allocate RAM */
     if (machine->ram_size > 2 * GiB) {
@@ -245,8 +314,8 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     openpic_irqs = g_new0(IrqLines, machine->smp.cpus);
-    dev = DEVICE(cpu);
     for (i = 0; i < machine->smp.cpus; i++) {
+        dev = DEVICE(cpus[i]);
         /* Mac99 IRQ connection between OpenPIC outputs pins
          * and PowerPC input pins
          */
@@ -358,6 +427,9 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(dev, "chrB", serial_hd(1));
 
+    pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
+    qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
+
     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
@@ -390,6 +462,26 @@ static void ppc_core99_init(MachineState *machine)
         }
     }
     g_free(openpic_irqs);
+
+    /*
+     * Wire the KeyLargo GPIO soft-reset lines for secondary CPUs (1-3) to
+     * cpu_kick(), so the guest OS can release each one from reset to
+     * start it running (see gpio.c GPIO 4/15/16 handling).
+     */
+    s = SYS_BUS_DEVICE(object_resolve_path_component(macio, "gpio"));
+    if (machine->smp.cpus > 1) {
+        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[1], 0);
+        sysbus_connect_irq(s, 4, cpu_kick_irq);
+    }
+    if (machine->smp.cpus > 2) {
+        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[2], 0);
+        sysbus_connect_irq(s, 15, cpu_kick_irq);
+    }
+    if (machine->smp.cpus > 3) {
+        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[3], 0);
+        sysbus_connect_irq(s, 16, cpu_kick_irq);
+    }
+    g_free(cpus);
 
     /* We only emulate 2 out of 3 IDE controllers for now */
     ide_drive_get(hd, ARRAY_SIZE(hd));
@@ -573,8 +665,8 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
     mc->desc = "Mac99 based PowerMac";
     mc->init = ppc_core99_init;
     mc->block_default_type = IF_IDE;
-    /* SMP is not supported currently */
-    mc->max_cpus = 1;
+    /* SMP supported via KeyLargo GPIO-based secondary CPU reset control */
+    mc->max_cpus = KEYLARGO_MAX_CPU;
     mc->default_boot_order = "cd";
     mc->default_display = "std";
     mc->default_nic = "sungem";
