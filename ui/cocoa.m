@@ -1252,12 +1252,32 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void)windowDidEnterFullScreen:(NSNotification *)notification
 {
+    /*
+     * The fullscreen Space transition animates a snapshot of the window's
+     * layer; if we let that resize animate implicitly, a stale copy of the
+     * pre-transition frame can remain composited above the freshly drawn
+     * content once the transition settles (most visible as a duplicated
+     * strip at the top of the screen on Apple Silicon native builds).
+     * Apply the letterboxed content size and force a full redraw with
+     * implicit layer actions disabled so no stale frame survives.
+     */
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [cocoaView resizeWindow];
+    [cocoaView setNeedsDisplay:YES];
+    [[cocoaView layer] setNeedsDisplay];
+    [CATransaction commit];
     [cocoaView grabMouse];
 }
 
 - (void)windowDidExitFullScreen:(NSNotification *)notification
 {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     [cocoaView resizeWindow];
+    [cocoaView setNeedsDisplay:YES];
+    [[cocoaView layer] setNeedsDisplay];
+    [CATransaction commit];
     [cocoaView ungrabMouse];
 }
 
