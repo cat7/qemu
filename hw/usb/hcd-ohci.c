@@ -710,16 +710,15 @@ static int ohci_service_iso_td(OHCIState *ohci, struct ohci_ed *ed)
         end_addr = next_offset;
     }
 
-    if (start_addr > end_addr) {
-        trace_usb_ohci_iso_td_bad_cc_overrun(start_addr, end_addr);
-        return 1;
-    }
-
-    if ((start_addr & OHCI_PAGE_MASK) != (end_addr & OHCI_PAGE_MASK)) {
+    if ((start_addr & OHCI_PAGE_MASK) == (end_addr & OHCI_PAGE_MASK)) {
+        if (start_addr > end_addr) {
+            trace_usb_ohci_iso_td_bad_cc_overrun(start_addr, end_addr);
+            return 1;
+        }
+        len = end_addr - start_addr + 1;
+    } else {
         len = (end_addr & OHCI_OFFSET_MASK) + 0x1001
             - (start_addr & OHCI_OFFSET_MASK);
-    } else {
-        len = end_addr - start_addr + 1;
     }
     if (len > sizeof(buf)) {
         len = sizeof(buf);
