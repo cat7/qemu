@@ -51,8 +51,25 @@ typedef struct coreaudioVoiceOut {
     bool enabled;
 } CoreaudioVoiceOut;
 
+typedef struct coreaudioVoiceIn {
+    HWVoiceIn hw;
+    pthread_mutex_t buf_mutex;
+    AudioDeviceID device_id;
+    int frame_size_setting;
+    uint32_t buffer_count;
+    UInt32 device_frame_size;
+    AudioDeviceIOProcID ioprocid;
+    bool enabled;
+} CoreaudioVoiceIn;
+
 static const AudioObjectPropertyAddress voice_out_addr = {
     kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMain
+};
+
+static const AudioObjectPropertyAddress voice_in_addr = {
+    kAudioHardwarePropertyDefaultInputDevice,
     kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyElementMain
 };
@@ -156,6 +173,80 @@ static OSStatus coreaudio_get_out_isrunning(AudioDeviceID id, UInt32 *result)
                                       result);
 }
 
+static OSStatus coreaudio_get_voice_in(AudioDeviceID *id)
+{
+    UInt32 size = sizeof(*id);
+
+    return AudioObjectGetPropertyData(kAudioObjectSystemObject,
+                                      &voice_in_addr,
+                                      0,
+                                      NULL,
+                                      &size,
+                                      id);
+}
+
+static OSStatus coreaudio_get_in_framesizerange(AudioDeviceID id,
+                                                AudioValueRange *framerange)
+{
+    UInt32 size = sizeof(*framerange);
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyBufferFrameSizeRange,
+        kAudioDevicePropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+
+    return AudioObjectGetPropertyData(id, &addr, 0, NULL, &size, framerange);
+}
+
+static OSStatus coreaudio_get_in_framesize(AudioDeviceID id, UInt32 *framesize)
+{
+    UInt32 size = sizeof(*framesize);
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyBufferFrameSize,
+        kAudioDevicePropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+
+    return AudioObjectGetPropertyData(id, &addr, 0, NULL, &size, framesize);
+}
+
+static OSStatus coreaudio_set_in_framesize(AudioDeviceID id, UInt32 *framesize)
+{
+    UInt32 size = sizeof(*framesize);
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyBufferFrameSize,
+        kAudioDevicePropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+
+    return AudioObjectSetPropertyData(id, &addr, 0, NULL, size, framesize);
+}
+
+static OSStatus coreaudio_set_in_streamformat(AudioDeviceID id,
+                                              AudioStreamBasicDescription *d)
+{
+    UInt32 size = sizeof(*d);
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyStreamFormat,
+        kAudioDevicePropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+
+    return AudioObjectSetPropertyData(id, &addr, 0, NULL, size, d);
+}
+
+static OSStatus coreaudio_get_in_isrunning(AudioDeviceID id, UInt32 *result)
+{
+    UInt32 size = sizeof(*result);
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyDeviceIsRunning,
+        kAudioDevicePropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+
+    return AudioObjectGetPropertyData(id, &addr, 0, NULL, &size, result);
+}
+
 static void coreaudio_logstatus(OSStatus status)
 {
     const char *str = "BUG";
@@ -242,6 +333,9 @@ static void G_GNUC_PRINTF(3, 4) coreaudio_logerr2(OSStatus status,
 
 #define coreaudio_playback_logerr(status, ...) \
     coreaudio_logerr2(status, "playback", __VA_ARGS__)
+
+#define coreaudio_capture_logerr(status, ...) \
+    coreaudio_logerr2(status, "capture", __VA_ARGS__)
 
 static int coreaudio_voice_out_buf_lock(CoreaudioVoiceOut *core,
                                         const char *fn_name)
@@ -650,14 +744,415 @@ static void coreaudio_enable_out(HWVoiceOut *hw, bool enable)
     update_out_device_playback_state(core);
 }
 
+/* ------------------------------------------------------------------ */
+/* Audio input (capture)                                              */
+/* ------------------------------------------------------------------ */
+
+static int coreaudio_voice_in_buf_lock(CoreaudioVoiceIn *core,
+                                       const char *fn_name)
+{
+    int err;
+
+    err = pthread_mutex_lock(&core->buf_mutex);
+    if (err) {
+        error_report("coreaudio: Could not lock voice in for %s: %s",
+                     fn_name, strerror(err));
+        return -1;
+    }
+    return 0;
+}
+
+static int coreaudio_voice_in_buf_unlock(CoreaudioVoiceIn *core,
+                                         const char *fn_name)
+{
+    int err;
+
+    err = pthread_mutex_unlock(&core->buf_mutex);
+    if (err) {
+        error_report("coreaudio: Could not unlock voice in for %s: %s",
+                     fn_name, strerror(err));
+        return -1;
+    }
+    return 0;
+}
+
+#define COREAUDIO_WRAPPER_FUNC_IN(name, ret_type, args_decl, args)       \
+    static ret_type glue(coreaudio_, name)args_decl                      \
+    {                                                                    \
+        CoreaudioVoiceIn *core = (CoreaudioVoiceIn *)hw;                 \
+        ret_type ret;                                                    \
+                                                                         \
+        if (coreaudio_voice_in_buf_lock(core, "coreaudio_" #name)) {     \
+            return 0;                                                    \
+        }                                                                \
+                                                                         \
+        ret = glue(audio_generic_, name)args;                            \
+                                                                         \
+        coreaudio_voice_in_buf_unlock(core, "coreaudio_" #name);         \
+        return ret;                                                      \
+    }
+COREAUDIO_WRAPPER_FUNC_IN(get_buffer_in, void *, (HWVoiceIn *hw, size_t *size),
+                           (hw, size))
+COREAUDIO_WRAPPER_FUNC_IN(read, size_t, (HWVoiceIn *hw, void *buf, size_t size),
+                           (hw, buf, size))
+#undef COREAUDIO_WRAPPER_FUNC_IN
+
+static void coreaudio_put_buffer_in(HWVoiceIn *hw, void *buf, size_t size)
+{
+    CoreaudioVoiceIn *core = (CoreaudioVoiceIn *)hw;
+
+    if (coreaudio_voice_in_buf_lock(core, "coreaudio_put_buffer_in")) {
+        return;
+    }
+
+    audio_generic_put_buffer_in(hw, buf, size);
+
+    coreaudio_voice_in_buf_unlock(core, "coreaudio_put_buffer_in");
+}
+
+/*
+ * Callback to receive audio input. Called without BQL.
+ * Allowed to lock "buf_mutex", but disallowed to have any other locks.
+ */
+static OSStatus in_device_ioproc(
+    AudioDeviceID inDevice,
+    const AudioTimeStamp *inNow,
+    const AudioBufferList *inInputData,
+    const AudioTimeStamp *inInputTime,
+    AudioBufferList *outOutputData,
+    const AudioTimeStamp *inOutputTime,
+    void *hwptr)
+{
+    HWVoiceIn *hw = hwptr;
+    CoreaudioVoiceIn *core = hwptr;
+    void *in;
+    UInt32 frame_size;
+    size_t len;
+
+    if (!inInputData || inInputData->mNumberBuffers < 1) {
+        return 0;
+    }
+
+    in = inInputData->mBuffers[0].mData;
+
+    if (coreaudio_voice_in_buf_lock(core, "in_device_ioproc")) {
+        return 0;
+    }
+
+    if (inDevice != core->device_id) {
+        coreaudio_voice_in_buf_unlock(core, "in_device_ioproc(old device)");
+        return 0;
+    }
+
+    frame_size = core->device_frame_size;
+    len = frame_size * hw->info.bytes_per_frame;
+
+    while (len) {
+        size_t write_len;
+        size_t free = hw->size_emul - hw->pending_emul;
+
+        if (free == 0) {
+            break; /* buffer full, drop remaining */
+        }
+
+        write_len = MIN(MIN(free, len), hw->size_emul - hw->pos_emul);
+        memcpy(hw->buf_emul + hw->pos_emul, in, write_len);
+        hw->pos_emul = (hw->pos_emul + write_len) % hw->size_emul;
+        hw->pending_emul += write_len;
+        len -= write_len;
+        in += write_len;
+    }
+
+    coreaudio_voice_in_buf_unlock(core, "in_device_ioproc");
+    return 0;
+}
+
+static OSStatus init_in_device(CoreaudioVoiceIn *core)
+{
+    AudioDeviceID device_id;
+    AudioDeviceIOProcID ioprocid;
+    AudioValueRange value_range;
+    OSStatus status;
+    UInt32 device_frame_size;
+
+    AudioStreamBasicDescription stream_basic_description = {
+        .mBitsPerChannel = audio_format_bits(core->hw.info.af),
+        .mBytesPerFrame = core->hw.info.bytes_per_frame,
+        .mBytesPerPacket = core->hw.info.bytes_per_frame,
+        .mChannelsPerFrame = core->hw.info.nchannels,
+        .mFormatFlags = kLinearPCMFormatFlagIsFloat,
+        .mFormatID = kAudioFormatLinearPCM,
+        .mFramesPerPacket = 1,
+        .mSampleRate = core->hw.info.freq
+    };
+
+    status = coreaudio_get_voice_in(&device_id);
+    if (status != kAudioHardwareNoError) {
+        coreaudio_capture_logerr(status,
+                                 "Could not get default input device");
+        return status;
+    }
+    if (device_id == kAudioDeviceUnknown) {
+        error_report("coreaudio: Could not initialize capture: "
+                     "Unknown audio input device");
+        return -1;
+    }
+
+    /* get minimum and maximum buffer frame sizes */
+    status = coreaudio_get_in_framesizerange(device_id, &value_range);
+    if (status == kAudioHardwareBadObjectError) {
+        return 0;
+    }
+    if (status != kAudioHardwareNoError) {
+        coreaudio_capture_logerr(status,
+                                 "Could not get input device buffer frame range");
+        return status;
+    }
+
+    if (value_range.mMinimum > core->frame_size_setting) {
+        device_frame_size = value_range.mMinimum;
+    } else if (value_range.mMaximum < core->frame_size_setting) {
+        device_frame_size = value_range.mMaximum;
+    } else {
+        device_frame_size = core->frame_size_setting;
+    }
+
+    /* set Buffer Frame Size */
+    status = coreaudio_set_in_framesize(device_id, &device_frame_size);
+    if (status == kAudioHardwareBadObjectError) {
+        return 0;
+    }
+    if (status != kAudioHardwareNoError) {
+        coreaudio_capture_logerr(status,
+                                 "Could not set input device buffer frame size %" PRIu32,
+                                 (uint32_t)device_frame_size);
+        return status;
+    }
+
+    /* get Buffer Frame Size */
+    status = coreaudio_get_in_framesize(device_id, &device_frame_size);
+    if (status == kAudioHardwareBadObjectError) {
+        return 0;
+    }
+    if (status != kAudioHardwareNoError) {
+        coreaudio_capture_logerr(status,
+                                 "Could not get input device buffer frame size");
+        return status;
+    }
+
+    /* set stream format */
+    status = coreaudio_set_in_streamformat(device_id,
+                                           &stream_basic_description);
+    if (status == kAudioHardwareBadObjectError) {
+        return 0;
+    }
+    if (status != kAudioHardwareNoError) {
+        coreaudio_capture_logerr(status,
+                                 "Could not set input samplerate %lf",
+                                 stream_basic_description.mSampleRate);
+        return status;
+    }
+
+    /* set Callback */
+    ioprocid = NULL;
+    status = AudioDeviceCreateIOProcID(device_id,
+                                       in_device_ioproc,
+                                       &core->hw,
+                                       &ioprocid);
+    if (status == kAudioHardwareBadDeviceError) {
+        return 0;
+    }
+    if (status != kAudioHardwareNoError || ioprocid == NULL) {
+        coreaudio_capture_logerr(status, "Could not set input IOProc");
+        return status;
+    }
+
+    core->device_id = device_id;
+    core->device_frame_size = device_frame_size;
+    core->hw.samples = core->buffer_count * core->device_frame_size;
+    audio_generic_initialize_buffer_in(&core->hw);
+    core->ioprocid = ioprocid;
+
+    return 0;
+}
+
+static void fini_in_device(CoreaudioVoiceIn *core)
+{
+    OSStatus status;
+    UInt32 isrunning;
+
+    status = coreaudio_get_in_isrunning(core->device_id, &isrunning);
+    if (status != kAudioHardwareBadObjectError) {
+        if (status != kAudioHardwareNoError) {
+            coreaudio_logerr(status,
+                             "Could not determine whether input device is running");
+        }
+
+        if (isrunning) {
+            status = AudioDeviceStop(core->device_id, core->ioprocid);
+            if (status != kAudioHardwareBadDeviceError &&
+                status != kAudioHardwareNoError) {
+                coreaudio_logerr(status, "Could not stop capture");
+            }
+        }
+    }
+
+    status = AudioDeviceDestroyIOProcID(core->device_id, core->ioprocid);
+    if (status != kAudioHardwareBadDeviceError &&
+        status != kAudioHardwareNoError) {
+        coreaudio_logerr(status, "Could not remove input IOProc");
+    }
+    core->device_id = kAudioDeviceUnknown;
+}
+
+static void update_in_device_capture_state(CoreaudioVoiceIn *core)
+{
+    OSStatus status;
+    UInt32 isrunning;
+
+    status = coreaudio_get_in_isrunning(core->device_id, &isrunning);
+    if (status != kAudioHardwareNoError) {
+        if (status != kAudioHardwareBadObjectError) {
+            coreaudio_logerr(status,
+                             "Could not determine whether input device is running");
+        }
+        return;
+    }
+
+    if (core->enabled) {
+        if (!isrunning) {
+            status = AudioDeviceStart(core->device_id, core->ioprocid);
+            if (status != kAudioHardwareBadDeviceError &&
+                status != kAudioHardwareNoError) {
+                coreaudio_logerr(status, "Could not resume capture");
+            }
+        }
+    } else {
+        if (isrunning) {
+            status = AudioDeviceStop(core->device_id, core->ioprocid);
+            if (status != kAudioHardwareBadDeviceError &&
+                status != kAudioHardwareNoError) {
+                coreaudio_logerr(status, "Could not pause capture");
+            }
+        }
+    }
+}
+
+/* called without BQL. */
+static OSStatus handle_voice_in_change(
+    AudioObjectID in_object_id,
+    UInt32 in_number_addresses,
+    const AudioObjectPropertyAddress *in_addresses,
+    void *in_client_data)
+{
+    CoreaudioVoiceIn *core = in_client_data;
+
+    bql_lock();
+
+    if (core->device_id) {
+        fini_in_device(core);
+    }
+
+    init_in_device(core);
+
+    if (core->device_id) {
+        update_in_device_capture_state(core);
+    }
+
+    bql_unlock();
+    return 0;
+}
+
+static int coreaudio_init_in(HWVoiceIn *hw, struct audsettings *as)
+{
+    OSStatus status;
+    CoreaudioVoiceIn *core = (CoreaudioVoiceIn *)hw;
+    int err;
+    Audiodev *dev = hw->s->dev;
+    AudiodevCoreaudioPerDirectionOptions *cpdo = dev->u.coreaudio.in;
+    struct audsettings obt_as;
+
+    /* create mutex */
+    err = pthread_mutex_init(&core->buf_mutex, NULL);
+    if (err) {
+        error_report("coreaudio: Could not create mutex: %s", strerror(err));
+        return -1;
+    }
+
+    obt_as = *as;
+    as = &obt_as;
+    as->fmt = AUDIO_FORMAT_F32;
+    audio_pcm_init_info(&hw->info, as);
+
+    core->frame_size_setting = audio_buffer_frames(
+        qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
+
+    core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+
+    status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
+                                            &voice_in_addr,
+                                            handle_voice_in_change,
+                                            core);
+    if (status != kAudioHardwareNoError) {
+        coreaudio_capture_logerr(status,
+                                 "Could not listen to input voice property change");
+        return -1;
+    }
+
+    if (init_in_device(core)) {
+        status = AudioObjectRemovePropertyListener(kAudioObjectSystemObject,
+                                                   &voice_in_addr,
+                                                   handle_voice_in_change,
+                                                   core);
+        if (status != kAudioHardwareNoError) {
+            coreaudio_capture_logerr(status,
+                                     "Could not remove input voice property change listener");
+        }
+        return -1;
+    }
+
+    return 0;
+}
+
+static void coreaudio_fini_in(HWVoiceIn *hw)
+{
+    OSStatus status;
+    int err;
+    CoreaudioVoiceIn *core = (CoreaudioVoiceIn *)hw;
+
+    status = AudioObjectRemovePropertyListener(kAudioObjectSystemObject,
+                                               &voice_in_addr,
+                                               handle_voice_in_change,
+                                               core);
+    if (status != kAudioHardwareNoError) {
+        coreaudio_logerr(status,
+                         "Could not remove input voice property change listener");
+    }
+
+    fini_in_device(core);
+
+    err = pthread_mutex_destroy(&core->buf_mutex);
+    if (err) {
+        error_report("coreaudio: Could not destroy mutex: %s", strerror(err));
+    }
+}
+
+static void coreaudio_enable_in(HWVoiceIn *hw, bool enable)
+{
+    CoreaudioVoiceIn *core = (CoreaudioVoiceIn *)hw;
+
+    core->enabled = enable;
+    update_in_device_capture_state(core);
+}
+
 static void audio_coreaudio_class_init(ObjectClass *klass, const void *data)
 {
     AudioMixengBackendClass *k = AUDIO_MIXENG_BACKEND_CLASS(klass);
 
     k->max_voices_out = 1;
-    k->max_voices_in = 0;
+    k->max_voices_in = 1;
     k->voice_size_out = sizeof(CoreaudioVoiceOut);
-    k->voice_size_in = 0;
+    k->voice_size_in = sizeof(CoreaudioVoiceIn);
 
     k->init_out = coreaudio_init_out;
     k->fini_out = coreaudio_fini_out;
@@ -670,6 +1165,13 @@ static void audio_coreaudio_class_init(ObjectClass *klass, const void *data)
     /* wrapper for audio_generic_put_buffer_out */
     k->put_buffer_out = coreaudio_put_buffer_out;
     k->enable_out = coreaudio_enable_out;
+
+    k->init_in = coreaudio_init_in;
+    k->fini_in = coreaudio_fini_in;
+    k->read = coreaudio_read;
+    k->get_buffer_in = coreaudio_get_buffer_in;
+    k->put_buffer_in = coreaudio_put_buffer_in;
+    k->enable_in = coreaudio_enable_in;
 }
 
 static const TypeInfo audio_types[] = {
