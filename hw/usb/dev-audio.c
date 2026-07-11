@@ -70,6 +70,11 @@ enum usb_audio_strings {
     STRING_OUTPUT_TERMINAL,
     STRING_NULL_STREAM,
     STRING_REAL_STREAM,
+    STRING_MIC_INPUT_TERMINAL,
+    STRING_MIC_FEATURE_UNIT,
+    STRING_MIC_OUTPUT_TERMINAL,
+    STRING_MIC_NULL_STREAM,
+    STRING_MIC_REAL_STREAM,
 };
 
 static const USBDescStrings usb_audio_stringtable = {
@@ -83,6 +88,11 @@ static const USBDescStrings usb_audio_stringtable = {
     [STRING_OUTPUT_TERMINAL]    = "Audio Output Terminal",
     [STRING_NULL_STREAM]        = "Audio Output - Disabled",
     [STRING_REAL_STREAM]        = "Audio Output - 48 kHz Stereo",
+    [STRING_MIC_INPUT_TERMINAL] = "Audio Input Microphone",
+    [STRING_MIC_FEATURE_UNIT]   = "Audio Input Volume Control",
+    [STRING_MIC_OUTPUT_TERMINAL]= "Audio Input Pipe",
+    [STRING_MIC_NULL_STREAM]    = "Audio Input - Disabled",
+    [STRING_MIC_REAL_STREAM]    = "Audio Input - 48 kHz Stereo",
 };
 
 /*
@@ -125,18 +135,19 @@ static const USBDescIface desc_iface[] = {
         .bInterfaceClass               = USB_CLASS_AUDIO,
         .bInterfaceSubClass            = USB_SUBCLASS_AUDIO_CONTROL,
         .iInterface                    = STRING_USBAUDIO_CONTROL,
-        .ndesc                         = 4,
+        .ndesc                         = 7,
         .descs = (USBDescOther[]) {
             {
-                /* Headphone Class-Specific AC Interface Header Descriptor */
+                /* Class-Specific AC Interface Header Descriptor */
                 .data = (uint8_t[]) {
-                    0x09,                       /*  u8  bLength */
+                    0x0a,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AC_HEADER,              /*  u8  bDescriptorSubtype */
                     U16(0x0100),                /* u16  bcdADC */
-                    U16(0x2b),                  /* u16  wTotalLength */
-                    0x01,                       /*  u8  bInCollection */
-                    0x01,                       /*  u8  baInterfaceNr */
+                    U16(0x4e),                  /* u16  wTotalLength */
+                    0x02,                       /*  u8  bInCollection */
+                    0x01,                       /*  u8  baInterfaceNr(1) */
+                    0x02,                       /*  u8  baInterfaceNr(2) */
                 }
             },{
                 /* Generic Stereo Input Terminal ID1 Descriptor */
@@ -177,6 +188,46 @@ static const USBDescIface desc_iface[] = {
                     0x00,                       /*  u8  bAssocTerminal */
                     0x02,                       /*  u8  bSourceID */
                     STRING_OUTPUT_TERMINAL,     /*  u8  iTerminal */
+                }
+            },{
+                /* Microphone Input Terminal ID4 Descriptor */
+                .data = (uint8_t[]) {
+                    0x0c,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AC_INPUT_TERMINAL,      /*  u8  bDescriptorSubtype */
+                    0x04,                       /*  u8  bTerminalID */
+                    U16(0x0201),                /* u16  wTerminalType (MIC) */
+                    0x00,                       /*  u8  bAssocTerminal */
+                    0x02,                       /*  u8  bNrChannels */
+                    U16(0x0003),                /* u16  wChannelConfig */
+                    0x00,                       /*  u8  iChannelNames */
+                    STRING_MIC_INPUT_TERMINAL,  /*  u8  iTerminal */
+                }
+            },{
+                /* Microphone Feature Unit ID5 Descriptor */
+                .data = (uint8_t[]) {
+                    0x0d,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AC_FEATURE_UNIT,        /*  u8  bDescriptorSubtype */
+                    0x05,                       /*  u8  bUnitID */
+                    0x04,                       /*  u8  bSourceID */
+                    0x02,                       /*  u8  bControlSize */
+                    U16(0x0001),                /* u16  bmaControls(0) */
+                    U16(0x0002),                /* u16  bmaControls(1) */
+                    U16(0x0002),                /* u16  bmaControls(2) */
+                    STRING_MIC_FEATURE_UNIT,    /*  u8  iFeature */
+                }
+            },{
+                /* USB Streaming Output Terminal ID6 Descriptor */
+                .data = (uint8_t[]) {
+                    0x09,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AC_OUTPUT_TERMINAL,     /*  u8  bDescriptorSubtype */
+                    0x06,                       /*  u8  bUnitID */
+                    U16(0x0101),                /* u16  wTerminalType (USB) */
+                    0x00,                       /*  u8  bAssocTerminal */
+                    0x05,                       /*  u8  bSourceID */
+                    STRING_MIC_OUTPUT_TERMINAL, /*  u8  iTerminal */
                 }
             }
         },
@@ -240,6 +291,66 @@ static const USBDescIface desc_iface[] = {
                 },
             },
         }
+    },{
+        .bInterfaceNumber              = 2,
+        .bAlternateSetting             = ALTSET_OFF,
+        .bNumEndpoints                 = 0,
+        .bInterfaceClass               = USB_CLASS_AUDIO,
+        .bInterfaceSubClass            = USB_SUBCLASS_AUDIO_STREAMING,
+        .iInterface                    = STRING_MIC_NULL_STREAM,
+    },{
+        .bInterfaceNumber              = 2,
+        .bAlternateSetting             = ALTSET_STEREO,
+        .bNumEndpoints                 = 1,
+        .bInterfaceClass               = USB_CLASS_AUDIO,
+        .bInterfaceSubClass            = USB_SUBCLASS_AUDIO_STREAMING,
+        .iInterface                    = STRING_MIC_REAL_STREAM,
+        .ndesc                         = 2,
+        .descs = (USBDescOther[]) {
+            {
+                /* Microphone Class-specific AS General Interface Descriptor */
+                .data = (uint8_t[]) {
+                    0x07,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AS_GENERAL,             /*  u8  bDescriptorSubtype */
+                    0x06,                       /*  u8  bTerminalLink */
+                    0x00,                       /*  u8  bDelay */
+                    0x01, 0x00,                 /* u16  wFormatTag */
+                }
+            },{
+                /* Microphone Type I Format Type Descriptor */
+                .data = (uint8_t[]) {
+                    0x0b,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AS_FORMAT_TYPE,         /*  u8  bDescriptorSubtype */
+                    0x01,                       /*  u8  bFormatType */
+                    0x02,                       /*  u8  bNrChannels */
+                    0x02,                       /*  u8  bSubFrameSize */
+                    0x10,                       /*  u8  bBitResolution */
+                    0x01,                       /*  u8  bSamFreqType */
+                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq */
+                }
+            }
+        },
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | 0x02,
+                .bmAttributes          = 0x0d,
+                .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(2),
+                .bInterval             = 1,
+                .is_audio              = 1,
+                /* Microphone Class-specific
+                   AS Audio Data Endpoint Descriptor */
+                .extra = (uint8_t[]) {
+                    0x07,                       /*  u8  bLength */
+                    USB_DT_CS_ENDPOINT,         /*  u8  bDescriptorType */
+                    DST_EP_GENERAL,             /*  u8  bDescriptorSubtype */
+                    0x00,                       /*  u8  bmAttributes */
+                    0x00,                       /*  u8  bLockDelayUnits */
+                    U16(0x0000),                /* u16  wLockDelay */
+                },
+            },
+        }
     }
 };
 
@@ -249,7 +360,7 @@ static const USBDescDevice desc_device = {
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
         {
-            .bNumInterfaces        = 2,
+            .bNumInterfaces        = 3,
             .bConfigurationValue   = DEV_CONFIG_VALUE,
             .iConfiguration        = STRING_CONFIG,
             .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
@@ -282,18 +393,19 @@ static const USBDescIface desc_iface_multi[] = {
         .bInterfaceClass               = USB_CLASS_AUDIO,
         .bInterfaceSubClass            = USB_SUBCLASS_AUDIO_CONTROL,
         .iInterface                    = STRING_USBAUDIO_CONTROL,
-        .ndesc                         = 4,
+        .ndesc                         = 7,
         .descs = (USBDescOther[]) {
             {
-                /* Headphone Class-Specific AC Interface Header Descriptor */
+                /* Class-Specific AC Interface Header Descriptor */
                 .data = (uint8_t[]) {
-                    0x09,                       /*  u8  bLength */
+                    0x0a,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AC_HEADER,              /*  u8  bDescriptorSubtype */
                     U16(0x0100),                /* u16  bcdADC */
-                    U16(0x37),                  /* u16  wTotalLength */
-                    0x01,                       /*  u8  bInCollection */
-                    0x01,                       /*  u8  baInterfaceNr */
+                    U16(0x5a),                  /* u16  wTotalLength */
+                    0x02,                       /*  u8  bInCollection */
+                    0x01,                       /*  u8  baInterfaceNr(1) */
+                    0x02,                       /*  u8  baInterfaceNr(2) */
                 }
             },{
                 /* Generic Stereo Input Terminal ID1 Descriptor */
@@ -340,6 +452,46 @@ static const USBDescIface desc_iface_multi[] = {
                     0x00,                       /*  u8  bAssocTerminal */
                     0x02,                       /*  u8  bSourceID */
                     STRING_OUTPUT_TERMINAL,     /*  u8  iTerminal */
+                }
+            },{
+                /* Microphone Input Terminal ID4 Descriptor */
+                .data = (uint8_t[]) {
+                    0x0c,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AC_INPUT_TERMINAL,      /*  u8  bDescriptorSubtype */
+                    0x04,                       /*  u8  bTerminalID */
+                    U16(0x0201),                /* u16  wTerminalType (MIC) */
+                    0x00,                       /*  u8  bAssocTerminal */
+                    0x02,                       /*  u8  bNrChannels */
+                    U16(0x0003),                /* u16  wChannelConfig */
+                    0x00,                       /*  u8  iChannelNames */
+                    STRING_MIC_INPUT_TERMINAL,  /*  u8  iTerminal */
+                }
+            },{
+                /* Microphone Feature Unit ID5 Descriptor */
+                .data = (uint8_t[]) {
+                    0x0d,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AC_FEATURE_UNIT,        /*  u8  bDescriptorSubtype */
+                    0x05,                       /*  u8  bUnitID */
+                    0x04,                       /*  u8  bSourceID */
+                    0x02,                       /*  u8  bControlSize */
+                    U16(0x0001),                /* u16  bmaControls(0) */
+                    U16(0x0002),                /* u16  bmaControls(1) */
+                    U16(0x0002),                /* u16  bmaControls(2) */
+                    STRING_MIC_FEATURE_UNIT,    /*  u8  iFeature */
+                }
+            },{
+                /* USB Streaming Output Terminal ID6 Descriptor */
+                .data = (uint8_t[]) {
+                    0x09,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AC_OUTPUT_TERMINAL,     /*  u8  bDescriptorSubtype */
+                    0x06,                       /*  u8  bUnitID */
+                    U16(0x0101),                /* u16  wTerminalType (USB) */
+                    0x00,                       /*  u8  bAssocTerminal */
+                    0x05,                       /*  u8  bSourceID */
+                    STRING_MIC_OUTPUT_TERMINAL, /*  u8  iTerminal */
                 }
             }
         },
@@ -509,6 +661,66 @@ static const USBDescIface desc_iface_multi[] = {
                 },
             },
         }
+    },{
+        .bInterfaceNumber              = 2,
+        .bAlternateSetting             = ALTSET_OFF,
+        .bNumEndpoints                 = 0,
+        .bInterfaceClass               = USB_CLASS_AUDIO,
+        .bInterfaceSubClass            = USB_SUBCLASS_AUDIO_STREAMING,
+        .iInterface                    = STRING_MIC_NULL_STREAM,
+    },{
+        .bInterfaceNumber              = 2,
+        .bAlternateSetting             = ALTSET_STEREO,
+        .bNumEndpoints                 = 1,
+        .bInterfaceClass               = USB_CLASS_AUDIO,
+        .bInterfaceSubClass            = USB_SUBCLASS_AUDIO_STREAMING,
+        .iInterface                    = STRING_MIC_REAL_STREAM,
+        .ndesc                         = 2,
+        .descs = (USBDescOther[]) {
+            {
+                /* Microphone Class-specific AS General Interface Descriptor */
+                .data = (uint8_t[]) {
+                    0x07,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AS_GENERAL,             /*  u8  bDescriptorSubtype */
+                    0x06,                       /*  u8  bTerminalLink */
+                    0x00,                       /*  u8  bDelay */
+                    0x01, 0x00,                 /* u16  wFormatTag */
+                }
+            },{
+                /* Microphone Type I Format Type Descriptor */
+                .data = (uint8_t[]) {
+                    0x0b,                       /*  u8  bLength */
+                    USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
+                    DST_AS_FORMAT_TYPE,         /*  u8  bDescriptorSubtype */
+                    0x01,                       /*  u8  bFormatType */
+                    0x02,                       /*  u8  bNrChannels */
+                    0x02,                       /*  u8  bSubFrameSize */
+                    0x10,                       /*  u8  bBitResolution */
+                    0x01,                       /*  u8  bSamFreqType */
+                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq */
+                }
+            }
+        },
+        .eps = (USBDescEndpoint[]) {
+            {
+                .bEndpointAddress      = USB_DIR_IN | 0x02,
+                .bmAttributes          = 0x0d,
+                .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(2),
+                .bInterval             = 1,
+                .is_audio              = 1,
+                /* Microphone Class-specific
+                   AS Audio Data Endpoint Descriptor */
+                .extra = (uint8_t[]) {
+                    0x07,                       /*  u8  bLength */
+                    USB_DT_CS_ENDPOINT,         /*  u8  bDescriptorType */
+                    DST_EP_GENERAL,             /*  u8  bDescriptorSubtype */
+                    0x00,                       /*  u8  bmAttributes */
+                    0x00,                       /*  u8  bLockDelayUnits */
+                    U16(0x0000),                /* u16  wLockDelay */
+                },
+            },
+        }
     }
 };
 
@@ -518,7 +730,7 @@ static const USBDescDevice desc_device_multi = {
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
         {
-            .bNumInterfaces        = 2,
+            .bNumInterfaces        = 3,
             .bConfigurationValue   = DEV_CONFIG_VALUE,
             .iConfiguration        = STRING_CONFIG,
             .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
@@ -632,6 +844,51 @@ static uint8_t *streambuf_get(struct streambuf *buf, size_t *len)
     return data;
 }
 
+/*
+ * Read from ring buffer into a USB packet (for capture/IN transfers).
+ * If not enough new data is available, repeats the last sent packet
+ * to avoid zero-sample artifacts (hiss) from rate mismatch underruns.
+ */
+static int streambuf_read(struct streambuf *buf, USBPacket *p,
+                          uint32_t channels)
+{
+    int64_t used = buf->prod - buf->cons;
+    size_t pkt_size = USBAUDIO_PACKET_SIZE(channels);
+
+    if (used >= (int64_t)pkt_size) {
+        size_t offset = buf->cons % buf->size;
+        if (offset + pkt_size <= buf->size) {
+            usb_packet_copy(p, buf->data + offset, pkt_size);
+        } else {
+            size_t first = buf->size - offset;
+            usb_packet_copy(p, buf->data + offset, first);
+            usb_packet_copy(p, buf->data, pkt_size - first);
+        }
+        buf->cons += pkt_size;
+    } else {
+        /*
+         * Underrun: not enough new captured data. Re-send the last
+         * consumed packet (still in the ring buffer behind cons).
+         * Falls back to silence only if nothing was ever captured.
+         */
+        if (buf->cons >= pkt_size) {
+            uint64_t prev = buf->cons - pkt_size;
+            size_t offset = prev % buf->size;
+            if (offset + pkt_size <= buf->size) {
+                usb_packet_copy(p, buf->data + offset, pkt_size);
+            } else {
+                size_t first = buf->size - offset;
+                usb_packet_copy(p, buf->data + offset, first);
+                usb_packet_copy(p, buf->data, pkt_size - first);
+            }
+        } else {
+            static uint8_t silence[USBAUDIO_PACKET_SIZE_BASE * 8];
+            usb_packet_copy(p, silence, pkt_size);
+        }
+    }
+    return pkt_size;
+}
+
 struct USBAudioState {
     /* qemu interfaces */
     USBDevice dev;
@@ -646,6 +903,15 @@ struct USBAudioState {
         struct streambuf buf;
         uint32_t channels;
     } out;
+
+    struct {
+        enum usb_audio_altset altset;
+        struct audsettings as;
+        SWVoiceIn *voice;
+        Volume vol;
+        struct streambuf buf;
+        uint32_t channels;
+    } in;
 
     /* properties */
     uint32_t debug;
@@ -705,6 +971,61 @@ static int usb_audio_set_output_altset(USBAudioState *s, int altset)
     return 0;
 }
 
+static void input_callback(void *opaque, int avail)
+{
+    USBAudioState *s = opaque;
+    struct streambuf *buf = &s->in.buf;
+
+    while (avail > 0) {
+        int64_t free = buf->size - (buf->prod - buf->cons);
+        size_t offset, chunk, nread;
+
+        if (free <= 0) {
+            break;
+        }
+        offset = buf->prod % buf->size;
+        chunk = buf->size - offset;
+        if ((int64_t)chunk > free) {
+            chunk = free;
+        }
+        if (chunk > (size_t)avail) {
+            chunk = avail;
+        }
+
+        nread = audio_be_read(s->audio_be, s->in.voice, buf->data + offset, chunk);
+        if (nread == 0) {
+            break;
+        }
+        buf->prod += nread;
+        avail -= nread;
+    }
+}
+
+static int usb_audio_set_input_altset(USBAudioState *s, int altset)
+{
+    switch (altset) {
+    case ALTSET_OFF:
+        if (s->in.voice) {
+            audio_be_set_active_in(s->audio_be, s->in.voice, false);
+        }
+        break;
+    case ALTSET_STEREO:
+        streambuf_init(&s->in.buf, s->buffer, s->in.channels);
+        if (s->in.voice) {
+            audio_be_set_active_in(s->audio_be, s->in.voice, true);
+        }
+        break;
+    default:
+        return -1;
+    }
+
+    if (s->debug) {
+        fprintf(stderr, "usb-audio: set input interface %d\n", altset);
+    }
+    s->in.altset = altset;
+    return 0;
+}
+
 /*
  * Note: we arbitrarily map the volume control range onto -inf..+8 dB
  */
@@ -754,6 +1075,41 @@ static int usb_audio_get_control(USBAudioState *s, uint8_t attrib,
             ret = 2;
         }
         break;
+
+    /* Microphone feature unit (ID5) controls */
+    case ATTRIB_ID(MUTE_CONTROL, CR_GET_CUR, 0x0500):
+        data[0] = s->in.vol.mute;
+        ret = 1;
+        break;
+    case ATTRIB_ID(VOLUME_CONTROL, CR_GET_CUR, 0x0500):
+        if (cn < 2) {
+            uint16_t vol = (s->in.vol.vol[cn] * 0x8800 + 127) / 255 + 0x8000;
+            data[0] = vol;
+            data[1] = vol >> 8;
+            ret = 2;
+        }
+        break;
+    case ATTRIB_ID(VOLUME_CONTROL, CR_GET_MIN, 0x0500):
+        if (cn < 2) {
+            data[0] = 0x01;
+            data[1] = 0x80;
+            ret = 2;
+        }
+        break;
+    case ATTRIB_ID(VOLUME_CONTROL, CR_GET_MAX, 0x0500):
+        if (cn < 2) {
+            data[0] = 0x00;
+            data[1] = 0x08;
+            ret = 2;
+        }
+        break;
+    case ATTRIB_ID(VOLUME_CONTROL, CR_GET_RES, 0x0500):
+        if (cn < 2) {
+            data[0] = 0x88;
+            data[1] = 0x00;
+            ret = 2;
+        }
+        break;
     }
 
     return ret;
@@ -767,6 +1123,7 @@ static int usb_audio_set_control(USBAudioState *s, uint8_t attrib,
     uint32_t aid = ATTRIB_ID(cs, attrib, idif);
     int ret = USB_RET_STALL;
     bool set_vol = false;
+    bool set_vol_in = false;
 
     switch (aid) {
     case ATTRIB_ID(MUTE_CONTROL, CR_SET_CUR, 0x0200):
@@ -794,6 +1151,33 @@ static int usb_audio_set_control(USBAudioState *s, uint8_t attrib,
             ret = 0;
         }
         break;
+
+    /* Microphone feature unit (ID5) controls */
+    case ATTRIB_ID(MUTE_CONTROL, CR_SET_CUR, 0x0500):
+        s->in.vol.mute = data[0] & 1;
+        set_vol_in = true;
+        ret = 0;
+        break;
+    case ATTRIB_ID(VOLUME_CONTROL, CR_SET_CUR, 0x0500):
+        if (cn < 2) {
+            uint16_t vol = data[0] + (data[1] << 8);
+
+            if (s->debug) {
+                fprintf(stderr, "usb-audio: mic cn %d vol %04x\n", cn,
+                        (uint16_t)vol);
+            }
+
+            vol -= 0x8000;
+            vol = (vol * 255 + 0x4400) / 0x8800;
+            if (vol > 255) {
+                vol = 255;
+            }
+
+            s->in.vol.vol[cn] = vol;
+            set_vol_in = true;
+            ret = 0;
+        }
+        break;
     }
 
     if (set_vol) {
@@ -806,6 +1190,16 @@ static int usb_audio_set_control(USBAudioState *s, uint8_t attrib,
             fprintf(stderr, "\n");
         }
         audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
+    }
+
+    if (set_vol_in) {
+        if (s->debug) {
+            fprintf(stderr, "usb-audio: mic mute %d, vol[0] %3d, vol[1] %3d\n",
+                    s->in.vol.mute, s->in.vol.vol[0], s->in.vol.vol[1]);
+        }
+        if (s->in.voice) {
+            audio_be_set_volume_in(s->audio_be, s->in.voice, &s->in.vol);
+        }
     }
 
     return ret;
@@ -878,6 +1272,8 @@ static void usb_audio_set_interface(USBDevice *dev, int iface,
 
     if (iface == 1) {
         usb_audio_set_output_altset(s, value);
+    } else if (iface == 2) {
+        usb_audio_set_input_altset(s, value);
     }
 }
 
@@ -889,6 +1285,7 @@ static void usb_audio_handle_reset(USBDevice *dev)
         fprintf(stderr, "usb-audio: reset\n");
     }
     usb_audio_set_output_altset(s, ALTSET_OFF);
+    usb_audio_set_input_altset(s, ALTSET_OFF);
 }
 
 static void usb_audio_handle_dataout(USBAudioState *s, USBPacket *p)
@@ -905,12 +1302,26 @@ static void usb_audio_handle_dataout(USBAudioState *s, USBPacket *p)
     }
 }
 
+static void usb_audio_handle_datain(USBAudioState *s, USBPacket *p)
+{
+    if (s->in.altset == ALTSET_OFF) {
+        p->status = USB_RET_STALL;
+        return;
+    }
+
+    streambuf_read(&s->in.buf, p, s->in.channels);
+}
+
 static void usb_audio_handle_data(USBDevice *dev, USBPacket *p)
 {
     USBAudioState *s = (USBAudioState *) dev;
 
     if (p->pid == USB_TOKEN_OUT && p->ep->nr == 1) {
         usb_audio_handle_dataout(s, p);
+        return;
+    }
+    if (p->pid == USB_TOKEN_IN && p->ep->nr == 2) {
+        usb_audio_handle_datain(s, p);
         return;
     }
 
@@ -932,8 +1343,13 @@ static void usb_audio_unrealize(USBDevice *dev)
 
     usb_audio_set_output_altset(s, ALTSET_OFF);
     audio_be_close_out(s->audio_be, s->out.voice);
-
     streambuf_fini(&s->out.buf);
+
+    usb_audio_set_input_altset(s, ALTSET_OFF);
+    if (s->in.voice) {
+        audio_be_close_in(s->audio_be, s->in.voice);
+    }
+    streambuf_fini(&s->in.buf);
 }
 
 static void usb_audio_realize(USBDevice *dev, Error **errp)
@@ -956,6 +1372,11 @@ static void usb_audio_realize(USBDevice *dev, Error **errp)
     for (i = 0; i < USBAUDIO_MAX_CHANNELS(s); ++i) {
         s->out.vol.vol[i] = 240; /* 0 dB */
     }
+
+    s->in.altset         = ALTSET_OFF;
+    s->in.vol.mute       = false;
+    s->in.vol.vol[0]     = 240; /* 0 dB */
+    s->in.vol.vol[1]     = 240;
 
     usb_audio_reinit(dev, 2);
 }
@@ -982,6 +1403,23 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
                                 s, output_callback, &s->out.as);
     audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
     audio_be_set_active_out(s->audio_be, s->out.voice, 0);
+
+    /* Input is always stereo */
+    s->in.channels       = 2;
+    s->in.vol.channels   = 2;
+    s->in.as.freq        = USBAUDIO_SAMPLE_RATE;
+    s->in.as.nchannels   = 2;
+    s->in.as.fmt         = AUDIO_FORMAT_S16;
+    streambuf_init(&s->in.buf, 32 * USBAUDIO_PACKET_SIZE(2), 2);
+
+    s->in.voice = audio_be_open_in(s->audio_be, s->in.voice, TYPE_USB_AUDIO,
+                               s, input_callback, &s->in.as);
+    if (s->in.voice) {
+        audio_be_set_volume_in(s->audio_be, s->in.voice, &s->in.vol);
+        audio_be_set_active_in(s->audio_be, s->in.voice, 0);
+    } else {
+        fprintf(stderr, "usb-audio: warning: audio input not available\n");
+    }
 }
 
 static const VMStateDescription vmstate_usb_audio = {
