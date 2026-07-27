@@ -780,15 +780,26 @@ static void cmd_inquiry(IDEState *s, uint8_t *buf)
 
         buf[0] = 0x05; /* CD-ROM */
         buf[1] = 0x80; /* removable */
-        buf[2] = 0x00; /* ISO */
+        buf[2] = 0x02; /* ANSI version: SCSI-2 (confirmed to match
+                         * DingusPPC's real ATAPI CdromDrive::inquiry(),
+                         * the proven-working reference for this exact
+                         * machine -- was previously 0x00/"unspecified") */
         buf[3] = 0x21; /* ATAPI-2 (XXX: put ATAPI-4 ?) */
         /* buf[size_idx] set below. */
         buf[5] = 0;    /* reserved */
         buf[6] = 0;    /* reserved */
         buf[7] = 0;    /* reserved */
-        padstr8(buf + 8, 8, "QEMU");
-        padstr8(buf + 16, 16, "QEMU DVD-ROM");
-        padstr8(buf + 32, 4, s->version);
+        /*
+         * Real classic Mac OS ATAPI/SCSI driver code applies quirks keyed
+         * on the drive's reported identity, and some real Old World Macs
+         * genuinely shipped a Sony-made CD-ROM here. DingusPPC (the proven
+         * working reference for this exact machine) impersonates this
+         * same real drive rather than a generic "QEMU" identity -- mirror
+         * it for Apple-ROM compatibility.
+         */
+        padstr8(buf + 8, 8, "SONY");
+        padstr8(buf + 16, 16, "CD-ROM CDU-8003A");
+        padstr8(buf + 32, 4, "1.9a");
         idx = 36;
     }
 
@@ -930,6 +941,54 @@ static void cmd_mode_sense(IDEState *s, uint8_t *buf)
             buf[28] = 0;
             buf[29] = 0;
             ide_atapi_cmd_reply(s, 30, max_len);
+            break;
+        case 0x30: /* Apple vendor-specific "Apple Vendor" page, containing
+                    * the literal "APPLE COMPUTER, INC" signature. Real
+                    * classic Mac OS CD-ROM detection specifically queries
+                    * this page as part of qualifying the drive -- QEMU's
+                    * own SCSI CD-ROM code (hw/scsi/scsi-disk.c,
+                    * MODE_PAGE_APPLE_VENDOR, used by hw/m68k/q800.c's
+                    * "quirk_mode_page_apple_vendor") documents this
+                    * directly: "otherwise CDROM detection fails in MacOS".
+                    * Mirrored here byte-for-byte for the ATAPI/IDE path. */
+            stw_be_p(&buf[0], 40 - 2);
+            buf[2] = 0x70;
+            buf[3] = 0;
+            buf[4] = 0;
+            buf[5] = 0;
+            buf[6] = 0;
+            buf[7] = 0;
+
+            buf[8] = 0x30;
+            buf[9] = 40 - 10;
+            memset(&buf[10], 0, 30);
+            memcpy(&buf[10 + 8], "APPLE COMPUTER, INC   ",
+                   sizeof("APPLE COMPUTER, INC   "));
+            ide_atapi_cmd_reply(s, 40, max_len);
+            break;
+        case 0x31: /* Apple vendor-specific "Apple Features" page. Classic
+                    * Mac OS's ATAPI/SCSI driver requests this during its
+                    * error-recovery path; real hardware/DingusPPC (the
+                    * proven-working reference for this exact machine)
+                    * answer it with a fixed ".App" signature rather than
+                    * an illegal-request error. */
+            stw_be_p(&buf[0], 16 - 2);
+            buf[2] = 0x70;
+            buf[3] = 0;
+            buf[4] = 0;
+            buf[5] = 0;
+            buf[6] = 0;
+            buf[7] = 0;
+
+            buf[8] = 0x31;
+            buf[9] = 16 - 10;
+            buf[10] = '.';
+            buf[11] = 'A';
+            buf[12] = 'p';
+            buf[13] = 'p';
+            buf[14] = 0x00;
+            buf[15] = 0x00;
+            ide_atapi_cmd_reply(s, 16, max_len);
             break;
         default:
             goto error_cmd;
