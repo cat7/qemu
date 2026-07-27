@@ -392,3 +392,10 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
 scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_status) "generic ioctl sgio: cmd=0x%x ret=%d status=0x%x host_status=0x%x"
 scsi_generic_persistent_reserve_out_reply(uint8_t service_action, uint8_t resv_type, uint64_t old_key, uint64_t new_key) "persistent reserve out reply service_action=%u resv_type=%u old_key=0x%" PRIx64 " new_key=0x%" PRIx64
 scsi_generic_pr_state_preempt(uint64_t key, uint8_t resv_type) "key=0x%" PRIx64 " resv_type=%u"
+
+# mesh.c
+mesh_seq_cmd(uint8_t cmd) "cmd=0x%x"
+mesh_select_start(uint8_t target) "target=%d"
+mesh_select_timeout_fire(uint8_t target, int found) "target=%d found=%d"
+mesh_reg_write(uint64_t addr, uint64_t val) "addr=0x%" PRIx64 " val=0x%" PRIx64
+mesh_irq_update(uint8_t int_stat, uint8_t int_mask, int level) "int_stat=0x%x int_mask=0x%x level=%d"

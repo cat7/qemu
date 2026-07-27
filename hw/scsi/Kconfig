@@ -30,6 +30,10 @@ config VMW_PVSCSI_SCSI_PCI
     depends on PCI
     select SCSI
 
+config MESH
+    bool
+    select SCSI
+
 config ESP
     bool
     select SCSI
