@@ -557,6 +557,15 @@ void dump_mmu(CPUPPCState *env)
         mmubooke206_dump_mmu(env);
         break;
     case POWERPC_MMU_SOFT_6xx:
+    case POWERPC_MMU_32B:
+        /*
+         * MMU_32B is the modern hash32 translation path
+         * (mmu-hash32.c's ppc_hash32_bat_lookup()), but it reads BAT
+         * state from the exact same env->IBAT/DBAT/nb_BATs fields
+         * mmu6xx_dump_mmu() already knows how to print -- "info tlb"
+         * was previously silently unimplemented for every CPU using
+         * this (now far more common than SOFT_6xx) MMU model.
+         */
         mmu6xx_dump_mmu(env);
         break;
 #if defined(TARGET_PPC64)

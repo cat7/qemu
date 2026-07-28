@@ -544,8 +544,16 @@ static void powerpc_excp_6xx(PowerPCCPU *cpu, int excp)
     /* new srr1 value excluding must-be-zero bits */
     msr = env->msr & ~0x783f0000ULL;
 
-    /* new interrupt handler msr preserves ME unless explicitly overridden */
-    new_msr = env->msr & ((target_ulong)1 << MSR_ME);
+    /*
+     * New interrupt handler msr preserves ME and IP unless explicitly
+     * overridden. Per the Programming Environments Manual (32-bit),
+     * Table 6-11 "External Interrupt--Register Settings" (representative
+     * of the general exception-entry MSR update rule), both ME and IP
+     * are explicitly listed as unchanged ("--") across exception entry;
+     * only IP's preservation was previously missing here.
+     */
+    new_msr = env->msr & (((target_ulong)1 << MSR_ME) |
+                           ((target_ulong)1 << MSR_EP));
 
     /* HV emu assistance interrupt only exists on server arch 2.05 or later */
     if (excp == POWERPC_EXCP_HV_EMU) {
@@ -690,8 +698,16 @@ static void powerpc_excp_7xx(PowerPCCPU *cpu, int excp)
     /* new srr1 value excluding must-be-zero bits */
     msr = env->msr & ~0x783f0000ULL;
 
-    /* new interrupt handler msr preserves ME unless explicitly overridden */
-    new_msr = env->msr & ((target_ulong)1 << MSR_ME);
+    /*
+     * New interrupt handler msr preserves ME and IP unless explicitly
+     * overridden. Per the Programming Environments Manual (32-bit),
+     * Table 6-11 "External Interrupt--Register Settings" (representative
+     * of the general exception-entry MSR update rule), both ME and IP
+     * are explicitly listed as unchanged ("--") across exception entry;
+     * only IP's preservation was previously missing here.
+     */
+    new_msr = env->msr & (((target_ulong)1 << MSR_ME) |
+                           ((target_ulong)1 << MSR_EP));
 
     /* HV emu assistance interrupt only exists on server arch 2.05 or later */
     if (excp == POWERPC_EXCP_HV_EMU) {
@@ -844,8 +860,16 @@ static void powerpc_excp_74xx(PowerPCCPU *cpu, int excp)
     /* new srr1 value excluding must-be-zero bits */
     msr = env->msr & ~0x783f0000ULL;
 
-    /* new interrupt handler msr preserves ME unless explicitly overridden */
-    new_msr = env->msr & ((target_ulong)1 << MSR_ME);
+    /*
+     * New interrupt handler msr preserves ME and IP unless explicitly
+     * overridden. Per the Programming Environments Manual (32-bit),
+     * Table 6-11 "External Interrupt--Register Settings" (representative
+     * of the general exception-entry MSR update rule), both ME and IP
+     * are explicitly listed as unchanged ("--") across exception entry;
+     * only IP's preservation was previously missing here.
+     */
+    new_msr = env->msr & (((target_ulong)1 << MSR_ME) |
+                           ((target_ulong)1 << MSR_EP));
 
     /* HV emu assistance interrupt only exists on server arch 2.05 or later */
     if (excp == POWERPC_EXCP_HV_EMU) {

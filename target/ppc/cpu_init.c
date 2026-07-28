@@ -166,9 +166,18 @@ static void register_7xx_sprs(CPUPPCState *env)
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
 
+    /*
+     * SIAR (Sampled Instruction Address Register) is loaded by the
+     * performance-monitor hardware, not normally written by software --
+     * but real 6xx/7xx/74xx silicon tolerates an explicit software write
+     * as a no-op rather than trapping it (matches the SPR_L2CR precedent
+     * elsewhere in this file). Real Old World Mac ROM 750 boot code
+     * writes it unconditionally during native hardware bring-up and
+     * expects that to be harmless.
+     */
     spr_register(env, SPR_7XX_SIAR, "SIAR",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, SPR_NOACCESS,
+                 &spr_read_generic, spr_access_nop,
                  0x00000000);
 
     spr_register(env, SPR_7XX_UMMCR0, "UMMCR0",
@@ -302,9 +311,18 @@ static void register_604_sprs(CPUPPCState *env)
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
 
+    /*
+     * SIAR (Sampled Instruction Address Register) is loaded by the
+     * performance-monitor hardware, not normally written by software --
+     * but real 6xx/7xx/74xx silicon tolerates an explicit software write
+     * as a no-op rather than trapping it (matches the SPR_L2CR precedent
+     * elsewhere in this file). Real Old World Mac ROM 750 boot code
+     * writes it unconditionally during native hardware bring-up and
+     * expects that to be harmless.
+     */
     spr_register(env, SPR_7XX_SIAR, "SIAR",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, SPR_NOACCESS,
+                 &spr_read_generic, spr_access_nop,
                  0x00000000);
 
     spr_register(env, SPR_SDA, "SDA",
@@ -543,9 +561,18 @@ static void register_74xx_sprs(CPUPPCState *env)
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
 
+    /*
+     * SIAR (Sampled Instruction Address Register) is loaded by the
+     * performance-monitor hardware, not normally written by software --
+     * but real 6xx/7xx/74xx silicon tolerates an explicit software write
+     * as a no-op rather than trapping it (matches the SPR_L2CR precedent
+     * elsewhere in this file). Real Old World Mac ROM 750 boot code
+     * writes it unconditionally during native hardware bring-up and
+     * expects that to be harmless.
+     */
     spr_register(env, SPR_7XX_SIAR, "SIAR",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, SPR_NOACCESS,
+                 &spr_read_generic, spr_access_nop,
                  0x00000000);
 
     spr_register(env, SPR_7XX_UMMCR0, "UMMCR0",
@@ -3568,9 +3595,19 @@ static void init_proc_750(CPUPPCState *env)
     register_sdr1_sprs(env);
     register_7xx_sprs(env);
 
+    /*
+     * Real hardware bring-up code (this ROM included) configures L2CR
+     * during early boot and reads it back to confirm the write took
+     * effect -- a standard PowerPC 750 L2-cache-enable sequence. Making
+     * writes a true no-op (the generic upstream default, harmless for
+     * targets that never read L2CR back) means that verification always
+     * fails on this specific CPU, since it never sees its own write.
+     * Use a real, storing write handler instead, matching DingusPPC's
+     * own generic (storing) SPR array behavior for this register.
+     */
     spr_register(env, SPR_L2CR, "L2CR",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, spr_access_nop,
+                 &spr_read_generic, &spr_write_generic,
                  0x00000000);
     /* Thermal management */
     register_thrm_sprs(env);
@@ -7484,7 +7521,7 @@ static const struct SysemuCPUOps ppc_sysemu_ops = {
 #include "accel/tcg/cpu-ops.h"
 
 static const TCGCPUOps ppc_tcg_ops = {
-  .mttcg_supported = TARGET_LONG_BITS == 64,
+  .mttcg_supported = true,
   .guest_default_memory_order = 0,
   .initialize = ppc_translate_init,
   .translate_code = ppc_translate_code,

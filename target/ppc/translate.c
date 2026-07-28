@@ -4174,7 +4174,14 @@ static inline void gen_op_mfspr(DisasContext *ctx)
                 gen_priv_exception(ctx, POWERPC_EXCP_PRIV_REG);
             }
         } else {
-            if (ctx->pr || sprn == 0 || sprn == 4 || sprn == 5 || sprn == 6) {
+            /* See the matching comment in gen_mtspr(): this hv-emu
+             * special-casing of specific low SPR numbers only makes sense
+             * where hypervisor mode exists at all (TARGET_PPC64). */
+            if (ctx->pr
+#if defined(TARGET_PPC64)
+                || sprn == 0 || sprn == 4 || sprn == 5 || sprn == 6
+#endif
+                ) {
                 gen_hvpriv_exception(ctx, POWERPC_EXCP_PRIV_REG);
             }
         }
@@ -4355,7 +4362,21 @@ static void gen_mtspr(DisasContext *ctx)
                 gen_priv_exception(ctx, POWERPC_EXCP_PRIV_REG);
             }
         } else {
-            if (ctx->pr || sprn == 0) {
+            /*
+             * sprn == 0 forcing a hv-emu exception only makes sense where
+             * hypervisor mode exists at all (64-bit ISA 2.07+ hosts); no
+             * 32-bit PowerPC implementation has ever had an HV mode (see
+             * MSR_HVB above, which is unconditionally 0 for !TARGET_PPC64),
+             * so real silicon there tolerates SPR 0 in supervisor mode as
+             * an undefined no-op -- some real-world firmware (e.g. Old
+             * World Mac ROMs on PowerPC 750) writes it unconditionally
+             * during boot and expects exactly that.
+             */
+            if (ctx->pr
+#if defined(TARGET_PPC64)
+                || sprn == 0
+#endif
+                ) {
                 gen_hvpriv_exception(ctx, POWERPC_EXCP_PRIV_REG);
             }
         }
