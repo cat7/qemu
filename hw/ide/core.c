@@ -1744,6 +1744,22 @@ static bool cmd_set_features(IDEState *s, uint8_t cmd)
             }
             return true;
         }
+    default:
+        /*
+         * Real ATA/IDE controllers are commonly lenient about optional
+         * SET FEATURES subcommands they don't implement, silently
+         * accepting them as a no-op rather than strictly aborting per
+         * spec -- confirmed against DingusPPC's own accurate hardware
+         * model (`devices/common/ata/atahd.cpp`), whose default case for
+         * any unrecognized subcommand always clears BUSY and fires the
+         * completion IRQ without ever setting an error. A real classic
+         * Mac OS ATA driver (g3beige boot-blocker investigation,
+         * PowerMac G3 Old World ROM) issues a short sequence of such
+         * subcommands (observed: 0x88, 0x99) during its own drive-
+         * initialization and gets stuck indefinitely polling status if
+         * any of them come back with ERR/ABRT set.
+         */
+        return true;
     }
 
 abort_cmd:

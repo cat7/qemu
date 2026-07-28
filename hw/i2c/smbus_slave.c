@@ -96,6 +96,7 @@ static int smbus_i2c_event(I2CSlave *s, enum i2c_event event)
                 dev->mode = SMBUS_CONFUSED;
             } else {
                 smbus_do_write(dev);
+                dev->data_len = 0;
                 DPRINTF("Read mode\n");
                 dev->mode = SMBUS_READ_DATA;
             }

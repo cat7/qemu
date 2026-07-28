@@ -276,6 +276,36 @@ static void conditional_branch(DBDMA_channel *ch)
 
 static void channel_run(DBDMA_channel *ch);
 
+#define DBDMA_SYNC_CONTINUE_BURST_LIMIT 1000000
+
+/*
+ * Command processing normally continues by scheduling the channel's
+ * bottom-half (DBDMA_kick()) or, for I/O commands, by a device's own
+ * completion callback -- both of which need the main-loop thread to
+ * take the BQL to actually run. A guest that polls this channel's
+ * status register in a tight, read-only loop (confirmed happening: a
+ * probe for a DMA-capable device that isn't modeled) can hold the BQL
+ * busy nearly continuously, starving that out for long stretches even
+ * though the relevant timer/BH is already due to run. Continuing the
+ * command list synchronously, within the same call chain as whatever
+ * triggered this step, sidesteps that dependency entirely.
+ *
+ * Bounded by a per-channel counter shared across every synchronous
+ * continuation point (dbdma_end(), load_word(), store_word(), nop())
+ * so a command list that branches back on itself forever (e.g. a
+ * continuous-capture style circular buffer) can't spin the host in a
+ * true infinite C loop -- once the limit is hit this returns false and
+ * the caller falls back to the original deferred (bh/timer) mechanism.
+ */
+static bool dbdma_should_continue_sync(DBDMA_channel *ch)
+{
+    if (!((ch->regs[DBDMA_STATUS] & RUN) && (ch->regs[DBDMA_STATUS] & ACTIVE))) {
+        return false;
+    }
+
+    return ch->sync_continue_count++ < DBDMA_SYNC_CONTINUE_BURST_LIMIT;
+}
+
 static void dbdma_end(DBDMA_io *io)
 {
     DBDMA_channel *ch = io->channel;
@@ -299,9 +329,9 @@ wait:
     /* Indicate that we're ready for a new DMA round */
     ch->io.processing = false;
 
-    if ((ch->regs[DBDMA_STATUS] & RUN) &&
-        (ch->regs[DBDMA_STATUS] & ACTIVE))
+    if (dbdma_should_continue_sync(ch)) {
         channel_run(ch);
+    }
 }
 
 static void start_output(DBDMA_channel *ch, int key, uint32_t addr,
@@ -386,6 +416,17 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
 
 wait:
     DBDMA_kick(dbdma_from_ch(ch));
+
+    /*
+     * LOAD_WORD/STORE_WORD/NOP advance the command pointer synchronously
+     * (via next()/conditional_branch() above) but historically only
+     * relied on DBDMA_kick()'s bottom-half to actually process whatever
+     * comes next -- see the comment on dbdma_should_continue_sync() for
+     * why that isn't reliable under a tight guest polling loop.
+     */
+    if (dbdma_should_continue_sync(ch)) {
+        channel_run(ch);
+    }
 }
 
 static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
@@ -419,6 +460,11 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
 
 wait:
     DBDMA_kick(dbdma_from_ch(ch));
+
+    /* See the matching comment in load_word(). */
+    if (dbdma_should_continue_sync(ch)) {
+        channel_run(ch);
+    }
 }
 
 static void nop(DBDMA_channel *ch)
@@ -436,6 +482,11 @@ static void nop(DBDMA_channel *ch)
 
 wait:
     DBDMA_kick(dbdma_from_ch(ch));
+
+    /* See the matching comment in load_word(). */
+    if (dbdma_should_continue_sync(ch)) {
+        channel_run(ch);
+    }
 }
 
 static void stop(DBDMA_channel *ch)
@@ -476,7 +527,8 @@ static void channel_run(DBDMA_channel *ch)
     phy_addr = le32_to_cpu(current->phy_addr);
 
     if (key == KEY_STREAM4) {
-        printf("command %x, invalid key 4\n", cmd);
+        qemu_log_mask(LOG_GUEST_ERROR, "DBDMA: command %x, invalid key 4\n",
+                      cmd);
         kill_channel(ch);
         return;
     }
@@ -503,8 +555,15 @@ static void channel_run(DBDMA_channel *ch)
         return;
     }
 
+    /*
+     * Mac OS's own drivers routinely issue LOAD_WORD/STORE_WORD
+     * descriptors with a stream key (0); treating it as KEY_SYSTEM is
+     * what they expect, so log only under -d guest_errors instead of
+     * printf-spamming every boot ("command 5000, invalid key 0").
+     */
     if (key < KEY_REGS) {
-        printf("command %x, invalid key %x\n", cmd, key);
+        qemu_log_mask(LOG_GUEST_ERROR, "DBDMA: command %x, invalid key %x\n",
+                      cmd, key);
         key = KEY_SYSTEM;
     }
 
@@ -543,6 +602,18 @@ static void DBDMA_run(DBDMAState *s)
         DBDMA_channel *ch = &s->channels[channel];
         uint32_t status = ch->regs[DBDMA_STATUS];
         if (!ch->io.processing && (status & RUN) && (status & ACTIVE)) {
+            /*
+             * Give this run of the bottom-half a fresh synchronous-
+             * continuation budget rather than letting sync_continue_count
+             * only ever get reset by a deferred completion (see
+             * dbdma_should_continue_sync()) -- that reset path can itself
+             * be the one starved of the BQL, in which case the budget,
+             * once spent, would otherwise never come back. The BH is
+             * scheduled unconditionally "ready" (no clock-deadline
+             * computation needed), so it is serviced far more reliably
+             * than a QEMU_CLOCK_VIRTUAL timer under the same contention.
+             */
+            ch->sync_continue_count = 0;
             channel_run(ch);
         }
     }
@@ -692,6 +763,8 @@ static void dbdma_control_write(DBDMA_channel *ch)
 
     /* If active, make sure the BH gets to run */
     if (status & ACTIVE) {
+        /* Fresh guest-triggered kick: see the comment in DBDMA_run(). */
+        ch->sync_continue_count = 0;
         DBDMA_kick(dbdma_from_ch(ch));
     }
 }
@@ -863,25 +936,71 @@ static void mac_dbdma_reset(DeviceState *d)
 
     for (i = 0; i < DBDMA_CHANNELS; i++) {
         memset(s->channels[i].regs, 0, DBDMA_SIZE);
+        s->channels[i].sync_continue_count = 0;
     }
+}
+
+#define DBDMA_UNASSIGNED_COMPLETION_DELAY_MS 1
+
+static void dbdma_unassigned_complete(void *opaque)
+{
+    DBDMA_channel *ch = opaque;
+
+    ch->sync_continue_count = 0;
+    ch->io.dma_end(&ch->io);
 }
 
 static void dbdma_unassigned_rw(DBDMA_io *io)
 {
     DBDMA_channel *ch = io->channel;
-    dbdma_cmd *current = &ch->current;
-    uint16_t cmd;
+
     qemu_log_mask(LOG_GUEST_ERROR, "%s: use of unassigned channel %d\n",
                   __func__, ch->channel);
-    ch->io.processing = false;
 
-    cmd = le16_to_cpu(current->command) & COMMAND_MASK;
-    if (cmd == OUTPUT_MORE || cmd == OUTPUT_LAST ||
-        cmd == INPUT_MORE || cmd == INPUT_LAST) {
-        current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
-        current->res_count = cpu_to_le16(io->len);
-        dbdma_cmdptr_save(ch);
+    /*
+     * No device is attached to service this transfer, but the command
+     * list itself still has to be completed properly (status/residual
+     * written back, then the command pointer advanced via the normal
+     * interrupt/branch handling) exactly like a real device's completion
+     * would -- otherwise channel_run() just re-reads and re-attempts the
+     * same never-advancing command forever, which is guest-visible as a
+     * permanent hang (confirmed: a native "wait for ChannelStatus.active
+     * to clear" poll loop spun indefinitely on this before this fix).
+     * DingusPPC's equivalent generic DMA channel model has the same
+     * behavior: an absent device callback is simply skipped, and the
+     * command list's own completion bookkeeping proceeds unconditionally.
+     *
+     * Completed inline (bounded by a burst limit) rather than always
+     * deferred: a deferred QEMU_CLOCK_VIRTUAL timer only fires once the
+     * main-loop thread takes the BQL to service it, but a guest that
+     * only *polls* this channel's status register (never writing
+     * anything further) can hold the BQL open almost continuously --
+     * each MMIO read re-acquires it as fast as the previous one releases
+     * it -- starving the main-loop thread out of ever running the timer
+     * at all. Confirmed live: the timer's expire_time had already
+     * elapsed while dbdma_unassigned_complete() had never been entered,
+     * leaving the channel's ACTIVE bit permanently stuck even though the
+     * "completion" was only ever paced by 1ms, not blocked forever.
+     * Completing inline happens within the same call chain as whatever
+     * triggered it (the guest's own CONTROL-register kick, or
+     * channel_run()'s recursive re-invocation for the next descriptor),
+     * which needs no further BQL acquisition by anyone else.
+     *
+     * The burst limit exists only to bound the one case that must not
+     * run inline: a genuinely-unbounded descriptor ring (e.g. a
+     * continuous-capture style circular buffer that branches back to
+     * its own start forever) would otherwise spin the host in a true
+     * infinite C loop. Once the limit is hit, fall back to the paced
+     * timer as before to yield back to the host/guest.
+     */
+    if (ch->sync_continue_count++ < DBDMA_SYNC_CONTINUE_BURST_LIMIT) {
+        ch->io.dma_end(&ch->io);
+        return;
     }
+
+    timer_mod(ch->unassigned_completion_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              DBDMA_UNASSIGNED_COMPLETION_DELAY_MS);
 }
 
 static void dbdma_unassigned_flush(DBDMA_io *io)
@@ -904,9 +1023,12 @@ static void mac_dbdma_init(Object *obj)
         ch->flush = dbdma_unassigned_flush;
         ch->channel = i;
         ch->io.channel = ch;
+        ch->unassigned_completion_timer =
+            timer_new_ms(QEMU_CLOCK_VIRTUAL, dbdma_unassigned_complete, ch);
     }
 
-    memory_region_init_io(&s->mem, obj, &dbdma_ops, s, "dbdma", 0x1000);
+    memory_region_init_io(&s->mem, obj, &dbdma_ops, s, "dbdma",
+                          DBDMA_REGION_SIZE);
     sysbus_init_mmio(sbd, &s->mem);
 }
 
