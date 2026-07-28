@@ -347,7 +347,22 @@ static void adb_kbd_reset(DeviceState *dev)
     ADBDevice *d = ADB_DEVICE(dev);
     KBDState *s = ADB_KEYBOARD(dev);
 
-    d->handler = 1;
+    /*
+     * Default handler ID 2 ("Apple Extended Keyboard"), not 1 ("Apple
+     * Standard Keyboard"): linux_to_adb_keycode[] above maps keys (F13-F15,
+     * the numeric keypad, Home/End/Page Up/Down, Forward Delete, cursor
+     * keys) that only exist on an Extended Keyboard -- a real Standard
+     * Keyboard has none of them. Real Extended Keyboard hardware also
+     * ships from the factory reporting handler ID 2, matching DingusPPC's
+     * AdbKeyboard::reset() (dev_handler_id = 2). Advertising handler 1
+     * here while behaving like handler 2 is a self-identification
+     * mismatch: an ADB host that trusts the device's initial self-reported
+     * ID during early bus/address discovery (rather than always issuing
+     * a register-3 handler-ID renegotiation) would treat this keyboard as
+     * a non-extended 63-key unit and never poll or interpret the extended
+     * keys correctly.
+     */
+    d->handler = 2;
     d->devaddr = ADB_DEVID_KEYBOARD;
     memset(s->data, 0, sizeof(s->data));
     s->rptr = 0;

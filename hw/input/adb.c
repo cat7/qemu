@@ -237,7 +237,12 @@ static void adb_bus_reset_hold(Object *obj, ResetType type)
 
     adb_bus->autopoll_enabled = false;
     adb_bus->autopoll_mask = 0xffff;
-    adb_bus->autopoll_rate_ms = 20;
+    /*
+     * Real CUDA hardware's default autopoll rate is 11ms (confirmed
+     * against DingusPPC's ViaCuda, which initializes poll_rate to 11 --
+     * matching the classic ADB Manager's expected default cadence).
+     */
+    adb_bus->autopoll_rate_ms = 11;
 }
 
 static void adb_bus_realize(BusState *qbus, Error **errp)
