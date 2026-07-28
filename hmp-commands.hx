@@ -426,6 +426,32 @@ SRST
 ERST
 
     {
+        .name       = "x-icount-get",
+        .args_type  = "",
+        .params     = "",
+        .help       = "EXPERIMENTAL: print icount's raw executed-instruction counter",
+        .cmd        = hmp_x_icount_get,
+    },
+
+SRST
+``x-icount-get``
+  EXPERIMENTAL. Print icount's raw executed-instruction counter (requires -icount).
+ERST
+
+    {
+        .name       = "x-cpu-throttle-set",
+        .args_type  = "pct:i",
+        .params     = "pct",
+        .help       = "EXPERIMENTAL: set generic vCPU throttle percentage (1-99)",
+        .cmd        = hmp_x_cpu_throttle_set,
+    },
+
+SRST
+``x-cpu-throttle-set`` *pct*
+  EXPERIMENTAL. Set the generic vCPU real-time throttle percentage (1-99).
+ERST
+
+    {
         .name       = "cont|c",
         .args_type  = "",
         .params     = "",

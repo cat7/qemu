@@ -33,6 +33,8 @@
 #include "block/block-hmp-cmds.h"
 #include "qobject/qdict.h"
 #include "qemu/cutils.h"
+#include "exec/icount.h"
+#include "system/cpu-throttle.h"
 #include "qemu/log.h"
 #include "net/slirp.h"
 #include "system/device_tree.h"
@@ -139,6 +141,37 @@ void hmp_quit(Monitor *mon, const QDict *qdict)
 void hmp_stop(Monitor *mon, const QDict *qdict)
 {
     qmp_stop(NULL);
+}
+
+/*
+ * EXPERIMENTAL, prototype-only debug commands for the g3beige
+ * VIA/CUDA-timing-race investigation: expose icount's raw instruction
+ * counter (for external governor measurement, without needing icount to
+ * also pace virtual time) and the existing generic cpu_throttle_set()
+ * mechanism (normally only reachable via the Cocoa UI's CPU-throttle
+ * menu), so an external control loop can steer real wall-clock
+ * execution speed based on measured instruction throughput. Not a
+ * considered-final QEMU API addition.
+ */
+void hmp_x_icount_get(Monitor *mon, const QDict *qdict)
+{
+    if (!icount_enabled()) {
+        monitor_printf(mon, "icount not enabled\n");
+        return;
+    }
+    monitor_printf(mon, "%" PRId64 "\n", icount_get());
+}
+
+void hmp_x_cpu_throttle_set(Monitor *mon, const QDict *qdict)
+{
+    int64_t pct = qdict_get_int(qdict, "pct");
+
+    if (pct < 1 || pct > 99) {
+        monitor_printf(mon, "pct must be 1-99\n");
+        return;
+    }
+    cpu_throttle_set((int)pct);
+    monitor_printf(mon, "throttle set to %" PRId64 "%%\n", pct);
 }
 
 void hmp_sync_profile(Monitor *mon, const QDict *qdict)
