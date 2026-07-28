@@ -51,6 +51,13 @@ config CS4231
 config ASC
     bool
 
+config AWACS
+    bool
+
+config TDA7433
+    bool
+    depends on I2C
+
 config VIRTIO_SND
     bool
     default y
