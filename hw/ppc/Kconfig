@@ -128,9 +128,17 @@ config MAC_OLDWORLD
     imply SUNGEM
     imply TEST_DEVICES
     select ADB
+    select ATHENS_CLOCKS
+    select ATI_MACH64
     select GRACKLE_PCI
     select HEATHROW_PIC
     select MACIO
+    select BMAC
+    select MESH
+    select AWACS
+    select TDA7433
+    select SWIM
+    select SMBUS_EEPROM
     select FW_CFG_PPC
 
 config MAC_NEWWORLD

@@ -28,6 +28,7 @@
 #include "qemu/module.h"
 #include "hw/misc/macio/cuda.h"
 #include "hw/pci/pci.h"
+#include "net/net.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -147,6 +148,15 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
         return;
     }
 
+    /*
+     * Real Beige G3 hardware's mac-io/heathrow chip reports revision-id=1
+     * in its PCI config space (confirmed against a real hardware Open
+     * Firmware device-tree dump, SourceFiles/G3/PowerMacG3-device-tree.txt,
+     * "revision-id" property under Node mac-io) -- we previously left this
+     * at the generic zero default.
+     */
+    pci_set_byte(&d->config[PCI_REVISION_ID], 1);
+
     /* Heathrow PIC */
     if (!qdev_realize(DEVICE(&os->pic), BUS(&s->macio_bus), errp)) {
         return;
@@ -175,22 +185,88 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
     sbd = SYS_BUS_DEVICE(&os->nvram);
     memory_region_add_subregion(&s->bar, 0x60000,
                                 sysbus_mmio_get_region(sbd, 0));
-    pmac_format_nvram_partition(&os->nvram, os->nvram.size);
+    pmac_format_nvram_partition_oldworld(&os->nvram);
 
-    /* IDE buses */
+    /*
+     * IDE buses. Channel numbers 0xb/0xc (not the seemingly more
+     * "familiar" 0x16/0x18) -- confirmed empirically after fixing
+     * DBDMA_CHANNEL_SHIFT (include/hw/ppc/mac_dbdma.h): with the
+     * corrected shift, a real ROM's IDE0 DMA-start command was
+     * observed live setting RUN on internal channel 0x0b, not 0x16.
+     * The previous 0x16/0x18 values were, like AWACS_DMA_IN_CHANNEL
+     * before this same fix, tuned to double the real channel number
+     * to compensate for the old, wrong shift -- not real hardware
+     * values in their own right.
+     */
     if (!macio_realize_ide(s, &os->ide[0],
                            qdev_get_gpio_in(pic_dev, OLDWORLD_IDE0_IRQ),
                            qdev_get_gpio_in(pic_dev, OLDWORLD_IDE0_DMA_IRQ),
-                           0x16, errp)) {
+                           0x0b, errp)) {
         return;
     }
 
     if (!macio_realize_ide(s, &os->ide[1],
                            qdev_get_gpio_in(pic_dev, OLDWORLD_IDE1_IRQ),
                            qdev_get_gpio_in(pic_dev, OLDWORLD_IDE1_DMA_IRQ),
-                           0x1a, errp)) {
+                           0x0c, errp)) {
         return;
     }
+
+    /* BMAC ethernet: on real hardware, always physically present */
+    qemu_configure_nic_device(DEVICE(&os->bmac), true, "bmac");
+    if (!qdev_realize(DEVICE(&os->bmac), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&os->bmac);
+    memory_region_add_subregion(&s->bar, 0x11000,
+                                sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_TX_IRQ));
+    sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_RX_IRQ));
+    bmac_register_dma(&os->bmac, &s->dbdma);
+
+    /* MESH SCSI controller: on real hardware, always physically present */
+    if (!qdev_realize(DEVICE(&os->mesh), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&os->mesh);
+    memory_region_add_subregion(&s->bar, 0x10000,
+                                sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_MESH_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_MESH_DMA_IRQ));
+    mesh_register_dma(&os->mesh, &s->dbdma);
+
+    /*
+     * AWACS sound codec: on real hardware, always physically present.
+     * Real Beige G3 ROM plays a startup chime very early in boot and
+     * hangs indefinitely polling Codec Status if nothing answers here.
+     */
+    if (!qdev_realize(DEVICE(&os->awacs), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&os->awacs);
+    memory_region_add_subregion(&s->bar, 0x14000,
+                                sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_AWACS_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_AWACS_DMA_IRQ));
+    awacs_register_dma(&os->awacs, &s->dbdma);
+
+    /*
+     * SWIM3 floppy controller: on real hardware, always physically present.
+     * The generic swim.c model exposes a 0x2000-byte IWM/ISM register
+     * window (sized for q800's memory map), but the real Beige G3 device
+     * tree registers only 0x1000 bytes for swim3 at this offset -- the
+     * following 0x1000 bytes belong to CUDA (mapped at 0x16000 below).
+     * Map only the first 0x1000 bytes via an alias so SWIM3 doesn't shadow
+     * CUDA's registers in macio's address space.
+     */
+    if (!qdev_realize(DEVICE(&os->swim), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&os->swim);
+    memory_region_init_alias(&os->swim_mmio_alias, OBJECT(s), "swim3-oldworld",
+                             sysbus_mmio_get_region(sbd, 0), 0, 0x1000);
+    memory_region_add_subregion(&s->bar, 0x15000, &os->swim_mmio_alias);
 }
 
 static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index)
@@ -223,6 +299,11 @@ static void macio_oldworld_init(Object *obj)
     for (i = 0; i < 2; i++) {
         macio_init_ide(s, &os->ide[i], i);
     }
+
+    object_initialize_child(obj, "bmac", &os->bmac, TYPE_BMAC);
+    object_initialize_child(obj, "mesh", &os->mesh, TYPE_MESH);
+    object_initialize_child(obj, "awacs", &os->awacs, TYPE_AWACS);
+    object_initialize_child(obj, "swim", &os->swim, TYPE_SWIM);
 }
 
 static void timer_write(void *opaque, hwaddr addr, uint64_t value,

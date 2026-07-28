@@ -33,6 +33,10 @@
 #include "hw/misc/macio/cuda.h"
 #include "hw/misc/macio/gpio.h"
 #include "hw/misc/macio/pmu.h"
+#include "hw/net/bmac.h"
+#include "hw/scsi/mesh.h"
+#include "hw/audio/awacs.h"
+#include "hw/block/swim.h"
 #include "hw/nvram/mac_nvram.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/ppc/openpic.h"
@@ -46,6 +50,14 @@
 #define OLDWORLD_IDE0_DMA_IRQ  0x2
 #define OLDWORLD_IDE1_IRQ      0xe
 #define OLDWORLD_IDE1_DMA_IRQ  0x3
+#define OLDWORLD_BMAC_TX_IRQ   0x20
+#define OLDWORLD_BMAC_RX_IRQ   0x21
+#define OLDWORLD_BMAC_IRQ      0x2a
+#define OLDWORLD_MESH_DMA_IRQ  0x0
+#define OLDWORLD_MESH_IRQ      0xc
+#define OLDWORLD_AWACS_IRQ     0x11
+#define OLDWORLD_AWACS_DMA_IRQ 0x8
+#define OLDWORLD_SWIM_IRQ      0x13
 
 /* New World IRQs */
 #define NEWWORLD_CUDA_IRQ      0x19
@@ -127,6 +139,11 @@ struct OldWorldMacIOState {
 
     MacIONVRAMState nvram;
     MACIOIDEState ide[2];
+    BMACState bmac;
+    MESHState mesh;
+    AWACSState awacs;
+    Swim swim;
+    MemoryRegion swim_mmio_alias;
 };
 
 #define TYPE_NEWWORLD_MACIO "macio-newworld"
