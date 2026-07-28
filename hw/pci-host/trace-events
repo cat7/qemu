@@ -16,6 +16,7 @@ bonito_spciconf_small_access(uint64_t addr, unsigned size) "PCI config address i
 
 # grackle.c
 grackle_set_irq(int irq_num, int level) "set_irq num %d level %d"
+grackle_ram_setup(uint32_t start, uint32_t end, uint64_t size) "MPC106 bank-decoded RAM range: start=0x%08x end=0x%08x size=%" PRIu64 " bytes"
 
 # gt64120.c
 gt64120_read(uint64_t addr, uint64_t value) "gt64120 read 0x%03"PRIx64" value:0x%08" PRIx64

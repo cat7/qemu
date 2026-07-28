@@ -33,10 +33,35 @@
 #include "qom/object.h"
 #include "hw/pci-host/grackle.h"
 
-/* Don't know if this matches real hardware, but it agrees with OHW.  */
+/*
+ * Real Gossamer PCI interrupt wiring (matching DingusPPC's Heathrow
+ * IntSrc table, itself derived from the real board): each slot has all
+ * its INTx pins tied to one dedicated Heathrow line -- onboard ATI GPU
+ * (devfn 0x12) -> line 0x16, slot A1 (0x0D) -> 0x17, B1 (0x0E) -> 0x18,
+ * C1 (0x0F) -> 0x19. The four outputs here are wired to Heathrow lines
+ * 0x16+i by mac_oldworld.c. The original generic (pin+slot)&3 rotation
+ * over lines 0x15-0x18 put every device on the wrong line -- found via
+ * the GPU's VBLANK interrupt asserting a line Mac OS never listens on
+ * (VBL task queue never ran; frozen mouse pointer while everything
+ * else worked). NOTE: enabling this wiring requires the ATI model's
+ * pulse-style VBL interrupt (see ati_mach64.c) -- with the older
+ * latched-line model, an unhandled early-boot VBL stayed asserted
+ * forever and wedged the ROM.
+ */
 static int pci_grackle_map_irq(PCIDevice *pci_dev, int irq_num)
 {
-    return (irq_num + (pci_dev->devfn >> 3)) & 3;
+    switch (pci_dev->devfn >> 3) {
+    case 0x12:                          /* onboard ATI GPU  -> 0x16 */
+        return 0;
+    case 0x0d:                          /* PCI slot A1      -> 0x17 */
+        return 1;
+    case 0x0e:                          /* PCI slot B1      -> 0x18 */
+        return 2;
+    case 0x0f:                          /* PCI slot C1      -> 0x19 */
+        return 3;
+    default:
+        return (irq_num + (pci_dev->devfn >> 3)) & 3;
+    }
 }
 
 static void pci_grackle_set_irq(void *opaque, int irq_num, int level)
@@ -89,9 +114,148 @@ static void grackle_init(Object *obj)
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
 }
 
+/*
+ * Real MPC106 ("Grackle") memory-controller bank-decode registers
+ * (NXP MPC106UM §5.1). The Beige G3 ROM programs these from the RAM
+ * geometry it reads via SPD, then sets MEMGO in MCCR1 to activate the
+ * bank(s). DingusPPC (a reference PowerMac emulator that boots this
+ * exact ROM successfully) derives its actual usable-RAM range from
+ * this register programming rather than trusting the nominal
+ * configured RAM size verbatim; QEMU's grackle model has never
+ * implemented these registers at all. Track them here so the RAM
+ * range implied by the ROM's own programming can be observed via
+ * trace, ahead of deciding whether/how it should affect the RAM
+ * mapping itself.
+ */
+enum {
+    GRACKLE_MSAR1  = 0x80,
+    GRACKLE_MSAR2  = 0x84,
+    GRACKLE_EMSAR1 = 0x88,
+    GRACKLE_EMSAR2 = 0x8c,
+    GRACKLE_MEAR1  = 0x90,
+    GRACKLE_MEAR2  = 0x94,
+    GRACKLE_EMEAR1 = 0x98,
+    GRACKLE_EMEAR2 = 0x9c,
+    GRACKLE_MBER   = 0xa0,
+    GRACKLE_MCCR1  = 0xf0,
+    GRACKLE_MEMGO  = 1 << 19,
+};
+
+typedef struct GrackleFunState {
+    PCIDevice parent_obj;
+
+    uint32_t mem_start[2];
+    uint32_t ext_mem_start[2];
+    uint32_t mem_end[2];
+    uint32_t ext_mem_end[2];
+    uint8_t mem_bank_en;
+    uint32_t mccr1;
+} GrackleFunState;
+
+/* Mirrors DingusPPC's MPC106::setup_ram() bank-decode arithmetic exactly. */
+static void grackle_log_ram_range(GrackleFunState *s)
+{
+    uint32_t bank_start[8], bank_end[8];
+    int bank_order[8];
+    int bank_count = 0;
+    uint32_t lo, hi;
+
+    for (int bank = 0; bank < 8; bank++) {
+        int word, shift;
+
+        if (!(s->mem_bank_en & (1 << bank))) {
+            continue;
+        }
+        word = bank >> 2;
+        shift = (bank & 3) * 8;
+        bank_start[bank_count] =
+            (((s->ext_mem_start[word] >> shift) & 3) << 28) |
+            (((s->mem_start[word] >> shift) & 0xff) << 20);
+        bank_end[bank_count] =
+            (((s->ext_mem_end[word] >> shift) & 3) << 28) |
+            (((s->mem_end[word] >> shift) & 0xff) << 20) | 0xfffff;
+        bank_order[bank_count] = bank_count;
+        bank_count++;
+    }
+    if (bank_count == 0) {
+        trace_grackle_ram_setup(0, 0, 0);
+        return;
+    }
+
+    for (int i = 0; i < bank_count; i++) {
+        for (int j = i + 1; j < bank_count; j++) {
+            if (bank_start[bank_order[j]] < bank_start[bank_order[i]]) {
+                int tmp = bank_order[i];
+                bank_order[i] = bank_order[j];
+                bank_order[j] = tmp;
+            }
+        }
+    }
+
+    lo = bank_start[bank_order[0]];
+    hi = bank_end[bank_order[0]];
+    for (int i = 1; i < bank_count; i++) {
+        if (bank_end[bank_order[i]] > hi) {
+            hi = bank_end[bank_order[i]];
+        }
+    }
+    trace_grackle_ram_setup(lo, hi, (uint64_t)hi - lo + 1);
+}
+
+static void grackle_pci_config_write(PCIDevice *d, uint32_t addr,
+                                      uint32_t val, int len)
+{
+    GrackleFunState *s = (GrackleFunState *)d;
+
+    pci_default_write_config(d, addr, val, len);
+
+    switch (addr & ~3u) {
+    case GRACKLE_MSAR1:
+        s->mem_start[0] = pci_get_long(d->config + GRACKLE_MSAR1);
+        break;
+    case GRACKLE_MSAR2:
+        s->mem_start[1] = pci_get_long(d->config + GRACKLE_MSAR2);
+        break;
+    case GRACKLE_EMSAR1:
+        s->ext_mem_start[0] = pci_get_long(d->config + GRACKLE_EMSAR1);
+        break;
+    case GRACKLE_EMSAR2:
+        s->ext_mem_start[1] = pci_get_long(d->config + GRACKLE_EMSAR2);
+        break;
+    case GRACKLE_MEAR1:
+        s->mem_end[0] = pci_get_long(d->config + GRACKLE_MEAR1);
+        break;
+    case GRACKLE_MEAR2:
+        s->mem_end[1] = pci_get_long(d->config + GRACKLE_MEAR2);
+        break;
+    case GRACKLE_EMEAR1:
+        s->ext_mem_end[0] = pci_get_long(d->config + GRACKLE_EMEAR1);
+        break;
+    case GRACKLE_EMEAR2:
+        s->ext_mem_end[1] = pci_get_long(d->config + GRACKLE_EMEAR2);
+        break;
+    case GRACKLE_MBER:
+        s->mem_bank_en = pci_get_long(d->config + GRACKLE_MBER) & 0xff;
+        break;
+    case GRACKLE_MCCR1:
+        s->mccr1 = pci_get_long(d->config + GRACKLE_MCCR1);
+        if (s->mccr1 & GRACKLE_MEMGO) {
+            grackle_log_ram_range(s);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void grackle_pci_realize(PCIDevice *d, Error **errp)
 {
+    GrackleFunState *s = (GrackleFunState *)d;
+
     d->config[PCI_CLASS_PROG] = 0x01;
+    /* Real MPC106 reset default (NXP MPC106UM §5.1.11): 64-bit ROM bus,
+     * MEMGO already set. */
+    s->mccr1 = 0xff820000;
 }
 
 static void grackle_pci_class_init(ObjectClass *klass, const void *data)
@@ -100,6 +264,7 @@ static void grackle_pci_class_init(ObjectClass *klass, const void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     k->realize   = grackle_pci_realize;
+    k->config_write = grackle_pci_config_write;
     k->vendor_id = PCI_VENDOR_ID_MOTOROLA;
     k->device_id = PCI_DEVICE_ID_MOTOROLA_MPC106;
     k->revision  = 0x00;
@@ -114,7 +279,7 @@ static void grackle_pci_class_init(ObjectClass *klass, const void *data)
 static const TypeInfo grackle_pci_info = {
     .name          = "grackle",
     .parent        = TYPE_PCI_DEVICE,
-    .instance_size = sizeof(PCIDevice),
+    .instance_size = sizeof(GrackleFunState),
     .class_init = grackle_pci_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
