@@ -320,22 +320,44 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [NSCursor unhide];
 }
 
-- (void)setMouseX:(int)x y:(int)y on:(bool)on
+/*
+ * Position (and size) the guest-cursor layer in VIEW coordinates. The
+ * guest reports cursor position in surface pixels, but the view may be
+ * displaying the surface scaled (zoom-to-fit windows, full-screen);
+ * without applying the view/surface ratio the cursor is drawn at the
+ * raw pixel coordinates, drifting ever further from the true guest
+ * position on scaled displays and hitting the window edge before the
+ * guest pointer reaches the screen edge.
+ */
+- (void)refreshCursorGeometry
 {
     CGPoint position;
+    NSSize size = [self bounds].size;
+    CGFloat sx = screen.width ? size.width / (CGFloat)screen.width : 1.0;
+    CGFloat sy = screen.height ? size.height / (CGFloat)screen.height : 1.0;
 
-    mouseX = x;
-    mouseY = y;
-    mouseOn = on;
-
-    position.x = mouseX;
-    position.y = screen.height - mouseY;
+    position.x = mouseX * sx;
+    position.y = size.height - mouseY * sy;
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
+    if (cursor) {
+        CGRect bounds = CGRectZero;
+        bounds.size.width = cursor->width * sx;
+        bounds.size.height = cursor->height * sy;
+        [cursorLayer setBounds:bounds];
+    }
     [cursorLayer setPosition:position];
     [cursorLayer setHidden:!mouseOn];
     [CATransaction commit];
+}
+
+- (void)setMouseX:(int)x y:(int)y on:(bool)on
+{
+    mouseX = x;
+    mouseY = y;
+    mouseOn = on;
+    [self refreshCursorGeometry];
 }
 
 - (void)setCursor:(QEMUCursor *)given_cursor
@@ -384,6 +406,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     [cursorLayer setContents:(id)image];
     [CATransaction commit];
     CGImageRelease(image);
+    [self refreshCursorGeometry];
 }
 
 - (void) drawRect:(NSRect) rect
@@ -602,6 +625,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         screen.height = h;
         [self resizeWindow];
         [self updateBounds];
+        [self refreshCursorGeometry];
     }
 
     // update screenBuffer
