@@ -32,6 +32,7 @@
 #include "system/block-backend.h"
 #include "migration/vmstate.h"
 #include "qemu/cutils.h"
+#include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "trace.h"
@@ -176,6 +177,108 @@ static void pmac_format_nvram_partition_of(MacIONVRAMState *nvr, int off,
 
     /* Free space partition */
     chrp_nvram_create_free_partition(&nvr->data[sysp_end], len - sysp_end);
+}
+
+/*
+ * Old World Macs' genuine Open Firmware NVRAM partition: signature 0x1275,
+ * version 5, at a fixed offset (0x1800) -- a completely different layout
+ * from the CHRP/OpenBIOS text partition above (which is what New World
+ * ROMs use instead; see DingusPPC's devices/common/ofnvram.cpp, whose own
+ * comments label OfConfigAppl "Old World" vs OfConfigChrp "New World").
+ * A real Beige G3 ROM's NanoKernel-level NVRAM validation looks for this
+ * exact structure; without it, the boot never leaves the 68K low-memory
+ * init code (confirmed by comparing against a live DingusPPC capture of
+ * the identical ROM, whose own NVRAM has this partition populated and
+ * has nothing at all at the offsets the CHRP partition above uses).
+ *
+ * The two chunks below are copied verbatim from a real, checksum-valid
+ * partition captured from a successful DingusPPC boot of this same ROM
+ * (header + int vars, then the string heap grown down from the partition
+ * end); everything in between is zero, matching the captured data.
+ */
+#define OLDWORLD_OF_OFFSET      0x1800
+#define OLDWORLD_OF_SIZE        0x800
+
+static const uint8_t oldworld_of_partition_head[] = {
+    /* sig=0x1275 version=5 num_pages=8 checksum=0x78fb here=0x185c top=0x1fe2 */
+    0x12, 0x75, 0x05, 0x08, 0x78, 0xfb, 0x18, 0x5c, 0x1f, 0xe2, 0x00, 0x00,
+    /* flags (auto-boot? only) */
+    0x20, 0x00, 0x00, 0x00,
+    /* real-base, real-size, virt-base, virt-size, load-base */
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+    /* pci-probe-list, screen-#columns, screen-#rows */
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x28,
+    /* selftest-#megs */
+    0x00, 0x00, 0x00, 0x00,
+    /* boot-device, boot-file, diag-device, diag-file, input-device,
+     * output-device, oem-banner, oem-logo, nvramrc, boot-command
+     * (offset,length) pairs into the string heap below */
+    0x1f, 0xf7, 0x00, 0x09, 0x1f, 0xf7, 0x00, 0x00,
+    0x1f, 0xef, 0x00, 0x08, 0x1f, 0xef, 0x00, 0x00, 0x1f, 0xec, 0x00, 0x03,
+    0x1f, 0xe6, 0x00, 0x06, 0x1f, 0xe6, 0x00, 0x00, 0x1f, 0xe6, 0x00, 0x00,
+    0x1f, 0xe6, 0x00, 0x00, 0x1f, 0xe2, 0x00, 0x04,
+};
+
+/* "/AAPL,ROM" (boot-device), "fd:diags" (diag-device), "kbd"
+ * (input-device), "screen" (output-device), "boot" (boot-command) */
+static const uint8_t oldworld_of_partition_strings[] = {
+    'b', 'o', 'o', 't', 's', 'c', 'r', 'e', 'e', 'n', 'k', 'b', 'd',
+    'f', 'd', ':', 'd', 'i', 'a', 'g', 's',
+    '/', 'A', 'A', 'P', 'L', ',', 'R', 'O', 'M',
+};
+
+/* Checks the same signature/version/checksum a real Old World ROM's own
+ * NVRAM validation would (see DingusPPC's OfConfigAppl::validate()) --
+ * used to tell an already-valid, persisted partition (loaded from an
+ * attached backing file, e.g. a prior boot's saved boot-device) apart
+ * from a fresh/blank one that still needs our defaults. */
+static bool oldworld_of_partition_valid(const uint8_t *buf)
+{
+    uint8_t tmp[OLDWORLD_OF_SIZE];
+    uint32_t acc = 0;
+    uint16_t stored;
+    int i;
+
+    if (lduw_be_p(buf) != 0x1275 || buf[2] != 5) {
+        return false;
+    }
+
+    stored = lduw_be_p(buf + 4);
+    memcpy(tmp, buf, OLDWORLD_OF_SIZE);
+    tmp[4] = tmp[5] = 0;
+    for (i = 0; i < OLDWORLD_OF_SIZE; i += 2) {
+        acc += lduw_be_p(tmp + i);
+    }
+    acc = (acc + (acc >> 16)) & 0xffff;
+
+    return ((~acc) & 0xffff) == stored;
+}
+
+/* Set up the Old World genuine-OF NVRAM partition (not the CHRP/OpenBIOS
+ * one below, which real Old World ROMs never look at). If a backing file
+ * (nvr->blk) already holds a valid partition -- persisted from an earlier
+ * run -- it's left untouched instead of being clobbered with defaults. */
+void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr)
+{
+    uint8_t *buf = &nvr->data[OLDWORLD_OF_OFFSET];
+
+    if (oldworld_of_partition_valid(buf)) {
+        return;
+    }
+
+    memset(buf, 0, OLDWORLD_OF_SIZE);
+    memcpy(buf, oldworld_of_partition_head, sizeof(oldworld_of_partition_head));
+    memcpy(buf + OLDWORLD_OF_SIZE - sizeof(oldworld_of_partition_strings),
+           oldworld_of_partition_strings, sizeof(oldworld_of_partition_strings));
+
+    if (nvr->blk) {
+        if (blk_pwrite(nvr->blk, OLDWORLD_OF_OFFSET, OLDWORLD_OF_SIZE, buf,
+                       0) < 0) {
+            error_report("%s: failed to write default Old World NVRAM "
+                        "partition", blk_name(nvr->blk));
+        }
+    }
 }
 
 #define OSX_NVRAM_SIGNATURE     (0x5A)
