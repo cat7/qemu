@@ -41,6 +41,7 @@ struct MouseState {
     QemuInputHandlerState *hs;
     int buttons_state, last_buttons_state;
     int dx, dy, dz;
+    bool polled_once;
 };
 
 
@@ -104,11 +105,23 @@ static int adb_mouse_poll(ADBDevice *d, uint8_t *obuf)
 {
     MouseState *s = ADB_MOUSE(d);
     int dx, dy;
+    bool report_reset_transient = !s->polled_once;
 
-    if (s->last_buttons_state == s->buttons_state &&
+    /*
+     * A real ADB mouse reports its actual (idle) state the first time
+     * it is talked to after a reset, even if the user has never touched
+     * it -- that initial packet is what lets the ADB Manager clear its
+     * low-memory MBState/mouse-tracking globals from their ROM-supplied
+     * startup default. Suppressing it here (as "nothing changed yet")
+     * left MBState stuck at its initial nonzero value forever, since we
+     * never sent a single packet for the OS to update it from.
+     */
+    if (s->polled_once &&
+        s->last_buttons_state == s->buttons_state &&
         s->dx == 0 && s->dy == 0) {
         return 0;
     }
+    s->polled_once = true;
 
     dx = s->dx;
     if (dx < -63) {
@@ -136,6 +149,28 @@ static int adb_mouse_poll(ADBDevice *d, uint8_t *obuf)
     }
     if (!(s->buttons_state & ADB_MOUSE_BUTTON_RIGHT)) {
         dx |= 0x80;
+    }
+
+    if (report_reset_transient) {
+        /*
+         * Real ADB mice report a momentary button-down transient in their
+         * very first post-reset Talk R0 response, even though the button
+         * isn't physically pressed -- a side effect of real hardware's
+         * power-on/reset behavior. Classic Mac OS's ADB Manager relies on
+         * seeing a genuine transition (not just "first packet, still
+         * idle") to clear the low-memory MBState global from its
+         * ROM-supplied startup default: sending only a static idle
+         * packet here (as the fix above does on its own) delivers data,
+         * but never a *change*, so MBState never actually gets cleared.
+         * Force that same one-shot transient here -- report the primary
+         * (left) button as pressed on this call regardless of actual
+         * state, and record a last_buttons_state that disagrees with the
+         * real buttons_state so adb_mouse_has_data() schedules an
+         * immediate follow-up poll, which will then correctly report the
+         * real (not-pressed) state as a genuine release transition.
+         */
+        dy &= ~0x80;
+        s->last_buttons_state = s->buttons_state ^ ADB_MOUSE_BUTTON_LEFT;
     }
 
     obuf[0] = dy;
@@ -235,7 +270,8 @@ static bool adb_mouse_has_data(ADBDevice *d)
 {
     MouseState *s = ADB_MOUSE(d);
 
-    return !(s->last_buttons_state == s->buttons_state &&
+    return !s->polled_once ||
+           !(s->last_buttons_state == s->buttons_state &&
              s->dx == 0 && s->dy == 0);
 }
 
@@ -248,12 +284,13 @@ static void adb_mouse_reset(DeviceState *dev)
     d->devaddr = ADB_DEVID_MOUSE;
     s->last_buttons_state = s->buttons_state = 0;
     s->dx = s->dy = s->dz = 0;
+    s->polled_once = false;
 }
 
 static const VMStateDescription vmstate_adb_mouse = {
     .name = "adb_mouse",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(parent_obj, MouseState, 0, vmstate_adb_device,
                        ADBDevice),
@@ -262,6 +299,7 @@ static const VMStateDescription vmstate_adb_mouse = {
         VMSTATE_INT32(dx, MouseState),
         VMSTATE_INT32(dy, MouseState),
         VMSTATE_INT32(dz, MouseState),
+        VMSTATE_BOOL(polled_once, MouseState),
         VMSTATE_END_OF_LIST()
     }
 };
