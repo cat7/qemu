@@ -109,6 +109,17 @@ typedef struct MOS6522Timer {
     int64_t next_irq_time;
     uint64_t frequency;
     QEMUTimer *timer;
+    /*
+     * Elapsed-tick value ("d") returned by the most recent get_counter()
+     * read of this timer, or -1 if it hasn't been read since the last
+     * machine/device reset. Deliberately NOT reset when the timer is
+     * reloaded (_PrimeTime/set_counter) -- see get_counter()'s comment for
+     * why two independent reload-then-read measurement cycles need this
+     * to persist across the reload to guarantee they can't come back
+     * equal. Deliberately left out of vmstate: it's read-side
+     * bookkeeping, not architectural state.
+     */
+    int64_t last_read_d;
 } MOS6522Timer;
 
 /**

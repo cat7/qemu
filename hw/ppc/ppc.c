@@ -520,6 +520,72 @@ int64_t cpu_ppc_load_tb_offset(CPUPPCState *env)
     return env->tb_env->tb_offset;
 }
 
+/*
+ * cpu_ppc_get_tb() derives the timebase from real host wall-clock time
+ * (QEMU_CLOCK_VIRTUAL), scaled by tb_freq -- genuinely correct and
+ * hardware-accurate on its own. But real firmware/OS code measures
+ * elapsed time by reading the timebase (mftb/mftbu), doing a small
+ * amount of work, and reading it again, then unconditionally dividing by
+ * the difference -- and on real silicon that's safe, because the CPU
+ * takes measurable, non-negligible real time to execute any instructions
+ * at all, comfortably more than one timebase tick, since CPU and
+ * timebase share the same physical clock domain by design. Without
+ * -icount, TCG decouples that pairing: it runs native PowerPC code (no
+ * interpretation/emulation overhead at all) as fast as the host allows,
+ * while the timebase still advances only with real wall-clock time, at
+ * this board's ~60ns tick period -- far finer than the VIA/CUDA clocks,
+ * so two mftb reads landing in the same tick is a routine occurrence on
+ * a fast host, not a rare edge case. Confirmed via live ROM disassembly
+ * and register capture: a Power Mac G3 ROM calibration routine did
+ * exactly this and hit a hardware-unreachable zero-elapsed-time reading,
+ * crashing the guest OS with "divide by zero".
+ *
+ * Guarantee the same real-hardware invariant this kind of code implicitly
+ * depends on -- each timebase read observes strictly more progress than
+ * the previous one did -- by tracking the last full 64-bit value handed
+ * to the guest and never handing back the same or an older one. TBL and
+ * TBU share the same watermark since they're two halves of one logical
+ * register. This doesn't affect the decrementer (scheduled independently
+ * via tb_env->decr_next) or explicit tb stores; it only changes the
+ * guest-visible read value in the narrow, real-hardware-unreachable case
+ * where successive reads would otherwise regress or repeat.
+ *
+ * This can't be an unconditional "always advance by at least one tick per
+ * call", though: ROM/OS code also polls the timebase in ordinary tight
+ * spin loops (e.g. waiting for a device status bit), calling this far
+ * more often per real tick than the ~60ns tick period allows. Confirmed
+ * live: such a loop drove the artificial advancement to run many ticks
+ * ahead of real elapsed time within a fraction of a second, and kept
+ * accelerating, since once the watermark gets ahead, *every* subsequent
+ * call is forced to advance again regardless of real time -- silently
+ * making the guest's clock run fast, which is a worse behavioral change
+ * than the bug being fixed. Real hardware would just show the same value
+ * on every iteration of such a poll loop until a real tick elapses, so
+ * that's what this should do too. Bound how far the watermark is allowed
+ * to run ahead of the real, honestly-computed value: enough ticks to
+ * guarantee two independent measurements a few instructions apart can
+ * never tie, not enough to let a busy loop meaningfully outrun real time.
+ */
+#define TB_MAX_AHEAD_OF_REAL 16
+
+static uint64_t cpu_ppc_load_tb_monotonic(ppc_tb_t *tb_env)
+{
+    uint64_t raw_tb = cpu_ppc_get_tb(tb_env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                     tb_env->tb_offset);
+    int64_t tb = (int64_t)raw_tb;
+
+    if (tb <= tb_env->last_tb) {
+        if (tb_env->last_tb - tb < TB_MAX_AHEAD_OF_REAL) {
+            tb = tb_env->last_tb + 1;
+        } else {
+            tb = tb_env->last_tb;
+        }
+    }
+    tb_env->last_tb = tb;
+
+    return (uint64_t)tb;
+}
+
 uint64_t cpu_ppc_load_tbl (CPUPPCState *env)
 {
     ppc_tb_t *tb_env = env->tb_env;
@@ -529,8 +595,7 @@ uint64_t cpu_ppc_load_tbl (CPUPPCState *env)
         return env->spr[SPR_TBL];
     }
 
-    tb = cpu_ppc_get_tb(tb_env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                        tb_env->tb_offset);
+    tb = cpu_ppc_load_tb_monotonic(tb_env);
     trace_ppc_tb_load(tb);
 
     return tb;
@@ -541,8 +606,7 @@ static inline uint32_t _cpu_ppc_load_tbu(CPUPPCState *env)
     ppc_tb_t *tb_env = env->tb_env;
     uint64_t tb;
 
-    tb = cpu_ppc_get_tb(tb_env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                        tb_env->tb_offset);
+    tb = cpu_ppc_load_tb_monotonic(tb_env);
     trace_ppc_tb_load(tb);
 
     return tb >> 32;
@@ -1117,6 +1181,7 @@ void cpu_ppc_tb_init(CPUPPCState *env, uint32_t freq)
 
     tb_env->tb_freq = freq;
     tb_env->decr_freq = freq;
+    tb_env->last_tb = -1;
 }
 
 void cpu_ppc_tb_reset(CPUPPCState *env)

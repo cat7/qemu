@@ -156,6 +156,55 @@ static unsigned int get_counter(MOS6522State *s, MOS6522Timer *ti)
 
     d = get_counter_value(s, ti);
 
+    /*
+     * get_counter_value() derives elapsed ticks from real host wall-clock
+     * time (QEMU_CLOCK_VIRTUAL), scaled per-timer (~783kHz/1.276us ticks
+     * for the generic VIA path, a different CUDA-specific transform for
+     * Timer1 -- see cuda_get_counter_value()) -- genuinely correct and
+     * hardware-accurate on its own. But real classic Mac ROM code (the
+     * Time Manager's CPU-speed calibration, backing _InsTime/_RmvTime/
+     * _PrimeTime) measures elapsed time by arming Timer1 with _PrimeTime,
+     * then almost immediately reading it back via _RmvTime -- twice in a
+     * row, once with negligible intervening work and once after a short
+     * busy-loop -- and unconditionally divides by the difference between
+     * the two measurements. Confirmed via live ROM disassembly (the
+     * calibration routine around 0x4f6bde) and register capture: each
+     * _PrimeTime reloads the timer (a fresh load_time epoch), so the two
+     * measurements are independent elapsed-since-reload values, and on a
+     * host fast enough to execute the ROM's own trap-dispatch and Prime/
+     * Remove sequence itself in under one tick period, *both* independent
+     * measurements can honestly compute to the same value -- not just a
+     * single read landing at d=0, but two separate reload-then-read
+     * cycles each doing so, which a fix scoped to a single load epoch
+     * (an earlier version of this fix, keyed only off qemu_clock_get_ns()
+     * vs this load's ti->load_time) cannot catch.
+     *
+     * Real silicon never hits this: a 68K/PPC750-era CPU takes measurable,
+     * non-negligible real time to execute the ROM's own trap dispatch
+     * between two such measurements, comfortably more than one VIA tick
+     * period, because CPU and VIA timer share the same physical clock
+     * domain by design -- so two independent measurements always differ
+     * by at least a little, even when the "real work" between them is
+     * itself negligible. TCG on a modern host can execute that same
+     * sequence far faster than 233-300MHz silicon ever could, decoupling
+     * that inherent pairing.
+     *
+     * Guarantee the same real-hardware invariant this ROM code implicitly
+     * (if unknowingly) depends on -- each read of this timer observes
+     * strictly more progress than the previous one did -- by tracking the
+     * last value ANY read of this timer returned, deliberately *not*
+     * reset when the timer is reloaded (_PrimeTime), so two independent
+     * measurements can never come back equal. This doesn't affect IRQ
+     * scheduling (computed independently by get_next_irq_time()); it only
+     * changes the guest-visible value in the narrow, real-hardware-
+     * unreachable case where successive reads would otherwise regress or
+     * repeat.
+     */
+    if (d <= ti->last_read_d) {
+        d = ti->last_read_d + 1;
+    }
+    ti->last_read_d = d;
+
     if (ti->index == 0) {
         /* the timer goes down from latch to -1 (period of latch + 2) */
         if (d <= (ti->counter_value + 1)) {
@@ -674,11 +723,13 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
 
     s->timers[0].frequency = s->frequency;
     s->timers[0].latch = 0xffff;
+    s->timers[0].last_read_d = -1;
     set_counter(s, &s->timers[0], 0xffff);
     timer_del(s->timers[0].timer);
 
     s->timers[1].frequency = s->frequency;
     s->timers[1].latch = 0xffff;
+    s->timers[1].last_read_d = -1;
     timer_del(s->timers[1].timer);
 }
 
@@ -695,6 +746,7 @@ static void mos6522_init(Object *obj)
 
     for (i = 0; i < ARRAY_SIZE(s->timers); i++) {
         s->timers[i].index = i;
+        s->timers[i].last_read_d = -1;
     }
 
     s->timers[0].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mos6522_timer1, s);

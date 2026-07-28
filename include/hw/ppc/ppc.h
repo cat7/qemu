@@ -37,6 +37,18 @@ struct ppc_tb_t {
     int64_t purr_offset;
     void *opaque;
     uint32_t flags;
+    /*
+     * Last full 64-bit timebase value handed to the guest via
+     * cpu_ppc_load_tbl()/cpu_ppc_load_tbu(), or -1 if never read. See the
+     * comment on those functions for why this needs to persist across
+     * calls: without it, two mftb reads close enough together in real
+     * host time (a near-certainty for native PowerPC code running
+     * without -icount, since tb_freq's tick period is much finer than a
+     * VIA tick and there's no emulation overhead to slow the guest down)
+     * can compute the exact same value, breaking any guest code that
+     * measures elapsed time as a difference of two timebase reads.
+     */
+    int64_t last_tb;
 };
 
 /* PPC Timers flags */
