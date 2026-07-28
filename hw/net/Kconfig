@@ -1,6 +1,9 @@
 config DP8393X
     bool
 
+config BMAC
+    bool
+
 config NE2000_COMMON
     bool
 
