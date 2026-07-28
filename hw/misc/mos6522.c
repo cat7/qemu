@@ -263,9 +263,20 @@ static void mos6522_timer1(void *opaque)
 static void mos6522_timer2(void *opaque)
 {
     MOS6522State *s = opaque;
-    MOS6522Timer *ti = &s->timers[1];
 
-    mos6522_timer2_update(s, ti, ti->next_irq_time);
+    /*
+     * Unlike T1, real 6522 hardware's T2 (in its only mode relevant here,
+     * timed-interrupt mode) is one-shot: it counts down once, fires, and
+     * then stops -- it does not automatically reload and keep firing.
+     * Software must explicitly rewrite T2C-H to arm it again (see
+     * set_counter(), called from the VIA_REG_T2CH write case). Confirmed
+     * against DingusPPC's ViaCuda, which arms T2 with an explicit
+     * add_oneshot_timer() rather than any repeating/continuous timer.
+     * Re-arming here unconditionally (as this used to do, mirroring T1)
+     * turned T2 into a free-running periodic interrupt source once
+     * enabled via IER, which native ROM code relying on T2's real
+     * one-shot semantics never expects and can spin on forever.
+     */
     s->ifr |= T2_INT;
     mos6522_update_irq(s);
 }
@@ -305,7 +316,13 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         s->ifr |= T1_INT;
     }
     if (now >= s->timers[1].next_irq_time) {
-        mos6522_timer2_update(s, &s->timers[1], now);
+        /*
+         * T2 is one-shot (see mos6522_timer2()) -- unlike T1, do not
+         * call mos6522_timer2_update() here, or this lazy catch-up
+         * check re-arms T2 on every single register read past its
+         * expiry, turning it back into a free-running periodic
+         * interrupt exactly like the bug fixed in the timer callback.
+         */
         s->ifr |= T2_INT;
     }
     switch (addr) {
@@ -384,9 +401,7 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         g_assert_not_reached();
     }
 
-    if (addr != VIA_REG_IFR || val != 0) {
-        trace_mos6522_read(addr, mos6522_reg_names[addr], val);
-    }
+    trace_mos6522_read(addr, mos6522_reg_names[addr], val);
 
     return val;
 }
@@ -648,7 +663,7 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
 
     s->b = 0;
     s->a = 0;
-    s->dirb = 0xff;
+    s->dirb = 0;
     s->dira = 0;
     s->sr = 0;
     s->acr = 0;

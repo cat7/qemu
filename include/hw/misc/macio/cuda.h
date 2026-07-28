@@ -28,6 +28,7 @@
 
 #include "hw/input/adb.h"
 #include "hw/misc/mos6522.h"
+#include "hw/i2c/i2c.h"
 #include "qom/object.h"
 
 /* CUDA commands (2nd byte) */
@@ -57,6 +58,7 @@
 #define CUDA_WAKEUP                    0x23
 #define CUDA_TIMER_TICKLE              0x24
 #define CUDA_COMBINED_FORMAT_IIC       0x25
+#define CUDA_OUT_PB0                   0x26
 
 
 /* MOS6522 CUDA */
@@ -80,6 +82,7 @@ struct CUDAState {
 
     ADBBusState adb_bus;
     MOS6522CUDAState mos6522_cuda;
+    I2CBus *i2c_bus;
 
     uint32_t tick_offset;
     uint64_t tb_frequency;
@@ -87,9 +90,24 @@ struct CUDAState {
     uint8_t last_b;
     uint8_t last_acr;
 
-    /* MacOS 9 is racy and requires a delay upon setting the SR_INT bit */
-    uint64_t sr_delay_ns;
+    /*
+     * MacOS 9 is racy and requires a delay upon setting the SR_INT bit.
+     * The actual delay is context-dependent -- see the CUDA_SR_DELAY_*
+     * constants in cuda.c -- so this is just the shared one-shot timer,
+     * armed with a different duration depending on what triggered it.
+     */
     QEMUTimer *sr_delay_timer;
+
+    /*
+     * CUDA_SET_ONE_SECOND_MODE support: once enabled, an unsolicited
+     * real-time-clock packet is pushed to the host once per real
+     * second (independent of, and in addition to, ADB autopoll). Real
+     * classic Mac OS enables this during boot; previously unimplemented
+     * here (guest got ERROR_PACKET/"unknown command" and never
+     * received the periodic tick it was expecting).
+     */
+    QEMUTimer *one_sec_timer;
+    uint8_t one_sec_mode;
 
     int data_in_size;
     int data_in_index;
@@ -98,6 +116,9 @@ struct CUDAState {
     qemu_irq irq;
     uint8_t data_in[128];
     uint8_t data_out[16];
+
+    /* Extended Parameter RAM, accessed via CUDA_GET_PRAM/CUDA_SET_PRAM */
+    uint8_t pram[256];
 };
 
 #endif /* CUDA_H */

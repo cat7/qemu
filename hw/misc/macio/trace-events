@@ -9,6 +9,7 @@ cuda_packet_receive(int len) "length %d"
 cuda_packet_receive_data(int i, const uint8_t data) "[%d] 0x%02x"
 cuda_packet_send(int len) "length %d"
 cuda_packet_send_data(int i, const uint8_t data) "[%d] 0x%02x"
+cuda_iic_nack(uint8_t addr, bool is_recv) "addr=0x%02x is_recv=%d"
 
 # macio.c
 macio_timer_write(uint64_t addr, unsigned len, uint64_t val) "write addr 0x%"PRIx64 " len %d val 0x%"PRIx64
