@@ -271,6 +271,10 @@ nvic_sysreg_write(uint64_t addr, uint32_t value, unsigned size) "NVIC sysreg wri
 heathrow_write(uint64_t addr, unsigned int n, uint64_t value) "0x%"PRIx64" %u: 0x%"PRIx64
 heathrow_read(uint64_t addr, unsigned int n, uint64_t value) "0x%"PRIx64" %u: 0x%"PRIx64
 heathrow_set_irq(int num, int level) "set_irq: num=0x%02x level=%d"
+heathrow_feat_ctrl_write(uint64_t value) "FEAT_CTRL = 0x%"PRIx64
+heathrow_feat_ctrl_read(uint64_t value) "FEAT_CTRL -> 0x%"PRIx64
+heathrow_ohare_id_write(uint64_t value) "OHARE_ID (ignored, read-only) = 0x%"PRIx64
+heathrow_ohare_id_read(uint64_t value) "OHARE_ID -> 0x%"PRIx64
 
 # bcm2835_ic.c
 bcm2835_ic_set_gpu_irq(int irq, int level) "GPU irq #%d level %d"
