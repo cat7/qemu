@@ -118,6 +118,13 @@ image is ATI's copyrighted firmware and is not shipped here; use your
 own dump. Without it everything still works via the guest's software
 display path.
 
+With the NDRV bound, the card's DDC/EDID (bit-banged over the monitor
+sense pins) lets AppleVision and the Monitors control panel read a
+synthesized monitor descriptor -- the guest identifies a "Multiple
+Scan Display". The advertised resolution can be tuned with the
+standard EDID properties, e.g.
+``-global ati-mach64-gt.xres=1024 -global ati-mach64-gt.yres=768``.
+
 Display, audio, control
 -----------------------
 
