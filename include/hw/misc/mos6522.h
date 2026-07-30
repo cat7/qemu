@@ -112,14 +112,20 @@ typedef struct MOS6522Timer {
     /*
      * Elapsed-tick value ("d") returned by the most recent get_counter()
      * read of this timer, or -1 if it hasn't been read since the last
-     * machine/device reset. Deliberately NOT reset when the timer is
-     * reloaded (_PrimeTime/set_counter) -- see get_counter()'s comment for
-     * why two independent reload-then-read measurement cycles need this
-     * to persist across the reload to guarantee they can't come back
-     * equal. Deliberately left out of vmstate: it's read-side
-     * bookkeeping, not architectural state.
+     * machine/device reset (or since last_read_real_ns aged out -- see
+     * get_counter()'s comment). Deliberately left out of vmstate: it's
+     * read-side bookkeeping, not architectural state.
      */
     int64_t last_read_d;
+    /*
+     * Host QEMU_CLOCK_VIRTUAL time (ns) of the read that produced
+     * last_read_d, or -1 if there hasn't been one since the last reset/
+     * expiry. Used to scope get_counter()'s monotonicity guarantee to
+     * reads that are genuinely close together in real wall-clock time --
+     * see get_counter()'s comment for why this can't just persist across
+     * every reload forever. Deliberately left out of vmstate.
+     */
+    int64_t last_read_real_ns;
 } MOS6522Timer;
 
 /**

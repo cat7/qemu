@@ -39,16 +39,17 @@ struct ppc_tb_t {
     uint32_t flags;
     /*
      * Last full 64-bit timebase value handed to the guest via
-     * cpu_ppc_load_tbl()/cpu_ppc_load_tbu(), or -1 if never read. See the
-     * comment on those functions for why this needs to persist across
-     * calls: without it, two mftb reads close enough together in real
-     * host time (a near-certainty for native PowerPC code running
-     * without -icount, since tb_freq's tick period is much finer than a
-     * VIA tick and there's no emulation overhead to slow the guest down)
-     * can compute the exact same value, breaking any guest code that
-     * measures elapsed time as a difference of two timebase reads.
+     * cpu_ppc_load_tbl()/cpu_ppc_load_tbu(), or -1 if never read (or
+     * since last_tb_real_ns aged out -- see cpu_ppc_load_tb_monotonic()).
      */
     int64_t last_tb;
+    /*
+     * Host QEMU_CLOCK_VIRTUAL time (ns) of the read that produced
+     * last_tb, or -1 if there hasn't been one since reset/expiry. Scopes
+     * the monotonicity guarantee to reads genuinely close together in
+     * real wall-clock time -- see cpu_ppc_load_tb_monotonic()'s comment.
+     */
+    int64_t last_tb_real_ns;
 };
 
 /* PPC Timers flags */

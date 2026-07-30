@@ -149,10 +149,34 @@ static uint64_t get_load_time(MOS6522State *s, MOS6522Timer *ti)
     }
 }
 
+/*
+ * Real-time window (ns) within which two get_counter() reads of the same
+ * timer are treated as part of one back-to-back measurement pair -- see
+ * the comment in get_counter() for what this guards against. Kept tight
+ * (a couple of this timer's own ~1.276us ticks, CUDA_TIMER_FREQ) rather
+ * than generous: a wider window (10us was tried and measured insufficient
+ * -- still ~80Hz on a Ticks counter that should read 60.15Hz) risks
+ * treating genuinely frequent-but-unrelated legitimate polling as part of
+ * the same pair, re-anchoring the window on every such call and never
+ * actually triggering the reset below.
+ */
+#define TIMER_MONOTONIC_WINDOW_NS 2500
+
+/*
+ * Bound on how far get_counter()'s forced advancement may run ahead of
+ * the honestly-computed value even *within* an active monotonic window
+ * -- belt-and-suspenders alongside the window reset above, for a busy
+ * loop tight enough to make several back-to-back calls within a single
+ * window. At this timer's ~1.276us tick period, 16 ticks is ~20us of
+ * maximum induced drift.
+ */
+#define TIMER_MAX_AHEAD_OF_REAL 16
+
 static unsigned int get_counter(MOS6522State *s, MOS6522Timer *ti)
 {
     int64_t d;
     unsigned int counter;
+    int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     d = get_counter_value(s, ti);
 
@@ -192,16 +216,56 @@ static unsigned int get_counter(MOS6522State *s, MOS6522Timer *ti)
      * Guarantee the same real-hardware invariant this ROM code implicitly
      * (if unknowingly) depends on -- each read of this timer observes
      * strictly more progress than the previous one did -- by tracking the
-     * last value ANY read of this timer returned, deliberately *not*
-     * reset when the timer is reloaded (_PrimeTime), so two independent
-     * measurements can never come back equal. This doesn't affect IRQ
-     * scheduling (computed independently by get_next_irq_time()); it only
-     * changes the guest-visible value in the narrow, real-hardware-
-     * unreachable case where successive reads would otherwise regress or
+     * last value ANY read of this timer returned. This CANNOT persist
+     * indefinitely across every future reload the way an earlier version
+     * of this fix did, though: Timer1 gets reloaded constantly during
+     * ordinary Time Manager operation (deferred tasks, scheduling), each
+     * with its own fresh load_time epoch -- so a watermark that's never
+     * reset ends up comparing entirely unrelated, genuinely-separated-in-
+     * real-time reload+read cycles against a stale high-water mark from
+     * some earlier, unconnected access, forcing them to "advance" too.
+     * Measured empirically: that version made the guest's whole notion of
+     * elapsed time (anything timed off this counter, including the
+     * VBL-driven Ticks counter backing double-click/key-repeat timing)
+     * run at 4-16x real speed depending on the exact bound used, not just
+     * a negligible one-time offset. Scope the guarantee to real wall-
+     * clock proximity instead: only force advancement if this read is
+     * happening within TIMER_MONOTONIC_WINDOW_NS of the previous one,
+     * matching the actual narrow case this exists for (two measurements
+     * from the same calibration sequence, genuinely close together in
+     * real host time) -- if real time has clearly moved on since the
+     * last read, trust the honestly-computed value and let the watermark
+     * reset, since that's a fresh, unrelated access, not a continuation
+     * of the same measurement pair. This doesn't affect IRQ scheduling
+     * (computed independently by get_next_irq_time()); it only changes
+     * the guest-visible value in the narrow, real-hardware-unreachable
+     * case where two back-to-back reads would otherwise regress or
      * repeat.
      */
+    if (now_ns - ti->last_read_real_ns >= TIMER_MONOTONIC_WINDOW_NS) {
+        ti->last_read_d = -1;
+    }
     if (d <= ti->last_read_d) {
-        d = ti->last_read_d + 1;
+        if (ti->last_read_d - d < TIMER_MAX_AHEAD_OF_REAL) {
+            d = ti->last_read_d + 1;
+        } else {
+            d = ti->last_read_d;
+        }
+    } else {
+        /*
+         * Genuine, honest advance: this is a real sync point with real
+         * time, so anchor the window here. Deliberately NOT done on a
+         * forced/held read above -- if it were, a continuous run of
+         * back-to-back-in-real-time calls (each one individually within
+         * the window of the previous) would keep pushing the deadline
+         * forward forever and the reset above would never trigger,
+         * reintroducing unbounded growth by another route. Anchoring
+         * only on genuine advances means the window measures "how long
+         * since we last KNEW we were caught up to real time", so a
+         * sustained forcing streak gets cut off after one window's worth
+         * of real time has elapsed, however many calls happened in it.
+         */
+        ti->last_read_real_ns = now_ns;
     }
     ti->last_read_d = d;
 
@@ -724,12 +788,14 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
     s->timers[0].frequency = s->frequency;
     s->timers[0].latch = 0xffff;
     s->timers[0].last_read_d = -1;
+    s->timers[0].last_read_real_ns = -1;
     set_counter(s, &s->timers[0], 0xffff);
     timer_del(s->timers[0].timer);
 
     s->timers[1].frequency = s->frequency;
     s->timers[1].latch = 0xffff;
     s->timers[1].last_read_d = -1;
+    s->timers[1].last_read_real_ns = -1;
     timer_del(s->timers[1].timer);
 }
 
@@ -747,6 +813,7 @@ static void mos6522_init(Object *obj)
     for (i = 0; i < ARRAY_SIZE(s->timers); i++) {
         s->timers[i].index = i;
         s->timers[i].last_read_d = -1;
+        s->timers[i].last_read_real_ns = -1;
     }
 
     s->timers[0].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mos6522_timer1, s);

@@ -553,33 +553,65 @@ int64_t cpu_ppc_load_tb_offset(CPUPPCState *env)
  * This can't be an unconditional "always advance by at least one tick per
  * call", though: ROM/OS code also polls the timebase in ordinary tight
  * spin loops (e.g. waiting for a device status bit), calling this far
- * more often per real tick than the ~60ns tick period allows. Confirmed
- * live: such a loop drove the artificial advancement to run many ticks
- * ahead of real elapsed time within a fraction of a second, and kept
- * accelerating, since once the watermark gets ahead, *every* subsequent
- * call is forced to advance again regardless of real time -- silently
- * making the guest's clock run fast, which is a worse behavioral change
- * than the bug being fixed. Real hardware would just show the same value
- * on every iteration of such a poll loop until a real tick elapses, so
- * that's what this should do too. Bound how far the watermark is allowed
- * to run ahead of the real, honestly-computed value: enough ticks to
- * guarantee two independent measurements a few instructions apart can
- * never tie, not enough to let a busy loop meaningfully outrun real time.
+ * more often per real tick than the ~60ns tick period allows. A bound
+ * alone (how far the watermark may run ahead of the honest value) isn't
+ * enough either: with no time-based reset, the watermark persists across
+ * *every* future call for the rest of the guest's uptime, including ones
+ * completely unrelated to the narrow back-to-back-measurement case this
+ * exists for -- any later mftb read landing within the bound of a stale
+ * watermark from some earlier, disconnected busy loop gets forced to
+ * advance too. Measured empirically (Ticks, the VBL-driven counter
+ * backing double-click/key-repeat timing): a bounded-but-not-time-scoped
+ * version of this fix, combined with mos6522.c's equivalent Timer1 fix,
+ * still ran the guest's clock at 4-5x real speed, not just a negligible
+ * one-time offset. Scope the guarantee to real wall-clock proximity
+ * instead: only force advancement if this read is within
+ * TB_MONOTONIC_WINDOW_NS of the previous one -- matching the actual
+ * narrow case (two measurements from the same calibration sequence,
+ * genuinely close together in real host time). If real time has clearly
+ * moved on since the last read, trust the honestly-computed value and
+ * let the watermark reset, since that's a fresh, unrelated access, not a
+ * continuation of the same measurement pair -- real hardware would show
+ * the same value on every iteration of an ordinary poll loop until a
+ * real tick elapses, so that's what this does too, just also handling
+ * the two-independent-reload-epochs case mos6522.c's comment describes.
+ */
+#define TB_MONOTONIC_WINDOW_NS 200
+
+/*
+ * Bound on how far the watermark may run ahead of the honest value even
+ * *within* an active window -- belt-and-suspenders alongside the window
+ * reset, for a busy loop tight enough to make several back-to-back calls
+ * within a single window. At this board's ~60ns tick period, 16 ticks is
+ * ~960ns of maximum induced drift.
  */
 #define TB_MAX_AHEAD_OF_REAL 16
 
 static uint64_t cpu_ppc_load_tb_monotonic(ppc_tb_t *tb_env)
 {
-    uint64_t raw_tb = cpu_ppc_get_tb(tb_env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                     tb_env->tb_offset);
+    int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t raw_tb = cpu_ppc_get_tb(tb_env, now_ns, tb_env->tb_offset);
     int64_t tb = (int64_t)raw_tb;
 
+    if (now_ns - tb_env->last_tb_real_ns >= TB_MONOTONIC_WINDOW_NS) {
+        tb_env->last_tb = -1;
+    }
     if (tb <= tb_env->last_tb) {
         if (tb_env->last_tb - tb < TB_MAX_AHEAD_OF_REAL) {
             tb = tb_env->last_tb + 1;
         } else {
             tb = tb_env->last_tb;
         }
+    } else {
+        /*
+         * Genuine, honest advance: a real sync point, so anchor the
+         * window here. Deliberately not done on a forced/held read --
+         * see mos6522.c's get_counter() for why sliding the window
+         * forward on every call (even forced ones) would let a
+         * continuous fast-polling loop keep the window perpetually
+         * "fresh" and never trigger the reset above.
+         */
+        tb_env->last_tb_real_ns = now_ns;
     }
     tb_env->last_tb = tb;
 
@@ -1182,6 +1214,7 @@ void cpu_ppc_tb_init(CPUPPCState *env, uint32_t freq)
     tb_env->tb_freq = freq;
     tb_env->decr_freq = freq;
     tb_env->last_tb = -1;
+    tb_env->last_tb_real_ns = -1;
 }
 
 void cpu_ppc_tb_reset(CPUPPCState *env)
