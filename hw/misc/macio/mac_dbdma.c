@@ -834,8 +834,28 @@ static uint64_t dbdma_read(void *opaque, hwaddr addr,
     switch(reg) {
     case DBDMA_CONTROL:
         value = ch->regs[DBDMA_STATUS];
-        break;
+        goto mask_active_if_processing;
     case DBDMA_STATUS:
+mask_active_if_processing:
+        /*
+         * While the channel is waiting on a device to complete an I/O
+         * transfer (ch->io.processing, e.g. an armed RX descriptor with
+         * no packet arrived yet), report ACTIVE as clear rather than the
+         * raw stored bit. On real DBDMA hardware, a channel stalled
+         * waiting for its device is not "active" from the status
+         * register's perspective -- ACTIVE means actively executing/
+         * completing commands. Real Darwin BMacEnet-family drivers poll
+         * this via a watchdog that checks !(status & kdbdmaActive) to
+         * decide "channel has stopped, time to feed it more work" --
+         * with ACTIVE permanently reported set while we're internally
+         * waiting, that check never fires, so the driver never considers
+         * the channel free for a new descriptor and never attempts a
+         * real send.
+         */
+        if (ch->io.processing) {
+            value &= ~ACTIVE;
+        }
+        break;
     case DBDMA_CMDPTR_LO:
     case DBDMA_INTR_SEL:
     case DBDMA_BRANCH_SEL:
