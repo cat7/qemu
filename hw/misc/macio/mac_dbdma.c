@@ -45,6 +45,7 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "system/dma.h"
+#include "trace.h"
 
 /* debug DBDMA */
 #define DEBUG_DBDMA 0
@@ -511,6 +512,7 @@ static void channel_run(DBDMA_channel *ch)
     ch->regs[DBDMA_STATUS] &= ~WAKE;
 
     cmd = le16_to_cpu(current->command) & COMMAND_MASK;
+    trace_dbdma_channel_run(ch->channel, le16_to_cpu(current->command));
 
     switch (cmd) {
     case DBDMA_NOP:
@@ -760,9 +762,24 @@ static void dbdma_control_write(DBDMA_channel *ch)
 
     /* Finally update the status register image */
     ch->regs[DBDMA_STATUS] = status;
+    trace_dbdma_control_write_done(ch->channel, status);
 
     /* If active, make sure the BH gets to run */
     if (status & ACTIVE) {
+        /*
+         * Re-fetch the current command descriptor from guest memory
+         * before (re)starting execution. Real DBDMA fetches the
+         * descriptor anew on every RUN start and WAKE re-examination;
+         * the Mac OS ethernet driver relies on this by keeping a STOP
+         * in its persistent TX ring, overwriting it in place with a
+         * real OUTPUT command and then just re-kicking the channel --
+         * without the re-fetch, the stale cached STOP is executed
+         * forever and no frame ever leaves the NIC. Don't reload while
+         * a device I/O for the current command is still in flight.
+         */
+        if (!ch->io.processing) {
+            dbdma_cmdptr_load(ch);
+        }
         /* Fresh guest-triggered kick: see the comment in DBDMA_run(). */
         ch->sync_continue_count = 0;
         DBDMA_kick(dbdma_from_ch(ch));
@@ -777,6 +794,7 @@ static void dbdma_write(void *opaque, hwaddr addr,
     DBDMA_channel *ch = &s->channels[channel];
     int reg = (addr - (channel << DBDMA_CHANNEL_SHIFT)) >> 2;
 
+    trace_dbdma_write(channel, reg, value);
     DBDMA_DPRINTFCH(ch, "writel 0x" HWADDR_FMT_plx " <= 0x%08"PRIx64"\n",
                     addr, value);
     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",

@@ -42,3 +42,8 @@ pmu_debug_protocol_cmd_toobig(int len) "command too big (%d bytes)"
 pmu_debug_protocol_cmd_send_resp_size(int len) "sending length byte: %d"
 pmu_debug_protocol_cmd_send_resp(int pos, int len) "sending byte: %d/%d"
 pmu_debug_protocol_cmd_resp_complete(int ier) "Response send complete. IER=0x%02x"
+
+# mac_dbdma.c
+dbdma_write(int channel, int reg, uint64_t value) "channel=0x%x reg=0x%x value=0x%"PRIx64
+dbdma_control_write_done(int channel, uint32_t status) "channel=0x%x new_status=0x%08x"
+dbdma_channel_run(int channel, uint16_t command) "channel=0x%x command=0x%04x"
