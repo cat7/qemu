@@ -428,8 +428,75 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     } else {
         int w = pixman_image_get_width(pixman_image);
         int h = pixman_image_get_height(pixman_image);
-        int bitsPerPixel = PIXMAN_FORMAT_BPP(pixman_image_get_format(pixman_image));
+        pixman_format_code_t pixfmt = pixman_image_get_format(pixman_image);
+        int bitsPerPixel = PIXMAN_FORMAT_BPP(pixfmt);
         int stride = pixman_image_get_stride(pixman_image);
+        int bitsPerComponent;
+        CGBitmapInfo bitmapInfo;
+
+        /*
+         * DIV_ROUND_UP(bitsPerPixel, 8) * 2 only happens to be correct
+         * for 32bpp surfaces (giving 8 bits/component); for a genuine
+         * 16bpp surface (e.g. PIXMAN_x1r5g5b5, used by hw/display/
+         * ati_mach64.c's 15bpp "Thousands of colors" mode) it computes 4,
+         * and for a 24bpp surface (PIXMAN_r8g8b8, that same device's
+         * "Millions of colors" -- real Mach64 hardware packs 24-bit
+         * color as 3 bytes/pixel, not padded to 32) it computes 6 --
+         * both describe a nonexistent bits-per-component layout to
+         * CoreGraphics. CGImageCreate doesn't error on this -- it just
+         * silently produces a blank/garbled image, even though the
+         * underlying pixel data is completely correct (confirmed via a
+         * QMP screendump of the same surface, which uses a separate,
+         * correct code path and renders fine). The 32-bit byte-order
+         * flag was also being applied unconditionally, which is wrong
+         * for anything other than a true 32-bit-per-pixel image. Handle
+         * the other formats this tree actually produces via
+         * qemu_create_displaysurface_from() explicitly; fall back to the
+         * original 32bpp-shaped formula for everything else, matching
+         * prior (working) behavior for 8/32bpp surfaces.
+         */
+        if (pixfmt == PIXMAN_x1r5g5b5) {
+            bitsPerComponent = 5;
+            /*
+             * Guest is PowerPC (big-endian) -- Mac OS/QuickDraw writes
+             * each 16-bit pixel value to VRAM in big-endian order, not
+             * host-native little-endian. Confirmed directly: a live VRAM
+             * read showed bytes "0x7f 0xff" at a pixel that renders as
+             * pure white on real hardware -- only forms 0x7FFF (white in
+             * x1r5g5b5) when read as big-endian; little-endian would give
+             * 0xFF7F instead. Using kCGBitmapByteOrder16Little here swaps
+             * every pixel's two bytes, producing wrong (but no longer
+             * blank) colors.
+             */
+            bitmapInfo = kCGBitmapByteOrder16Big | kCGImageAlphaNoneSkipFirst;
+        } else if (pixfmt == PIXMAN_r8g8b8) {
+            /*
+             * Packed 3-bytes/pixel, no alpha byte to skip -- component
+             * order in memory is R,G,B (that's what distinguishes
+             * PIXMAN_r8g8b8 from PIXMAN_b8g8r8 in pixman itself), which
+             * is exactly what kCGImageAlphaNone + default byte order
+             * gives CoreGraphics for an 8-bit-per-component RGB image.
+             */
+            bitsPerComponent = 8;
+            bitmapInfo = kCGBitmapByteOrderDefault | kCGImageAlphaNone;
+        } else if (pixfmt == PIXMAN_b8g8r8x8) {
+            /*
+             * "Millions of colors" (32bpp ARGB8888 on the CRTC side).
+             * Same big-endian-guest story as the 16bpp case above: each
+             * pixel is stored MSB-first as bytes X,R,G,B, which is
+             * exactly what PIXMAN_b8g8r8x8 (as opposed to the
+             * little-endian-native PIXMAN_x8r8g8b8) tags in
+             * hw/display/ati_mach64.c's ati_mach64_pixman_format().
+             * kCGBitmapByteOrder32Big + AlphaNoneSkipFirst describes
+             * that same X,R,G,B memory order to CoreGraphics.
+             */
+            bitsPerComponent = 8;
+            bitmapInfo = kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipFirst;
+        } else {
+            bitsPerComponent = DIV_ROUND_UP(bitsPerPixel, 8) * 2;
+            bitmapInfo = kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst;
+        }
+
         CGDataProviderRef dataProviderRef = CGDataProviderCreateWithData(
             NULL,
             pixman_image_get_data(pixman_image),
@@ -439,11 +506,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         CGImageRef imageRef = CGImageCreate(
             w, //width
             h, //height
-            DIV_ROUND_UP(bitsPerPixel, 8) * 2, //bitsPerComponent
+            bitsPerComponent, //bitsPerComponent
             bitsPerPixel, //bitsPerPixel
             stride, //bytesPerRow
             colorspace, //colorspace
-            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst, //bitmapInfo
+            bitmapInfo, //bitmapInfo
             dataProviderRef, //provider
             NULL, //decode
             0, //interpolate
@@ -1205,6 +1272,18 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [window setAcceptsMouseMovedEvents:YES];
         [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
         [window setTitle:qemu_name ? [NSString stringWithFormat:@"QEMU %s", qemu_name] : @"QEMU"];
+        if (@available(macOS 11.0, *)) {
+            /*
+             * Default "automatic" separator style draws a partial-width
+             * divider line under the title bar (decided by heuristics
+             * meant for scroll views/toolbars) even though this window
+             * has neither -- it renders as a black-to-white line that
+             * stops partway across, sitting on top of (but unrelated to)
+             * the guest's own menu bar drawn just below it. There is no
+             * titlebar-adjacent content here, so just turn it off.
+             */
+            [window setTitlebarSeparatorStyle:NSTitlebarSeparatorStyleNone];
+        }
         [window setContentView:cocoaView];
         [window makeKeyAndOrderFront:self];
         [window center];

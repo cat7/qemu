@@ -30,6 +30,7 @@
 #include "hw/pci/pci_device.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "ui/input.h"
 
 #define PCI_VENDOR_ID_ATI            0x1002
 /*
@@ -119,7 +120,6 @@ struct ATIMach64State {
 
     ATIMach64Mode mode;
     bool mode_dirty;
-    bool cursor_composited;
 
     /*
      * Real hardware fires a VBLANK interrupt from the CRTC continuously
@@ -134,6 +134,25 @@ struct ATIMach64State {
      */
     QEMUTimer *vblank_timer;
     QEMUTimer *vblank_end_timer;
+
+    /*
+     * WORKAROUND, not real hardware behavior: real Mach64 silicon never
+     * autonomously tracks the host pointer -- the hardware cursor only
+     * ever moves when software writes CUR_HORZ_VERT_POSN. This exists
+     * because classic Mac OS's own VBL-queue-driven cursor task
+     * (CrsrVBLTask) stops being serviced by the guest's interrupt
+     * dispatcher partway through boot (see the project's investigation
+     * notes), so the guest itself never issues those writes again. Since
+     * the guest's own cursor-tracking logic never runs, we track the
+     * real host pointer ourselves here and drive CUR_HORZ_VERT_POSN
+     * directly, entirely independent of guest software -- letting the
+     * cursor's on-screen position work even though the guest's own
+     * dispatch is stuck. This does NOT address keyboard input or any
+     * other guest-side symptom of the same stall.
+     */
+    QemuInputHandlerState *cursor_hs;
+    int host_cursor_x;
+    int host_cursor_y;
 };
 
 #endif /* ATI_MACH64_H */

@@ -4,13 +4,15 @@
  * See ati_mach64.h for background: this models the ATI Mach64 "3D Rage
  * Pro" chip (PCI vendor 0x1002, device 0x4750, revision 0x5c) -- the
  * identity directly confirmed by this machine's own real Open Firmware
- * device-tree dump. Milestone scope: correct PCI identity/BAR layout and
+ * device-tree dump. Milestone scope: correct PCI identity/BAR layout,
  * enough CRTC/DAC/config register modeling for native ROM boot-time
- * probing and a basic mode-set to work, rendered through a plain linear
- * framebuffer. The 2D BitBLT engine, hardware cursor, overlay/video-in
- * registers and true DDC/I2C are deliberately not modeled yet -- classic
+ * probing and a basic mode-set, a linear framebuffer, and the hardware
+ * cursor. The 2D BitBLT engine, 3D pipeline/CCE, overlay/video-in
+ * registers and true DDC/I2C are deliberately not modeled -- classic
  * Mac OS QuickDraw always has a software fallback per pixel depth, so
- * none of that is boot-blocking.
+ * none of that is boot-blocking. There is currently no 2D or 3D
+ * acceleration of any kind; all drawing goes through QuickDraw's
+ * software rasterizer into plain VRAM.
  *
  * This work is licensed under the GNU GPL license version 2 or later.
  */
@@ -19,9 +21,12 @@
 #include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
+#include "exec/icount.h"
 #include "hw/pci/pci_device.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "ui/console.h"
 #include "ui/qemu-pixman.h"
 #include "qom/object.h"
@@ -63,7 +68,21 @@ static pixman_format_code_t ati_mach64_pixman_format(uint32_t pix_fmt)
     case ATI_PIX_FMT_RGB888:
         return PIXMAN_r8g8b8;
     case ATI_PIX_FMT_ARGB8888:
-        return PIXMAN_x8r8g8b8;
+        /*
+         * Guest is PowerPC (big-endian) -- each 32-bit pixel is stored
+         * to VRAM MSB-first (byte order X,R,G,B), not host-native
+         * little-endian. PIXMAN_x8r8g8b8 assumes a little-endian-native
+         * word and reads those same four bytes as B,G,R,X, scrambling
+         * every pixel (confirmed via a live VRAM read: bytes
+         * "00 63 63 9c" at a known blue-purple desktop-pattern pixel --
+         * only reproduces RGB(99,99,156) when read as X,R,G,B --
+         * PIXMAN_x8r8g8b8 turns those same bytes into a dark-olive
+         * RGB(99,99,0) instead, matching the wrong colors seen live).
+         * PIXMAN_b8g8r8x8 is the format whose native-word bit layout
+         * (B,G,R,X from MSB) matches those bytes when loaded on a
+         * little-endian host.
+         */
+        return PIXMAN_b8g8r8x8;
     default:
         return PIXMAN_x8r8g8b8;
     }
@@ -98,6 +117,18 @@ static bool ati_mach64_mode_valid(ATIMach64State *s, const ATIMach64Mode *mode)
         return false;
     }
     if (mode->width < 16 || mode->height < 16 || mode->bpp == 0) {
+        return false;
+    }
+    /*
+     * A depth switch that leaves OFF_PITCH's pitch field stale/zero
+     * relative to the new bpp (e.g. still sized for the previous depth,
+     * momentarily during a live mode-change register sequence) must not
+     * be accepted -- an undersized stride fed into
+     * qemu_create_displaysurface_from() corrupts the whole framebuffer
+     * view rather than just clipping, since pixman reads full rows at
+     * the given stride regardless of the true per-pixel width.
+     */
+    if ((uint64_t)mode->pitch < (uint64_t)mode->width * mode->bpp) {
         return false;
     }
     if ((uint64_t)mode->fb_offset + (uint64_t)mode->pitch * mode->height >
@@ -139,70 +170,6 @@ static void ati_mach64_draw_8bpp(ATIMach64State *s, DisplaySurface *ds,
     }
 }
 
-/*
- * Composite the hardware cursor directly into the surface ("software
- * cursor" style). Only possible on the palettized path, which repaints
- * the whole surface every refresh anyway; it makes the visible cursor
- * pixel-exact with the guest's own idea of its position, sidestepping
- * every display-backend cursor-layer geometry quirk.
- */
-static void ati_mach64_composite_cursor(ATIMach64State *s, DisplaySurface *ds,
-                                        const ATIMach64Mode *mode)
-{
-    uint32_t posn = s->regs[ATI_CUR_HORZ_VERT_POSN >> 2];
-    uint32_t offs = s->regs[ATI_CUR_HORZ_VERT_OFF >> 2];
-    uint32_t raw0 = s->regs[ATI_CUR_CLR0 >> 2];
-    uint32_t raw1 = s->regs[ATI_CUR_CLR1 >> 2];
-    uint32_t clr0 = 0xff000000u | (((raw0 >> 8) & 0xff) << 16) |
-                    (((raw0 >> 16) & 0xff) << 8) | ((raw0 >> 24) & 0xff);
-    uint32_t clr1 = 0xff000000u | (((raw1 >> 8) & 0xff) << 16) |
-                    (((raw1 >> 16) & 0xff) << 8) | ((raw1 >> 24) & 0xff);
-    uint32_t vram_off = (s->regs[ATI_CUR_OFFSET >> 2] & 0xfffff) * 8;
-    int x0 = (int)(posn & ATI_CUR_POSN_MASK) -
-             (int)(offs & ATI_CUR_OFF_MASK);
-    int y0 = (int)((posn >> 16) & ATI_CUR_POSN_MASK) -
-             (int)((offs >> 16) & ATI_CUR_OFF_MASK);
-    const uint8_t *src;
-    uint32_t *dst;
-    int row, px, x, y;
-
-    if (!(s->regs[ATI_GEN_TEST_CNTL >> 2] & ATI_GEN_CUR_ENABLE)) {
-        return;
-    }
-    if (vram_off + 64 * 64 / 4 > ATI_MACH64_VRAM_SIZE) {
-        return;
-    }
-    src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + vram_off;
-
-    for (row = 0; row < 64; row++) {
-        y = y0 + row;
-        if (y < 0 || y >= mode->height) {
-            continue;
-        }
-        dst = (uint32_t *)((uint8_t *)surface_data(ds) +
-                           y * surface_stride(ds));
-        for (px = 0; px < 64; px++) {
-            x = x0 + px;
-            if (x < 0 || x >= mode->width) {
-                continue;
-            }
-            switch ((src[row * 16 + px / 4] >> ((px % 4) * 2)) & 3) {
-            case 0:
-                dst[x] = clr0;
-                break;
-            case 1:
-                dst[x] = clr1;
-                break;
-            case 3:
-                dst[x] ^= 0x00ffffffu; /* complement of display pixel */
-                break;
-            default:
-                break; /* transparent */
-            }
-        }
-    }
-}
-
 static bool ati_mach64_update_display(void *opaque)
 {
     ATIMach64State *s = opaque;
@@ -237,9 +204,7 @@ static bool ati_mach64_update_display(void *opaque)
     if (palettized) {
         ds = qemu_console_surface(s->con);
         ati_mach64_draw_8bpp(s, ds, &mode);
-        ati_mach64_composite_cursor(s, ds, &mode);
     }
-    s->cursor_composited = palettized;
     qemu_console_update_full(s->con);
 
     return true;
@@ -328,19 +293,140 @@ static void ati_mach64_cursor_update(ATIMach64State *s)
         qemu_console_set_cursor(s->con, c);
         cursor_unref(c);
     }
-    /*
-     * When the cursor is being composited straight into the surface
-     * (palettized modes), suppress the backend overlay cursor so it
-     * doesn't appear twice; the composited image is the pixel-exact
-     * one.
-     */
-    qemu_console_set_mouse(s->con, x, y, on && !s->cursor_composited);
+    qemu_console_set_mouse(s->con, x, y, on);
 }
+
+/*
+ * Classic Mac OS low-memory globals for mouse position and button
+ * state (Guide to Macintosh Family Hardware / SysEqu.a -- fixed
+ * addresses, stable across boots and OS versions, physical/identity-
+ * mapped in guest RAM). MTemp/RawMouse/Mouse are each a packed
+ * QuickDraw Point: high 16 bits = v (Y), low 16 bits = h (X); normally
+ * kept in sync by the guest's own ADB-interrupt-time completion
+ * handler (MTemp, updated first) and CrsrVBLTask (RawMouse/Mouse,
+ * copied from MTemp each cycle, pinned to CrsrPin). MBState is a
+ * single byte, bit 7 clear (0x00) = button down, set (0xff in
+ * practice) = up -- also normally updated directly by the ADB
+ * completion handler, matching real ADB's own active-low convention.
+ * This is exactly the historic "$172" address this project's own
+ * investigation spent many passes characterizing as "the wait" --
+ * $172 is literally MBState. See the WORKAROUND comment below for why
+ * we write these directly instead of leaving it to the guest.
+ */
+#define MAC_LOWMEM_MTEMP     0x828
+#define MAC_LOWMEM_RAWMOUSE  0x82c
+#define MAC_LOWMEM_MOUSE     0x830
+#define MAC_LOWMEM_MBSTATE   0x172
+
+/*
+ * WORKAROUND -- see the field comment on host_cursor_x/y in
+ * ati_mach64.h for why this exists: real hardware never does this,
+ * software always drives CUR_HORZ_VERT_POSN, and it certainly never
+ * pokes the guest OS's own low-memory globals directly. Tracks the
+ * real host pointer/button state and writes it both into the hardware
+ * cursor position registers (so the on-screen pointer is visible and
+ * usable) and directly into the guest's MTemp/RawMouse/Mouse/MBState
+ * low-memory globals, standing in for the guest's own stalled
+ * ADB-completion handler and CrsrVBLTask. Without the low-memory
+ * writes, the visible cursor moves but the guest's own click-location
+ * and button-state bookkeeping stays frozen whenever its dispatch is
+ * stuck, so clicks land wherever it was last stalled (or don't
+ * register at all) rather than where the pointer visibly is -- worse
+ * than doing nothing. This only affects the *guest's own bookkeeping*
+ * globals; ADB's own existing path is unaffected and still separately
+ * delivers real button transitions to the ADB device model.
+ */
+static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
+                                         QemuInputEvent *evt)
+{
+    ATIMach64State *s = ATI_MACH64(dev);
+    ATIMach64Mode mode;
+    uint32_t point_be;
+
+    ati_mach64_get_mode(s, &mode);
+    if (!ati_mach64_mode_valid(s, &mode)) {
+        return;
+    }
+
+    /*
+     * Button/MBState handling deliberately removed (2026-07-29): once
+     * virtual memory is disabled in the guest, ADB click delivery works
+     * correctly through the guest's own native path -- confirmed via
+     * live testing with this host-side button write disabled. Writing
+     * MBState here as well would race the guest's own now-working
+     * update and risks corrupting it. Only cursor *position* remains
+     * host-tracked, since CrsrVBLTask (the VBL-driven cursor redraw
+     * task) still doesn't get serviced by the guest on its own.
+     */
+    if (evt->type != INPUT_EVENT_KIND_REL) {
+        return;
+    }
+
+    if (evt->rel.axis == INPUT_AXIS_X) {
+        s->host_cursor_x += evt->rel.value;
+    } else if (evt->rel.axis == INPUT_AXIS_Y) {
+        s->host_cursor_y += evt->rel.value;
+    } else {
+        return;
+    }
+
+    if (s->host_cursor_x < 0) {
+        s->host_cursor_x = 0;
+    } else if (s->host_cursor_x >= (int)mode.width) {
+        s->host_cursor_x = mode.width - 1;
+    }
+    if (s->host_cursor_y < 0) {
+        s->host_cursor_y = 0;
+    } else if (s->host_cursor_y >= (int)mode.height) {
+        s->host_cursor_y = mode.height - 1;
+    }
+
+    s->regs[ATI_CUR_HORZ_VERT_POSN >> 2] =
+        ((uint32_t)s->host_cursor_y << 16) | (uint32_t)s->host_cursor_x;
+
+    point_be = cpu_to_be32(((uint32_t)(uint16_t)s->host_cursor_y << 16) |
+                           (uint32_t)(uint16_t)s->host_cursor_x);
+    address_space_write(&address_space_memory, MAC_LOWMEM_MTEMP,
+                        MEMTXATTRS_UNSPECIFIED, &point_be, 4);
+    address_space_write(&address_space_memory, MAC_LOWMEM_RAWMOUSE,
+                        MEMTXATTRS_UNSPECIFIED, &point_be, 4);
+    address_space_write(&address_space_memory, MAC_LOWMEM_MOUSE,
+                        MEMTXATTRS_UNSPECIFIED, &point_be, 4);
+    ati_mach64_cursor_update(s);
+}
+
+static const QemuInputHandler ati_mach64_cursor_handler = {
+    .name  = "ATI Mach64 hardware cursor (host-tracking workaround)",
+    .mask  = INPUT_EVENT_MASK_REL,
+    .event = ati_mach64_host_cursor_event,
+};
 
 #define ATI_MACH64_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
 /* Blank interval = last 1/8 of the frame, matching the phase-computed
  * live VBLANK status bit in the INT_CNTL read path. */
 #define ATI_MACH64_VBLANK_LEN_NS    (ATI_MACH64_VBLANK_PERIOD_NS / 8)
+/*
+ * icount-only compensation for the live VBLANK status bit (see its read
+ * handler below): under -icount, guest instructions advance QEMU_CLOCK_VIRTUAL
+ * by a fixed amount each, decoupled from real host speed. A bounded-retry
+ * guest busy-wait poll (Mac OS's boot-time "wait for the CRT timing
+ * generator" check is exactly such a loop, confirmed live: ~10000 iterations,
+ * each burning a fixed slice of virtual time) can therefore cover far less
+ * virtual time per call than on real hardware, where the same poll finishes
+ * in real microseconds regardless of VBLANK phase. At the project's
+ * established icount shift=4, that budget is ~1.9ms -- smaller than this
+ * bit's normal ~2.08ms "on" window, so under fully deterministic icount
+ * pacing a poll that starts out of phase can miss forever, not just
+ * occasionally (confirmed live: 3 early hits, then permanent timeout for the
+ * rest of boot, reproducible across shift=4/7/auto). Shrinking the "off" gap
+ * to a fixed, small slice of virtual time under icount -- regardless of
+ * shift -- keeps any poll with a reasonable instruction budget from ever
+ * landing in it, without touching the realistic ~12.5% duty cycle used in
+ * normal (non-icount) operation. Precedented pattern: icount_enabled()-gated
+ * device/DMA timing compensation for guest determinism assumptions that only
+ * break under icount, e.g. system/dma-helpers.c's overlapping-SG splitting.
+ */
+#define ATI_MACH64_VBLANK_ICOUNT_GAP_NS 50000
 /*
  * How long the PCI IRQ line itself stays physically asserted each
  * frame -- deliberately much shorter than ATI_MACH64_VBLANK_LEN_NS
@@ -596,11 +682,16 @@ static uint64_t ati_mach64_mmio_read(void *opaque, hwaddr addr, unsigned size)
          * toggling, our own boot never got past this exact check to
          * program CRTC_GEN_CNTL/H_TOTAL_DISP/V_TOTAL_DISP/OFF_PITCH at
          * all. Modeled as the last ~12.5% of each 60Hz frame period,
-         * a plausible real-CRT vblank duty cycle.
+         * a plausible real-CRT vblank duty cycle -- except under icount,
+         * where the "off" gap is instead pinned to a small fixed slice of
+         * virtual time (see ATI_MACH64_VBLANK_ICOUNT_GAP_NS above).
          */
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         int64_t phase = now % ATI_MACH64_VBLANK_PERIOD_NS;
-        bool in_vblank = phase >= (ATI_MACH64_VBLANK_PERIOD_NS * 7 / 8);
+        int64_t vblank_start = icount_enabled()
+            ? ATI_MACH64_VBLANK_ICOUNT_GAP_NS
+            : (ATI_MACH64_VBLANK_PERIOD_NS * 7 / 8);
+        bool in_vblank = phase >= vblank_start;
 
         result = (result & ~ATI_CRTC_VBLANK) | (in_vblank ? ATI_CRTC_VBLANK : 0);
         break;
@@ -707,7 +798,11 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         /* VBLANK_INT (bit 2) and VLINE_INT (bit 4) are
          * write-1-to-acknowledge status bits; the EN bits are plain
          * read/write. Acks do not touch the interrupt line -- it is a
-         * pulse driven purely by the vblank timers (see above). */
+         * pulse driven purely by the vblank timers (see above); this
+         * matches DingusPPC's own reference atirage.cpp exactly (its
+         * write_reg() ack path only clears status bits and never calls
+         * pci_interrupt() -- the line is driven solely by its vbl_cb
+         * timer callback). Confirmed by direct source comparison. */
         uint32_t pending = s->regs[reg_num] &
                            (ATI_CRTC_VBLANK_INT | ATI_CRTC_VLINE_INT);
         if (word & ATI_CRTC_VBLANK_INT_AK) {
@@ -718,6 +813,14 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         }
         s->regs[reg_num] = (word & ~(ATI_CRTC_VBLANK_INT |
                                      ATI_CRTC_VLINE_INT)) | pending;
+        /* TEMPORARY test-only reinstatement of the ack-driven early
+         * deassert (contradicts the DingusPPC reference comparison above
+         * -- kept only to test whether it explains this session's one
+         * successful boot; not a final decision). */
+        if (!pending) {
+            timer_del(s->vblank_end_timer);
+            pci_set_irq(PCI_DEVICE(s), 0);
+        }
         return;
     }
     case ATI_CUR_CLR0:
@@ -896,12 +999,28 @@ static void ati_mach64_realize(PCIDevice *dev, Error **errp)
                                        ati_mach64_vblank_end_tick, s);
     timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               ATI_MACH64_VBLANK_PERIOD_NS);
+
+    /*
+     * With virtual memory off in the guest, live testing confirmed ADB
+     * click and keyboard delivery now work through the guest's own
+     * native path (previously masked/confused by this same handler also
+     * writing MBState). Cursor *position* tracking (CrsrVBLTask, the
+     * VBL-driven cursor redraw task) still isn't serviced by the guest
+     * on its own, so this handler stays registered for REL events only
+     * -- see the button-handling removal note in
+     * ati_mach64_host_cursor_event().
+     */
+    s->cursor_hs = qemu_input_handler_register(DEVICE(dev),
+                                               &ati_mach64_cursor_handler);
 }
 
 static void ati_mach64_exit(PCIDevice *dev)
 {
     ATIMach64State *s = ATI_MACH64(dev);
 
+    if (s->cursor_hs) {
+        qemu_input_handler_unregister(s->cursor_hs);
+    }
     timer_free(s->vblank_timer);
     qemu_graphic_console_close(s->con);
 }
