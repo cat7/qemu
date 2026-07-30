@@ -363,6 +363,18 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
         return;
     }
 
+    /*
+     * Ignore implausibly large single-event deltas: the SDL backend
+     * synthesizes window-sized relative jumps on grab/ungrab and on
+     * the pointer entering the window (warp compensation), which are
+     * not real hand motion -- integrating one slams the tracked
+     * position into a screen corner. Real pointing devices deliver
+     * far smaller per-event deltas.
+     */
+    if (evt->rel.value > 256 || evt->rel.value < -256) {
+        return;
+    }
+
     if (evt->rel.axis == INPUT_AXIS_X) {
         s->host_cursor_x += evt->rel.value;
     } else if (evt->rel.axis == INPUT_AXIS_Y) {
