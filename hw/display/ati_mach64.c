@@ -24,6 +24,9 @@
 #include "exec/icount.h"
 #include "hw/pci/pci_device.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/i2c/i2c.h"
+#include "hw/i2c/bitbang_i2c.h"
+#include "hw/display/i2c-ddc.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "system/address-spaces.h"
@@ -598,16 +601,44 @@ static uint32_t ati_mach64_gp_io_write(ATIMach64State *s, uint32_t word)
      * 8-15, dirs byte at bits 24-31).
      */
     uint32_t rword = word;
-    uint8_t gpio_levels = (rword >> 8) & 0xff;
-    uint8_t gpio_dirs = (rword >> 24) & 0xff;
+    uint8_t raw_levels = (rword >> 8) & 0xff;
+    uint8_t raw_dirs = (rword >> 24) & 0xff;
+    uint8_t lvl3, dir3;         /* 3-bit logical sense code: bit0, SCL, SDA */
+    uint8_t appsense_lvl, appsense_dir;
     uint8_t result;
 
-    gpio_levels = ((gpio_levels & 0x30) >> 3) | (gpio_levels & 1);
-    gpio_levels ^= 7;
-    gpio_dirs = ((gpio_dirs & 0x30) >> 3) | (gpio_dirs & 1);
-    gpio_levels &= ~gpio_dirs;
+    /*
+     * The three physical GPIO sense pins map to a 3-bit logical code:
+     * physical bit 0 -> logical bit 0, physical bit 4 -> logical bit 1
+     * (I2C SCL), physical bit 5 -> logical bit 2 (I2C SDA).
+     */
+    lvl3 = ((raw_levels & 0x30) >> 3) | (raw_levels & 1);
+    dir3 = ((raw_dirs & 0x30) >> 3) | (raw_dirs & 1);
 
-    switch ((gpio_dirs << 3) | gpio_levels) {
+    /*
+     * Always drive the DDC/I2C engine from the SCL/SDA lines so the
+     * EDID slave stays in sync: a line configured as output presents
+     * its level, an input line reads high (pulled up). This coexists
+     * with the Apple Monitor Sense response below because the ROM's
+     * sense probe uses one-hot direction patterns (exactly one line
+     * driven low) that never occur during real I2C signalling.
+     */
+    {
+        int scl = (dir3 & 2) ? !!(lvl3 & 2) : 1;
+        int sda = (dir3 & 4) ? !!(lvl3 & 4) : 1;
+
+        bitbang_i2c_set(&s->bbi2c, BITBANG_I2C_SCL, scl);
+        sda = bitbang_i2c_set(&s->bbi2c, BITBANG_I2C_SDA, sda);
+        /* I2C readback: SCL -> logical bit 1, SDA -> logical bit 2 */
+        s->i2c_sense = (scl ? 2 : 0) | (sda ? 4 : 0);
+    }
+
+    /* Apple Monitor Sense probe decode (unchanged; boot mode-set relies
+     * on this). Uses its own munged view of the same pins. */
+    appsense_lvl = (lvl3 ^ 7) & ~dir3;
+    appsense_dir = dir3;
+
+    switch ((appsense_dir << 3) | appsense_lvl) {
     case 0043: /* sense line 2 pulled low; read sense line 1 and 0 */
         result = (ATI_APPLESENSE_EXT_CODE & 0060) >> 4;
         break;
@@ -619,7 +650,12 @@ static uint32_t ati_mach64_gp_io_write(ATIMach64State *s, uint32_t word)
         result = (ATI_APPLESENSE_EXT_CODE & 0003) << 1;
         break;
     default:
-        result = ATI_APPLESENSE_STD_CODE;
+        /*
+         * Not an Apple-sense probe: the guest is either bit-banging
+         * I2C or reading the bus at rest. Return the live I2C line
+         * state so DDC EDID reads work.
+         */
+        result = s->i2c_sense;
         break;
     }
 
@@ -1027,6 +1063,18 @@ static void ati_mach64_realize(PCIDevice *dev, Error **errp)
         s->cursor_hs = qemu_input_handler_register(DEVICE(dev),
                                                    &ati_mach64_cursor_handler);
     }
+
+    /*
+     * DDC/I2C EDID slave on the GP_IO sense pins (I2C address 0x50),
+     * bit-banged by the guest -- lets AppleVision and the Monitors
+     * control panel read a valid monitor descriptor. The EDID payload
+     * is synthesized by QEMU's generic generator (as for every emulated
+     * GPU); the real chip would read it from the attached monitor's ROM.
+     */
+    I2CBus *i2cbus = i2c_init_bus(DEVICE(dev), "ati-mach64.ddc");
+    bitbang_i2c_init(&s->bbi2c, i2cbus);
+    i2c_slave_set_address(I2C_SLAVE(&s->i2cddc), 0x50);
+    qdev_realize(DEVICE(&s->i2cddc), BUS(i2cbus), &error_abort);
 }
 
 static void ati_mach64_exit(PCIDevice *dev)
@@ -1068,6 +1116,7 @@ static const VMStateDescription vmstate_ati_mach64 = {
 static const Property ati_mach64_properties[] = {
     DEFINE_PROP_BOOL("host-cursor-tracking", ATIMach64State,
                      host_cursor_tracking, true),
+    DEFINE_EDID_PROPERTIES(ATIMach64State, i2cddc.edid_info),
 };
 
 static void ati_mach64_class_init(ObjectClass *klass, const void *data)
@@ -1131,10 +1180,18 @@ static void ati_mach64_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 
+static void ati_mach64_init(Object *obj)
+{
+    ATIMach64State *s = ATI_MACH64(obj);
+
+    object_initialize_child(obj, "edid", &s->i2cddc, TYPE_I2CDDC);
+}
+
 static const TypeInfo ati_mach64_type_info = {
     .name           = TYPE_ATI_MACH64,
     .parent         = TYPE_PCI_DEVICE,
     .instance_size  = sizeof(ATIMach64State),
+    .instance_init  = ati_mach64_init,
     .class_init     = ati_mach64_class_init,
     .interfaces     = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },

@@ -28,6 +28,8 @@
 #define ATI_MACH64_H
 
 #include "hw/pci/pci_device.h"
+#include "hw/i2c/bitbang_i2c.h"
+#include "hw/display/i2c-ddc.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "ui/input.h"
@@ -154,6 +156,17 @@ struct ATIMach64State {
     bool host_cursor_tracking;
     int host_cursor_x;
     int host_cursor_y;
+
+    /*
+     * DDC/I2C over the GP_IO sense pins: an EDID-serving I2C slave the
+     * guest bit-bangs to read monitor identity (used by AppleVision and
+     * the Monitors control panel). Independent of the Apple Monitor
+     * Sense response on the same pins, which the ROM's boot-time
+     * mode-set still relies on.
+     */
+    bitbang_i2c_interface bbi2c;
+    I2CDDCState i2cddc;
+    uint8_t i2c_sense;   /* last I2C SCL/SDA readback, 3-bit logical */
 };
 
 #endif /* ATI_MACH64_H */
