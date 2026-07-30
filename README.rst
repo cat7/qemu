@@ -104,6 +104,38 @@ Display, audio, control
 * ``-qmp unix:/tmp/g3.sock,server,nowait`` -- optional QMP control
   socket for scripting (screenshots, pausing, memory dumps).
 
+Non-standard behaviours and workarounds
+---------------------------------------
+
+Beyond ordinary device emulation, this fork uses a few deliberate
+tricks to get classic Mac OS fully usable; know about them before
+debugging "odd" behaviour:
+
+* **Host-driven mouse cursor (ATI card).** Classic Mac OS moves its
+  cursor from a VBL-queue task (``CrsrVBLTask``) that stops being
+  serviced by the guest's interrupt dispatcher partway through boot,
+  so the guest never programs the ATI hardware-cursor position
+  registers itself. ``hw/display/ati_mach64.c`` therefore tracks the
+  *host* pointer position directly and writes ``CUR_HORZ_VERT_POSN``
+  on the guest's behalf -- position only; clicks and all other input
+  still travel the normal emulated ADB path. If cursor motion works
+  but feels "different" from real hardware, this is why.
+* **CPU speed governor** (see above) -- a TCG plugin, not machine
+  code, so it must be present at every launch; nothing in the binary
+  enforces it.
+* **Guest setting: Virtual Memory must be OFF** (Memory control
+  panel). With VM enabled, the guest's exception dispatch degrades
+  over time (ADB input and unrelated subsystems progressively stop
+  responding); the underlying cause lives somewhere in the hashed-
+  page-table/DSI path and is not yet fixed at the source. VM off
+  avoids it entirely and is the supported configuration.
+* **Automatic PRAM/NVRAM persistence.** Two backing files are created
+  automatically in the working directory when not explicitly
+  configured: ``pram.img`` (CUDA PRAM: startup disk choice, network
+  config, time zone...) and ``nvram.img`` (Old World Open Firmware
+  NVRAM). Delete them for a "PRAM zap"; override the PRAM file with
+  ``-global cuda.drive=<file>``.
+
 
 Documentation
 =============
