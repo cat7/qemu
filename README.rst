@@ -72,11 +72,16 @@ Storage and choosing the boot device
 * ``-drive file=...,format=raw,media=disk`` -- IDE hard disk (raw
   HFS/HFS+ image). Repeat for a second disk (becomes the IDE slave).
 * ``-cdrom foo.iso`` -- ATAPI CD-ROM.
+* Floppy (SWIM3 Superdrive, boot/read/write; raw MFM images only,
+  1440K or 720K)::
+
+    -drive if=none,id=fd,file=floppy.img,format=raw -global swim3.drive=fd
 * Boot selection works the classic-Mac way, not the QEMU way: the
   real ROM ignores QEMU's ``-boot`` option and scans for a blessed
   System Folder, preferring the PRAM-stored startup device.
 
-  * Surest way to boot a CD: attach only the CD and no hard disk.
+  * Surest way to boot a CD (or floppy): attach only that medium and
+    no hard disk.
   * With both attached: pick the CD in the guest's Startup Disk
     control panel and reboot -- the choice persists across QEMU
     restarts (CUDA PRAM is saved to disk by this fork).
