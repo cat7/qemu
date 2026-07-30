@@ -67,6 +67,8 @@ static void adb_mouse_handle_event(DeviceState *dev, QemuConsole *src,
 
     switch (evt->type) {
     case INPUT_EVENT_KIND_REL:
+        trace_adb_device_mouse_handle_event(evt->type, evt->rel.axis,
+                                            evt->rel.value, 0);
         if (evt->rel.axis == INPUT_AXIS_X) {
             s->dx += evt->rel.value;
         } else if (evt->rel.axis == INPUT_AXIS_Y) {
@@ -75,6 +77,8 @@ static void adb_mouse_handle_event(DeviceState *dev, QemuConsole *src,
         break;
 
     case INPUT_EVENT_KIND_BTN:
+        trace_adb_device_mouse_handle_event(evt->type, evt->btn.button,
+                                            0, evt->btn.down);
         if (bmap[evt->btn.button]) {
             if (evt->btn.down) {
                 s->buttons_state |= bmap[evt->btn.button];
@@ -185,8 +189,18 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
     int cmd, reg, olen;
 
     if ((buf[0] & 0x0f) == ADB_FLUSH) {
-        /* flush mouse fifo */
-        s->buttons_state = s->last_buttons_state;
+        /*
+         * Flush discards pending, not-yet-reported relative motion --
+         * real hardware has no queued button data to flush, since the
+         * button state is a live physical line, not buffered. Reverting
+         * buttons_state to last_buttons_state here (as this code used to)
+         * silently erases any real button transition (e.g. a release)
+         * that happened between the last poll and this Flush, since
+         * buttons_state is the only place that transition is recorded --
+         * permanently desyncing the guest's button bookkeeping from
+         * reality (observed as a window drag that never ends because the
+         * guest never sees the mouse-up).
+         */
         s->dx = 0;
         s->dy = 0;
         s->dz = 0;
