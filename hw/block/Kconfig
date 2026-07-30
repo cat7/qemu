@@ -32,3 +32,6 @@ config VHOST_USER_BLK
 
 config SWIM
     bool
+
+config SWIM3
+    bool

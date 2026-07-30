@@ -111,3 +111,14 @@ swim_iwmctrl_read(int reg, const char *name, unsigned size, uint64_t value) "reg
 swim_iwmctrl_write(int reg, const char *name, unsigned size, uint64_t value) "reg=%d [%s] size=%u value=0x%"PRIx64
 swim_switch_to_ism(void) "switch from IWM to ISM mode"
 swim_switch_to_iwm(void) "switch from ISM to IWM mode"
+
+# swim3.c
+swim3_reg_read(unsigned reg, uint64_t value) "reg=%u value=0x%"PRIx64
+swim3_reg_write(unsigned reg, uint8_t value) "reg=%u value=0x%02x"
+swim3_drive_status(uint8_t addr, uint8_t value) "addr=0x%x value=%d"
+swim3_drive_command(uint8_t addr, uint8_t value) "addr=0x%x value=%d"
+swim3_motor(bool on) "motor=%d"
+swim3_irq(bool level, uint8_t flags, uint8_t mask) "level=%d flags=0x%02x mask=0x%02x"
+swim3_access_start(bool write, int track, int head, uint8_t first_sec, uint8_t xfer_cnt) "write=%d track=%d head=%d first_sec=%u count=%u"
+swim3_sector_io(bool read, int track, int head, int sector, bool ok) "read=%d track=%d head=%d sector=%d ok=%d"
+swim3_dma_armed(int is_out, uint64_t addr, int len) "out=%d addr=0x%"PRIx64" len=%d"

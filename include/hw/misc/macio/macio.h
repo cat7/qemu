@@ -36,7 +36,7 @@
 #include "hw/net/bmac.h"
 #include "hw/scsi/mesh.h"
 #include "hw/audio/awacs.h"
-#include "hw/block/swim.h"
+#include "hw/block/swim3.h"
 #include "hw/nvram/mac_nvram.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/ppc/openpic.h"
@@ -142,8 +142,7 @@ struct OldWorldMacIOState {
     BMACState bmac;
     MESHState mesh;
     AWACSState awacs;
-    Swim swim;
-    MemoryRegion swim_mmio_alias;
+    Swim3State swim;
 };
 
 #define TYPE_NEWWORLD_MACIO "macio-newworld"

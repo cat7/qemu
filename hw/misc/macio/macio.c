@@ -270,21 +270,21 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
     awacs_register_dma(&os->awacs, &s->dbdma);
 
     /*
-     * SWIM3 floppy controller: on real hardware, always physically present.
-     * The generic swim.c model exposes a 0x2000-byte IWM/ISM register
-     * window (sized for q800's memory map), but the real Beige G3 device
-     * tree registers only 0x1000 bytes for swim3 at this offset -- the
-     * following 0x1000 bytes belong to CUDA (mapped at 0x16000 below).
-     * Map only the first 0x1000 bytes via an alias so SWIM3 doesn't shadow
-     * CUDA's registers in macio's address space.
+     * SWIM3 floppy controller: always physically present on the real
+     * board. Real register-level SWIM3 model (16 byte-wide registers at
+     * a 16-byte stride, 0x1000 window, matching the real device tree's
+     * reg size); sector data moves through DBDMA channel 1, main IRQ
+     * 0x13, floppy DMA IRQ 0x01.
      */
     if (!qdev_realize(DEVICE(&os->swim), BUS(&s->macio_bus), errp)) {
         return;
     }
     sbd = SYS_BUS_DEVICE(&os->swim);
-    memory_region_init_alias(&os->swim_mmio_alias, OBJECT(s), "swim3-oldworld",
-                             sysbus_mmio_get_region(sbd, 0), 0, 0x1000);
-    memory_region_add_subregion(&s->bar, 0x15000, &os->swim_mmio_alias);
+    memory_region_add_subregion(&s->bar, 0x15000,
+                                sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_SWIM_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, 0x01));
+    swim3_register_dma(&os->swim, &s->dbdma);
 }
 
 static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index)
@@ -330,7 +330,7 @@ static void macio_oldworld_init(Object *obj)
     }
     object_initialize_child(obj, "mesh", &os->mesh, TYPE_MESH);
     object_initialize_child(obj, "awacs", &os->awacs, TYPE_AWACS);
-    object_initialize_child(obj, "swim", &os->swim, TYPE_SWIM);
+    object_initialize_child(obj, "swim", &os->swim, TYPE_SWIM3);
 }
 
 static void timer_write(void *opaque, hwaddr addr, uint64_t value,

@@ -70,6 +70,7 @@ config MOS6522
 config MACIO
     bool
     select CUDA
+    select SWIM3
     select ESCC
     select IDE_MACIO
     select MAC_DBDMA
