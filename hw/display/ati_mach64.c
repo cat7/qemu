@@ -23,6 +23,7 @@
 #include "qemu/units.h"
 #include "exec/icount.h"
 #include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "system/address-spaces.h"
@@ -1010,8 +1011,10 @@ static void ati_mach64_realize(PCIDevice *dev, Error **errp)
      * -- see the button-handling removal note in
      * ati_mach64_host_cursor_event().
      */
-    s->cursor_hs = qemu_input_handler_register(DEVICE(dev),
-                                               &ati_mach64_cursor_handler);
+    if (s->host_cursor_tracking) {
+        s->cursor_hs = qemu_input_handler_register(DEVICE(dev),
+                                                   &ati_mach64_cursor_handler);
+    }
 }
 
 static void ati_mach64_exit(PCIDevice *dev)
@@ -1039,6 +1042,20 @@ static const VMStateDescription vmstate_ati_mach64 = {
         VMSTATE_UINT8_ARRAY(dac_comp_buf, ATIMach64State, 3),
         VMSTATE_END_OF_LIST()
     }
+};
+
+/*
+ * host-cursor-tracking gates the host-pointer-driven cursor workaround
+ * (see ati_mach64_host_cursor_event()). Default on. Turn off with
+ * -global ati-mach64-gt.host-cursor-tracking=off to test whether the
+ * guest's own CrsrVBLTask-driven cursor path works -- the workaround
+ * was justified on boots that all predated the TimeDBRA-calibration
+ * governor and heathrow acknowledge fixes, so the underlying guest
+ * stall may no longer occur.
+ */
+static const Property ati_mach64_properties[] = {
+    DEFINE_PROP_BOOL("host-cursor-tracking", ATIMach64State,
+                     host_cursor_tracking, true),
 };
 
 static void ati_mach64_class_init(ObjectClass *klass, const void *data)
@@ -1097,6 +1114,7 @@ static void ati_mach64_class_init(ObjectClass *klass, const void *data)
     k->realize   = ati_mach64_realize;
     k->exit      = ati_mach64_exit;
     dc->vmsd     = &vmstate_ati_mach64;
+    device_class_set_props(dc, ati_mach64_properties);
     device_class_set_legacy_reset(dc, ati_mach64_reset);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }

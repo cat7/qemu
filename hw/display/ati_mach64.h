@@ -151,6 +151,7 @@ struct ATIMach64State {
      * other guest-side symptom of the same stall.
      */
     QemuInputHandlerState *cursor_hs;
+    bool host_cursor_tracking;
     int host_cursor_x;
     int host_cursor_y;
 };
