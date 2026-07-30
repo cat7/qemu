@@ -212,18 +212,36 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
         return;
     }
 
-    /* BMAC ethernet: on real hardware, always physically present */
-    qemu_configure_nic_device(DEVICE(&os->bmac), true, "bmac");
-    if (!qdev_realize(DEVICE(&os->bmac), BUS(&s->macio_bus), errp)) {
-        return;
+    /*
+     * BMAC ethernet: on real hardware, always physically present, so this
+     * is unconditional by default. But unlike a pluggable PCI NIC, there's
+     * no way to remove it after the fact (e.g. via `-device` vs `-nodefaults`)
+     * -- it's baked into this machine model. That makes it impossible to
+     * boot a CD/disk whose System Folder has a network extension that
+     * crashes when it sees an Ethernet controller (e.g. a buggy AppleTalk
+     * library) unless bmac can be left out entirely. Gate it on whether
+     * the user actually asked for networking at all (`-nic ...`/`-net ...`,
+     * as opposed to `-net none` or no networking option at all) -- if not,
+     * skip creating the device altogether rather than just leaving it
+     * disconnected from a netdev, so the guest's Open Firmware/Device
+     * Manager doesn't see an Ethernet controller in the address space at
+     * all.
+     */
+    if (qemu_find_nic_info(TYPE_BMAC, true, "bmac")) {
+        qemu_configure_nic_device(DEVICE(&os->bmac), true, "bmac");
+        if (!qdev_realize(DEVICE(&os->bmac), BUS(&s->macio_bus), errp)) {
+            return;
+        }
+        sbd = SYS_BUS_DEVICE(&os->bmac);
+        memory_region_add_subregion(&s->bar, 0x11000,
+                                    sysbus_mmio_get_region(sbd, 0));
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_IRQ));
+        sysbus_connect_irq(sbd, 1,
+                           qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_TX_IRQ));
+        sysbus_connect_irq(sbd, 2,
+                           qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_RX_IRQ));
+        bmac_register_dma(&os->bmac, &s->dbdma);
     }
-    sbd = SYS_BUS_DEVICE(&os->bmac);
-    memory_region_add_subregion(&s->bar, 0x11000,
-                                sysbus_mmio_get_region(sbd, 0));
-    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_IRQ));
-    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_TX_IRQ));
-    sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_RX_IRQ));
-    bmac_register_dma(&os->bmac, &s->dbdma);
 
     /* MESH SCSI controller: on real hardware, always physically present */
     if (!qdev_realize(DEVICE(&os->mesh), BUS(&s->macio_bus), errp)) {
@@ -300,7 +318,16 @@ static void macio_oldworld_init(Object *obj)
         macio_init_ide(s, &os->ide[i], i);
     }
 
-    object_initialize_child(obj, "bmac", &os->bmac, TYPE_BMAC);
+    /*
+     * Only create the bmac child object at all if the user actually asked
+     * for networking (see the realize-time check for why) -- QEMU asserts
+     * every object_initialize_child()'d device gets realized before
+     * machine init completes, so it's not enough to just skip realizing
+     * it later while still creating it here.
+     */
+    if (qemu_find_nic_info(TYPE_BMAC, true, "bmac")) {
+        object_initialize_child(obj, "bmac", &os->bmac, TYPE_BMAC);
+    }
     object_initialize_child(obj, "mesh", &os->mesh, TYPE_MESH);
     object_initialize_child(obj, "awacs", &os->awacs, TYPE_AWACS);
     object_initialize_child(obj, "swim", &os->swim, TYPE_SWIM);
