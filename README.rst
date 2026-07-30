@@ -102,7 +102,10 @@ Display, audio, control
 -----------------------
 
 * ``-display cocoa`` -- native macOS window (includes this fork's
-  host-cursor integration).
+  host-cursor integration). This is the supported backend on macOS:
+  ``-display sdl`` currently wedges the main loop / receives no input
+  on macOS hosts (unresolved; SDL is only expected to matter for a
+  future Windows build, where it is the primary backend).
 * ``-audiodev coreaudio,id=snd -global awacs.audiodev=snd`` -- sound
   output through the AWACS model (use ``-audiodev none,id=snd`` for
   silence). On Linux substitute an appropriate ``-audiodev`` backend.
