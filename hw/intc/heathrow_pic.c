@@ -207,15 +207,16 @@ static void heathrow_set_irq(void *opaque, int num, int level)
         pic->levels |= irq_bit;
     } else {
         /*
-         * NOTE (2026-07-28): DingusPPC's MacIoBase::ack_int_common()
-         * latches int_events on ALL transitions (falling edges too) in
-         * 68K mode; mirroring that here was tried while chasing the
-         * VBL-ISR starvation and then REVERTED -- it did not help the
-         * starvation in headless tests, and it is the only
-         * guest-visible change in the build where interactive mouse
-         * tracking regressed from working to consistently dead across
-         * reboots. Do not re-add without a controlled A/B test of
-         * interactive tracking.
+         * NOTE (2026-07-29): re-tested both-edges latching (DingusPPC's
+         * MacIoBase::ack_int_common() approach) again, this time with an
+         * objective, quantified A/B test -- live CPU-level External
+         * Interrupt rate via a TCG plugin, not a screenshot judgment call.
+         * Result: no measurable change (~2-5 interrupts per 2M
+         * instructions either way) and the idle-loop hang this was meant
+         * to fix still consumed ~25% of all instructions continuously
+         * with the change in place. Confirms the original 2026-07-28
+         * revert's conclusion was correct. Do not re-add without new
+         * evidence this actually changes the interrupt rate.
          */
         pic->levels &= ~irq_bit;
     }
