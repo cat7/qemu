@@ -97,7 +97,18 @@ static void heathrow_write(void *opaque, hwaddr addr,
         heathrow_update_irq(s);
         break;
     case 0x08:
-        if ((pic->mask & HEATHROW_INT_MODE_68K) &&
+        /*
+         * The 68k-style-acknowledge mode flag is chip-global, selected
+         * by bit 31 of the PRIMARY bank's mask register (IRQs 0-31,
+         * register block 0x20 = pics[1]); there is no separate mode bit
+         * for the auxiliary bank. Mac OS sets the flag once in the
+         * primary mask (observed: mask1=0x845ff80c, mask2=0x402) and
+         * then acks BOTH banks with 0x80000000 clear-all writes --
+         * gating per-bank on the bank's own mask left every aux-bank
+         * ack a silent no-op, so an edge-latched aux event (e.g. the
+         * bmac ethernet IRQ 0x2a) could never be acknowledged at all.
+         */
+        if ((s->pics[1].mask & HEATHROW_INT_MODE_68K) &&
             (value & HEATHROW_INT_MODE_68K)) {
             /* 68k-style "clear everything" acknowledgement */
             pic->events = 0;
@@ -157,6 +168,14 @@ static uint64_t heathrow_read(void *opaque, hwaddr addr,
             value = pic->mask;
             break;
         case 0xc:
+            /*
+             * NOTE (2026-07-30): masking this down to
+             * (levels & level_triggered) was tried as an interrupt-storm
+             * fix and REVERTED: early ROM boot legitimately polls raw
+             * input lines here (Ticks never started, gray-screen hang).
+             * The storm was fully explained by the bank-0 acknowledge
+             * bug fixed in the write handler below instead.
+             */
             value = pic->levels;
             break;
         default:
