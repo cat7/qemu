@@ -241,6 +241,13 @@ static void adb_bus_reset_hold(Object *obj, ResetType type)
      * Real CUDA hardware's default autopoll rate is 11ms (confirmed
      * against DingusPPC's ViaCuda, which initializes poll_rate to 11 --
      * matching the classic ADB Manager's expected default cadence).
+     * A/B tested against upstream QEMU's original, undocumented 20ms
+     * default (2026-07-29) to check for interaction with the guest's
+     * interrupt-dispatch degradation -- inconclusive given this boot
+     * sequence's already-established run-to-run nondeterminism, and
+     * 20ms has no real justification of its own (traced through 20+
+     * years of upstream history, found none), so kept at the
+     * hardware-accurate value.
      */
     adb_bus->autopoll_rate_ms = 11;
 }
