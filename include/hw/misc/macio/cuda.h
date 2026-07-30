@@ -117,8 +117,13 @@ struct CUDAState {
     uint8_t data_in[128];
     uint8_t data_out[16];
 
-    /* Extended Parameter RAM, accessed via CUDA_GET_PRAM/CUDA_SET_PRAM */
+    /* Extended Parameter RAM, accessed via CUDA_GET_PRAM/CUDA_SET_PRAM.
+     * Optionally backed by a "-drive" file (like q800's mac_via PRAM) so
+     * settings the guest OS stores in PRAM (e.g. the Memory control
+     * panel's virtual memory on/off flag) persist across separate QEMU
+     * invocations instead of resetting to zero every boot. */
     uint8_t pram[256];
+    BlockBackend *pram_blk;
 };
 
 #endif /* CUDA_H */

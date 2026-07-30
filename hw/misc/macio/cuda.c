@@ -26,12 +26,16 @@
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
 #include "hw/misc/macio/cuda.h"
 #include "qemu/timer.h"
+#include "system/block-backend.h"
 #include "system/runstate.h"
 #include "system/rtc.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
+#include "qobject/qdict.h"
 #include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -717,6 +721,60 @@ static bool cuda_cmd_get_pram(CUDAState *s,
     return true;
 }
 
+/*
+ * Auto-manage a default PRAM backing file, "pram.img", when the user
+ * hasn't attached one explicitly via -global cuda.drive=... -- mirrors
+ * mac_oldworld.c's mac_oldworld_default_nvram_blk() for "nvram.img"
+ * exactly (same auto-create-if-missing, auto-size-up semantics), so
+ * PRAM-resident guest settings persist across runs by default just
+ * like real hardware's battery-backed PRAM, without the user needing
+ * to pre-create an empty file by hand.
+ */
+static BlockBackend *cuda_default_pram_blk(void)
+{
+    static const char filename[] = "pram.img";
+    struct stat st;
+    BlockBackend *blk;
+    Error *local_err = NULL;
+    int fd;
+
+    fd = qemu_open_old(filename, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        warn_report("could not open/create default PRAM image '%s': %s",
+                    filename, strerror(errno));
+        return NULL;
+    }
+    if (fstat(fd, &st) == 0 && st.st_size < (int64_t)sizeof(((CUDAState *)0)->pram)) {
+        if (ftruncate(fd, sizeof(((CUDAState *)0)->pram)) != 0) {
+            warn_report("could not size default PRAM image '%s': %s",
+                        filename, strerror(errno));
+        }
+    }
+    close(fd);
+
+    QDict *options = qdict_new();
+    qdict_put_str(options, "driver", "raw");
+    blk = blk_new_open(filename, NULL, options, BDRV_O_RDWR, &local_err);
+    if (!blk) {
+        warn_report_err(local_err);
+        return NULL;
+    }
+    return blk;
+}
+
+/* Write PRAM back out to the optional backing file (see the "drive"
+ * property), matching q800's mac_via pram_update() -- without this,
+ * PRAM-resident settings (e.g. Memory control panel's virtual memory
+ * on/off flag) reset to zero on every fresh QEMU invocation. */
+static void cuda_pram_update(CUDAState *s)
+{
+    if (s->pram_blk) {
+        if (blk_pwrite(s->pram_blk, 0, sizeof(s->pram), s->pram, 0) < 0) {
+            qemu_log("cuda_pram_update: cannot write to file\n");
+        }
+    }
+}
+
 static bool cuda_cmd_set_pram(CUDAState *s,
                               const uint8_t *in_data, int in_len,
                               uint8_t *out_data, int *out_len)
@@ -729,6 +787,7 @@ static bool cuda_cmd_set_pram(CUDAState *s,
 
     addr = (((uint16_t)in_data[0]) << 8) | in_data[1];
     s->pram[addr % sizeof(s->pram)] = in_data[2];
+    cuda_pram_update(s);
     *out_len = 0;
     return true;
 }
@@ -930,6 +989,33 @@ static void cuda_realize(DeviceState *dev, Error **errp)
     s->one_sec_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cuda_one_sec_tick, s);
 
     adb_register_autopoll_callback(adb_bus, cuda_adb_poll, s);
+
+    if (!s->pram_blk) {
+        s->pram_blk = cuda_default_pram_blk();
+    }
+
+    if (s->pram_blk) {
+        int64_t len = blk_getlength(s->pram_blk);
+        int ret;
+
+        if (len < 0) {
+            error_setg_errno(errp, -len,
+                             "could not get length of PRAM backing image");
+            return;
+        }
+        ret = blk_set_perm(s->pram_blk,
+                           BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                           BLK_PERM_ALL, errp);
+        if (ret < 0) {
+            return;
+        }
+
+        ret = blk_pread(s->pram_blk, 0, sizeof(s->pram), s->pram, 0);
+        if (ret < 0) {
+            error_setg(errp, "can't read PRAM contents");
+            return;
+        }
+    }
 }
 
 static void cuda_init(Object *obj)
@@ -951,6 +1037,7 @@ static void cuda_init(Object *obj)
 
 static const Property cuda_properties[] = {
     DEFINE_PROP_UINT64("timebase-frequency", CUDAState, tb_frequency, 0),
+    DEFINE_PROP_DRIVE("drive", CUDAState, pram_blk),
 };
 
 static void cuda_class_init(ObjectClass *oc, const void *data)
