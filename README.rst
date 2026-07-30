@@ -98,6 +98,26 @@ Networking
 * Debug capture:
   ``-nic user,model=bmac,id=n1 -object filter-dump,id=fd,netdev=n1,file=tx.pcap``
 
+ATI FCode ROM (recommended)
+---------------------------
+
+Attaching a real ATI Mach64-family Open Firmware FCode ROM dump as the
+video card's PCI expansion ROM makes the machine ROM's OF execute it,
+which names the device node properly (``ATY,mach64_3DUPro``) and lets
+Apple's real ATI display driver (NDRV) bind -- noticeably faster
+display output than the generic fallback path:
+
+.. code-block:: shell
+
+  -global ati-mach64-gt.romfile=/path/to/ati_fcode.rom
+
+Verified working with a Mach64 3D Rage "GT" FCode ROM (ATI p/n
+109-39200-00, FCode 1.53) -- its FCode probes the emulated chip and
+correctly identifies it as family member "GT-C" (Rage Pro). The ROM
+image is ATI's copyrighted firmware and is not shipped here; use your
+own dump. Without it everything still works via the guest's software
+display path.
+
 Display, audio, control
 -----------------------
 
