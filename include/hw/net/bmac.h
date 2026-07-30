@@ -231,6 +231,8 @@ struct BMACState {
     int srom_read_bit;
     bool srom_cs_prev;
     bool srom_clk_prev;
+    int srom_data_edge_skip;
+    bool srom_dummy_pending;
 };
 
 /* Called by macio once its DBDMA controller is realized */

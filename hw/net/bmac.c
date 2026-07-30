@@ -25,6 +25,7 @@
 #include "hw/net/bmac.h"
 #include "system/dma.h"
 #include "system/address-spaces.h"
+#include "trace.h"
 #include <zlib.h>
 
 /* Convert register byte offset to our 16-bit register array index */
@@ -64,7 +65,10 @@
 
 static void bmac_update_irq(BMACState *s)
 {
-    if (s->status & ~s->int_mask) {
+    bool raise = s->status & ~s->int_mask;
+
+    trace_bmac_irq_update(raise, s->status, s->int_mask);
+    if (raise) {
         qemu_irq_raise(s->irq);
     } else {
         qemu_irq_lower(s->irq);
@@ -247,12 +251,16 @@ static void bmac_srom_reset(BMACState *s)
     s->srom_addr = 0;
     s->srom_read_data = 0;
     s->srom_read_bit = 0;
+    s->srom_data_edge_skip = 0;
+    s->srom_dummy_pending = false;
     s->srom_cs_prev = false;
     s->srom_clk_prev = false;
 }
 
 static void bmac_srom_clock_edge(BMACState *s, bool cs, bool clk, bool di)
 {
+    trace_bmac_srom_edge(cs, clk, di, s->srom_state);
+
     if (cs && !s->srom_cs_prev) {
         bmac_srom_reset(s);
         s->srom_state = SROM_STATE_OPCODE;
@@ -276,25 +284,88 @@ static void bmac_srom_clock_edge(BMACState *s, bool cs, bool clk, bool di)
                 s->srom_bit_count = 0;
                 s->srom_state = (opcode == SROM_CMD_READ) ?
                     SROM_STATE_ADDRESS : SROM_STATE_IDLE;
+                trace_bmac_srom_opcode(opcode, s->srom_state);
             }
             break;
         case SROM_STATE_ADDRESS:
             if (s->srom_bit_count >= 6) { /* 93C46: 6-bit address */
                 s->srom_addr = s->srom_shift_reg & 0x3f;
                 s->srom_read_data = s->srom_data[s->srom_addr];
-                s->srom_read_bit = 17; /* 17 = dummy bit, 16..1 = data */
+                trace_bmac_srom_address(s->srom_addr, s->srom_read_data);
+                /*
+                 * A real 93C46 outputs a leading dummy/start bit (always
+                 * 0) before the 16 real data bits, MSB first. An earlier
+                 * pass removed this dummy bit to match DingusPPC's
+                 * BigMac model (no dummy-bit special case) -- but
+                 * disassembling Mac OS 8.5's actual native bmac driver
+                 * proved it genuinely peeks this exact bit and aborts
+                 * the whole read if it's nonzero, which only a real
+                 * dummy 0 bit satisfies (DingusPPC's own driver stack
+                 * apparently never exercises that check, so its model
+                 * not needing one doesn't mean real hardware doesn't
+                 * have one).
+                 *
+                 * The dummy is tracked as a one-shot flag
+                 * (srom_dummy_pending), completely separate from
+                 * srom_read_bit, rather than as an extra numeric bit
+                 * position (read_bit=17): srom_read_bit is initialized
+                 * straight to 16 (the true MSB's position) and is what
+                 * the *next real* data read will use once the dummy is
+                 * consumed. Folding the dummy into the numeric countdown
+                 * (17..1) was tried first and seemed to work for the
+                 * abort-check alone, but corrupted every real data bit
+                 * read afterward: whichever single edge's decrement got
+                 * skipped to keep the dummy read correct also left the
+                 * main 16-bit read loop exactly one edge short by the
+                 * end, so its capture came out silently doubled (a
+                 * clean value << 1) instead of the real 16 bits --
+                 * confirmed bit-by-bit against a live register trace on
+                 * both a scratch instance and the user's real disk
+                 * (00:05:02:12:34:56 read back as 00:0a:04:24:68:ac,
+                 * i.e. exactly the expected bytes each shifted left one
+                 * bit). Decoupling the dummy from the numeric position
+                 * entirely avoids that -- read_bit never needs an
+                 * out-of-range placeholder value at all.
+                 */
+                s->srom_dummy_pending = true;
+                s->srom_read_bit = 16;
                 s->srom_state = SROM_STATE_DATA;
                 s->srom_bit_count = 0;
                 s->srom_shift_reg = 0;
+                /*
+                 * The falling edge that completes this same 6th address
+                 * bit's clock cycle (handled just below, in this exact
+                 * function call for a rising edge, or the very next call
+                 * for a falling edge) is part of finishing the ADDRESS
+                 * phase, not a real data-clock cycle -- it must not
+                 * advance srom_read_bit, or the dummy-bit read (which
+                 * must not itself consume a real bit position) and the
+                 * first real data bit after it both end up reading the
+                 * same, wrong position.
+                 */
+                s->srom_data_edge_skip = 1;
             }
             break;
         case SROM_STATE_DATA:
+            /*
+             * The rising edge right after the dummy-bit read (itself
+             * riding on the address-completing falling edge, protected
+             * from decrementing by srom_data_edge_skip above) is what
+             * ends the dummy phase -- clearing the flag here, rather
+             * than as part of that same falling edge, is what keeps
+             * srom_read_bit sitting at the true MSB's position (16) for
+             * both the dummy read and the first real data read that
+             * immediately follows it.
+             */
+            s->srom_dummy_pending = false;
             break;
         }
     }
 
     if (!clk && s->srom_clk_prev) { /* falling edge: advance output bit */
-        if (s->srom_state == SROM_STATE_DATA && s->srom_read_bit > 0) {
+        if (s->srom_data_edge_skip > 0) {
+            s->srom_data_edge_skip--;
+        } else if (s->srom_state == SROM_STATE_DATA && s->srom_read_bit > 0) {
             s->srom_read_bit--;
         }
     }
@@ -307,11 +378,13 @@ static uint16_t bmac_srom_get_data(BMACState *s)
     if (s->srom_state != SROM_STATE_DATA) {
         return 0;
     }
-    if (s->srom_read_bit == 17) {
-        return 0; /* dummy bit before data, always 0 */
+    if (s->srom_dummy_pending) {
+        trace_bmac_srom_getdata(s->srom_read_bit, 0);
+        return 0; /* leading dummy/start bit, always 0 */
     }
     if (s->srom_read_bit >= 1 && s->srom_read_bit <= 16) {
         int bit = (s->srom_read_data >> (s->srom_read_bit - 1)) & 1;
+        trace_bmac_srom_getdata(s->srom_read_bit, bit);
         /* Set the data-out bit in both low and high byte positions */
         return bit ? (SROMCSR_DOUT_LO | SROMCSR_DOUT_HI) : 0;
     }
@@ -378,7 +451,23 @@ static bool bmac_can_receive_packet(BMACState *s, const uint8_t *buf)
 static bool bmac_can_receive(NetClientState *nc)
 {
     BMACState *s = qemu_get_nic_opaque(nc);
-    return (s->regs[REG_INDEX(BMAC_RXCFG)] & RXCFG_ENABLE) != 0;
+
+    /*
+     * Must also gate on rx_dma_waiting: bmac_receive() silently drops
+     * any packet that arrives before the driver has armed the next RX
+     * descriptor (returns size without ever writing/completing it).
+     * Reporting "can receive" from RXCFG_ENABLE alone told the net
+     * layer it was always safe to deliver immediately, so any packet
+     * landing in the gap between one RX completion and the driver
+     * re-arming the ring (e.g. an ARP reply or DHCP offer during
+     * negotiation) was lost with no retry -- qemu_flush_queued_packets()
+     * is already called from bmac_rx_dma_rw() once a descriptor is
+     * armed, so gating here lets the net layer's normal queuing take
+     * over instead.
+     */
+    bool enabled = (s->regs[REG_INDEX(BMAC_RXCFG)] & RXCFG_ENABLE) != 0;
+    trace_bmac_can_receive(enabled, s->rx_dma_waiting);
+    return enabled && s->rx_dma_waiting;
 }
 
 static ssize_t bmac_receive(NetClientState *nc, const uint8_t *buf,
@@ -391,6 +480,8 @@ static ssize_t bmac_receive(NetClientState *nc, const uint8_t *buf,
     uint16_t rxcfg = s->regs[REG_INDEX(BMAC_RXCFG)];
     uint16_t frame_len, rx_pkt_status;
 
+    trace_bmac_rx_receive(size, bmac_can_receive_packet(s, buf),
+                          s->rx_dma_waiting, io != NULL);
     if (!bmac_can_receive_packet(s, buf) || !s->rx_dma_waiting || !io) {
         return size;
     }
@@ -446,11 +537,38 @@ static void bmac_set_link_status(NetClientState *nc)
     BMACState *s = qemu_get_nic_opaque(nc);
 
     s->link_up = !nc->link_down;
+    /*
+     * Real link status is exposed to the guest driver via TWO independent
+     * hardware paths, not one:
+     *
+     *  1. The MII PHY's standard BMSR_LINK bit, read via BMAC_MIFCSR's
+     *     bit-banged MII interface (MDIO/MDC).
+     *  2. XCVRIF_LINK (BMAC_XCVRIF bit 0x0100). The real Beige G3 (Gossamer)
+     *     board schematic (main logic board, sheet 12 "Heathrow I/O ASIC"
+     *     and sheet 13 "Ethernet: Transceiver, Magnetics, Connector,
+     *     Address PROM") shows Heathrow's MDC pin is NOT CONNECTED on this
+     *     board -- the MDIO management interface is electrically disabled,
+     *     so path (1) can never actually be used by any real driver on
+     *     real hardware. Instead, the LXT907 PHY's dedicated link-status
+     *     output (pin 20, "LEDL"/ETH10BT_LINK) is wired directly into
+     *     Heathrow's RX_ER input pin, which Heathrow's BMAC block reflects
+     *     through XCVR_IF -- confirming this bit is a real, load-bearing
+     *     hardware signal, not a fabrication.
+     *
+     * An EARLIER version of this fix forced XCVRIF_LINK permanently on
+     * (and re-forced it on every register write), which was wrong for a
+     * different reason: it stomped the bit back to 1 immediately even
+     * when the guest tried to write/poll for it clearing, breaking the
+     * driver's real init-time write-then-poll sequence. The correct model
+     * (matching how BMSR_LINK is already handled below) is to compute
+     * this bit fresh at *read* time from live s->link_up, never storing
+     * or re-forcing it on writes -- see bmac_read()'s BMAC_XCVRIF case,
+     * which also confirms (via live testing) that this bit reads
+     * active-low (0 = link present), not active-high.
+     */
     if (s->link_up) {
-        s->regs[REG_INDEX(BMAC_XCVRIF)] |= XCVRIF_LINK;
         s->phy_regs[MII_BMSR] |= BMSR_LINK;
     } else {
-        s->regs[REG_INDEX(BMAC_XCVRIF)] &= ~XCVRIF_LINK;
         s->phy_regs[MII_BMSR] &= ~BMSR_LINK;
     }
 }
@@ -481,6 +599,28 @@ static uint64_t bmac_read(void *opaque, hwaddr addr, unsigned size)
         val |= bmac_srom_get_data(s);
         break;
 
+    case BMAC_XCVRIF:
+        /*
+         * XCVRIF_LINK reflects the real board's PHY-link-status wire (see
+         * bmac_set_link_status() for the schematic-derived reasoning) --
+         * computed fresh from live link state on every read, never stored,
+         * so a guest poll sees a real value instead of a permanently-forced
+         * bit. Active-low (0 = link present), confirmed by live testing:
+         * with this bit active-high the guest driver reads it exactly 7
+         * times then permanently aborts its hardware-init sequence
+         * (TXCFG/RXCFG/the hash table never get programmed, matching a
+         * previously-documented regression); with it active-low the driver
+         * reads it exactly once, is satisfied, and completes full
+         * hardware init every time thereafter -- consistent with
+         * XCVRIF_COLLOW (this same register's other status bit) also being
+         * documented as active-low.
+         */
+        val = s->regs[REG_INDEX(addr)] & ~XCVRIF_LINK;
+        if (!s->link_up) {
+            val |= XCVRIF_LINK;
+        }
+        break;
+
     default:
         if (addr < BMAC_REG_SIZE) {
             int idx = REG_INDEX(addr);
@@ -501,7 +641,9 @@ static uint64_t bmac_read(void *opaque, hwaddr addr, unsigned size)
      * natively little-endian; DEVICE_BIG_ENDIAN MMIO plus this bswap16
      * reproduces that swap for the bus.
      */
-    return bswap16(val & 0xffff);
+    val = bswap16(val & 0xffff);
+    trace_bmac_reg_read(addr, val, size);
+    return val;
 }
 
 static void bmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
@@ -509,6 +651,7 @@ static void bmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     BMACState *s = BMAC(opaque);
 
     val = bswap16(val & 0xffff);
+    trace_bmac_reg_write(addr, val, size);
 
     switch (addr) {
     case BMAC_STATUS:
@@ -540,7 +683,23 @@ static void bmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case BMAC_BHASH1:
     case BMAC_BHASH2:
     case BMAC_BHASH3:
-        s->hash_table[(BMAC_BHASH3 - addr) / 0x10] = val;
+        /*
+         * BHASH0 (bits 15-0) sits at the HIGHEST address (0x730) and
+         * BHASH3 (bits 63-48) at the LOWEST (0x700) -- addresses count
+         * down as significance goes up. hash_table[] is indexed the
+         * other way (index 0 = bits 15-0, per bmac_hash_index()'s
+         * hash_table[idx>>4]), so the reference point for this
+         * computation must be BMAC_BHASH0 (the highest address, mapping
+         * to the lowest index), not BMAC_BHASH3. Using BMAC_BHASH3 here
+         * only produced a correct (zero) index for BHASH3 itself --
+         * addr is unsigned (hwaddr), so BMAC_BHASH3 - addr underflows
+         * for BHASH0/1/2 into a huge wrapped index, corrupting memory
+         * far outside the 4-entry hash_table[] array. This meant only
+         * 16 of the real 64 hash-filter bits (BHASH3's) were ever
+         * actually landing in hash_table[] correctly -- a likely cause
+         * of multicast traffic silently not matching the filter.
+         */
+        s->hash_table[(BMAC_BHASH0 - addr) / 0x10] = val;
         s->regs[REG_INDEX(addr)] = val;
         return;
 
@@ -576,8 +735,13 @@ static void bmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
 
     case BMAC_XCVRIF:
-        s->regs[REG_INDEX(addr)] = (val & ~XCVRIF_LINK) |
-            (s->link_up ? XCVRIF_LINK : 0);
+        /*
+         * Store whatever the guest writes; XCVRIF_LINK is recomputed
+         * fresh from live link state on every READ instead (see
+         * bmac_read()'s case and bmac_set_link_status()), so it doesn't
+         * matter whether the guest's write included that bit or not.
+         */
+        s->regs[REG_INDEX(addr)] = val;
         return;
 
     default:
@@ -629,7 +793,23 @@ static void bmac_reset(DeviceState *dev)
 
     bmac_srom_reset(s);
 
-    s->regs[REG_INDEX(BMAC_CHIPID)] = 0x00c4; /* Paddington BMAC */
+    /*
+     * Beige G3 (Gossamer) is a Heathrow-based machine (this project's own
+     * hw/intc/heathrow_pic.c) -- Paddington is a later macio revision
+     * (iMac rev B, Lombard PowerBook) that didn't exist yet in 1997.
+     * Real chip IDs confirmed against DingusPPC's real-hardware-derived
+     * BigMac model (devices/ethernet/bigmac.h): Heathrow=0xB1,
+     * Paddington=0xC7 -- the previous 0xC4 here was wrong even for
+     * Paddington (transcription error), and Paddington was the wrong
+     * identity for this machine regardless. Real native BigMac drivers
+     * branch PHY/init handling on this exact ID (see DingusPPC's own
+     * bigmac.cpp: "if (chip_id == Paddington) {...} else {// assume
+     * Heathrow with LXT907 PHY}") -- reporting the wrong family here is
+     * a very plausible reason a real driver would silently take a wrong
+     * init path and never fully attach, independent of any individual
+     * register being otherwise correct.
+     */
+    s->regs[REG_INDEX(BMAC_CHIPID)] = 0x00b1; /* Heathrow BMAC */
     s->regs[REG_INDEX(BMAC_IPG1)] = 0x0008;
     s->regs[REG_INDEX(BMAC_IPG2)] = 0x0004;
     s->regs[REG_INDEX(BMAC_ALIMIT)] = 0x0010;
@@ -653,7 +833,7 @@ static void bmac_reset(DeviceState *dev)
 
     s->link_up = true;
     bmac_phy_reset(s);
-    s->regs[REG_INDEX(BMAC_XCVRIF)] = XCVRIF_LINK | XCVRIF_CLK | XCVRIF_SERIAL;
+    s->regs[REG_INDEX(BMAC_XCVRIF)] = XCVRIF_CLK | XCVRIF_SERIAL;
 }
 
 static NetClientInfo net_bmac_info = {
@@ -705,8 +885,10 @@ static void bmac_tx_dma_rw(DBDMA_io *io)
 
         if (memcmp(buf, s->mac_addr, 6) == 0) {
             /* Destination is our own MAC: loop back to the RX path */
+            trace_bmac_tx_send(io->len, true);
             bmac_receive(qemu_get_queue(s->nic), buf, io->len);
         } else {
+            trace_bmac_tx_send(io->len, false);
             qemu_send_packet(qemu_get_queue(s->nic), buf, io->len);
         }
 
@@ -745,6 +927,7 @@ static void bmac_rx_dma_rw(DBDMA_io *io)
     s->rx_dma_waiting = true;
     s->rx_dma_addr = io->addr;
     s->rx_dma_len = io->len;
+    trace_bmac_rx_dma_armed(io->addr, io->len);
     s->rx_dma_io = io;
 
     qemu_flush_queued_packets(qemu_get_queue(s->nic));
