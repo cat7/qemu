@@ -31,6 +31,80 @@ QEMU as a whole is released under the GNU General Public License,
 version 2. For full licensing details, consult the LICENSE file.
 
 
+Running the Beige Power Mac G3 (this fork)
+==========================================
+
+This fork's focus is the ``g3beige`` machine (Beige Power Mac G3
+"Gossamer") booted from a real dumped ROM into classic Mac OS. A full
+invocation looks like:
+
+.. code-block:: shell
+
+  ./qemu-system-ppc \
+    -M g3beige -m 256 \
+    -bios /path/to/PowerMacG3v3.ROM \
+    -drive file=/path/to/disk.img,format=raw,media=disk \
+    -cdrom /path/to/cd.iso \
+    -nic user,model=bmac \
+    -display cocoa \
+    -audiodev coreaudio,id=snd -global awacs.audiodev=snd \
+    -plugin contrib/plugins/libgovernor.dylib,mips=100
+
+Machine and firmware
+--------------------
+
+* ``-M g3beige -m 256`` -- the Gossamer machine with 256 MB RAM (the
+  real board maxes out at 768).
+* ``-bios PowerMacG3v3.ROM`` -- a real dumped Beige G3 ROM image.
+* ``-plugin contrib/plugins/libgovernor.dylib,mips=100`` -- **required**.
+  Caps guest execution speed so the ROM's ``TimeDBRA`` timing
+  calibration works; without it the CPU outruns the 1 ms VIA timing
+  window, the calibration stores 0, and Mac OS later dies with
+  "divide by zero" system errors (Apple's ATAPI CD driver, Open
+  Transport AppleTalk). Values up to ~200 MIPS calibrate correctly;
+  250 and above do not. See ``contrib/plugins/governor.c`` for the
+  full story. Build the plugin with
+  ``ninja contrib/plugins/libgovernor.dylib`` (``.so`` on Linux).
+
+Storage and choosing the boot device
+------------------------------------
+
+* ``-drive file=...,format=raw,media=disk`` -- IDE hard disk (raw
+  HFS/HFS+ image). Repeat for a second disk (becomes the IDE slave).
+* ``-cdrom foo.iso`` -- ATAPI CD-ROM.
+* Boot selection works the classic-Mac way, not the QEMU way: the
+  real ROM ignores QEMU's ``-boot`` option and scans for a blessed
+  System Folder, preferring the PRAM-stored startup device.
+
+  * Surest way to boot a CD: attach only the CD and no hard disk.
+  * With both attached: pick the CD in the guest's Startup Disk
+    control panel and reboot -- the choice persists across QEMU
+    restarts (CUDA PRAM is saved to disk by this fork).
+
+Networking
+----------
+
+* ``-nic user,model=bmac`` -- the onboard BMAC ethernet on slirp NAT:
+  the guest gets 10.0.2.15 via DHCP (gateway 10.0.2.2), with outbound
+  TCP/UDP forwarded to the host network. Append
+  ``,mac=52:54:00:xx:yy:zz`` to pin the MAC address.
+* Omitting all network options creates the bmac with the same
+  defaults; ``-net none`` removes the device entirely.
+* Debug capture:
+  ``-nic user,model=bmac,id=n1 -object filter-dump,id=fd,netdev=n1,file=tx.pcap``
+
+Display, audio, control
+-----------------------
+
+* ``-display cocoa`` -- native macOS window (includes this fork's
+  host-cursor integration).
+* ``-audiodev coreaudio,id=snd -global awacs.audiodev=snd`` -- sound
+  output through the AWACS model (use ``-audiodev none,id=snd`` for
+  silence). On Linux substitute an appropriate ``-audiodev`` backend.
+* ``-qmp unix:/tmp/g3.sock,server,nowait`` -- optional QMP control
+  socket for scripting (screenshots, pausing, memory dumps).
+
+
 Documentation
 =============
 
