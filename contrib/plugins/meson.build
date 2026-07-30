@@ -2,17 +2,23 @@ contrib_plugins = [
 'bbv.c',
 'cache.c',
 'cflow.c',
+'divwatch.c',
 'drcov.c',
+'errsite.c',
+'excwatch.c',
 'execlog.c',
+'governor.c',
 'hotblocks.c',
 'hotpages.c',
 'howvec.c',
 'hwprofile.c',
 'ips.c',
+'memwatch.c',
 'rangeexec.c',
 'stoptrigger.c',
 'traps.c',
 'uftrace.c',
+'zdivwatch.c',
 ]
 
 if host_os != 'windows'
