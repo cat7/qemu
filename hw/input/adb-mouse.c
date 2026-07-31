@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "ui/console.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/input/adb.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -42,6 +43,17 @@ struct MouseState {
     int buttons_state, last_buttons_state;
     int dx, dy, dz;
     bool polled_once;
+    /*
+     * Multiplier applied to incoming host motion deltas. Host input
+     * arrives in host pixels (~100 per inch of physical mouse travel)
+     * while the classic Apple mouse protocol handler declares 200
+     * counts per inch, so guests that normalize pointer speed by the
+     * declared resolution (Mac OS X's AppleADBMouse does; classic Mac
+     * OS's cursor scaling largely doesn't) see half-speed motion at
+     * the default of 1. Set 2 for a faithful "200 cpi device" feel on
+     * such guests: -global adb-mouse.motion-scale=2.
+     */
+    uint8_t motion_scale;
 };
 
 
@@ -69,10 +81,22 @@ static void adb_mouse_handle_event(DeviceState *dev, QemuConsole *src,
     case INPUT_EVENT_KIND_REL:
         trace_adb_device_mouse_handle_event(evt->type, evt->rel.axis,
                                             evt->rel.value, 0);
+        /*
+         * Ignore implausibly large single-event deltas: display
+         * backends synthesize window-sized relative jumps around
+         * grab/ungrab and pointer-warp compensation (observed with
+         * both SDL and Cocoa), which are not real hand motion --
+         * integrating one teleports the guest cursor (observed as
+         * occasional wild jumps while tracking in Mac OS X guests).
+         * Real pointing devices deliver far smaller per-event deltas.
+         */
+        if (evt->rel.value > 256 || evt->rel.value < -256) {
+            break;
+        }
         if (evt->rel.axis == INPUT_AXIS_X) {
-            s->dx += evt->rel.value;
+            s->dx += evt->rel.value * s->motion_scale;
         } else if (evt->rel.axis == INPUT_AXIS_Y) {
-            s->dy += evt->rel.value;
+            s->dy += evt->rel.value * s->motion_scale;
         }
         break;
 
@@ -238,20 +262,36 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
                 trace_adb_device_mouse_request_change_addr(d->devaddr);
                 break;
             default:
-                d->devaddr = buf[1] & 0xf;
                 /*
+                 * A plain handler assignment ignores the address field
+                 * -- only the reserved handler bytes 0x00/0xFE/0xFD
+                 * latch a new address (confirmed against DingusPPC's
+                 * real-hardware-verified AdbMouse::set_register_3,
+                 * which leaves my_addr untouched for handler values).
+                 * Latching it here too (as this used to) would let a
+                 * malformed handler-change write teleport the device
+                 * to a different bus address.
+                 *
                  * we support handlers:
                  * 0x01: Classic Apple Mouse Protocol / 100 cpi operations
                  * 0x02: Classic Apple Mouse Protocol / 200 cpi operations
+                 * 0x04: Extended Apple Mouse Protocol (see the reg 1
+                 *       read below -- lets the guest read our declared
+                 *       resolution/button count instead of assuming the
+                 *       classic protocol's fixed 200 cpi; Mac OS X's
+                 *       AppleADBMouse scales pointer speed inversely
+                 *       with device resolution, so the classic handler
+                 *       made the cursor crawl at half speed given that
+                 *       our "counts" are host pixels, not physical
+                 *       1/200-inch mouse travel)
                  * we don't support handlers (at least):
                  * 0x03: Mouse systems A3 trackball
-                 * 0x04: Extended Apple Mouse Protocol
                  * 0x2f: Microspeed mouse
                  * 0x42: Macally
                  * 0x5f: Microspeed mouse
                  * 0x66: Microspeed mouse
                  */
-                if (buf[2] == 1 || buf[2] == 2) {
+                if (buf[2] == 1 || buf[2] == 2 || buf[2] == 4) {
                     d->handler = buf[2];
                 }
 
@@ -267,6 +307,28 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
             olen = adb_mouse_poll(d, obuf);
             break;
         case 1:
+            /*
+             * Extended Apple Mouse Protocol device info -- must be
+             * exactly 8 bytes or the guest rejects handler 4
+             * (AppleADBMouseType4::probe): device signature (u32),
+             * resolution in counts per inch (big-endian u16), device
+             * class, button count. Resolution 100 gives a ~1:1 feel
+             * since our motion units are host pixels (~100 per inch of
+             * physical mouse travel), twice the speed the classic
+             * handler's assumed 200 cpi produced. The signature must
+             * not be 'tpad' (that selects the trackpad code path).
+             */
+            if (d->handler == 4) {
+                obuf[0] = 'Q';
+                obuf[1] = 'E';
+                obuf[2] = 'M';
+                obuf[3] = 'U';
+                obuf[4] = 0;
+                obuf[5] = 100;
+                obuf[6] = 1;    /* device class: mouse */
+                obuf[7] = 2;    /* buttons */
+                olen = 8;
+            }
             break;
         case 3:
             obuf[0] = d->devaddr;
@@ -294,7 +356,22 @@ static void adb_mouse_reset(DeviceState *dev)
     ADBDevice *d = ADB_DEVICE(dev);
     MouseState *s = ADB_MOUSE(dev);
 
-    d->handler = 2;
+    /*
+     * The default (reset-time) handler ID doubles as an IOKit driver
+     * match key on Mac OS X: AppleADBMouse's Type 4 (Extended Apple
+     * Mouse Protocol) personality matches "ADB Match" = "3-01" --
+     * address 3 with DEFAULT handler 1 -- while the classic Type 1/2
+     * personalities match bare address "3". With any other default
+     * (this used to be 2, briefly 4) the extended-protocol driver
+     * never even probes, OS X falls back to the classic 200 cpi
+     * protocol, and pointer speed is halved (its HID layer normalizes
+     * by declared resolution; our "counts" are host pixels at roughly
+     * 100/inch). Defaulting to 1 lets Type 4 match, negotiate handler
+     * 4, and read our true resolution from register 1. Guests that
+     * only know the classic protocol simply run us as the 100 cpi
+     * classic mouse, which matches our units anyway.
+     */
+    d->handler = 1;
     d->devaddr = ADB_DEVID_MOUSE;
     s->last_buttons_state = s->buttons_state = 0;
     s->dx = s->dy = s->dz = 0;
@@ -335,6 +412,10 @@ static void adb_mouse_initfn(Object *obj)
     d->devaddr = ADB_DEVID_MOUSE;
 }
 
+static const Property adb_mouse_properties[] = {
+    DEFINE_PROP_UINT8("motion-scale", MouseState, motion_scale, 1),
+};
+
 static void adb_mouse_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -349,6 +430,7 @@ static void adb_mouse_class_init(ObjectClass *oc, const void *data)
     adc->devhasdata = adb_mouse_has_data;
     device_class_set_legacy_reset(dc, adb_mouse_reset);
     dc->vmsd = &vmstate_adb_mouse;
+    device_class_set_props(dc, adb_mouse_properties);
 }
 
 static const TypeInfo adb_mouse_type_info = {
