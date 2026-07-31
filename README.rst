@@ -136,6 +136,11 @@ Display, audio, control
 * ``-audiodev coreaudio,id=snd -global awacs.audiodev=snd`` -- sound
   output through the AWACS model (use ``-audiodev none,id=snd`` for
   silence). On Linux substitute an appropriate ``-audiodev`` backend.
+  Do not expect perfection: the boot chime is accurate, but short
+  system sounds (at least under classic Mac OS) can still come out
+  with audible glitches -- the Sound Manager streams through a
+  buffer only a few milliseconds deep, which real hardware services
+  in lockstep but an emulator host cannot always keep up with.
 * ``-qmp unix:/tmp/g3.sock,server,nowait`` -- optional QMP control
   socket for scripting (screenshots, pausing, memory dumps).
 
@@ -158,18 +163,19 @@ debugging "odd" behaviour:
 * **CPU speed governor** (see above) -- a TCG plugin, not machine
   code, so it must be present at every launch; nothing in the binary
   enforces it.
-* **Guest setting: Virtual Memory must be OFF** (Memory control
-  panel). With VM enabled, the guest's exception dispatch degrades
-  over time (ADB input and unrelated subsystems progressively stop
-  responding); the underlying cause lives somewhere in the hashed-
-  page-table/DSI path and is not yet fixed at the source. VM off
-  avoids it entirely and is the supported configuration.
 * **Automatic PRAM/NVRAM persistence.** Two backing files are created
   automatically in the working directory when not explicitly
   configured: ``pram.img`` (CUDA PRAM: startup disk choice, network
   config, time zone...) and ``nvram.img`` (Old World Open Firmware
   NVRAM). Delete them for a "PRAM zap"; override the PRAM file with
   ``-global cuda.drive=<file>``.
+
+  **Keep separate state per guest OS.** A Mac OS X boot rewrites the
+  Open Firmware variables in these files; a subsequent classic Mac OS
+  boot reusing them then hangs in the ROM halfway through the startup
+  chime. Launch each guest OS from its own working directory (each
+  gets its own ``pram.img``/``nvram.img``), or delete both files when
+  switching between classic Mac OS and OS X.
 
 
 Documentation
