@@ -321,7 +321,26 @@ static void heathrow_reset(DeviceState *d)
     HeathrowState *s = HEATHROW(d);
 
     s->pics[0].level_triggered = 0;
-    s->pics[1].level_triggered = 0x1ff00000;
+    /*
+     * Bits 20-28 are the DMA/PCI level sources, EXCEPT the GPU line
+     * (bit 22, IntSrc::PCI_GPU per DingusPPC's Gossamer map, = the
+     * onboard ATI VBL interrupt). DingusPPC drives the CPU interrupt
+     * from latched events ONLY (GrandCentral::signal_cpu_int:
+     * `int_events & int_mask`, never the live level) and its ATIRage
+     * vbl_cb PULSES the request line each frame -- asserting at blank
+     * start (latching a Heathrow event) and deasserting at blank end
+     * unconditionally, NOT holding it until the driver acks the device.
+     * Treating the GPU line as level-triggered here instead kept the
+     * CPU interrupt asserted after the guest cleared the event, so
+     * Mac OS 9 (which runs the PIC in 68k "clear-all" mode and cannot
+     * drop the held device level from its ack) re-entered the primary
+     * interrupt handler in a storm that starved its native VBL
+     * interrupt-service handler -- the ATI Graphics Accelerator
+     * extension then hung at boot. Making the GPU edge-latched (event
+     * only, re-latched by the ATI's per-frame pulse) matches the
+     * reference and lets every guest's ack quiesce the line.
+     */
+    s->pics[1].level_triggered = 0x1ff00000 & ~(1u << 0x16);
     s->feat_ctrl = 0;
     s->ohare_id = HEATHROW_OHARE_ID_GOSSAMER_DESKTOP;
 }
