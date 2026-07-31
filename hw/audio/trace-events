@@ -61,3 +61,14 @@ virtio_snd_handle_event(void) "event queue callback called"
 virtio_snd_pcm_stream_flush(uint32_t stream) "flushing stream %"PRIu32
 virtio_snd_handle_tx_xfer(void) "tx queue callback called"
 virtio_snd_handle_rx_xfer(void) "rx queue callback called"
+
+# awacs.c
+awacs_set_rate(int sr_id, int rate) "sr_id=%d rate=%d"
+awacs_open_voice(int rate) "rate=%d"
+awacs_dma_out(uint64_t addr, int len, int rate, int64_t now_ns) "addr=0x%"PRIx64" len=%d rate=%d now=%"PRId64
+awacs_out_complete_fire(int64_t now_ns) "now=%"PRId64
+awacs_fifo_overflow(int dropped) "dropped=%d bytes"
+awacs_mmio_write(uint64_t addr, uint64_t val, unsigned size) "addr=0x%"PRIx64" val=0x%"PRIx64" size=%u"
+awacs_cb(int avail, int fifo_count, int64_t now_ns) "avail=%d fifo=%d now=%"PRId64
+awacs_cb_write(int chunk, size_t written, int fifo_after) "chunk=%d written=%zu fifo_after=%d"
+awacs_mmio_read(uint64_t addr, uint64_t val, unsigned size) "addr=0x%"PRIx64" val=0x%"PRIx64" size=%u"

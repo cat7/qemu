@@ -37,6 +37,7 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "system/dma.h"
+#include "trace.h"
 
 /* Real Screamer sample rates, indexed by SOUND_CTRL bits 8-10 (see
  * DingusPPC's AwacsScreamer::AwacsScreamer, devices/sound/awacs.cpp). */
@@ -53,8 +54,10 @@ static void awacs_fifo_push(AWACSState *s, const uint8_t *data, int len)
 {
     int i;
 
+    s->last_push_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     for (i = 0; i < len; i++) {
         if (s->out_fifo_count >= AWACS_OUT_FIFO_SIZE) {
+            trace_awacs_fifo_overflow(len - i);
             break;
         }
         s->out_fifo[s->out_fifo_wptr] = data[i];
@@ -74,17 +77,62 @@ static void awacs_fifo_push(AWACSState *s, const uint8_t *data, int len)
  * empirically: audio_be_write's own buffer, ~4100 bytes, accepted
  * exactly one 4096-byte chunk then returned 0 for every further call).
  */
+/*
+ * One audio frame is stereo 16-bit = 4 bytes. Every write to the
+ * backend MUST be a whole number of frames: a partial-frame write
+ * desynchronises the interleaved L/R stream for everything that
+ * follows (each subsequent 16-bit sample is split across two output
+ * samples and the channels swap), which manifests as harsh, noisy
+ * playback -- most audible on the short, intermittent system alert
+ * sounds, and not on a single continuous stream like the boot chime
+ * that happens to stay aligned throughout. Neither the backend's
+ * reported `avail` nor its accepted `written` count is guaranteed
+ * frame-aligned, so we round both down here.
+ */
+#define AWACS_FRAME_BYTES 4
+
+/* Playout cushion (see the field comment in awacs.h): target depth the
+ * FIFO must reach before a freshly (re)started stream begins draining,
+ * and how long to keep waiting for it once the guest stops pushing. */
+#define AWACS_PREBUF_NS         (30 * 1000 * 1000)
+#define AWACS_PREBUF_GIVEUP_NS  (50 * 1000 * 1000)
+
 static void awacs_audio_callback(void *opaque, int avail)
 {
     AWACSState *s = AWACS(opaque);
 
-    while (avail > 0 && s->out_fifo_count > 0) {
+    trace_awacs_cb(avail, s->out_fifo_count,
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+
+    if (s->out_fifo_count == 0) {
+        /* Stream drained (or never started): next data prebuffers. */
+        s->prebuffering = true;
+        return;
+    }
+    if (s->prebuffering) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int rate = s->cur_sample_rate ? s->cur_sample_rate : 44100;
+        uint32_t want = (uint64_t)rate * AWACS_FRAME_BYTES *
+                        AWACS_PREBUF_NS / NANOSECONDS_PER_SECOND;
+
+        if (s->out_fifo_count < want &&
+            now - s->last_push_ns < AWACS_PREBUF_GIVEUP_NS) {
+            return;
+        }
+        s->prebuffering = false;
+    }
+
+    avail -= avail % AWACS_FRAME_BYTES;
+
+    while (avail >= AWACS_FRAME_BYTES &&
+           s->out_fifo_count >= AWACS_FRAME_BYTES) {
         uint8_t staging[4096];
         int chunk = MIN(avail, (int)sizeof(staging));
         int i;
         size_t written;
 
         chunk = MIN(chunk, (int)s->out_fifo_count);
+        chunk -= chunk % AWACS_FRAME_BYTES;
         for (i = 0; i < chunk; i++) {
             staging[i] = s->out_fifo[s->out_fifo_rptr];
             s->out_fifo_rptr = (s->out_fifo_rptr + 1) % AWACS_OUT_FIFO_SIZE;
@@ -92,10 +140,14 @@ static void awacs_audio_callback(void *opaque, int avail)
         s->out_fifo_count -= chunk;
 
         written = audio_be_write(s->audio_be, s->voice, staging, chunk);
+        trace_awacs_cb_write(chunk, written, s->out_fifo_count);
+        /* Only advance by whole frames; hold back any partial-frame
+         * tail the backend accepted so the stream never desyncs. */
+        written -= written % AWACS_FRAME_BYTES;
         avail -= written;
         if (written < (size_t)chunk) {
-            /* Backend couldn't take it all either -- put the unwritten
-             * tail back at the front of the FIFO and stop for now. */
+            /* Backend couldn't take it all -- put the unwritten tail
+             * back at the front of the FIFO and stop for now. */
             s->out_fifo_rptr = (s->out_fifo_rptr + AWACS_OUT_FIFO_SIZE -
                                (chunk - written)) % AWACS_OUT_FIFO_SIZE;
             s->out_fifo_count += chunk - written;
@@ -113,6 +165,7 @@ static void awacs_open_voice(AWACSState *s, int sample_rate)
         .big_endian = false,
     };
 
+    trace_awacs_open_voice(sample_rate);
     s->cur_sample_rate = sample_rate;
     s->voice = audio_be_open_out(s->audio_be, s->voice, "awacs.out", s,
                                  awacs_audio_callback, &as);
@@ -130,6 +183,36 @@ static void awacs_open_voice(AWACSState *s, int sample_rate)
  */
 #define AWACS_DMA_CHANNEL 8
 #define AWACS_DMA_IN_CHANNEL 9
+
+/*
+ * Fire each paced DBDMA-out completion this many ns before the point
+ * where the descriptor's audio would *start* playing (i.e. the
+ * effective lookahead is one descriptor duration plus this margin).
+ * Sustained playback pacing comes from the accumulating
+ * play_deadline_ns; this only bounds how far ahead of real playback
+ * the guest may run.
+ *
+ * Completing ahead of a descriptor's playback *start* (not just its
+ * end) matters for the ROM boot chime: the ROM arms the whole 404 KB
+ * chime chain (13 x 32 KB descriptors, 186 ms each) and then reuses
+ * part of the buffer (zeroes 0x8100..0x9277, measured ~12 ms later
+ * even CPU-throttled to real-hardware speed), so descriptor data must
+ * be snapshotted essentially at arm time -- which only happens once
+ * the previous descriptor's completion lets the DBDMA engine advance.
+ * With duration-plus-margin lookahead the first chime completion fires
+ * immediately and every descriptor is read well before the guest
+ * touches it (verified byte-identical to the DingusPPC-matched
+ * reference capture).
+ *
+ * Keeping the margin itself small matters for the Sound Manager,
+ * which streams via ~1 ms descriptors: while the accumulated deadline
+ * is still inside the lookahead window completions fire instantly,
+ * and the guest's stream clock races ahead of real time exactly like
+ * the old always-instant behavior (measured: 20-60 ms onset dropouts
+ * with a flat 200 ms window). A ~30 ms margin engages pacing almost
+ * immediately, well above one VBL service period.
+ */
+#define AWACS_COMPLETE_MARGIN_NS (30 * 1000 * 1000)
 
 /*
  * DBDMA channel callback: the ROM's startup chime (and any other sound
@@ -156,6 +239,20 @@ static void awacs_dma_rw(DBDMA_io *io)
     uint8_t buf[4096];
     hwaddr addr = io->addr;
     int remaining = io->len;
+
+    /* Deferred rate changes (see pending_rate in awacs.h) apply when
+     * stream data actually arrives -- any leftover previous-stream
+     * tail is small (the completion-pacing margin). Also bootstraps
+     * the voice if data ever arrives before any rate write. */
+    if (s->pending_rate && s->pending_rate != s->cur_sample_rate) {
+        awacs_open_voice(s, s->pending_rate);
+    } else if (!s->voice) {
+        awacs_open_voice(s, s->cur_sample_rate ? s->cur_sample_rate : 44100);
+    }
+    s->pending_rate = 0;
+
+    trace_awacs_dma_out(io->addr, io->len, s->cur_sample_rate,
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     /*
      * A single descriptor's req_count can be up to 0x8000+ bytes (a
@@ -197,11 +294,65 @@ static void awacs_dma_rw(DBDMA_io *io)
         remaining -= len;
     }
 
-    io->dma_end(io);
+    /*
+     * Pace completion to real playback time (see the field comment on
+     * out_complete_timer). Compute when this descriptor's audio will
+     * have finished playing, accumulating across back-to-back
+     * descriptors; fire the completion a small lookahead before that so
+     * the guest's next buffer arrives before the FIFO underruns. Only
+     * one DBDMA-out descriptor is ever in flight (io->processing gates
+     * the channel), so a single pending slot suffices.
+     */
+    {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int frames = io->len / AWACS_FRAME_BYTES;
+        int rate = s->cur_sample_rate ? s->cur_sample_rate : 44100;
+        int64_t dur_ns = (int64_t)frames * NANOSECONDS_PER_SECOND / rate;
+        int64_t fire_ns;
+
+        if (s->play_deadline_ns < now) {
+            s->play_deadline_ns = now;   /* buffer had drained/underran */
+        }
+        s->play_deadline_ns += dur_ns;
+
+        fire_ns = s->play_deadline_ns - dur_ns - AWACS_COMPLETE_MARGIN_NS;
+        if (fire_ns < now) {
+            fire_ns = now;
+        }
+        s->pending_out_io = io;
+        timer_mod(s->out_complete_timer, fire_ns);
+    }
+}
+
+/* Fire a descriptor's DBDMA completion once its audio has (nearly)
+ * finished playing -- see awacs_dma_rw(). */
+static void awacs_out_complete(void *opaque)
+{
+    AWACSState *s = opaque;
+    DBDMA_io *io = s->pending_out_io;
+
+    if (io) {
+        trace_awacs_out_complete_fire(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        s->pending_out_io = NULL;
+        io->dma_end(io);
+    }
 }
 
 static void awacs_dma_flush(DBDMA_io *io)
 {
+    AWACSState *s = AWACS(io->opaque);
+
+    /*
+     * The channel is being flushed or stopped. If a paced completion
+     * is still pending, fire it now: leaving the timer armed would let
+     * dma_end() run later against a channel the guest may have stopped
+     * or reprogrammed. Already-buffered FIFO audio is left to drain
+     * naturally.
+     */
+    if (s->pending_out_io) {
+        timer_del(s->out_complete_timer);
+        awacs_out_complete(s);
+    }
 }
 
 /*
@@ -256,11 +407,37 @@ void awacs_register_dma(AWACSState *s, void *dbdma)
                            awacs_dma_in_rw, awacs_dma_in_flush, s);
 }
 
+/*
+ * Free-running frame counter -- see the field comment in awacs.h. The
+ * FRAME_COUNT register value is little-endian on the bus like the rest
+ * of this block (the guest accesses it byte-reversed), so the computed
+ * value is bswapped on read and the written value un-bswapped, keeping
+ * the raw-value convention the other registers use.
+ */
+static uint32_t awacs_frame_count(AWACSState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int rate = s->cur_sample_rate ? s->cur_sample_rate : 44100;
+    int64_t elapsed = now - s->frame_count_base_ns;
+
+    return s->frame_count_base_val +
+           (uint32_t)(elapsed * rate / NANOSECONDS_PER_SECOND);
+}
+
+static uint64_t awacs_read_internal(AWACSState *s, uint32_t reg, hwaddr addr);
+
 static uint64_t awacs_read(void *opaque, hwaddr addr, unsigned size)
 {
     AWACSState *s = AWACS(opaque);
     uint32_t reg = addr & 0xff;
+    uint64_t ret = awacs_read_internal(s, reg, addr);
 
+    trace_awacs_mmio_read(addr, ret, size);
+    return ret;
+}
+
+static uint64_t awacs_read_internal(AWACSState *s, uint32_t reg, hwaddr addr)
+{
     switch (reg) {
     case AWACS_SOUND_CTRL:
         return s->sound_ctrl;
@@ -275,7 +452,7 @@ static uint64_t awacs_read(void *opaque, hwaddr addr, unsigned size)
     case AWACS_BYTE_SWAP:
         return s->byte_swap;
     case AWACS_FRAME_COUNT:
-        return s->frame_count;
+        return bswap32(awacs_frame_count(s));
     default:
         qemu_log_mask(LOG_UNIMP, "awacs: read from unknown register 0x%"
                       HWADDR_PRIx "\n", addr);
@@ -289,15 +466,30 @@ static void awacs_write(void *opaque, hwaddr addr, uint64_t val,
     AWACSState *s = AWACS(opaque);
     uint32_t reg = addr & 0xff;
 
+    trace_awacs_mmio_write(addr, val, size);
     switch (reg) {
     case AWACS_SOUND_CTRL:
         s->sound_ctrl = val;
         {
-            int sr_id = (val >> 8) & 7;
+            /* Rate field of the true (byteswapped) register value --
+             * see the comment block in awacs.h. */
+            uint32_t ctrl = bswap32((uint32_t)val);
+            int sr_id = (ctrl >> AWACS_CTRL_RATE_SHIFT) &
+                        AWACS_CTRL_RATE_MASK;
             int rate = awacs_sample_rates[sr_id];
 
+            trace_awacs_set_rate(sr_id, rate);
             if (rate != s->cur_sample_rate) {
-                awacs_open_voice(s, rate);
+                /* Keep the free-running frame counter continuous
+                 * across the rate change. */
+                s->frame_count_base_val = awacs_frame_count(s);
+                s->frame_count_base_ns =
+                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                /* Never touch the voice here -- see pending_rate in
+                 * awacs.h. Applied when data arrives at this rate. */
+                s->pending_rate = rate;
+            } else {
+                s->pending_rate = 0;
             }
         }
         break;
@@ -314,7 +506,8 @@ static void awacs_write(void *opaque, hwaddr addr, uint64_t val,
         s->byte_swap = val;
         break;
     case AWACS_FRAME_COUNT:
-        s->frame_count = val;
+        s->frame_count_base_val = bswap32((uint32_t)val);
+        s->frame_count_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "awacs: write to unknown register 0x%"
@@ -341,11 +534,20 @@ static void awacs_reset(DeviceState *dev)
     s->codec_ctrl = 0;
     s->clip_count = 0;
     s->byte_swap = 0;
-    s->frame_count = 0;
+    s->frame_count_base_val = 0;
+    s->frame_count_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->pending_rate = 0;
+    s->prebuffering = true;
+    s->last_push_ns = 0;
     s->dma_in_status = 0x10;
     s->out_fifo_rptr = 0;
     s->out_fifo_wptr = 0;
     s->out_fifo_count = 0;
+    s->play_deadline_ns = 0;
+    if (s->out_complete_timer) {
+        timer_del(s->out_complete_timer);
+    }
+    s->pending_out_io = NULL;
 }
 
 static void awacs_init(Object *obj)
@@ -367,12 +569,18 @@ static void awacs_realize(DeviceState *dev, Error **errp)
     if (!audio_be_check(&s->audio_be, errp)) {
         return;
     }
+    s->out_complete_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         awacs_out_complete, s);
 }
 
 static void awacs_unrealize(DeviceState *dev)
 {
     AWACSState *s = AWACS(dev);
 
+    if (s->out_complete_timer) {
+        timer_free(s->out_complete_timer);
+        s->out_complete_timer = NULL;
+    }
     if (s->voice) {
         audio_be_close_out(s->audio_be, s->voice);
     }
@@ -380,14 +588,16 @@ static void awacs_unrealize(DeviceState *dev)
 
 static const VMStateDescription vmstate_awacs = {
     .name = "awacs",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(sound_ctrl, AWACSState),
         VMSTATE_UINT32(codec_ctrl, AWACSState),
         VMSTATE_UINT32(clip_count, AWACSState),
         VMSTATE_UINT32(byte_swap, AWACSState),
-        VMSTATE_UINT32(frame_count, AWACSState),
+        VMSTATE_UINT32(frame_count_base_val, AWACSState),
+        VMSTATE_INT64(frame_count_base_ns, AWACSState),
+        VMSTATE_INT32(pending_rate, AWACSState),
         VMSTATE_END_OF_LIST()
     }
 };

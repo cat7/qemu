@@ -26,7 +26,9 @@
 
 #include "qom/object.h"
 #include "hw/core/sysbus.h"
+#include "hw/ppc/mac_dbdma.h"
 #include "qemu/audio.h"
+#include "qemu/timer.h"
 
 #define TYPE_AWACS "awacs"
 OBJECT_DECLARE_SIMPLE_TYPE(AWACSState, AWACS)
@@ -48,6 +50,35 @@ OBJECT_DECLARE_SIMPLE_TYPE(AWACSState, AWACS)
 #define AWACS_MAKER_CRYSTAL      1     /* manufacturer id, bits 16-19 */
 #define AWACS_REV_SCREAMER       3     /* chip revision, bits 20-23 */
 
+/*
+ * SOUND_CTRL sample-rate field. These registers are little-endian on
+ * the bus (the guest driver accesses them with byte-reversed
+ * load/stores through this DEVICE_BIG_ENDIAN-declared region), so the
+ * true register value is bswap32() of the raw MMIO value; the rate
+ * field is bits 8-10 of that -- kHWRateMask/kHWRateShift in Apple's
+ * own awacs_OWhw.h (apple-oss-distributions/AppleOnboardAudio,
+ * AppleLegacyAudio/AppleOWScreamerAudio -- the Old World Screamer
+ * driver for exactly this hardware), same field Linux's
+ * sound/ppc/awacs.h calls MASK_RATE. Codes index the 44.1 kHz-family
+ * table (awacs_sample_rates): 0=44100, 2=22050, 5=11025, ...
+ *
+ * Behavior confirmed live from Mac OS 8.5: the classic driver writes
+ * the stream's rate here when a sound starts (e.g. 0x4211 = code 2 for
+ * a 22.05 kHz stream) and parks the codec at code 5 (11025) when
+ * output goes idle -- so rate writes arrive both at stream start and
+ * right after a sound finishes, while our FIFO can still hold that
+ * sound's tail (we buffer ahead of real playback; real hardware holds
+ * only a few samples). The voice reopen is therefore deferred until
+ * the FIFO drains (see pending_rate).
+ *
+ * (Codec register 1 bits 3-5 look like a rate field too -- Linux calls
+ * them MASK_SAMPLERATE -- but the classic driver leaves stale values
+ * there that don't track the output rate, and Apple's own awacs_OWhw.h
+ * comments them "!!!Do these bits do anything???". Not used.)
+ */
+#define AWACS_CTRL_RATE_SHIFT    8
+#define AWACS_CTRL_RATE_MASK     0x7
+
 struct AWACSState {
     /*< private >*/
     SysBusDevice parent_obj;
@@ -60,7 +91,20 @@ struct AWACSState {
     uint32_t codec_ctrl;
     uint32_t clip_count;
     uint32_t byte_swap;
-    uint32_t frame_count;
+
+    /*
+     * Free-running frame counter (FRAME_COUNT register). Real hardware
+     * counts serial-bus frames continuously once the clocks run; the
+     * classic Mac OS driver polls it (a handful of reads with a retry
+     * cap) to confirm the codec is alive before acting on a sample-rate
+     * change -- with a counter stuck at 0 those polls time out and the
+     * driver silently abandons rate reprogramming (confirmed live: only
+     * the first post-boot quality switch was ever written to the
+     * hardware). Modeled as time-based: value = base_val + elapsed
+     * virtual time * cur_sample_rate.
+     */
+    uint32_t frame_count_base_val;
+    int64_t frame_count_base_ns;
 
     /*
      * Rotating single-bit "device status" value the audio-in DBDMA
@@ -90,6 +134,31 @@ struct AWACSState {
     AudioBackend *audio_be;
     SWVoiceOut *voice;
     int cur_sample_rate;
+    /* Rate written by the guest but not yet applied to the voice --
+     * applied only when DMA data actually arrives while the voice runs
+     * at a different rate. Applying at write time is wrong twice over:
+     * it would retime audio still buffered from the previous stream,
+     * and the classic driver parks the codec at 11025 whenever output
+     * goes idle and unparks at the next sound, so eager application
+     * would tear down and reopen the host voice around every single
+     * sound (audibly glitchy on coreaudio). 0 = none pending. */
+    int pending_rate;
+
+    /*
+     * Playout cushion. The Sound Manager streams through a small
+     * ping-pong (observed: 2 x 2048 bytes = ~23 ms total), so the
+     * guest can never run more than that ahead and the FIFO trough
+     * between refills is a few ms -- less than one audio-timer period.
+     * Real hardware doesn't care (no host in the loop); for us any
+     * host callback jitter empties the FIFO and playback stutters.
+     * When a stream starts (or restarts after the FIFO emptied), hold
+     * the backend off until ~30 ms is buffered (or the guest stops
+     * pushing, so short one-shot sounds still play) -- a one-time,
+     * inaudible added latency that keeps the steady-state trough above
+     * the jitter floor.
+     */
+    bool prebuffering;
+    int64_t last_push_ns;
     /*
      * A single DBDMA descriptor chain for one chime is ~404KB on real
      * hardware (confirmed against DingusPPC's own captured chime
@@ -105,6 +174,22 @@ struct AWACSState {
     uint32_t out_fifo_rptr;
     uint32_t out_fifo_wptr;
     uint32_t out_fifo_count;
+
+    /*
+     * Real-time pacing of DBDMA-out completion. On real hardware the
+     * channel's completion interrupt fires when the buffer has actually
+     * been clocked out to the codec, not the instant the data is read
+     * from memory. Classic Mac OS's Sound Manager double-buffers short
+     * sounds and swaps buffers on that interrupt, so completing a
+     * descriptor instantly makes it mispace the swaps and the sound
+     * comes out chopped into fragments. Hold each descriptor's
+     * completion until its samples would have finished playing (minus a
+     * small lookahead so the next buffer arrives before the FIFO
+     * underruns).
+     */
+    QEMUTimer *out_complete_timer;
+    DBDMA_io *pending_out_io;
+    int64_t play_deadline_ns;
 };
 
 void awacs_register_dma(AWACSState *s, void *dbdma);
