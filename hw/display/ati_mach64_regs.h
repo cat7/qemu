@@ -154,6 +154,9 @@
 #define ATI_FIFO_STAT             0x310
 #define ATI_GUI_TRAJ_CNTL         0x330
 #define ATI_GUI_STAT              0x338
+/* Rage Pro (GT) command-FIFO depth, reported free in GUI_STAT bits
+ * 16-23 (matches DingusPPC's ATIRage cmd_fifo_size for the GT). */
+#define ATI_MACH64_GUI_FIFO_SIZE  48
 
 /* DST_CNTL fields */
 #define ATI_DST_X_LEFT_TO_RIGHT   (1u << 0)
@@ -170,15 +173,34 @@
 #define ATI_MONO_SRC_MASK         0x70000
 #define ATI_MONO_SRC_ONE          0x00000
 
-/* DP_MIX foreground mix (bits 16-20); ROP-style codes */
+/* DP_MIX foreground mix (bits 16-20) and background mix (bits 0-4);
+ * ROP-style codes. Foreground applies to mono 1-bits and to
+ * foreground/blit sources; background applies to mono 0-bits. */
 #define ATI_FRGD_MIX_SHIFT        16
 #define ATI_FRGD_MIX_MASK         0x1f
+#define ATI_BKGD_MIX_MASK         0x1f
 #define ATI_MIX_D                 0x3   /* leave destination */
 #define ATI_MIX_XOR               0x5   /* dst ^= src */
 #define ATI_MIX_S                 0x7   /* copy source */
 
-/* DP_PIX_WIDTH destination pixel-width codes (bits 0-3) */
+/* DP_SRC foreground/mono source selectors (see ATI_FRGD_SRC_* /
+ * ATI_MONO_SRC_* above); HOST means the CPU streams the pixels. */
+#define ATI_FRGD_SRC_HOST         0x200
+#define ATI_MONO_SRC_HOST         0x20000
+
+/* DP_PIX_WIDTH destination pixel-width codes (bits 0-3), host source
+ * pixel-width codes (bits 16-19), and byte-order (bit 24). */
 #define ATI_PIX_WIDTH_DST_MASK    0xf
+#define ATI_PIX_WIDTH_HOST_SHIFT  16
+#define ATI_PIX_WIDTH_HOST_MASK   0xf
+#define ATI_PIX_WIDTH_BYTE_ORDER  (1u << 24)   /* set = LSB-to-MSB */
+
+/* HOST_CNTL bit 0: source rows are aligned to a whole host word. */
+#define ATI_HOST_BYTE_ALIGN       0x1
+
+/* Host-data register block (CPU streams pixel/mask words here). */
+#define ATI_HOST_DATA0            0x200
+#define ATI_HOST_DATAF            0x23C
 
 /*
  * 3D setup/raster engine (Rage 3D/Rage Pro) -- block 0 control

@@ -453,6 +453,108 @@ static int ati_mach64_2d_bytes_pp(uint32_t pix_width_code)
     }
 }
 
+/* Apply one source colour to a destination pixel through a raster mix.
+ * Only the mixes a display driver actually programs are handled. */
+static inline void ati_mach64_2d_put(uint8_t *p, int bpp, uint32_t color,
+                                     uint8_t mix)
+{
+    int b;
+
+    switch (mix) {
+    case ATI_MIX_S:                              /* write source */
+        for (b = 0; b < bpp; b++) {
+            p[b] = (color >> (8 * b)) & 0xff;
+        }
+        break;
+    case ATI_MIX_XOR:
+        for (b = 0; b < bpp; b++) {
+            p[b] ^= (color >> (8 * b)) & 0xff;
+        }
+        break;
+    case ATI_MIX_D:                              /* leave destination */
+    default:
+        break;
+    }
+}
+
+/*
+ * Consume one 32-bit HOST_DATA word for an in-progress host-source
+ * blit (see the hb_* fields in ati_mach64.h). Two modes:
+ *
+ *  - Mono expansion (hb_mono): each of the 32 bits is one destination
+ *    pixel, MSB-first within the big-endian word (a 1 uses the
+ *    foreground colour/mix, a 0 the background). This is the glyph
+ *    path: classic Mac 1bpp font bitmaps are MSB-left, and the driver
+ *    streams them here to be colour-expanded on the fly.
+ *
+ *  - Packed colour (host bpp 8/16/32): the word carries whole pixels,
+ *    low-order pixel first, written straight through the foreground
+ *    mix.
+ *
+ * Pixels advance left-to-right; at the row's right edge the cursor
+ * wraps to the next row and, if HOST_BYTE_ALIGN is set, the rest of
+ * the current word is discarded so each source row starts on a fresh
+ * word (the common case for text). The exact bit/byte order was
+ * confirmed against a qtest that mirrors the driver's HOST_DATA
+ * writes (contrib/mach64-2d-test).
+ */
+static void ati_mach64_host_data(ATIMach64State *s, uint32_t word)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    int sc_left = s->regs[ATI_SC_LEFT >> 2] & 0x1fff;
+    int sc_right = s->regs[ATI_SC_RIGHT >> 2] & 0x1fff;
+    int sc_top = s->regs[ATI_SC_TOP >> 2] & 0x7fff;
+    int sc_bottom = s->regs[ATI_SC_BOTTOM >> 2] & 0x7fff;
+    int bpp = s->hb_dst_bpp;
+    int nunits = s->hb_mono ? 32 : (4 / s->hb_host_bpp);
+    int i;
+
+    for (i = 0; i < nunits && s->hb_h > 0; i++) {
+        uint32_t color;
+        uint8_t mix;
+
+        if (s->hb_mono) {
+            int bit = (word >> (31 - i)) & 1;
+            color = bit ? s->hb_frgd_clr : s->hb_bkgd_clr;
+            mix = bit ? s->hb_frgd_mix : s->hb_bkgd_mix;
+        } else {
+            if (s->hb_host_bpp == 1) {
+                color = (word >> (8 * i)) & 0xff;
+            } else if (s->hb_host_bpp == 2) {
+                color = (word >> (16 * i)) & 0xffff;
+            } else {
+                color = word;
+            }
+            mix = s->hb_frgd_mix;
+        }
+
+        if (s->hb_x >= sc_left && s->hb_x <= sc_right &&
+            s->hb_y >= sc_top && s->hb_y <= sc_bottom) {
+            uint64_t off = s->hb_dst_base +
+                ((uint64_t)s->hb_y * s->hb_dst_pitch + s->hb_x) * bpp;
+            if (off + bpp <= ATI_MACH64_VRAM_SIZE) {
+                ati_mach64_2d_put(vram + off, bpp, color, mix);
+            }
+        }
+
+        if (++s->hb_x >= s->hb_x0 + s->hb_w) {
+            s->hb_x = s->hb_x0;
+            s->hb_y++;
+            if (--s->hb_h <= 0) {
+                break;
+            }
+            if (s->hb_byte_align) {
+                break;               /* next row starts a fresh word */
+            }
+        }
+    }
+
+    if (s->hb_h <= 0) {
+        s->hb_active = false;
+        memory_region_set_dirty(&s->vram, 0, ATI_MACH64_VRAM_SIZE);
+    }
+}
+
 static void ati_mach64_2d_op(ATIMach64State *s)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -478,14 +580,65 @@ static void ati_mach64_2d_op(ATIMach64State *s)
     uint32_t src_base = (src_op & 0xfffff) * 8;
     int src_pitch = ((src_op >> 22) & 0x3ff) * 8;
     uint32_t frgd_src = dp_src & ATI_FRGD_SRC_MASK;
+    uint32_t mono_src = dp_src & ATI_MONO_SRC_MASK;
     bool copy = (frgd_src == ATI_FRGD_SRC_BLIT);
     bool fill = (frgd_src == ATI_FRGD_SRC_FRGD_CLR);
+    bool mono_host = (mono_src == ATI_MONO_SRC_HOST);
+    bool color_host = (frgd_src == ATI_FRGD_SRC_HOST) &&
+                      (mono_src == ATI_MONO_SRC_ONE);
     uint32_t color = s->regs[ATI_DP_FRGD_CLR >> 2];
     int y, x, clip;
 
     if (w == 0 || h == 0) {
         return;
     }
+
+    /*
+     * Host-source blit: the CPU will stream pixel/mask words to the
+     * HOST_DATA registers next. Latch the destination rectangle and
+     * expansion state here; the drawing happens in
+     * ati_mach64_host_data() as those words arrive.
+     */
+    if (mono_host || color_host) {
+        int host_code = (s->regs[ATI_DP_PIX_WIDTH >> 2] >>
+                         ATI_PIX_WIDTH_HOST_SHIFT) & ATI_PIX_WIDTH_HOST_MASK;
+        int host_bpp = ati_mach64_2d_bytes_pp(host_code);
+
+        if (bpp == 0 || dst_pitch == 0 ||
+            (s->regs[ATI_CLR_CMP_CNTL >> 2] & 7) != 0 ||
+            (color_host && host_bpp == 0)) {
+            trace_ati_mach64_2d_unimp(dp_src, s->regs[ATI_DP_MIX >> 2],
+                                      s->regs[ATI_DP_PIX_WIDTH >> 2]);
+            return;
+        }
+        if (!(dst_cntl & ATI_DST_X_LEFT_TO_RIGHT)) {
+            dst_x -= w - 1;
+        }
+        if (!(dst_cntl & ATI_DST_Y_TOP_TO_BOTTOM)) {
+            dst_y -= h - 1;
+        }
+        s->hb_active = true;
+        s->hb_mono = mono_host;
+        s->hb_host_bpp = host_bpp;
+        s->hb_dst_bpp = bpp;
+        s->hb_byte_align =
+            (s->regs[ATI_HOST_CNTL >> 2] & ATI_HOST_BYTE_ALIGN) != 0;
+        s->hb_x0 = dst_x;
+        s->hb_x = dst_x;
+        s->hb_y = dst_y;
+        s->hb_w = w;
+        s->hb_h = h;
+        s->hb_dst_base = dst_base;
+        s->hb_dst_pitch = dst_pitch;
+        s->hb_frgd_clr = s->regs[ATI_DP_FRGD_CLR >> 2];
+        s->hb_bkgd_clr = s->regs[ATI_DP_BKGD_CLR >> 2];
+        s->hb_frgd_mix = frgd_mix;
+        s->hb_bkgd_mix = s->regs[ATI_DP_MIX >> 2] & ATI_BKGD_MIX_MASK;
+        trace_ati_mach64_2d_host(dst_x, dst_y, w, h, bpp, mono_host,
+                                 host_bpp);
+        return;
+    }
+
     if (frgd_mix == ATI_MIX_D) {
         return;                          /* mix "leave destination" */
     }
@@ -884,6 +1037,26 @@ static uint64_t ati_mach64_mmio_read(void *opaque, hwaddr addr, unsigned size)
     result = s->regs[reg_num];
 
     switch (addr & ~3U) {
+    case ATI_GUI_STAT:
+        /*
+         * Report the GUI (2D) engine as idle with a completely free
+         * command FIFO. Bit 0 (GUI_ACTIVE) = 0 means idle; bits 16-23
+         * (FIFO_CNT) hold the number of free FIFO entries. Our engine
+         * completes every operation synchronously, so it is always
+         * idle with a fully-available FIFO. The Rage Pro (GT) has a
+         * 48-entry command FIFO; a driver that waits for FIFO space
+         * before writing engine registers (Mac OS 9's ATI Graphics
+         * Accelerator does, polling here) spins forever if this field
+         * reads 0. Matches DingusPPC's ATIRage GUI_STAT "pretend empty
+         * FIFO" (cmd_fifo_size << 16).
+         */
+        result = ATI_MACH64_GUI_FIFO_SIZE << 16;
+        break;
+    case ATI_FIFO_STAT:
+        /* Per-slot "in use" bitmask (low 16 bits) + error (bit 31);
+         * an idle engine has an empty FIFO and no error. */
+        result = 0;
+        break;
     case ATI_CLOCK_CNTL:
     {
         uint8_t pll_addr = (result >> ATI_PLL_ADDR_SHIFT) & ATI_PLL_ADDR_MASK;
@@ -1137,6 +1310,14 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         s->regs[reg_num] = word;
         ati_mach64_3d_trigger(s, word);
         return;
+    case ATI_HOST_DATA0 ... ATI_HOST_DATAF:
+        /* Pixel/mask words streamed by the CPU for a host-source blit
+         * set up in ati_mach64_2d_op(). */
+        s->regs[reg_num] = word;
+        if (s->hb_active) {
+            ati_mach64_host_data(s, word);
+        }
+        return;
     default:
         s->regs[reg_num] = word;
         return;
@@ -1181,6 +1362,7 @@ static void ati_mach64_reset(DeviceState *dev)
     s->dac_comp_index = 0;
     memset(s->dac_comp_buf, 0, sizeof(s->dac_comp_buf));
     s->mode_dirty = true;
+    s->hb_active = false;
 
     /* GUI engine power-on defaults: scissors fully open, drawing
      * direction left-to-right / top-to-bottom. */

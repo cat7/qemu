@@ -167,3 +167,55 @@ for y in range(12):
             print(f"DIR MISMATCH at ({x},{y}): {got:#x} != {expect:#x}")
             ok = False
 print("direction test:", "PASS" if ok else "FAIL")
+
+# --- test 6: 8bpp mono expansion host blit (glyph draw) ---
+# 8x2 rect at (4,3); fg=0xEE (1-bits), bg=0x22 (0-bits), both mix S (opaque)
+q.write_bytes(VRAM_BASE, b'\x11' * (PITCH * 8))
+reg(0x2d0, 0x2)                     # DP_PIX_WIDTH: dst 8bpp, host 1bpp(mono) (bits16-19=0)
+reg(0x2c4, 0xEE)                    # DP_FRGD_CLR
+reg(0x2c0, 0x22)                    # DP_BKGD_CLR
+reg(0x2d4, 0x70007)                 # DP_MIX: frgd=S(0x70000), bkgd=S(0x7)
+reg(0x2d8, 0x20100)                 # DP_SRC: MONO_SRC=HOST(0x20000) | FRGD_SRC=FRGD_CLR(0x100)
+reg(0x240, 0x1)                     # HOST_CNTL: BYTE_ALIGN
+reg(0x100, (PITCH // 8) << 22)      # DST_OFF_PITCH
+reg(0x130, 0x3)                     # DST_CNTL L2R T2B
+reg(0x10c, (4 << 16) | 3)           # DST_Y_X
+reg(0x118, (8 << 16) | 2)           # DST_HEIGHT_WIDTH -> arm host blit
+# stream 2 words, MSB-first: row0 = 0b10110001..., row1 = 0b01001110...
+row0 = 0b10110001
+row1 = 0b01001110
+reg(0x200, row0 << 24)              # HOST_DATA0: bits 31..24 = the 8 pixels
+reg(0x200, row1 << 24)
+ok = True
+def expect_mono(bits, x):
+    return 0xEE if (bits >> (7 - x)) & 1 else 0x22
+for yy in range(8):
+    r = q.read_bytes(VRAM_BASE + yy * PITCH, 16)
+    for xx in range(16):
+        if yy == 3 and 4 <= xx < 12:
+            e = expect_mono(row0, xx - 4)
+        elif yy == 4 and 4 <= xx < 12:
+            e = expect_mono(row1, xx - 4)
+        else:
+            e = 0x11
+        if r[xx] != e:
+            print(f"MONO MISMATCH ({xx},{yy}): {r[xx]:#x} != {e:#x}")
+            ok = False
+print("mono-host test:", "PASS" if ok else "FAIL")
+
+# --- test 7: 8bpp packed-color host blit ---
+q.write_bytes(VRAM_BASE, b'\x11' * (PITCH * 8))
+reg(0x2d0, 0x20002)                 # dst 8bpp | host 8bpp(bits16-19=2 -> 0x20000)
+reg(0x2d4, 0x70007)
+reg(0x2d8, 0x200)                   # FRGD_SRC=HOST(0x200), MONO_SRC=ONE
+reg(0x240, 0x1)
+reg(0x100, (PITCH // 8) << 22)
+reg(0x130, 0x3)
+reg(0x10c, (2 << 16) | 1)           # (x=2,y=1)
+reg(0x118, (4 << 16) | 1)           # 4x1
+# one word = 4 packed 8bpp pixels, low pixel first: p0=0xA0,p1=0xB1,p2=0xC2,p3=0xD3
+reg(0x200, 0xD3C2B1A0)
+r = q.read_bytes(VRAM_BASE + 1 * PITCH, 8)
+exp = [0x11,0x11,0xA0,0xB1,0xC2,0xD3,0x11,0x11]
+ok = all(r[i]==exp[i] for i in range(8))
+print("color-host test:", "PASS" if ok else "FAIL", "" if ok else f"got {[hex(b) for b in r[:8]]}")
