@@ -444,32 +444,26 @@ static const QemuInputHandler ati_mach64_cursor_handler = {
  */
 #define ATI_MACH64_VBLANK_ICOUNT_GAP_NS 50000
 /*
- * How long the PCI IRQ line itself stays physically asserted each
- * frame -- deliberately much shorter than ATI_MACH64_VBLANK_LEN_NS
- * above (which models the CRT's real, visually-accurate ~12.5% duty
- * cycle for the read-only status bit, a completely separate concern).
- * Heathrow's mask marks this GPU line level_triggered
- * (level_triggered = 0x1ff00000, see heathrow_pic.c), so
- * heathrow_check_irq() ORs the raw physical level into the trigger
- * condition regardless of any "clear events" ack the guest issues --
- * acking does not lower the CPU-visible interrupt while the physical
- * line is still held high. Holding it for the full 1/8-frame (~2.08ms)
- * duration let the guest's level-triggered exception handler be
- * re-taken continuously for the whole window (confirmed empirically:
- * a live MMIO trace at the Finder desktop showed a tight repeating
- * ack/read spin on the heathrow PIC registers, thousands of times per
- * frame, GPR-visible CPU PC alternating between a fixed ROM interrupt
- * stub and a fixed 68K-interpreter return address -- i.e. a genuine
- * interrupt-storm livelock, not a dispatcher decision, explaining why
- * Mac OS's ATI ISR only ever completed twice). Real Mach64 silicon
- * would have its request line dropped by software acking the device's
- * own INT_CNTL status bits almost immediately (microseconds, not
- * milliseconds); this short, fixed pulse is a stand-in for that until
- * ack-driven deassertion is modeled, chosen long enough to guarantee
- * the CPU sees at least one exception even under coarse icount
- * granularity, but far too short to storm.
+ * How long the PCI IRQ line stays asserted each frame if the guest
+ * does NOT acknowledge the device (INT_CNTL ack writes deassert it
+ * early -- see the INT_CNTL write handler). Heathrow marks this GPU
+ * line level_triggered (0x1ff00000, heathrow_pic.c) and its event
+ * latch deliberately EXCLUDES level-triggered lines, so the interrupt
+ * is guest-visible only while the line is physically high. The old
+ * 2us pulse here was unobservably short for any handler that takes
+ * more than a few hundred instructions to read the PIC (measured
+ * live: Mac OS X 10.2 acked only 16 of 1017 VBL interrupts, its
+ * dispatcher usually finding nothing pending by the time it looked --
+ * the direct cause of the VBL-starved frozen-cursor-when-idle bug,
+ * and the same mechanism as classic Mac OS's long-stalled
+ * CrsrVBLTask). Real silicon holds the line until software acks the
+ * device; we now do the same, with this full-blanking-interval cap as
+ * the fallback for boot phases that never ack. (The 2026-07-28
+ * experiment that rejected held lines as "storming" predates the
+ * MMIO endianness fix -- guest acks were byte-swap-corrupted then and
+ * could never land.)
  */
-#define ATI_MACH64_VBLANK_IRQ_LEN_NS 2000
+#define ATI_MACH64_VBLANK_IRQ_LEN_NS ATI_MACH64_VBLANK_LEN_NS
 
 /*
  * Interrupt semantics -- gated pulse (empirically the only shape both
@@ -514,6 +508,7 @@ static void ati_mach64_vblank_timer_tick(void *opaque)
                                            ATI_CRTC_VLINE_INT;
         int_cntl = s->regs[ATI_CRTC_INT_CNTL >> 2];
         if (int_cntl & (ATI_CRTC_VBLANK_INT_EN | ATI_CRTC_VLINE_INT_EN)) {
+            trace_ati_mach64_vblank_irq(1, int_cntl);
             pci_set_irq(PCI_DEVICE(s), 1);
             timer_mod(s->vblank_end_timer, now + ATI_MACH64_VBLANK_IRQ_LEN_NS);
         }
@@ -862,10 +857,17 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         }
         s->regs[reg_num] = (word & ~(ATI_CRTC_VBLANK_INT |
                                      ATI_CRTC_VLINE_INT)) | pending;
-        /* TEMPORARY test-only reinstatement of the ack-driven early
-         * deassert (contradicts the DingusPPC reference comparison above
-         * -- kept only to test whether it explains this session's one
-         * successful boot; not a final decision). */
+        trace_ati_mach64_int_ack(word, pending);
+        /*
+         * Ack-driven deassertion, matching real silicon: once no
+         * enabled interrupt status remains pending, drop the request
+         * line immediately instead of waiting out the blanking-window
+         * fallback timer. Heathrow's event latch excludes
+         * level-triggered lines, so guests only ever see this
+         * interrupt while the line is high -- see the
+         * ATI_MACH64_VBLANK_IRQ_LEN_NS comment for the measured
+         * dispatch-starvation this fixes.
+         */
         if (!pending) {
             timer_del(s->vblank_end_timer);
             pci_set_irq(PCI_DEVICE(s), 0);

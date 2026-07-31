@@ -150,6 +150,8 @@ ati_mm_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "
 # ati_mach64.c
 ati_mach64_mmio_read(unsigned int size, uint64_t addr, uint64_t val) "%u 0x%"PRIx64 " -> 0x%"PRIx64
 ati_mach64_mmio_write(unsigned int size, uint64_t addr, uint64_t val) "%u 0x%"PRIx64 " <- 0x%"PRIx64
+ati_mach64_vblank_irq(int level, uint32_t int_cntl) "level=%d int_cntl=0x%08x"
+ati_mach64_int_ack(uint32_t written, uint32_t remaining_pending) "written=0x%08x pending_after=0x%08x"
 
 # artist.c
 artist_reg_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 "%s -> 0x%08"PRIx64

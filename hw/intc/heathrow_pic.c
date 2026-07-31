@@ -124,10 +124,29 @@ static void heathrow_write(void *opaque, hwaddr addr,
              * is nothing else that ever lowers it), and a native
              * dispatch loop waiting for that level to clear spins
              * forever even though the DMA transfer itself completed.
+             *
+             * The GPU line (0x16, bit 22) is included for a related
+             * reason: the ATI holds its request until its INT_CNTL is
+             * acked (as real silicon does), but Mac OS X Server 1.x's
+             * Rhapsody-era driver never acks the device at all
+             * (measured: 6 device acks in 26k VBL interrupts) -- with
+             * the line then held for the whole blanking window, its
+             * level-triggered ISR re-entered in a storm that burned
+             * ~12.5% of guest CPU and halved its wall clock. Dropping
+             * the level at the guest's own PIC acknowledgment cannot
+             * race dispatch visibility (the guest has, by definition,
+             * already seen the interrupt it is acking), and guests
+             * that do ack the device (Mac OS X 10.2's NDRV path)
+             * deassert through the device first anyway.
              */
-            pic->levels &= ~(value & 0x7ff);
-            /* do not reset level triggered IRQs */
-            value &= ~pic->level_triggered;
+            pic->levels &= ~(value & (0x7ff | (1 << 0x16)));
+            /*
+             * Acks clear latched events for every source, matching the
+             * latch change above (DingusPPC clears int_events by the
+             * written mask with no level-triggered exclusion). A
+             * still-asserted level keeps the interrupt pending anyway
+             * through the levels term in heathrow_check_irq().
+             */
             pic->events &= ~value;
         }
         heathrow_update_irq(s);
@@ -221,7 +240,23 @@ static void heathrow_set_irq(void *opaque, int num, int level)
          * permanently pending and causing an infinite re-entry storm.
          */
         if (!last_level) {
-            pic->events |= irq_bit & ~pic->level_triggered;
+            /*
+             * Latch an event for EVERY source on a rising edge --
+             * including level-triggered ones. Upstream QEMU excluded
+             * level-triggered lines here (events |= bit &
+             * ~level_triggered), leaving them visible ONLY while the
+             * line is physically high; DingusPPC's real-hardware-
+             * verified GrandCentral::ack_int_common() latches
+             * int_events on a 0-to-1 transition for all sources with
+             * no such exclusion. The exclusion made the ATI VBL
+             * interrupt (level-triggered GPU line 0x16) invisible to
+             * any guest whose dispatcher reads the events register or
+             * that samples after the line dropped -- the root cause
+             * under a whole family of VBL-starvation bugs (classic
+             * Mac OS CrsrVBLTask stalls, Mac OS X frozen-idle-cursor,
+             * Rhapsody screen-refresh/clock problems).
+             */
+            pic->events |= irq_bit;
         }
         pic->levels |= irq_bit;
     } else {
