@@ -180,4 +180,43 @@
 /* DP_PIX_WIDTH destination pixel-width codes (bits 0-3) */
 #define ATI_PIX_WIDTH_DST_MASK    0xf
 
+/*
+ * 3D setup/raster engine (Rage 3D/Rage Pro) -- block 0 control
+ * registers plus the block 1 (byte offsets 0x400-0x7FF) vertex and
+ * setup registers, per Linux's include/video/mach64.h and Mesa's
+ * mach64 DRI driver. A triangle is drawn by loading the three
+ * vertices' state and writing ONE_OVER_AREA (strip continuation
+ * layouts alias further vertex loads followed by another
+ * ONE_OVER_AREA per new triangle). Exact operand fixed-point formats
+ * are to be confirmed against a live classic-Mac RAVE driver capture
+ * before the rasterizer lands -- see ati_mach64_3d_trigger().
+ */
+#define ATI_Z_OFF_PITCH           0x148
+#define ATI_Z_CNTL                0x14C
+#define ATI_SCALE_3D_CNTL         0x1FC
+#define ATI_VERTEX_1_S            0x640
+#define ATI_VERTEX_1_T            0x644
+#define ATI_VERTEX_1_W            0x648
+#define ATI_VERTEX_1_SPEC_ARGB    0x64C
+#define ATI_VERTEX_1_Z            0x650
+#define ATI_VERTEX_1_ARGB         0x654
+#define ATI_VERTEX_1_X_Y          0x658
+#define ATI_ONE_OVER_AREA         0x65C
+#define ATI_VERTEX_2_S            0x660
+#define ATI_VERTEX_2_T            0x664
+#define ATI_VERTEX_2_W            0x668
+#define ATI_VERTEX_2_SPEC_ARGB    0x66C
+#define ATI_VERTEX_2_Z            0x670
+#define ATI_VERTEX_2_ARGB         0x674
+#define ATI_VERTEX_2_X_Y          0x678
+#define ATI_VERTEX_3_S            0x680
+#define ATI_VERTEX_3_T            0x684
+#define ATI_VERTEX_3_W            0x688
+#define ATI_VERTEX_3_SPEC_ARGB    0x68C
+#define ATI_VERTEX_3_Z            0x690
+#define ATI_VERTEX_3_ARGB         0x694
+#define ATI_VERTEX_3_X_Y          0x698
+#define ATI_ONE_OVER_AREA_UC      0x700
+#define ATI_SETUP_CNTL            0x704
+
 #endif /* ATI_MACH64_REGS_H */

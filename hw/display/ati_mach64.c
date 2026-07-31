@@ -595,6 +595,40 @@ static void ati_mach64_2d_op(ATIMach64State *s)
                             (uint64_t)h * dst_pitch * bpp);
 }
 
+/*
+ * 3D setup-engine trigger scaffolding: no rasterizer yet -- this
+ * traces the complete decoded vertex/state snapshot every time a
+ * guest driver fires a triangle (ONE_OVER_AREA write after loading
+ * vertex state), so a live capture against ATI's own classic-Mac RAVE
+ * driver can pin down the operand fixed-point formats before the
+ * rasterizer is written. Loud by design.
+ */
+static void ati_mach64_3d_trigger(ATIMach64State *s, uint32_t one_over_area)
+{
+    trace_ati_mach64_3d_tri(one_over_area,
+                            s->regs[ATI_SETUP_CNTL >> 2],
+                            s->regs[ATI_SCALE_3D_CNTL >> 2],
+                            s->regs[ATI_Z_CNTL >> 2],
+                            s->regs[ATI_VERTEX_1_X_Y >> 2],
+                            s->regs[ATI_VERTEX_2_X_Y >> 2],
+                            s->regs[ATI_VERTEX_3_X_Y >> 2]);
+    trace_ati_mach64_3d_vtx(1, s->regs[ATI_VERTEX_1_ARGB >> 2],
+                            s->regs[ATI_VERTEX_1_Z >> 2],
+                            s->regs[ATI_VERTEX_1_S >> 2],
+                            s->regs[ATI_VERTEX_1_T >> 2],
+                            s->regs[ATI_VERTEX_1_W >> 2]);
+    trace_ati_mach64_3d_vtx(2, s->regs[ATI_VERTEX_2_ARGB >> 2],
+                            s->regs[ATI_VERTEX_2_Z >> 2],
+                            s->regs[ATI_VERTEX_2_S >> 2],
+                            s->regs[ATI_VERTEX_2_T >> 2],
+                            s->regs[ATI_VERTEX_2_W >> 2]);
+    trace_ati_mach64_3d_vtx(3, s->regs[ATI_VERTEX_3_ARGB >> 2],
+                            s->regs[ATI_VERTEX_3_Z >> 2],
+                            s->regs[ATI_VERTEX_3_S >> 2],
+                            s->regs[ATI_VERTEX_3_T >> 2],
+                            s->regs[ATI_VERTEX_3_W >> 2]);
+}
+
 #define ATI_MACH64_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
 /* Blank interval = last 1/8 of the frame, matching the phase-computed
  * live VBLANK status bit in the INT_CNTL read path. */
@@ -1097,6 +1131,11 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         s->regs[ATI_DST_WIDTH >> 2] = word >> 16;
         s->regs[ATI_DST_HEIGHT >> 2] = word & 0xffff;
         ati_mach64_2d_op(s);
+        return;
+    case ATI_ONE_OVER_AREA:
+    case ATI_ONE_OVER_AREA_UC:
+        s->regs[reg_num] = word;
+        ati_mach64_3d_trigger(s, word);
         return;
     default:
         s->regs[reg_num] = word;
