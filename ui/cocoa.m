@@ -818,6 +818,17 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     NSUInteger modifiers = [event modifierFlags];
 
     /*
+     * The window exists (and receives events) before cocoa_display_init
+     * has created the keyboard state -- a click or keypress in that gap
+     * (easily seconds long when a freshly copied binary's first-run
+     * validation stalls startup) dereferenced NULL here and crashed the
+     * whole VM. Let macOS have the event until we're ready.
+     */
+    if (!kbd) {
+        return false;
+    }
+
+    /*
      * Check -[NSEvent modifierFlags] here.
      *
      * There is a NSEventType for an event notifying the change of
