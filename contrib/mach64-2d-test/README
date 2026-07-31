@@ -1,0 +1,14 @@
+Standalone qtest exerciser for the Mach64 GUI (2D) engine.
+
+Run:
+  ./qemu-system-ppc -M g3beige -display none -accel qtest \
+      -qtest unix:/tmp/qt.sock,server,nowait -bios <rom> \
+      -audiodev none,id=q -global awacs.audiodev=q &
+  python3 test_2d.py /tmp/qt.sock
+
+Programs the ATI PCI BARs through the Grackle config window, seeds
+VRAM patterns, issues fills/copies through the register interface and
+verifies the resulting bytes: solid fill, overlapping copy, scissor
+clipping, 16bpp XOR fill, and reversed-direction (corner-coordinate)
+copies. All values are written as little-endian raw bytes ("write"
+commands) since the register aperture is a little-endian device.

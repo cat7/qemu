@@ -106,4 +106,78 @@
 #define ATI_CFG_CHIP_TYPE_SHIFT   0
 #define ATI_CFG_CHIP_MAJOR_SHIFT  24
 
+/*
+ * GUI (2D drawing) engine block -- byte offsets and field layouts per
+ * Linux's include/video/mach64.h (derived from ATI's Mach64 register
+ * reference) and drivers/video/fbdev/aty/mach64_accel.c usage:
+ * DST_Y_X = (x << 16) | y, DST_HEIGHT_WIDTH = (width << 16) | height
+ * (writing it triggers the operation), OFF_PITCH = offset/8 in bits
+ * 0-19 (units of 8 bytes) and pitch/8 in bits 22-31 (units of 8
+ * pixels).
+ */
+#define ATI_DST_OFF_PITCH         0x100
+#define ATI_DST_X                 0x104
+#define ATI_DST_Y                 0x108
+#define ATI_DST_Y_X               0x10C
+#define ATI_DST_WIDTH             0x110
+#define ATI_DST_HEIGHT            0x114
+#define ATI_DST_HEIGHT_WIDTH      0x118
+#define ATI_DST_X_WIDTH           0x11C
+#define ATI_DST_CNTL              0x130
+#define ATI_SRC_OFF_PITCH         0x180
+#define ATI_SRC_X                 0x184
+#define ATI_SRC_Y                 0x188
+#define ATI_SRC_Y_X               0x18C
+#define ATI_SRC_WIDTH1            0x190
+#define ATI_SRC_HEIGHT1           0x194
+#define ATI_SRC_HEIGHT1_WIDTH1    0x198
+#define ATI_SRC_CNTL              0x1B4
+#define ATI_HOST_CNTL             0x240
+#define ATI_PAT_REG0              0x280
+#define ATI_PAT_REG1              0x284
+#define ATI_PAT_CNTL              0x288
+#define ATI_SC_LEFT               0x2A0
+#define ATI_SC_RIGHT              0x2A4
+#define ATI_SC_LEFT_RIGHT         0x2A8
+#define ATI_SC_TOP                0x2AC
+#define ATI_SC_BOTTOM             0x2B0
+#define ATI_SC_TOP_BOTTOM         0x2B4
+#define ATI_DP_BKGD_CLR           0x2C0
+#define ATI_DP_FRGD_CLR           0x2C4
+#define ATI_DP_WRITE_MSK          0x2C8
+#define ATI_DP_PIX_WIDTH          0x2D0
+#define ATI_DP_MIX                0x2D4
+#define ATI_DP_SRC                0x2D8
+#define ATI_CLR_CMP_CLR           0x300
+#define ATI_CLR_CMP_MSK           0x304
+#define ATI_CLR_CMP_CNTL          0x308
+#define ATI_FIFO_STAT             0x310
+#define ATI_GUI_TRAJ_CNTL         0x330
+#define ATI_GUI_STAT              0x338
+
+/* DST_CNTL fields */
+#define ATI_DST_X_LEFT_TO_RIGHT   (1u << 0)
+#define ATI_DST_Y_TOP_TO_BOTTOM   (1u << 1)
+#define ATI_DST_LAST_PEL          (1u << 5)
+
+/* DP_SRC fields (frgd source bits 8-10, bkgd 0-2, mono 16-18) */
+#define ATI_FRGD_SRC_MASK         0x700
+#define ATI_FRGD_SRC_BKGD_CLR     0x000
+#define ATI_FRGD_SRC_FRGD_CLR     0x100
+#define ATI_FRGD_SRC_HOST         0x200
+#define ATI_FRGD_SRC_BLIT         0x300
+#define ATI_FRGD_SRC_PATTERN      0x400
+#define ATI_MONO_SRC_MASK         0x70000
+#define ATI_MONO_SRC_ONE          0x00000
+
+/* DP_MIX foreground mix (bits 16-20); ROP-style codes */
+#define ATI_FRGD_MIX_SHIFT        16
+#define ATI_FRGD_MIX_MASK         0x1f
+#define ATI_MIX_D                 0x3   /* leave destination */
+#define ATI_MIX_XOR               0x5   /* dst ^= src */
+#define ATI_MIX_S                 0x7   /* copy source */
+
+/* DP_PIX_WIDTH destination pixel-width codes (bits 0-3) */
+#define ATI_PIX_WIDTH_DST_MASK    0xf
+
 #endif /* ATI_MACH64_REGS_H */

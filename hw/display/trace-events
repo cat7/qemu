@@ -151,6 +151,9 @@ ati_mm_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "
 ati_mach64_mmio_read(unsigned int size, uint64_t addr, uint64_t val) "%u 0x%"PRIx64 " -> 0x%"PRIx64
 ati_mach64_mmio_write(unsigned int size, uint64_t addr, uint64_t val) "%u 0x%"PRIx64 " <- 0x%"PRIx64
 ati_mach64_vblank_irq(int level, uint32_t int_cntl) "level=%d int_cntl=0x%08x"
+ati_mach64_2d_fill(int x, int y, int w, int h, int bpp, uint32_t color, uint32_t mix) "fill %dx%d at (%d,%d) bpp=%d color=0x%x mix=0x%x"
+ati_mach64_2d_copy(int sx, int sy, int dx, int dy, int w, int h, int bpp, uint32_t mix) "copy %dx%d from (%d,%d) to (%d,%d) bpp=%d mix=0x%x"
+ati_mach64_2d_unimp(uint32_t dp_src, uint32_t dp_mix, uint32_t pix_width) "unimplemented op dp_src=0x%x dp_mix=0x%x pix_width=0x%x"
 ati_mach64_int_ack(uint32_t written, uint32_t remaining_pending) "written=0x%08x pending_after=0x%08x"
 
 # artist.c

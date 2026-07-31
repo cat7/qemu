@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "exec/icount.h"
@@ -416,6 +417,183 @@ static const QemuInputHandler ati_mach64_cursor_handler = {
     .mask  = INPUT_EVENT_MASK_REL,
     .event = ati_mach64_host_cursor_event,
 };
+
+/*
+ * GUI (2D) engine -- the Mach64 BitBLT block, register semantics per
+ * Linux's include/video/mach64.h and mach64_accel.c (the layouts are
+ * unambiguous there: DST_Y_X = (x << 16) | y, DST_HEIGHT_WIDTH =
+ * (width << 16) | height and writing it triggers the operation).
+ *
+ * Only the operations a display driver's copyarea/fillrect path
+ * actually issues are implemented: solid fill and screen-to-screen
+ * copy, with the S / D / XOR mixes and rectangular scissors.
+ * Everything else (host-data transfers, patterns, mono expansion,
+ * color compare, line drawing) traces as unimplemented so real-guest
+ * gaps surface immediately. Operations complete synchronously, so
+ * GUI_STAT always reads idle and FIFO_STAT always reads empty.
+ *
+ * The guest's direction bits (DST_CNTL) are used only to interpret
+ * the start coordinates (right-to-left/bottom-to-top ops give the
+ * right/bottom corner); execution order for overlapping copies is
+ * chosen internally (row order by overlap direction, memmove within
+ * a row), which is always safe.
+ */
+static int ati_mach64_2d_bytes_pp(uint32_t pix_width_code)
+{
+    switch (pix_width_code & ATI_PIX_WIDTH_DST_MASK) {
+    case 2:
+        return 1;           /* 8 bpp */
+    case 3:                 /* 15 bpp */
+    case 4:                 /* 16 bpp */
+        return 2;
+    case 6:
+        return 4;           /* 32 bpp */
+    default:
+        return 0;           /* 1/4/24 bpp engine modes: not implemented */
+    }
+}
+
+static void ati_mach64_2d_op(ATIMach64State *s)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t dp_src = s->regs[ATI_DP_SRC >> 2];
+    uint32_t frgd_mix = (s->regs[ATI_DP_MIX >> 2] >> ATI_FRGD_MIX_SHIFT) &
+                        ATI_FRGD_MIX_MASK;
+    uint32_t dst_cntl = s->regs[ATI_DST_CNTL >> 2];
+    uint32_t dst_op = s->regs[ATI_DST_OFF_PITCH >> 2];
+    uint32_t src_op = s->regs[ATI_SRC_OFF_PITCH >> 2];
+    int bpp = ati_mach64_2d_bytes_pp(s->regs[ATI_DP_PIX_WIDTH >> 2]);
+    int dst_x = s->regs[ATI_DST_X >> 2] & 0x1fff;
+    int dst_y = s->regs[ATI_DST_Y >> 2] & 0x7fff;
+    int src_x = s->regs[ATI_SRC_X >> 2] & 0x1fff;
+    int src_y = s->regs[ATI_SRC_Y >> 2] & 0x7fff;
+    int w = s->regs[ATI_DST_WIDTH >> 2] & 0x3fff;
+    int h = s->regs[ATI_DST_HEIGHT >> 2] & 0x7fff;
+    int sc_left = s->regs[ATI_SC_LEFT >> 2] & 0x1fff;
+    int sc_right = s->regs[ATI_SC_RIGHT >> 2] & 0x1fff;
+    int sc_top = s->regs[ATI_SC_TOP >> 2] & 0x7fff;
+    int sc_bottom = s->regs[ATI_SC_BOTTOM >> 2] & 0x7fff;
+    uint32_t dst_base = (dst_op & 0xfffff) * 8;
+    int dst_pitch = ((dst_op >> 22) & 0x3ff) * 8;   /* pixels */
+    uint32_t src_base = (src_op & 0xfffff) * 8;
+    int src_pitch = ((src_op >> 22) & 0x3ff) * 8;
+    uint32_t frgd_src = dp_src & ATI_FRGD_SRC_MASK;
+    bool copy = (frgd_src == ATI_FRGD_SRC_BLIT);
+    bool fill = (frgd_src == ATI_FRGD_SRC_FRGD_CLR);
+    uint32_t color = s->regs[ATI_DP_FRGD_CLR >> 2];
+    int y, x, clip;
+
+    if (w == 0 || h == 0) {
+        return;
+    }
+    if (frgd_mix == ATI_MIX_D) {
+        return;                          /* mix "leave destination" */
+    }
+    if (bpp == 0 || (!copy && !fill) ||
+        (dp_src & ATI_MONO_SRC_MASK) != ATI_MONO_SRC_ONE ||
+        (s->regs[ATI_CLR_CMP_CNTL >> 2] & 7) != 0 ||
+        (frgd_mix != ATI_MIX_S && frgd_mix != ATI_MIX_XOR) ||
+        dst_pitch == 0 || (copy && src_pitch == 0)) {
+        trace_ati_mach64_2d_unimp(dp_src, s->regs[ATI_DP_MIX >> 2],
+                                  s->regs[ATI_DP_PIX_WIDTH >> 2]);
+        return;
+    }
+
+    /* Direction bits locate the start corner; normalize to top-left. */
+    if (!(dst_cntl & ATI_DST_X_LEFT_TO_RIGHT)) {
+        dst_x -= w - 1;
+        src_x -= w - 1;
+    }
+    if (!(dst_cntl & ATI_DST_Y_TOP_TO_BOTTOM)) {
+        dst_y -= h - 1;
+        src_y -= h - 1;
+    }
+
+    /* Rectangular scissors (inclusive bounds). */
+    clip = sc_left - dst_x;
+    if (clip > 0) {
+        dst_x += clip;
+        src_x += clip;
+        w -= clip;
+    }
+    clip = sc_top - dst_y;
+    if (clip > 0) {
+        dst_y += clip;
+        src_y += clip;
+        h -= clip;
+    }
+    if (dst_x + w - 1 > sc_right) {
+        w = sc_right - dst_x + 1;
+    }
+    if (dst_y + h - 1 > sc_bottom) {
+        h = sc_bottom - dst_y + 1;
+    }
+    if (w <= 0 || h <= 0 || dst_x < 0 || dst_y < 0 ||
+        (copy && (src_x < 0 || src_y < 0))) {
+        return;
+    }
+
+    /* Bounds: reject anything that could touch outside VRAM. */
+    if ((uint64_t)dst_base +
+        ((uint64_t)(dst_y + h - 1) * dst_pitch + dst_x + w) * bpp >
+        ATI_MACH64_VRAM_SIZE ||
+        (copy &&
+         (uint64_t)src_base +
+         ((uint64_t)(src_y + h - 1) * src_pitch + src_x + w) * bpp >
+         ATI_MACH64_VRAM_SIZE)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ati-mach64: 2D op exceeds VRAM, dropped\n");
+        return;
+    }
+
+    if (fill) {
+        uint8_t pix[4];
+        int b;
+
+        trace_ati_mach64_2d_fill(dst_x, dst_y, w, h, bpp, color, frgd_mix);
+        for (b = 0; b < bpp; b++) {
+            pix[b] = (color >> (8 * b)) & 0xff;
+        }
+        for (y = 0; y < h; y++) {
+            uint8_t *row = vram + dst_base +
+                           ((uint64_t)(dst_y + y) * dst_pitch + dst_x) * bpp;
+            if (frgd_mix == ATI_MIX_XOR) {
+                for (x = 0; x < w * bpp; x++) {
+                    row[x] ^= pix[x % bpp];
+                }
+            } else if (bpp == 1) {
+                memset(row, pix[0], w);
+            } else {
+                for (x = 0; x < w; x++) {
+                    memcpy(row + (uint64_t)x * bpp, pix, bpp);
+                }
+            }
+        }
+    } else {
+        bool reverse_y = (dst_base == src_base) && (dst_y > src_y);
+
+        trace_ati_mach64_2d_copy(src_x, src_y, dst_x, dst_y, w, h, bpp,
+                                 frgd_mix);
+        for (y = 0; y < h; y++) {
+            int ry = reverse_y ? h - 1 - y : y;
+            uint8_t *drow = vram + dst_base +
+                            ((uint64_t)(dst_y + ry) * dst_pitch + dst_x) * bpp;
+            const uint8_t *srow = vram + src_base +
+                            ((uint64_t)(src_y + ry) * src_pitch + src_x) * bpp;
+            if (frgd_mix == ATI_MIX_XOR) {
+                for (x = 0; x < w * bpp; x++) {
+                    drow[x] ^= srow[x];
+                }
+            } else {
+                memmove(drow, srow, (size_t)w * bpp);
+            }
+        }
+    }
+
+    memory_region_set_dirty(&s->vram,
+                            dst_base + (uint64_t)dst_y * dst_pitch * bpp,
+                            (uint64_t)h * dst_pitch * bpp);
+}
 
 #define ATI_MACH64_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
 /* Blank interval = last 1/8 of the frame, matching the phase-computed
@@ -883,6 +1061,43 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         s->regs[reg_num] = word;
         ati_mach64_cursor_update(s);
         return;
+    /*
+     * GUI (2D) engine: composite registers mirror into their component
+     * registers (the engine itself only reads the components), and a
+     * DST_HEIGHT_WIDTH write triggers the operation -- the standard
+     * Mach64 programming model (mach64_accel.c's draw_rect()).
+     */
+    case ATI_DST_Y_X:
+        s->regs[reg_num] = word;
+        s->regs[ATI_DST_X >> 2] = word >> 16;
+        s->regs[ATI_DST_Y >> 2] = word & 0xffff;
+        return;
+    case ATI_SRC_Y_X:
+        s->regs[reg_num] = word;
+        s->regs[ATI_SRC_X >> 2] = word >> 16;
+        s->regs[ATI_SRC_Y >> 2] = word & 0xffff;
+        return;
+    case ATI_SRC_HEIGHT1_WIDTH1:
+        s->regs[reg_num] = word;
+        s->regs[ATI_SRC_WIDTH1 >> 2] = word >> 16;
+        s->regs[ATI_SRC_HEIGHT1 >> 2] = word & 0xffff;
+        return;
+    case ATI_SC_LEFT_RIGHT:
+        s->regs[reg_num] = word;
+        s->regs[ATI_SC_LEFT >> 2] = word & 0xffff;
+        s->regs[ATI_SC_RIGHT >> 2] = word >> 16;
+        return;
+    case ATI_SC_TOP_BOTTOM:
+        s->regs[reg_num] = word;
+        s->regs[ATI_SC_TOP >> 2] = word & 0xffff;
+        s->regs[ATI_SC_BOTTOM >> 2] = word >> 16;
+        return;
+    case ATI_DST_HEIGHT_WIDTH:
+        s->regs[reg_num] = word;
+        s->regs[ATI_DST_WIDTH >> 2] = word >> 16;
+        s->regs[ATI_DST_HEIGHT >> 2] = word & 0xffff;
+        ati_mach64_2d_op(s);
+        return;
     default:
         s->regs[reg_num] = word;
         return;
@@ -927,6 +1142,15 @@ static void ati_mach64_reset(DeviceState *dev)
     s->dac_comp_index = 0;
     memset(s->dac_comp_buf, 0, sizeof(s->dac_comp_buf));
     s->mode_dirty = true;
+
+    /* GUI engine power-on defaults: scissors fully open, drawing
+     * direction left-to-right / top-to-bottom. */
+    s->regs[ATI_SC_RIGHT >> 2] = 0x1fff;
+    s->regs[ATI_SC_BOTTOM >> 2] = 0x7fff;
+    s->regs[ATI_SC_LEFT_RIGHT >> 2] = 0x1fff0000;
+    s->regs[ATI_SC_TOP_BOTTOM >> 2] = 0x7fff0000;
+    s->regs[ATI_DST_CNTL >> 2] = ATI_DST_X_LEFT_TO_RIGHT |
+                                 ATI_DST_Y_TOP_TO_BOTTOM;
 
     s->regs[ATI_CONFIG_CHIP_ID >> 2] =
         (ATI_RAGE_PRO_ASIC_ID << ATI_CFG_CHIP_MAJOR_SHIFT) |
