@@ -247,6 +247,18 @@ static int adb_kbd_request(ADBDevice *d, uint8_t *obuf,
             /* LED status */
             break;
         case 3:
+            /*
+             * MacOS 9 has a bug in its ADB driver whereby after
+             * configuring the ADB bus devices it sends another write
+             * of invalid length to reg 3. Ignore it to prevent an
+             * address clash with the previous device (the mouse has
+             * carried this same guard for years; the keyboard was
+             * exposed to the identical hazard).
+             */
+            if (len != 3) {
+                return 0;
+            }
+
             switch (buf[2]) {
             case ADB_CMD_SELF_TEST:
                 break;
@@ -257,8 +269,10 @@ static int adb_kbd_request(ADBDevice *d, uint8_t *obuf,
                 trace_adb_device_kbd_request_change_addr(d->devaddr);
                 break;
             default:
-                d->devaddr = buf[1] & 0xf;
                 /*
+                 * A plain handler assignment ignores the address field
+                 * -- see the matching comment in adb-mouse.c.
+                 *
                  * we support handlers:
                  * 1: Apple Standard Keyboard
                  * 2: Apple Extended Keyboard (LShift = RShift)
@@ -282,8 +296,20 @@ static int adb_kbd_request(ADBDevice *d, uint8_t *obuf,
         case 1:
             break;
         case 2:
-            obuf[0] = 0x00; /* XXX: check this */
-            obuf[1] = 0x07; /* led status */
+            /*
+             * Live modifier-key and LED state, ACTIVE-LOW: a 0 bit
+             * means "key pressed" / "LED lit". Byte 0: reserved(7),
+             * Delete, Caps Lock, Reset, Control, Shift, Option,
+             * Command; byte 1: Clear/NumLock, ScrollLock, reserved,
+             * LED bits. The old 0x00 here reported EVERY modifier as
+             * held down -- classic Mac OS never reads this register,
+             * but Mac OS X Server/Rhapsody seeds its modifier state
+             * from it at startup and came up believing Caps Lock (and
+             * everything else) was engaged. Report everything
+             * released / all LEDs off.
+             */
+            obuf[0] = 0xff;
+            obuf[1] = 0xff;
             olen = 2;
             break;
         case 3:
