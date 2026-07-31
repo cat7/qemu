@@ -204,6 +204,9 @@ typedef struct DBDMA_channel {
      * dbdma_unassigned_rw().
      */
     QEMUTimer *unassigned_completion_timer;
+    /* Re-evaluation pacing for a channel parked on an unmet WAIT
+     * condition -- see the comment in nop(). */
+    QEMUTimer *wait_poll_timer;
     /*
      * Counts consecutive inline (synchronous) command-list continuations
      * chained within one call stack -- shared by every synchronous

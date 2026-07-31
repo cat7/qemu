@@ -387,6 +387,8 @@ static void start_input(DBDMA_channel *ch, int key, uint32_t addr,
     }
 }
 
+static void dbdma_park_wait(DBDMA_channel *ch);
+
 static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
                      uint16_t len)
 {
@@ -405,8 +407,11 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
     dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len,
                     MEMTXATTRS_UNSPECIFIED);
 
-    if (conditional_wait(ch))
-        goto wait;
+    /* Unmet wait parks the channel -- see the comment above nop(). */
+    if (conditional_wait(ch)) {
+        dbdma_park_wait(ch);
+        return;
+    }
 
     current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
     dbdma_cmdptr_save(ch);
@@ -415,7 +420,6 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
     conditional_interrupt(ch);
     next(ch);
 
-wait:
     DBDMA_kick(dbdma_from_ch(ch));
 
     /*
@@ -449,8 +453,11 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
     dma_memory_write(&address_space_memory, addr, &current->cmd_dep, len,
                      MEMTXATTRS_UNSPECIFIED);
 
-    if (conditional_wait(ch))
-        goto wait;
+    /* Unmet wait parks the channel -- see the comment above nop(). */
+    if (conditional_wait(ch)) {
+        dbdma_park_wait(ch);
+        return;
+    }
 
     current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
     dbdma_cmdptr_save(ch);
@@ -459,7 +466,6 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
     conditional_interrupt(ch);
     next(ch);
 
-wait:
     DBDMA_kick(dbdma_from_ch(ch));
 
     /* See the matching comment in load_word(). */
@@ -468,12 +474,50 @@ wait:
     }
 }
 
+/*
+ * An unmet wait condition parks the channel: real hardware leaves it
+ * ACTIVE, command pointer unadvanced, quiescent until the device's
+ * status lines (DEVSTAT) or a channel register write change the
+ * situation. Re-kicking the bottom-half immediately here (as this
+ * used to) makes a waiting NOP spin forever at host speed: Mac OS X
+ * 10.2's AppleSCCSerial parks exactly such a NOP+wait program on the
+ * SCC-A DBDMA channel (waiting on an SCC status line nothing ever
+ * raises), which starved the whole boot.
+ *
+ * Device models change DEVSTAT by poking ch->regs directly with no
+ * event we can hook (and Mac OS 8.5's boot genuinely depends on a
+ * wait being released that way -- parking with no re-evaluation hangs
+ * it in the ROM), so a parked channel re-evaluates on a slow timer:
+ * ~1000 evaluations/s instead of millions, cheap enough to run
+ * indefinitely yet prompt enough that a released wait proceeds within
+ * a millisecond.
+ */
+#define DBDMA_WAIT_POLL_MS 1
+
+static void dbdma_wait_poll(void *opaque)
+{
+    DBDMA_channel *ch = opaque;
+
+    if ((ch->regs[DBDMA_STATUS] & RUN) && (ch->regs[DBDMA_STATUS] & ACTIVE)) {
+        DBDMA_kick(dbdma_from_ch(ch));
+    }
+}
+
+static void dbdma_park_wait(DBDMA_channel *ch)
+{
+    timer_mod(ch->wait_poll_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + DBDMA_WAIT_POLL_MS);
+}
+
 static void nop(DBDMA_channel *ch)
 {
     dbdma_cmd *current = &ch->current;
 
-    if (conditional_wait(ch))
-        goto wait;
+    /* Unmet wait parks the channel -- see the comment above. */
+    if (conditional_wait(ch)) {
+        dbdma_park_wait(ch);
+        return;
+    }
 
     current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
     dbdma_cmdptr_save(ch);
@@ -481,7 +525,6 @@ static void nop(DBDMA_channel *ch)
     conditional_interrupt(ch);
     conditional_branch(ch);
 
-wait:
     DBDMA_kick(dbdma_from_ch(ch));
 
     /* See the matching comment in load_word(). */
@@ -1063,6 +1106,8 @@ static void mac_dbdma_init(Object *obj)
         ch->io.channel = ch;
         ch->unassigned_completion_timer =
             timer_new_ms(QEMU_CLOCK_VIRTUAL, dbdma_unassigned_complete, ch);
+        ch->wait_poll_timer =
+            timer_new_ms(QEMU_CLOCK_VIRTUAL, dbdma_wait_poll, ch);
     }
 
     memory_region_init_io(&s->mem, obj, &dbdma_ops, s, "dbdma",
