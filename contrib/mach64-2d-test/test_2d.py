@@ -219,3 +219,50 @@ r = q.read_bytes(VRAM_BASE + 1 * PITCH, 8)
 exp = [0x11,0x11,0xA0,0xB1,0xC2,0xD3,0x11,0x11]
 ok = all(r[i]==exp[i] for i in range(8))
 print("color-host test:", "PASS" if ok else "FAIL", "" if ok else f"got {[hex(b) for b in r[:8]]}")
+
+# --- test 8: NOT_DST invert fill ---
+base = bytes(range(256))*  (PITCH*4//256 + 1)
+q.write_bytes(VRAM_BASE, base[:PITCH*4])
+reg(0x2d0, 0x2)                     # 8bpp
+reg(0x2d4, 0x0)                     # DP_MIX: frgd=NOT_DST(0), bkgd=NOT_DST(0)
+reg(0x2d8, 0x707)                   # the observed invert dp_src
+reg(0x2a8, 0x1fff0000); reg(0x2b4, 0x7fff0000)  # scissors open
+reg(0x100, (PITCH//8)<<22); reg(0x130, 0x3)
+reg(0x10c, (3<<16)|1)               # (x=3,y=1)
+reg(0x118, (5<<16)|2)               # 5x2
+ok = True
+for yy in range(4):
+    r = q.read_bytes(VRAM_BASE + yy*PITCH, 12)
+    for xx in range(12):
+        orig = base[yy*PITCH + xx]
+        e = (~orig) & 0xff if (1<=yy<=2 and 3<=xx<8) else orig
+        if r[xx] != e:
+            print(f"INVERT MISMATCH ({xx},{yy}): {r[xx]:#x} != {e:#x}"); ok=False
+print("invert test:", "PASS" if ok else "FAIL")
+
+# --- test 9: mono 8x8 pattern fill ---
+q.write_bytes(VRAM_BASE, b'\x11'*(PITCH*10))
+reg(0x2d0, 0x2)
+reg(0x2c4, 0xF0)                    # frgd
+reg(0x2c0, 0x0C)                    # bkgd
+reg(0x2d4, 0x70007)                 # frgd=S, bkgd=S
+reg(0x2d8, 0x400)                   # FRGD_SRC=PATTERN
+reg(0x288, 0x01000000)             # PAT_CNTL: MONO_8x8_ENABLE
+# pattern: rows0-3 in PAT_REG0, rows4-7 in PAT_REG1; 8 bits/row MSB-left
+pat_rows = [0b10000001,0b01000010,0b00100100,0b00011000,
+            0b00011000,0b00100100,0b01000010,0b10000001]
+pat0 = sum(pat_rows[r] << ((3-r)*8) for r in range(4))
+pat1 = sum(pat_rows[r] << ((3-(r-4))*8) for r in range(4,8))
+reg(0x280, pat0); reg(0x284, pat1)
+reg(0x100, (PITCH//8)<<22); reg(0x130, 0x3)
+reg(0x10c, 0)                       # (0,0)
+reg(0x118, (16<<16)|10)             # 16x10 -> tiles the 8x8 pattern
+ok = True
+for yy in range(10):
+    r = q.read_bytes(VRAM_BASE + yy*PITCH, 16)
+    for xx in range(16):
+        bit = (pat_rows[yy & 7] >> (7 - (xx & 7))) & 1
+        e = 0xF0 if bit else 0x0C
+        if r[xx] != e:
+            print(f"PATTERN MISMATCH ({xx},{yy}): {r[xx]:#x} != {e:#x}"); ok=False
+print("pattern test:", "PASS" if ok else "FAIL")

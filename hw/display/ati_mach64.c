@@ -471,6 +471,11 @@ static inline void ati_mach64_2d_put(uint8_t *p, int bpp, uint32_t color,
             p[b] ^= (color >> (8 * b)) & 0xff;
         }
         break;
+    case ATI_MIX_NOT_DST:                        /* invert destination */
+        for (b = 0; b < bpp; b++) {
+            p[b] = ~p[b];
+        }
+        break;
     case ATI_MIX_D:                              /* leave destination */
     default:
         break;
@@ -639,14 +644,32 @@ static void ati_mach64_2d_op(ATIMach64State *s)
         return;
     }
 
-    if (frgd_mix == ATI_MIX_D) {
+    /*
+     * Invert-destination fill (NOT_DST mix): source-independent, so it
+     * is accepted whatever the source-select field says -- Mac OS uses
+     * it for cursors, text-selection and menu highlighting. Monochrome
+     * 8x8 pattern fill (PATTERN source): the desktop background and
+     * window fills; each pixel picks foreground or background per the
+     * PAT_REG0/1 bit at (x&7, y&7).
+     */
+    bool invert = (frgd_mix == ATI_MIX_NOT_DST) && !copy;
+    bool pattern = (frgd_src == ATI_FRGD_SRC_PATTERN) &&
+                   (s->regs[ATI_PAT_CNTL >> 2] & ATI_PAT_MONO_8x8_ENABLE);
+    uint32_t bkgd_clr = s->regs[ATI_DP_BKGD_CLR >> 2];
+    uint8_t bkgd_mix = s->regs[ATI_DP_MIX >> 2] & ATI_BKGD_MIX_MASK;
+    uint32_t pat0 = s->regs[ATI_PAT_REG0 >> 2];
+    uint32_t pat1 = s->regs[ATI_PAT_REG1 >> 2];
+
+    if (frgd_mix == ATI_MIX_D && !invert && !pattern) {
         return;                          /* mix "leave destination" */
     }
-    if (bpp == 0 || (!copy && !fill) ||
+    if (bpp == 0 || dst_pitch == 0 ||
         (dp_src & ATI_MONO_SRC_MASK) != ATI_MONO_SRC_ONE ||
         (s->regs[ATI_CLR_CMP_CNTL >> 2] & 7) != 0 ||
-        (frgd_mix != ATI_MIX_S && frgd_mix != ATI_MIX_XOR) ||
-        dst_pitch == 0 || (copy && src_pitch == 0)) {
+        (copy && src_pitch == 0) ||
+        !(invert || pattern ||
+          ((fill || copy) &&
+           (frgd_mix == ATI_MIX_S || frgd_mix == ATI_MIX_XOR)))) {
         trace_ati_mach64_2d_unimp(dp_src, s->regs[ATI_DP_MIX >> 2],
                                   s->regs[ATI_DP_PIX_WIDTH >> 2]);
         return;
@@ -699,7 +722,29 @@ static void ati_mach64_2d_op(ATIMach64State *s)
         return;
     }
 
-    if (fill) {
+    if (invert || pattern) {
+        trace_ati_mach64_2d_fill(dst_x, dst_y, w, h, bpp,
+                                 pattern ? pat0 : color, frgd_mix);
+        for (y = 0; y < h; y++) {
+            uint8_t *row = vram + dst_base +
+                           ((uint64_t)(dst_y + y) * dst_pitch + dst_x) * bpp;
+            for (x = 0; x < w; x++) {
+                if (pattern) {
+                    int px = (dst_x + x) & 7;
+                    int py = (dst_y + y) & 7;
+                    uint32_t pr = (py < 4) ? pat0 : pat1;
+                    int bit = (pr >> ((3 - (py & 3)) * 8 + (7 - px))) & 1;
+
+                    ati_mach64_2d_put(row + (uint64_t)x * bpp, bpp,
+                                      bit ? color : bkgd_clr,
+                                      bit ? frgd_mix : bkgd_mix);
+                } else {
+                    ati_mach64_2d_put(row + (uint64_t)x * bpp, bpp,
+                                      0, ATI_MIX_NOT_DST);
+                }
+            }
+        }
+    } else if (fill) {
         uint8_t pix[4];
         int b;
 

@@ -167,6 +167,28 @@ struct ATIMach64State {
     bitbang_i2c_interface bbi2c;
     I2CDDCState i2cddc;
     uint8_t i2c_sense;   /* last I2C SCL/SDA readback, 3-bit logical */
+
+    /*
+     * Host-data blit state (GUI engine, CPU-sourced pixels). Set up by
+     * a DST_HEIGHT_WIDTH trigger whose DP_SRC selects HOST as the
+     * foreground (or the mono) source; the guest then streams pixel or
+     * 1bpp-mask words to the HOST_DATA registers, which this consumes
+     * left-to-right, top-to-bottom into the destination rectangle.
+     * Used for text/glyph drawing, which the accelerated NDRV offloads
+     * to the engine. hb_active gates the HOST_DATA write path.
+     */
+    bool hb_active;
+    bool hb_mono;          /* 1bpp mask expansion vs packed color */
+    bool hb_byte_align;    /* each source row starts on a fresh word */
+    int hb_host_bpp;       /* bytes/pixel of the host color data */
+    int hb_dst_bpp;
+    int hb_x, hb_y;        /* current write position within the rect */
+    int hb_x0, hb_w, hb_h; /* rect origin-x, width, height (rows left = h - y) */
+    uint32_t hb_dst_base;
+    int hb_dst_pitch;      /* pixels */
+    uint32_t hb_frgd_clr, hb_bkgd_clr;
+    uint8_t hb_frgd_mix, hb_bkgd_mix;
+    bool hb_lsb_first;     /* mono bit order within each byte */
 };
 
 #endif /* ATI_MACH64_H */

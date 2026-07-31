@@ -179,9 +179,15 @@
 #define ATI_FRGD_MIX_SHIFT        16
 #define ATI_FRGD_MIX_MASK         0x1f
 #define ATI_BKGD_MIX_MASK         0x1f
+#define ATI_MIX_NOT_DST           0x0   /* dst = ~dst (source ignored) */
 #define ATI_MIX_D                 0x3   /* leave destination */
 #define ATI_MIX_XOR               0x5   /* dst ^= src */
 #define ATI_MIX_S                 0x7   /* copy source */
+
+/* PAT_CNTL: enable of the 8x8 monochrome pattern (PAT_REG0 = rows 0-3,
+ * PAT_REG1 = rows 4-7, 8 bits/row MSB-left; a set bit picks the
+ * foreground colour/mix, a clear bit the background). */
+#define ATI_PAT_MONO_8x8_ENABLE   0x01000000
 
 /* DP_SRC foreground/mono source selectors (see ATI_FRGD_SRC_* /
  * ATI_MONO_SRC_* above); HOST means the CPU streams the pixels. */
