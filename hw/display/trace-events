@@ -147,6 +147,20 @@ sii9022_switch_mode(const char *mode) "mode: %s"
 ati_mm_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s -> 0x%"PRIx64
 ati_mm_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s <- 0x%"PRIx64
 
+# ati_rage128.c
+ati_rage128_reg_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s -> 0x%"PRIx64
+ati_rage128_reg_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s <- 0x%"PRIx64
+ati_rage128_unk_read(unsigned int size, uint64_t addr, uint64_t val) "UNKNOWN %u 0x%"PRIx64" -> 0x%"PRIx64
+ati_rage128_unk_write(unsigned int size, uint64_t addr, uint64_t val) "UNKNOWN %u 0x%"PRIx64" <- 0x%"PRIx64
+ati_rage128_pll_read(unsigned int idx, uint32_t val) "pll[0x%x] -> 0x%08x"
+ati_rage128_pll_write(unsigned int idx, uint32_t val) "pll[0x%x] <- 0x%08x"
+ati_rage128_vblank_irq(int level, uint32_t int_cntl) "level=%d int_cntl=0x%08x"
+ati_rage128_int_ack(uint32_t written, uint32_t remaining) "written=0x%08x pending_after=0x%08x"
+ati_rage128_update(int w, int h, int bpp, int valid, uint32_t fb_off) "update %dx%d bpp=%d valid=%d fb_off=0x%x"
+ati_rage128_mode_reg(const char *name, uint32_t val) "%s <- 0x%08x"
+ati_rage128_i2c(uint8_t addr, uint8_t count, int receive, int nack, uint8_t edid_off) "addr=0x%02x count=%u receive=%d nack=%d edid_off=%u"
+ati_rage128_aper_endian(uint32_t aper0, uint32_t aper1, int reg_swap) "APER_0_ENDIAN=%u APER_1_ENDIAN=%u REG_ENDIAN=%d"
+
 # ati_mach64.c
 ati_mach64_mmio_read(unsigned int size, uint64_t addr, uint64_t val) "%u 0x%"PRIx64 " -> 0x%"PRIx64
 ati_mach64_mmio_write(unsigned int size, uint64_t addr, uint64_t val) "%u 0x%"PRIx64 " <- 0x%"PRIx64

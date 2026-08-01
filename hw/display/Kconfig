@@ -139,6 +139,12 @@ config ATI_MACH64
     select BITBANG_I2C
     select DDC
 
+config ATI_RAGE128
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select EDID
+
 config MACFB
     bool
     select FRAMEBUFFER
