@@ -776,7 +776,16 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
 
     s->b = 0;
     s->a = 0;
-    s->dirb = 0;
+    /*
+     * A bare 6522 resets with port B as all-inputs, but 0xff here is
+     * de-facto ABI for QEMU's shipped OpenBIOS: its CUDA driver
+     * (drivers/cuda.c) starts bit-banging TIP/TACK on port B without
+     * ever programming DIRB, so an all-inputs reset masks those writes
+     * to nothing and the very first CUDA request hangs firmware boot
+     * (found by bisect -- every -kernel/CD boot through OpenBIOS died).
+     * Real Mac ROMs program DDRB themselves and don't care either way.
+     */
+    s->dirb = 0xff;
     s->dira = 0;
     s->sr = 0;
     s->acr = 0;
