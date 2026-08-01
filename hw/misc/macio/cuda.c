@@ -285,6 +285,30 @@ static void cuda_send_packet_to_host(CUDAState *s,
     cuda_delay_set_sr_int(s, CUDA_SR_DELAY_ATTENTION);
 }
 
+/*
+ * True while the host is inside a byte transfer (TIP asserted) or a
+ * queued CUDA->host response has not been fully read out. Unsolicited
+ * packets (ADB autopoll data, one-second RTC ticks) must not be sent
+ * in either state: the real Cuda is a single-threaded microcontroller
+ * that only emits them from its idle loop, never mid-transaction --
+ * DingusPPC's ViaCuda::autopoll_handler() implements exactly this
+ * gate ("Don't send async packets while the host has TIP asserted",
+ * "time packets are not urgent enough to preempt"). Sending anyway
+ * overwrote data_in underneath the guest's in-progress read, slipping
+ * its byte framing: motion deltas got consumed as button/status bytes
+ * and packet boundaries smeared -- the long-standing "phantom clicks
+ * and cursor jumps under load" input corruption, worst on progress
+ * screens where the busy guest drains packets slowly. Skipping is
+ * safe: mouse/keyboard deltas keep accumulating in the ADB device for
+ * the next poll, and a missed RTC tick is superseded by the next.
+ */
+static bool cuda_unsolicited_busy(CUDAState *s)
+{
+    MOS6522State *ms = MOS6522(&s->mos6522_cuda);
+
+    return !(ms->b & TIP) || s->data_in_index < s->data_in_size;
+}
+
 static void cuda_adb_poll(void *opaque)
 {
     CUDAState *s = opaque;
@@ -292,6 +316,9 @@ static void cuda_adb_poll(void *opaque)
     uint8_t obuf[ADB_MAX_OUT_LEN + 2];
     int olen;
 
+    if (cuda_unsolicited_busy(s)) {
+        return;
+    }
     olen = adb_poll(adb_bus, obuf + 2, adb_bus->autopoll_mask);
     if (olen > 0) {
         obuf[0] = ADB_PACKET;
@@ -319,17 +346,24 @@ static void cuda_one_sec_tick(void *opaque)
         return;
     }
 
-    real_time = s->tick_offset + (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
-                                  / NANOSECONDS_PER_SECOND);
+    /*
+     * Never preempt an in-progress or unread exchange (see
+     * cuda_unsolicited_busy()); this tick's time value is superseded
+     * by the next one anyway.
+     */
+    if (!cuda_unsolicited_busy(s)) {
+        real_time = s->tick_offset + (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                                      / NANOSECONDS_PER_SECOND);
 
-    obuf[0] = CUDA_PACKET;
-    obuf[1] = 0;
-    obuf[2] = CUDA_GET_TIME;
-    obuf[3] = real_time >> 24;
-    obuf[4] = real_time >> 16;
-    obuf[5] = real_time >> 8;
-    obuf[6] = real_time;
-    cuda_send_packet_to_host(s, obuf, sizeof(obuf));
+        obuf[0] = CUDA_PACKET;
+        obuf[1] = 0;
+        obuf[2] = CUDA_GET_TIME;
+        obuf[3] = real_time >> 24;
+        obuf[4] = real_time >> 16;
+        obuf[5] = real_time >> 8;
+        obuf[6] = real_time;
+        cuda_send_packet_to_host(s, obuf, sizeof(obuf));
+    }
 
     timer_mod(s->one_sec_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
                                  + NANOSECONDS_PER_SECOND);
