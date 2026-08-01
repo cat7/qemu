@@ -172,6 +172,26 @@
 #define ATI_DP_PIX_WIDTH          0x2D0
 #define ATI_DP_MIX                0x2D4
 #define ATI_DP_SRC                0x2D8
+/*
+ * Field-order-swapped aliases of DST_Y_X (0x10C) and DST_HEIGHT_WIDTH
+ * (0x118): here the coordinate register carries Y in the upper half
+ * and X in the lower, and the size register carries height above
+ * width -- the reverse of the 0x10x pair, which is the whole point of
+ * their existence (a driver picks whichever order its own state is
+ * already packed in and writes two registers instead of four).
+ * Writing DST_WIDTH_HEIGHT triggers the operation exactly like
+ * DST_HEIGHT_WIDTH does.
+ *
+ * Mac OS's accelerated ATI extension issues every screen-to-screen
+ * copy through this pair -- confirmed by live trace: a scroll writes
+ * DST_X_Y/SRC_Y_X/SRC_WIDTH1/DST_WIDTH_HEIGHT and nothing else.
+ * Without these, the whole class of blits was silently swallowed by
+ * the unmodelled-register fallthrough while fills and host blits
+ * (which use the 0x10x pair) worked, so windows scrolled by redrawing
+ * only the newly exposed band and leaving the moved content stale.
+ */
+#define ATI_DST_X_Y               0x2E8
+#define ATI_DST_WIDTH_HEIGHT      0x2EC
 #define ATI_USR_DST_PITCH         0x2F0
 /*
  * Rage Pro macro-context registers (3D RAGE LT PRO Register

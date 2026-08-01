@@ -649,5 +649,49 @@ ok = all(rows[r][c] == tile[(r * 32 + c)] for r in range(4) for c in range(32)
 result("src-traj1-linear", ok, f"row0={rows[0][:20].hex()}")
 reg(0x1b4, 0)                                       # restore plain source
 
+# --- test 19: DST_X_Y / DST_WIDTH_HEIGHT, the field-order-swapped
+# trigger pair.  Replays the exact register sequence captured from Mac
+# OS's accelerated ATI extension performing a window scroll: it issues
+# every screen-to-screen copy through these aliases, never through
+# DST_Y_X/DST_HEIGHT_WIDTH, so leaving them unmodelled silently
+# dropped the entire class of blits.
+engine_defaults()
+pat = bytes((y * 53 + x * 7) & 0xff for y in range(40) for x in range(PITCH))
+q.write_bytes(VRAM_BASE, pat)
+reg(0x2d8, 0x300)                   # DP_SRC: frgd = BLIT
+reg(0x18c, (20 << 16) | 24)         # SRC_Y_X: X=20, Y=24
+reg(0x190, 32)                      # SRC_WIDTH1 (height1 unbounded)
+reg(0x2e8, (16 << 16) | 20)         # DST_X_Y: Y=16, X=20   (swapped!)
+reg(0x2ec, (8 << 16) | 32)          # DST_WIDTH_HEIGHT: h=8, w=32 -> trigger
+ok = True
+for r in range(8):
+    row = q.read_bytes(VRAM_BASE + (16 + r) * PITCH + 20, 32)
+    want = pat[(24 + r) * PITCH + 20:(24 + r) * PITCH + 52]
+    if row != want:
+        print(f"  row {r}: {row[:8].hex()} != {want[:8].hex()}")
+        ok = False
+result("dst-x-y-width-height-alias", ok)
+
+# horizontal move through the same aliases (sideways scrolling used
+# the identical path, and was broken identically)
+q.write_bytes(VRAM_BASE, pat)
+reg(0x18c, (24 << 16) | 30)         # SRC_Y_X: X=24, Y=30
+reg(0x190, 24)
+reg(0x2e8, (30 << 16) | 12)         # DST_X_Y: Y=30, X=12
+reg(0x2ec, (5 << 16) | 24)          # h=5, w=24 -> trigger
+ok = True
+for r in range(5):
+    row = q.read_bytes(VRAM_BASE + (30 + r) * PITCH + 12, 24)
+    want = pat[(30 + r) * PITCH + 24:(30 + r) * PITCH + 48]
+    if row != want:
+        print(f"  row {r}: {row[:8].hex()} != {want[:8].hex()}")
+        ok = False
+result("dst-alias-horizontal", ok)
+
+# the aliases must also read back through their canonical counterparts
+ok = (regread(0x10c) == ((12 << 16) | 30) and
+      regread(0x118) == ((24 << 16) | 5))
+result("dst-alias-mirrors", ok, f"y_x={regread(0x10c):#x} hw={regread(0x118):#x}")
+
 print(f"\n{npass} passed, {nfail} failed")
 sys.exit(1 if nfail else 0)

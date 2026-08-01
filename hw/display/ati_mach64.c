@@ -2077,6 +2077,20 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         s->regs[ATI_DST_HEIGHT >> 2] = word & 0xffff;
         ati_mach64_2d_op(s);
         return;
+    case ATI_DST_X_Y:
+        /* Same fields as DST_Y_X, opposite halves (see the header). */
+        s->regs[reg_num] = word;
+        s->regs[ATI_DST_Y >> 2] = word >> 16;
+        s->regs[ATI_DST_X >> 2] = word & 0xffff;
+        s->regs[ATI_DST_Y_X >> 2] = (word << 16) | (word >> 16);
+        return;
+    case ATI_DST_WIDTH_HEIGHT:
+        s->regs[reg_num] = word;
+        s->regs[ATI_DST_HEIGHT >> 2] = word >> 16;
+        s->regs[ATI_DST_WIDTH >> 2] = word & 0xffff;
+        s->regs[ATI_DST_HEIGHT_WIDTH >> 2] = (word << 16) | (word >> 16);
+        ati_mach64_2d_op(s);
+        return;
     case ATI_DST_BRES_LNTH:
         /*
          * Loading the line length starts a line draw unless the
