@@ -125,6 +125,19 @@ Scan Display". The advertised resolution can be tuned with the
 standard EDID properties, e.g.
 ``-global ati-mach64-gt.xres=1024 -global ati-mach64-gt.yres=768``.
 
+The emulated GUI (2D) engine covers the full documented data path --
+fills, screen-to-screen and host-sourced blits, monochrome expansion
+(host, VRAM-source and 8x8 pattern), all 16 bitwise mixes/ROPs, the
+plane write mask, color-compare transparency, the Bresenham line
+engine, and the Rage Pro ``DP_SET_GUI_ENGINE2`` context macro that
+Apple's accelerated NDRV programs every operation through -- so
+non-Mac guests whose drivers use the accelerator (Linux ``atyfb``
+consoles, XFree86/X.Org ``mach64`` XAA and EXA) are expected to work
+too. Still unimplemented (traced as ``ati_mach64_2d_unimp``): 1/4 bpp
+engine modes, polygon/trapezoid fills and the generalized rotating
+VRAM pattern source. A byte-exact regression suite for all of this
+lives in ``contrib/mach64-2d-test``.
+
 Display, audio, control
 -----------------------
 

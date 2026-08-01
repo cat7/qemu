@@ -7,8 +7,31 @@ Run:
   python3 test_2d.py /tmp/qt.sock
 
 Programs the ATI PCI BARs through the Grackle config window, seeds
-VRAM patterns, issues fills/copies through the register interface and
-verifies the resulting bytes: solid fill, overlapping copy, scissor
-clipping, 16bpp XOR fill, and reversed-direction (corner-coordinate)
-copies. All values are written as little-endian raw bytes ("write"
-commands) since the register aperture is a little-endian device.
+VRAM patterns, issues operations through the register interface and
+verifies the resulting bytes against independent software models:
+
+  - solid fill, overlapping copy, scissor clipping, 16bpp XOR fill,
+    reversed-direction (corner-coordinate) copies
+  - host-data blits: documented byte order (bytes low-to-high,
+    MSB-first per byte, byte-boundary row alignment), the Mac NDRV's
+    HOST_CNTL big-endian translation, transparent (bkgd mix = D)
+    expansion, packed 8bpp color and byte-swapped 16bpp color
+  - NOT_DST invert; mono 8x8 pattern fill through both programming
+    models (Apple's FRGD_SRC_PATTERN + PAT_CNTL bit 24, XFree86's
+    MONO_SRC_PATTERN + PAT_CNTL bit 0), documented row packing
+    (row 0 = low byte)
+  - the full 16-code bitwise mix/ROP table
+  - the DP_WRITE_MSK plane mask
+  - color-compare transparency, source and destination keyed
+  - the Bresenham line engine: 11 lines x all octants x LAST_PEL
+    on/off, checked pixel-exact against a software Bresenham using
+    the documented register formulas
+  - mono expansion from a 1bpp VRAM blit source (MONO_SRC_BLIT)
+  - the Rage Pro DP_SET_GUI_ENGINE2 one-write context macro (the way
+    Apple's accelerated NDRV programs every operation)
+  - GUI_TRAJ_CNTL decomposition into DST/SRC/PAT/HOST_CNTL (the way
+    Linux's atyfb programs its engine defaults)
+
+All values are written as little-endian raw bytes ("write" commands)
+since the register aperture is a little-endian device. Exits nonzero
+on any failure.

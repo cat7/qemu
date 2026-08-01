@@ -105,10 +105,17 @@ struct ATIMach64State {
 
     MemoryRegion vram;
     MemoryRegion mmio;
+    MemoryRegion mmio_bar2;
     MemoryRegion io;
     MemoryRegion mmio_in_vram;
+    MemoryRegion mmio_in_vram_blk1;
     MemoryRegion vram_be_mirror;
     QemuConsole *con;
+
+    /* BM_ADDR/BM_DATA register-list port state (see ati_mach64_regs.h) */
+    bool bm_data_mode;
+    uint8_t bm_reg;
+    int bm_reg_count;
 
     uint32_t regs[ATI_MACH64_NUM_REGS];
     uint8_t plls[ATI_MACH64_NUM_PLLS];
@@ -179,16 +186,21 @@ struct ATIMach64State {
      */
     bool hb_active;
     bool hb_mono;          /* 1bpp mask expansion vs packed color */
-    bool hb_byte_align;    /* each source row starts on a fresh word */
+    bool hb_byte_align;    /* re-align to a byte boundary on row wrap */
+    bool hb_lsb_first;     /* DP_BYTE_PIX_ORDER: LSB-first within a byte */
+    bool hb_bigendian;     /* HOST_CNTL: byte-swap each incoming word */
+    bool hb_triple;        /* packed-24bpp: one mono bit = 3 dst bytes */
+    bool hb_rot24;         /* packed-24bpp color component per dst byte */
     int hb_host_bpp;       /* bytes/pixel of the host color data */
     int hb_dst_bpp;
     int hb_x, hb_y;        /* current write position within the rect */
-    int hb_x0, hb_w, hb_h; /* rect origin-x, width, height (rows left = h - y) */
+    int hb_x0, hb_w, hb_h, hb_h0; /* rect origin-x, width, height (rows left = h - y) */
+    int hb_bit;            /* mono: consumed bits of the current word */
+    int hb_words;          /* HOST_DATA words consumed by this blit */
     uint32_t hb_dst_base;
     int hb_dst_pitch;      /* pixels */
     uint32_t hb_frgd_clr, hb_bkgd_clr;
     uint8_t hb_frgd_mix, hb_bkgd_mix;
-    bool hb_lsb_first;     /* mono bit order within each byte */
 };
 
 #endif /* ATI_MACH64_H */
