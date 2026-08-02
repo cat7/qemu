@@ -24,8 +24,8 @@
  * This work is licensed under the GNU GPL license version 2 or later.
  */
 
-#ifndef ATI_MACH64_H
-#define ATI_MACH64_H
+#ifndef ATI_MACH64_INT_H
+#define ATI_MACH64_INT_H
 
 #include "hw/pci/pci_device.h"
 #include "hw/i2c/bitbang_i2c.h"
@@ -203,5 +203,16 @@ struct ATIMach64State {
     uint32_t hb_frgd_clr, hb_bkgd_clr;
     uint8_t hb_frgd_mix, hb_bkgd_mix;
 };
+
+
+/* ati_mach64_dbg.c */
+const char *ati_mach64_reg_name(uint32_t base);
+
+/* ati_mach64_2d.c */
+void ati_mach64_2d_op(ATIMach64State *s);
+void ati_mach64_2d_line(ATIMach64State *s, uint32_t lnth);
+void ati_mach64_set_gui_engine2(ATIMach64State *s, uint32_t w);
+void ati_mach64_3d_trigger(ATIMach64State *s, uint32_t one_over_area);
+void ati_mach64_host_data(ATIMach64State *s, uint32_t word);
 
 #endif /* ATI_MACH64_H */
