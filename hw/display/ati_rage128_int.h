@@ -25,8 +25,8 @@
  * This work is licensed under the GNU GPL license version 2 or later.
  */
 
-#ifndef ATI_RAGE128_H
-#define ATI_RAGE128_H
+#ifndef ATI_RAGE128_INT_H
+#define ATI_RAGE128_INT_H
 
 #include "hw/pci/pci_device.h"
 #include "hw/display/edid.h"
@@ -249,4 +249,11 @@ struct ATIRage128State {
 };
 
 
-#endif /* ATI_RAGE128_H */
+/* ati_rage128_dbg.c */
+const char *ati_rage128_reg_name(uint32_t base);
+
+/* ati_rage128_2d.c */
+void ati_rage128_2d_blt(ATIRage128State *s);
+bool ati_rage128_host_data_flush(ATIRage128State *s);
+
+#endif /* ATI_RAGE128_INT_H */

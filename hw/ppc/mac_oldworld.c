@@ -43,7 +43,7 @@
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
 #include "hw/misc/macio/cuda.h"
-#include "hw/display/ati_mach64.h"
+#include "hw/display/ati_mach64_int.h"
 #include "hw/i2c/smbus_eeprom.h"
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"

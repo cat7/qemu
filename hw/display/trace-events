@@ -167,8 +167,8 @@ ati_rage128_pm4_indirect(uint32_t offset, uint32_t dwords, uint32_t first) "IB d
 ati_rage128_monid(uint32_t raw, uint32_t y) "GPIO_MONID probe raw=0x%08x -> Y=0x%x"
 
 # ati_mach64.c
-ati_mach64_mmio_read(unsigned int size, uint64_t addr, uint64_t val) "%u 0x%"PRIx64 " -> 0x%"PRIx64
-ati_mach64_mmio_write(unsigned int size, uint64_t addr, uint64_t val) "%u 0x%"PRIx64 " <- 0x%"PRIx64
+ati_mach64_mmio_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s -> 0x%"PRIx64
+ati_mach64_mmio_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s <- 0x%"PRIx64
 ati_mach64_vblank_irq(int level, uint32_t int_cntl) "level=%d int_cntl=0x%08x"
 ati_mach64_2d_fill(int x, int y, int w, int h, int bpp, uint32_t color, uint32_t mix, uint32_t base, int pitch) "fill at (%d,%d) %dx%d bpp=%d color=0x%x mix=0x%x base=0x%x pitch=%d"
 ati_mach64_2d_copy(int sx, int sy, int dx, int dy, int w, int h, int bpp, uint32_t sbase, uint32_t dbase, int pitch) "copy from (%d,%d) to (%d,%d) %dx%d bpp=%d sbase=0x%x dbase=0x%x pitch=%d"
