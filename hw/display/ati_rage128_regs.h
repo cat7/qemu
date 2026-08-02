@@ -79,6 +79,15 @@
 #define R128_AGP_CNTL                0x0174
 #define R128_AGP_APER_OFFSET         0x0178
 #define R128_PCI_GART_PAGE           0x017c
+/*
+ * The ATI PCI GART table (whose guest-physical base page the driver
+ * writes into PCI_GART_PAGE): 8192 little-endian 32-bit entries, one
+ * per 4KB page of a 32MB card-address "VM" window, each entry the
+ * bus/physical address of the backing page (ati_pcigart.c,
+ * DRM_ATI_GART_PCI flavor: plain LE32 page address, no flag bits).
+ */
+#define R128_PCIGART_TABLE_ENTRIES   8192
+#define R128_SOFT_RESET_GUI          (1u << 0)
 #define R128_PC_NGUI_MODE            0x0180
 #define R128_PC_NGUI_CTLSTAT         0x0184
 #define R128_PC_MISC_CTL             0x0188
@@ -108,6 +117,230 @@
 #define R128_GUI_DEBUG0              0x16a0
 #define R128_WAIT_UNTIL              0x1720
 #define R128_GUI_STAT                0x1740
+#define R128_GUI_SCRATCH_REG0        0x15e0
+#define R128_GUI_SCRATCH_REG1        0x15e4
+
+/*
+ * PM4/CCE (Concurrent Command Engine) GUI command-FIFO ring buffer --
+ * the mechanism the real classic Mac driver actually uses for register
+ * and 2D command submission on this card, reached after the older
+ * one-shot BM_GUI_TABLE descriptor engine's own smoke test succeeds.
+ * RRG-G04500-C's coverage of this whole area is minimal (only
+ * PM4_VC_TIMESTAMP0/1 at 0x7B0/0x7B4 and PM4_BUFFER_DL_WPTR_DELAY at
+ * 0x718 have real register pages; the manual's PM4 vertex-engine
+ * block simply stops there). These offsets are cross-verified two
+ * ways: live-traced (2026-08-02, retail PCI card ROM/NDRV) against a
+ * prior, independent reference implementation of this same engine
+ * (SourceFiles/ATI/qemu/ati_cce.c, read-only project reference
+ * material) -- R128_PM4_STAT's offset in particular was *predicted*
+ * by that reference and then found to match a live guest poll byte-
+ * for-byte, and PM4_BUFFER_DL_WPTR (0x714) sits exactly 4 bytes before
+ * the manual-documented PM4_BUFFER_DL_WPTR_DELAY (0x718), which is
+ * exactly the layout that register's own name implies.
+ *
+ * The ring buffer lives in VRAM (byte offset given by
+ * R128_PM4_BUFFER_OFFSET), not system memory -- this PCI, non-AGP
+ * variant has no GART/system-memory command access, unlike later
+ * AGP/PCIe parts. Packet format (from the same reference, itself
+ * textbook ATI PM4: type in bits[31:30] of each ring dword): type 0 =
+ * sequential register writes starting at ((header&0x1FFF)<<2), count
+ * ((header>>16)&0x3FFF)+1, one-register-repeated if bit15 set; type 1
+ * = two register writes (rare, not modeled); type 2 = NOP/padding;
+ * type 3 = a 2D/3D draw command (opcode in bits[15:8], not modeled
+ * yet -- consumed and traced as unimplemented so the ring position
+ * stays correct).
+ */
+#define R128_PM4_BUFFER_OFFSET       0x0700
+#define R128_PM4_BUFFER_CNTL         0x0704
+#define R128_PM4_BUFFER_WM_CNTL      0x0708
+#define R128_PM4_BUFFER_DL_RPTR_ADDR 0x070c
+#define R128_PM4_BUFFER_DL_RPTR      0x0710
+#define R128_PM4_BUFFER_DL_WPTR      0x0714
+#define R128_PM4_IW_INDOFF           0x0738
+#define R128_PM4_IW_INDSIZE          0x073c
+#define R128_PM4_STAT                0x07b8
+#define R128_PM4_MICROCODE_ADDR      0x07d4
+#define R128_PM4_MICROCODE_RADDR     0x07d8
+#define R128_PM4_MICROCODE_DATAH     0x07dc
+#define R128_PM4_MICROCODE_DATAL     0x07e0
+#define R128_PM4_BUFFER_ADDR         0x07f0
+#define R128_PM4_MICRO_CNTL          0x07fc
+
+/*
+ * PM4_BUFFER_CNTL semantics per the Linux r128 DRM driver
+ * (r128_drv.h, the authoritative public reference for this engine --
+ * our previous START/RESET bit-0/bit-4 interpretation, inherited from
+ * the SourceFiles reference implementation, was wrong): bits [31:28]
+ * select the command-FIFO partitioning MODE (0 = NONPM4/none, odd
+ * values are PIO variants, even values 2-8 give the primary stream a
+ * bus-master ring; mode 7 "64PIO_64VCBM_64INDBM" -- PIO primary
+ * stream + bus-master vertex/indirect buffers -- is what Mac OS X
+ * 10.2's driver uses, value 0x78000000 with NOUPDATE), bit 27 =
+ * NOUPDATE (don't DMA the read pointer to memory), and the low bits
+ * hold log2 of the ring size in qwords for the ring modes.
+ */
+#define R128_PM4_MODE_MASK           (15u << 28)
+#define R128_PM4_NONPM4              (0u << 28)
+#define R128_PM4_192BM               (2u << 28)
+#define R128_PM4_128BM_64INDBM       (4u << 28)
+#define R128_PM4_64BM_128INDBM       (6u << 28)
+#define R128_PM4_64BM_64VCBM_64INDBM (8u << 28)
+#define R128_PM4_BUFFER_CNTL_NOUPDATE (1u << 27)
+#define R128_PM4_BUFFER_SIZE_L2QW(c) ((c) & 0xff)
+#define R128_PM4_BUFFER_DL_DONE      (1u << 31)
+#define R128_PM4_MICRO_FREERUN       (1u << 30)
+#define R128_PM4_MICROCODE_WORDS     256
+
+/*
+ * PM4_BUFFER_OFFSET flag: ring lives in AGP/"VM" (GART-translated)
+ * space rather than local VRAM; the rest of the value is the offset
+ * within that space (Linux: "ring_start | R128_AGP_OFFSET").
+ */
+#define R128_AGP_OFFSET_FLAG         0x02000000
+
+#define R128_PM4_PACKET_TYPE(h)      (((h) >> 30) & 3)
+#define R128_PM4_PACKET0_REG(h)      (((h) & 0x1fff) << 2)
+#define R128_PM4_PACKET0_ONE_REG(h)  (((h) >> 15) & 1)
+#define R128_PM4_PACKET_COUNT(h)     ((((h) >> 16) & 0x3fff) + 1)
+#define R128_PM4_PACKET3_OPCODE(h)   (((h) >> 8) & 0xff)
+#define R128_PM4_PACKET1_REG1(h)     (((h) & 0x7ff) << 2)
+#define R128_PM4_PACKET1_REG2(h)     ((((h) >> 11) & 0x7ff) << 2)
+
+/*
+ * PM4 packet3 2D draw opcodes actually needed to make PAINT (solid
+ * fill) and BITBLT (screen-to-screen copy, including cross-card
+ * copies staged through HOSTDATA_BLT) work -- offsets/semantics from
+ * SourceFiles/ATI/qemu/ati_int.h, cross-checked against real ATI
+ * driver conventions (same opcode values used by every Rage/Radeon
+ * generation's PM4 parser).
+ */
+#define R128_PM4_OPCODE_PAINT         0x91
+#define R128_PM4_OPCODE_BITBLT        0x92
+#define R128_PM4_OPCODE_HOSTDATA_BLT  0x94
+
+/*
+ * PIO alternative submission path for the same PM4 stream: undocumented
+ * in RRG-G04500-C (whose own "GUI Bus Mastering Registers" section is a
+ * stub -- see above), but live-traced 2026-08-02 against the retail PCI
+ * card's real NDRV, and named/offset-confirmed against the independent
+ * reference (SourceFiles/ATI/qemu/ati_regs.h). Both addresses are the
+ * same push port -- consecutive writes there (regardless of which of
+ * the two addresses each individual write lands on) feed the next dword
+ * of an ordinary PM4 packet stream, identical in format to the ring's.
+ * Confirmed live: a 6-dword stream across 3 writes decoded as two
+ * type-0 packets, the second of which wrote the exact 64-bit fence
+ * value the driver polls for at GUI_SCRATCH_REG0/1 -- i.e. this IS the
+ * real driver's actual submission path, not a secondary/optional one.
+ */
+#define R128_PM4_FIFO_DATA_EVEN      0x1000
+#define R128_PM4_FIFO_DATA_ODD       0x1004
+
+/*
+ * 2D GUI (destination datapath) engine. Offsets cross-verified directly
+ * against RRG-G04500-C (unlike the PM4/CCE block above, this whole area
+ * IS fully documented in the manual, chapter "Destination GUI
+ * Registers"/"Datapath Registers") AND against the real, shipped,
+ * upstream QEMU `ati-vga` device (hw/display/ati.c/ati_regs.h/ati_2d.c)
+ * -- both independent sources agree on every offset here byte-for-byte.
+ * Semantics (which combined register triggers a blit on write, the
+ * DP_GUI_MASTER_CNTL field-aliasing behavior, the HOST_DATA accumulator
+ * protocol) are ported from that same upstream ati_2d.c/ati.c, which is
+ * real production code -- not the abandoned SourceFiles/ATI/qemu clone
+ * (see project memory: that tree was already tried once and its
+ * accelerator never loaded).
+ */
+#define R128_DST_OFFSET              0x1404
+#define R128_DST_PITCH               0x1408
+#define R128_DST_WIDTH               0x140c
+#define R128_DST_HEIGHT              0x1410
+#define R128_SRC_X                   0x1414
+#define R128_SRC_Y                   0x1418
+#define R128_DST_X                   0x141c
+#define R128_DST_Y                   0x1420
+#define R128_SRC_PITCH_OFFSET        0x1428
+#define R128_DST_PITCH_OFFSET        0x142c
+#define R128_SRC_Y_X                 0x1434
+#define R128_DST_Y_X                 0x1438
+#define R128_DST_HEIGHT_WIDTH        0x143c
+#define R128_DP_GUI_MASTER_CNTL      0x146c
+#define R128_DP_BRUSH_BKGD_CLR       0x1478
+#define R128_DP_BRUSH_FRGD_CLR       0x147c
+#define R128_DST_WIDTH_X             0x1588
+#define R128_SRC_X_Y                 0x1590
+#define R128_DST_X_Y                 0x1594
+#define R128_DST_WIDTH_HEIGHT        0x1598
+#define R128_DST_HEIGHT_Y            0x15a0
+#define R128_SRC_OFFSET              0x15ac
+#define R128_SRC_PITCH               0x15b0
+#define R128_DP_SRC_FRGD_CLR         0x15d8
+#define R128_DP_SRC_BKGD_CLR         0x15dc
+#define R128_SC_LEFT                 0x1640
+#define R128_SC_RIGHT                0x1644
+#define R128_SC_TOP                  0x1648
+#define R128_SC_BOTTOM               0x164c
+#define R128_SRC_SC_RIGHT            0x1654
+#define R128_SRC_SC_BOTTOM           0x165c
+#define R128_DP_CNTL                 0x16c0
+#define R128_DP_DATATYPE             0x16c4
+#define R128_DP_MIX                  0x16c8
+#define R128_DP_WRITE_MASK           0x16cc
+#define R128_DEFAULT_OFFSET          0x16e0
+#define R128_DEFAULT_PITCH           0x16e4
+#define R128_DEFAULT_SC_BOTTOM_RIGHT 0x16e8
+#define R128_SC_TOP_LEFT             0x16ec
+#define R128_SC_BOTTOM_RIGHT         0x16f0
+#define R128_SRC_SC_BOTTOM_RIGHT     0x16f4
+#define R128_HOST_DATA0              0x17c0
+#define R128_HOST_DATA1              0x17c4
+#define R128_HOST_DATA2              0x17c8
+#define R128_HOST_DATA3              0x17cc
+#define R128_HOST_DATA4              0x17d0
+#define R128_HOST_DATA5              0x17d4
+#define R128_HOST_DATA6              0x17d8
+#define R128_HOST_DATA7              0x17dc
+#define R128_HOST_DATA_LAST          0x17e0
+
+#define R128_ATI_HOST_DATA_ACC_BITS  128
+
+#define R128_DP_DST_DATATYPE         0x0000000f
+#define R128_DP_BRUSH_DATATYPE       0x00000f00
+#define R128_DP_SRC_DATATYPE         0x00030000
+#define R128_DP_ROP3                 0x00ff0000
+#define R128_DP_SRC_SOURCE           0x00000700
+#define R128_DP_SRC_HOST             0x00000300
+#define R128_DP_SRC_HOST_BYTEALIGN   0x00000400
+#define R128_DP_BYTE_PIX_ORDER       0x40000000
+#define R128_SRC_MONO_FRGD_BKGD      0x00000000
+#define R128_SRC_MONO_FRGD           0x00010000
+#define R128_SRC_COLOR                0x00030000
+#define R128_DST_X_LEFT_TO_RIGHT     0x00000001
+#define R128_DST_Y_TOP_TO_BOTTOM     0x00000002
+#define R128_GMC_SRC_PITCH_OFFSET_CNTL 0x00000001
+#define R128_GMC_DST_PITCH_OFFSET_CNTL 0x00000002
+#define R128_GMC_SRC_CLIPPING        0x00000004
+#define R128_GMC_DST_CLIPPING        0x00000008
+#define R128_GMC_ROP3_MASK           0x00ff0000
+#define R128_ROP3_BLACKNESS          0x00000000
+#define R128_ROP3_SRCCOPY            0x00cc0000
+#define R128_ROP3_PATCOPY            0x00f00000
+#define R128_ROP3_WHITENESS          0x00ff0000
+
+/*
+ * GUI bus mastering (RRG-G04500-C 3.34 "GUI Bus Mastering Registers" is
+ * a stub in the manual itself -- literally "<No description>" with no
+ * register table, confirmed against the actual PDF page, not a text
+ * extraction gap). Only BM_QUEUE_FREE_STATUS (0xA14), BM_ABORT (0xA88)
+ * and the BM_CHUNK_0_VAL name (revision-history mention only) are
+ * documented anywhere in it, and this smoke test doesn't touch any of
+ * them. BM_GUI_TABLE's offset and the descriptor format are
+ * reverse-engineered from a live capture of the real OEM Mac FCode's
+ * post-CRTC-bringup bus-master smoke test (2026-08-02): it writes an 8
+ * byte sentinel to system RAM, points a one-entry descriptor table at
+ * it via this register, then reads back GUI_SCRATCH_REG0/1 expecting
+ * the sentinel to have landed there -- see ati_rage128_bm_gui_run().
+ */
+#define R128_BM_GUI_TABLE            0x0a50
+#define R128_BM_CHUNK_0_VAL          0x0a18
 
 /* PCI config space read-only mirror */
 #define R128_CFG_MIRROR_BASE         0x0f00

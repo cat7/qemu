@@ -163,6 +163,7 @@ struct ATIMach64State {
     bool host_cursor_tracking;
     int host_cursor_x;
     int host_cursor_y;
+    bool monitor_connected;
 
     /*
      * DDC/I2C over the GP_IO sense pins: an EDID-serving I2C slave the

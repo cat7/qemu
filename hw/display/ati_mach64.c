@@ -1667,14 +1667,30 @@ static uint32_t ati_mach64_gp_io_write(ATIMach64State *s, uint32_t word)
 
     switch ((appsense_dir << 3) | appsense_lvl) {
     case 0043: /* sense line 2 pulled low; read sense line 1 and 0 */
-        result = (ATI_APPLESENSE_EXT_CODE & 0060) >> 4;
+        /*
+         * With no monitor plugged in there's no pull-down resistor
+         * network at all: every sense line just floats to its
+         * pulled-up high default regardless of which one we're
+         * driving low, i.e. every probe reads back "both other lines
+         * high" (3) -- the real "no monitor connected" pattern
+         * (overall code 7), as opposed to a specific monitor's fixed
+         * resistor-encoded ID. Real Old World Macs pick their
+         * boot/console display by which port actually senses a
+         * monitor; the monitor-connected property lets that same
+         * real mechanism be tested here.
+         */
+        result = s->monitor_connected ? (ATI_APPLESENSE_EXT_CODE & 0060) >> 4
+                                       : 3;
         break;
     case 0025: /* sense line 1 pulled low; read sense line 2 and 0 */
-        result = ((ATI_APPLESENSE_EXT_CODE & 0010) >> 1) |
-                 ((ATI_APPLESENSE_EXT_CODE & 0004) >> 2);
+        result = s->monitor_connected
+                     ? ((ATI_APPLESENSE_EXT_CODE & 0010) >> 1) |
+                       ((ATI_APPLESENSE_EXT_CODE & 0004) >> 2)
+                     : 3;
         break;
     case 0016: /* sense line 0 pulled low; read sense line 2 and 1 */
-        result = (ATI_APPLESENSE_EXT_CODE & 0003) << 1;
+        result = s->monitor_connected ? (ATI_APPLESENSE_EXT_CODE & 0003) << 1
+                                       : 3;
         break;
     default:
         /*
@@ -2507,6 +2523,16 @@ static const VMStateDescription vmstate_ati_mach64 = {
 static const Property ati_mach64_properties[] = {
     DEFINE_PROP_BOOL("host-cursor-tracking", ATIMach64State,
                      host_cursor_tracking, true),
+    /*
+     * Real Old World Macs pick which video port is the boot/console
+     * display by physical monitor-sense detection, not a stored
+     * preference -- set to off (e.g. -global
+     * ati-mach64-gt.monitor-connected=off) to simulate nothing being
+     * plugged into the onboard port, the same way a real user would
+     * by connecting their monitor to an add-in card's port instead.
+     */
+    DEFINE_PROP_BOOL("monitor-connected", ATIMach64State,
+                     monitor_connected, true),
     DEFINE_EDID_PROPERTIES(ATIMach64State, i2cddc.edid_info),
 };
 
