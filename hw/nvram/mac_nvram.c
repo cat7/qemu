@@ -35,6 +35,8 @@
 #include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "qobject/qdict.h"
+#include "qapi/error.h"
 #include "trace.h"
 #include <zlib.h> /* for adler32 */
 
@@ -305,6 +307,57 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
     stl_be_p(&data[16], adler32(0, &data[20], len - 20));
 }
 
+/*
+ * Manage a default NVRAM backing file when the user has not attached one
+ * with -drive if=mtd,... Without this the contents are re-stamped from
+ * scratch on every run, so nothing a firmware writes -- boot-device,
+ * auto-boot?, the lot -- ever survives a restart.
+ */
+BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size)
+{
+    struct stat st;
+    BlockBackend *blk;
+    Error *local_err = NULL;
+    QDict *options;
+    int fd;
+
+    fd = qemu_open_old(filename, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        warn_report("could not open/create default NVRAM image '%s': %s",
+                    filename, strerror(errno));
+        return NULL;
+    }
+    if (fstat(fd, &st) == 0 && st.st_size < size) {
+        if (ftruncate(fd, size) != 0) {
+            warn_report("could not size default NVRAM image '%s': %s",
+                        filename, strerror(errno));
+        }
+    }
+    close(fd);
+
+    options = qdict_new();
+    qdict_put_str(options, "driver", "raw");
+    blk = blk_new_open(filename, NULL, options, BDRV_O_RDWR, &local_err);
+    if (!blk) {
+        warn_report_err(local_err);
+        return NULL;
+    }
+    return blk;
+}
+
+/* True if nothing has ever been stored here. */
+bool macio_nvram_is_blank(MacIONVRAMState *nvr, int len)
+{
+    int i;
+
+    for (i = 0; i < len; i++) {
+        if (nvr->data[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Set up NVRAM with OF and OSX partitions */
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
 {
@@ -315,5 +368,12 @@ void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
      */
     pmac_format_nvram_partition_of(nvr, 0, len / 2);
     pmac_format_nvram_partition_osx(nvr, len / 2, len / 2);
+
+    if (nvr->blk) {
+        if (blk_pwrite(nvr->blk, 0, len, nvr->data, 0) < 0) {
+            error_report("%s: failed to write default NVRAM partitions",
+                         blk_name(nvr->blk));
+        }
+    }
 }
 type_init(macio_nvram_register_types)

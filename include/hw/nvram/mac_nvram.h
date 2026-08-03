@@ -48,6 +48,8 @@ struct MacIONVRAMState {
 };
 
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);
+BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size);
+bool macio_nvram_is_blank(MacIONVRAMState *nvr, int len);
 void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr);
 
 #endif /* MAC_NVRAM_H */

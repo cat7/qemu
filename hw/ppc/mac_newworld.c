@@ -54,6 +54,8 @@
 #include "hw/ppc/ppc.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/nvram/mac_nvram.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
 #include "hw/core/boards.h"
 #include "hw/pci-host/uninorth.h"
 #include "hw/input/adb.h"
@@ -236,7 +238,7 @@ static void ppc_core99_init(MachineState *machine)
     MACIOIDEState *macio_ide;
     BusState *adb_bus;
     MacIONVRAMState *nvr;
-    DriveInfo *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
+    DriveInfo *dinfo, *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
     void *fw_cfg;
     SysBusDevice *s;
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
@@ -676,10 +678,30 @@ static void ppc_core99_init(MachineState *machine)
     dev = qdev_new(TYPE_MACIO_NVRAM);
     qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
     qdev_prop_set_uint32(dev, "it_shift", 1);
+
+    dinfo = drive_get(IF_MTD, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive(dev, "drive", blk_by_legacy_dinfo(dinfo));
+    } else {
+        BlockBackend *nvram_blk =
+            macio_nvram_default_blk("nvram.img", MACIO_NVRAM_SIZE);
+
+        if (nvram_blk) {
+            qdev_prop_set_drive(dev, "drive", nvram_blk);
+        }
+    }
+
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
-    pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    /*
+     * Only seed the default partitions into a genuinely fresh image --
+     * otherwise the firmware's own persisted variables get overwritten on
+     * every boot, which is exactly what we are trying to stop.
+     */
+    if (macio_nvram_is_blank(nvr, MACIO_NVRAM_SIZE)) {
+        pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    }
     /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
