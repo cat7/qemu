@@ -97,6 +97,21 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
     default:
         break;
     }
+
+    /*
+     * Engine writes go straight through the RAM pointer, bypassing the
+     * MemoryRegion accessors that would otherwise set the dirty bits, so
+     * mark the touched pixel by hand. Without this, everything the 2D
+     * engine draws is invisible to dirty tracking: the display refresh
+     * has no reason to repaint those scanlines, and -- because this
+     * device reuses DIRTY_MEMORY_VGA to find the live framebuffer --
+     * an accelerated desktop looks like a completely idle region of
+     * VRAM. Observed live on Mac OS X 10.3, which draws through the
+     * engine: the CRTC described a valid 800x600x32bpp framebuffer that
+     * the scanner scored as dead, so the auto-detect heuristic
+     * overrode it and put a garbled 1024x768 guess on screen instead.
+     */
+    memory_region_set_dirty(&s->vram, addr, bpp / 8);
 }
 
 static uint32_t ati_rage128_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,
