@@ -288,10 +288,10 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
     swim3_register_dma(&os->swim, &s->dbdma);
 }
 
-static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index)
+static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index,
+                           uint32_t addr)
 {
     gchar *name = g_strdup_printf("ide[%i]", index);
-    uint32_t addr = 0x1f000 + ((index + 1) * 0x1000);
 
     object_initialize_child(OBJECT(s), name, ide, TYPE_MACIO_IDE);
     qdev_prop_set_uint32(DEVICE(ide), "addr", addr);
@@ -316,7 +316,7 @@ static void macio_oldworld_init(Object *obj)
     qdev_prop_set_uint32(dev, "it_shift", 4);
 
     for (i = 0; i < 2; i++) {
-        macio_init_ide(s, &os->ide[i], i);
+        macio_init_ide(s, &os->ide[i], i, 0x20000 + i * 0x1000);
     }
 
     /*
@@ -397,14 +397,21 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     if (!macio_realize_ide(s, &ns->ide[0],
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_IRQ),
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_DMA_IRQ),
-                           0x16, errp)) {
+                           NEWWORLD_IDE0_DMA_CHAN, errp)) {
         return;
     }
 
     if (!macio_realize_ide(s, &ns->ide[1],
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_IRQ),
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_DMA_IRQ),
-                           0x1a, errp)) {
+                           NEWWORLD_IDE1_DMA_CHAN, errp)) {
+        return;
+    }
+
+    if (!macio_realize_ide(s, &ns->ide[2],
+                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE2_IRQ),
+                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE2_DMA_IRQ),
+                           NEWWORLD_IDE2_DMA_CHAN, errp)) {
         return;
     }
 
@@ -467,8 +474,9 @@ static void macio_newworld_init(Object *obj)
 
     object_initialize_child(obj, "gpio", &ns->gpio, TYPE_MACIO_GPIO);
 
-    for (i = 0; i < 2; i++) {
-        macio_init_ide(s, &ns->ide[i], i);
+    /* ata-4@1f000, ata-3@20000, ata-3@21000 -- see NEWWORLD_IDE*_IRQ */
+    for (i = 0; i < 3; i++) {
+        macio_init_ide(s, &ns->ide[i], i, 0x1f000 + i * 0x1000);
     }
 }
 

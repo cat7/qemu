@@ -64,10 +64,22 @@
 #define NEWWORLD_PMU_IRQ       0x19
 #define NEWWORLD_ESCCB_IRQ     0x24
 #define NEWWORLD_ESCCA_IRQ     0x25
-#define NEWWORLD_IDE0_IRQ      0xd
-#define NEWWORLD_IDE0_DMA_IRQ  0x2
-#define NEWWORLD_IDE1_IRQ      0xe
-#define NEWWORLD_IDE1_DMA_IRQ  0x3
+/*
+ * KeyLargo has three ATA buses. The numbers below are what a real
+ * PowerMac3,4 reports: ata-4@1f000 (Ultra ATA/66, the boot disks),
+ * ata-3@20000 and ata-3@21000. Each bus's second "reg" tuple gives its
+ * DBDMA register block, so the channel is (addr - 0x8000) / 0x100 --
+ * 0x8a00, 0x8b00 and 0x8c00 respectively.
+ */
+#define NEWWORLD_IDE0_IRQ      0x13   /* ata-4@1f000 */
+#define NEWWORLD_IDE0_DMA_IRQ  0xb
+#define NEWWORLD_IDE0_DMA_CHAN 0xa
+#define NEWWORLD_IDE1_IRQ      0x14   /* ata-3@20000 */
+#define NEWWORLD_IDE1_DMA_IRQ  0xc
+#define NEWWORLD_IDE1_DMA_CHAN 0xb
+#define NEWWORLD_IDE2_IRQ      0x15   /* ata-3@21000 */
+#define NEWWORLD_IDE2_DMA_IRQ  0xd
+#define NEWWORLD_IDE2_DMA_CHAN 0xc
 #define NEWWORLD_EXTING_GPIO1  0x2f
 #define NEWWORLD_EXTING_GPIO9  0x37
 
@@ -156,7 +168,7 @@ struct NewWorldMacIOState {
     bool has_pmu;
     bool has_adb;
     OpenPICState pic;
-    MACIOIDEState ide[2];
+    MACIOIDEState ide[3];
     MacIOGPIOState gpio;
 };
 

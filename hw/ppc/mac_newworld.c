@@ -80,7 +80,7 @@
 #include "hw/core/cpu.h"
 #include "trace.h"
 
-#define MAX_IDE_BUS 2
+#define MAX_IDE_BUS 3
 #define CFG_ADDR 0xf0000510
 #define TBFREQ (25UL * 1000UL * 1000UL)
 #define CLOCKFREQ (900UL * 1000UL * 1000UL)
@@ -606,14 +606,19 @@ static void ppc_core99_init(MachineState *machine)
     }
     g_free(cpus);
 
-    /* We only emulate 2 out of 3 IDE controllers for now */
+    /*
+     * KeyLargo's three ATA buses: ata-4@1f000 carries the hard disks (Open
+     * Firmware's "hd" and "ultra0"/"ultra1" aliases), ata-3@20000 is
+     * "ide0"/"ide1"/"cd" and ata-3@21000 is "zip".
+     */
     ide_drive_get(hd, ARRAY_SIZE(hd));
 
-    macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[0]"));
-    macio_ide_init_drives(macio_ide, hd);
+    for (i = 0; i < MAX_IDE_BUS; i++) {
+        g_autofree char *name = g_strdup_printf("ide[%d]", i);
 
-    macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
-    macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
+        macio_ide = MACIO_IDE(object_resolve_path_component(macio, name));
+        macio_ide_init_drives(macio_ide, &hd[i * MAX_IDE_DEVS]);
+    }
 
     if (has_adb) {
         if (has_pmu) {
@@ -757,7 +762,9 @@ static char *core99_fw_dev_path(FWPathProvider *p, BusState *bus,
 
     if (!strcmp(object_get_typename(OBJECT(dev)), "macio-ide")) {
         macio_ide = MACIO_IDE(dev);
-        return g_strdup_printf("ata-3@%x", macio_ide->addr);
+        /* The Ultra ATA/66 bus is an ata-4 node; the other two are ata-3. */
+        return g_strdup_printf("ata-%d@%x", macio_ide->addr == 0x1f000 ? 4 : 3,
+                               macio_ide->addr);
     }
 
     if (!strcmp(object_get_typename(OBJECT(dev)), "ide-hd")) {
