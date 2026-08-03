@@ -361,8 +361,7 @@ static void ati_rage128_pick_auto_fb(ATIRage128State *s, int nblocks)
     }
 
     if (best_len == 0) {
-        trace_ati_rage128_auto_fb(0, 0, 0, 0, false, 0);
-        s->auto_fb_valid = false;
+        trace_ati_rage128_auto_fb(0, 0, 0, 0, s->auto_fb_valid, 0);
         s->auto_fb_pending_valid = false;
         return;
     }
@@ -396,8 +395,8 @@ static void ati_rage128_pick_auto_fb(ATIRage128State *s, int nblocks)
     if (!found || best_score > best_size / 10) {
         trace_ati_rage128_auto_fb((uint32_t)best_start *
                                   ATI_RAGE128_FB_SCAN_BLOCK,
-                                  0, 0, best_size, false, best_score);
-        s->auto_fb_valid = false;
+                                  0, 0, best_size, s->auto_fb_valid,
+                                  best_score);
         s->auto_fb_pending_valid = false;
         return;
     }
@@ -407,9 +406,8 @@ static void ati_rage128_pick_auto_fb(ATIRage128State *s, int nblocks)
     if ((uint64_t)candidate.fb_offset +
         (uint64_t)candidate.pitch * candidate.height > ATI_RAGE128_VRAM_SIZE) {
         trace_ati_rage128_auto_fb(candidate.fb_offset, candidate.width,
-                                  candidate.height, candidate.bpp, false,
-                                  best_score);
-        s->auto_fb_valid = false;
+                                  candidate.height, candidate.bpp,
+                                  s->auto_fb_valid, best_score);
         s->auto_fb_pending_valid = false;
         return;
     }
@@ -419,13 +417,30 @@ static void ati_rage128_pick_auto_fb(ATIRage128State *s, int nblocks)
      * same one has come out of two consecutive scans -- see the field
      * comment on auto_fb_pending in ati_rage128.h for the two churn
      * states this suppresses.
+     *
+     * Adoption is deliberately one-way: a scan that disagrees replaces
+     * the *pending* candidate but never clears an already-adopted
+     * framebuffer, and neither do the three "can't tell" early returns
+     * above. Reverting to "none" on a single dissenting scan is what
+     * this heuristic must not do, because the display then snaps back
+     * to CRTC1's stale last-known-good mode for a frame and snaps
+     * forward again the moment the run settles -- visible as a flicker
+     * synchronised to whatever is writing VRAM. Mouse motion and an
+     * animating progress bar both do exactly that: they add a second
+     * competing write-run, so the largest-run pick alternates between
+     * it and the real desktop. A static desktop hits the same edge
+     * from the other side, since its activity credit eventually decays
+     * to nothing and best_len falls to 0.
+     *
+     * Keeping the last adopted mode costs nothing when the guess was
+     * right and is no worse than the stale CRTC1 mode when it wasn't;
+     * a genuinely new framebuffer still takes over as soon as it has
+     * been stable for the same two scans any first adoption needs.
      */
     if (s->auto_fb_pending_valid &&
         memcmp(&candidate, &s->auto_fb_pending, sizeof(candidate)) == 0) {
         s->auto_fb_mode = candidate;
         s->auto_fb_valid = true;
-    } else {
-        s->auto_fb_valid = false;
     }
     s->auto_fb_pending = candidate;
     s->auto_fb_pending_valid = true;
@@ -511,7 +526,21 @@ static bool ati_rage128_update_display(void *opaque)
     }
 
     ati_rage128_scan_vram_activity(s);
-    if (s->auto_fb_valid &&
+    /*
+     * A CRTC mode that is valid *right now* is authoritative and is never
+     * second-guessed. The heuristic only gets a say while the registers
+     * are not currently describing a usable mode, i.e. when we are
+     * falling back on the remembered one above.
+     *
+     * The old "CRTC1 is never programmed properly" premise this override
+     * was built on does not hold: a live Mac OS X 10.3 session reads back
+     * CRTC_GEN_CNTL=0x03090600, H_DISP->800, V_DISP->600, CRTC_OFFSET
+     * 0x8000, CRTC_PITCH 0x68 -- a complete and correct 800x600x32bpp
+     * mode -- and the guest paints into exactly that. Letting a guess
+     * outrank that is how the display ended up showing a garbled
+     * 1024x768.
+     */
+    if (!valid && s->auto_fb_valid &&
         (s->auto_fb_mode.fb_offset != mode.fb_offset ||
          s->auto_fb_mode.width != mode.width ||
          s->auto_fb_mode.height != mode.height ||
@@ -538,14 +567,26 @@ static bool ati_rage128_update_display(void *opaque)
         bool crtc_region_live = false;
         int i;
 
-        if (valid) {
-            for (i = first; i <= last &&
-                 i < (int)(ATI_RAGE128_VRAM_SIZE /
-                           ATI_RAGE128_FB_SCAN_BLOCK); i++) {
-                if (s->fb_scan_activity[i] >= ATI_RAGE128_FB_ACTIVITY_THRESH) {
-                    crtc_region_live = true;
-                    break;
-                }
+        /*
+         * Test the region of whichever mode we are actually about to
+         * draw -- including the remembered one when the CRTC enable
+         * bits are momentarily clear. Gating this on `valid` was
+         * wrong: a mode-set is a disable/reprogram/re-enable sequence,
+         * so CRTC_GEN_CNTL spends much of its life with CRTC_EN and
+         * CRTC_EXT_DISP_EN down (Mac OS X 10.3 writes it as 0x1, 0x3,
+         * 0x200 and 0x01000200 in the course of one mode change).
+         * Skipping the check there left crtc_region_live false, so the
+         * heuristic overrode a perfectly good, actively-painted
+         * framebuffer every time -- visible as the display churning
+         * between resolutions while the guest is already up, and as a
+         * correct mode appearing briefly and then being lost again.
+         */
+        for (i = first; i <= last &&
+             i < (int)(ATI_RAGE128_VRAM_SIZE /
+                       ATI_RAGE128_FB_SCAN_BLOCK); i++) {
+            if (s->fb_scan_activity[i] >= ATI_RAGE128_FB_ACTIVITY_THRESH) {
+                crtc_region_live = true;
+                break;
             }
         }
         if (!crtc_region_live) {
@@ -553,12 +594,34 @@ static bool ati_rage128_update_display(void *opaque)
         }
     }
 
-    if (memcmp(&s->mode, &mode, sizeof(mode)) != 0 || s->mode_dirty) {
-        s->mode = mode;
-        s->mode_dirty = false;
+    /*
+     * Only reallocate the DisplaySurface when its geometry actually
+     * changes. It used to be recreated whenever *any* part of the mode
+     * differed or mode_dirty was set -- but mode_dirty is raised by every
+     * CRTC register write, and CRTC_OFFSET is written on every buffer
+     * flip ("Updated for buffer flips", RRG-G04500-C 3.9). Mac OS X
+     * double-buffers, so that tore down and recreated the whole surface
+     * several times a second, which the UI shows as flicker. A changed
+     * offset or pitch only changes where we read from; the surface is
+     * still the same size and format, so it can stay.
+     *
+     * Compare against the surface's own dimensions rather than against
+     * the previously recorded mode. Those two can drift apart -- the
+     * console can end up holding a surface this function did not create
+     * -- and a stale s->mode that already "matches" then suppresses the
+     * reallocation forever, leaving the guest drawing an 800x600 desktop
+     * into a 640x480 surface (seen live: a correctly rendered but
+     * off-centre, clipped installer window). Asking the surface is
+     * self-correcting; asking our own bookkeeping is not.
+     */
+    ds = qemu_console_surface(s->con);
+    if (!ds || surface_width(ds) != mode.width ||
+        surface_height(ds) != mode.height) {
         ds = qemu_create_displaysurface(mode.width, mode.height);
         qemu_console_set_surface(s->con, ds);
     }
+    s->mode = mode;
+    s->mode_dirty = false;
     ds = qemu_console_surface(s->con);
     switch (mode.pix_width) {
     case R128_PIX_WIDTH_8BPP:
