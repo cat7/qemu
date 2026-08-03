@@ -112,6 +112,14 @@ enum {
     PMU_PWR_GET_WAKEUP_EVENTS = 0x03,
     PMU_PWR_SET_WAKEUP_EVENTS = 0x04,
     PMU_PWR_CLR_WAKEUP_EVENTS = 0x05,
+    /*
+     * The two below are not in Linux's via-pmu driver (whose subcommand
+     * list stops at 0x05); their numbers, payloads and reply sizes come
+     * from disassembling Mac OS X 10.4's ApplePMU kext, which sends both
+     * while power management initialises.
+     */
+    PMU_PWR_LAST_SHUTDOWN_CAUSE = 0x07, /* reply: 1 byte cause code */
+    PMU_PWR_SERVER_ID = 0x08,           /* no arg: get; 1-byte arg: set */
 };
 
 /* Power events wakeup bits */
@@ -224,6 +232,9 @@ struct PMUState {
     uint32_t tick_offset;
     QEMUTimer *one_sec_timer;
     int64_t one_sec_target;
+
+    /* PMU_POWER_EVENTS server ID (set/queried by Mac OS X's ApplePMU) */
+    uint8_t server_id;
 
     /* GPIO */
     MacIOGPIOState *gpio;
