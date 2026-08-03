@@ -84,9 +84,25 @@
 
 #define MAX_IDE_BUS 3
 #define CFG_ADDR 0xf0000510
-#define TBFREQ (25UL * 1000UL * 1000UL)
-#define CLOCKFREQ (900UL * 1000UL * 1000UL)
-#define BUSFREQ (100UL * 1000UL * 1000UL)
+/*
+ * The frequencies a real PowerMac3,4 (Digital Audio) publishes in its own
+ * device tree, taken verbatim from an lsprop dump of /cpus/PowerPC,G4@0:
+ *
+ *   timebase-frequency  0x01fbf711    33,224,977 Hz
+ *   clock-frequency     0x1bd0c4a9   466,978,473 Hz
+ *   bus-frequency       0x07efdc44   132,899,908 Hz
+ *
+ * These are not round numbers because the real clocks are not: the bus runs
+ * a shade under 133MHz and the timebase is exactly bus/4, as on every 60x-bus
+ * PowerPC. Keeping that ratio matters -- guests derive one from the other.
+ *
+ * The previous values here (25MHz / 900MHz / 100MHz) were round stand-ins,
+ * with the 900MHz CPU figure picked to convince Mac OS X it was running on a
+ * supported machine rather than to describe any real hardware.
+ */
+#define TBFREQ    33224977UL
+#define CLOCKFREQ 466978473UL
+#define BUSFREQ   132899908UL
 
 #define NDRV_VGA_FILENAME "qemu_vga.ndrv"
 
@@ -277,7 +293,6 @@ static void ppc_core99_init(MachineState *machine)
     for (i = 0; i < machine->smp.cpus; i++) {
         cpus[i] = POWERPC_CPU(cpu_create(machine->cpu_type));
 
-        /* Set time-base frequency to 100 Mhz */
         cpu_ppc_tb_init(&cpus[i]->env, TBFREQ);
 
         /*
@@ -786,7 +801,6 @@ static void ppc_core99_init(MachineState *machine)
         fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_KVM_PID, getpid());
     }
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, tbfreq);
-    /* Mac OS X requires a "known good" clock-frequency value; pass it one. */
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ, CLOCKFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ, BUSFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
