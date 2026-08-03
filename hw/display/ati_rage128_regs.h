@@ -417,6 +417,13 @@
 #define R128_CRTC_V_DISP_MASK        0x7ff
 #define R128_CRTC_OFFSET_MASK        0x01fffff8 /* [24:0], bits 2:0 wired 0 */
 #define R128_CRTC_OFFSET_LOCK        (1u << 31)
+/*
+ * Bit 31 of CUR_OFFSET, CUR_HORZ_VERT_POSN and CUR_HORZ_VERT_OFF alike:
+ * held set across the several register writes needed to move the cursor
+ * past the top/left edges or to change its shape, so the update lands
+ * atomically (RRG-G04500-C 3.13).
+ */
+#define R128_CUR_LOCK                (1u << 31)
 #define R128_CRTC_PITCH_MASK         0x3ff      /* [9:0], pixels * 8 */
 
 /* CLOCK_CNTL_INDEX */

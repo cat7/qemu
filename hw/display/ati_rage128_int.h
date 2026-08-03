@@ -106,6 +106,20 @@ struct ATIRage128State {
 
     ATIRage128Mode mode;
     bool mode_dirty;
+    /*
+     * Cursor updates are coalesced to one per displayed frame. Moving the
+     * pointer past the top edge takes two writes that must agree --
+     * CUR_OFFSET advances 16 bytes per hidden line while CUR_VERT_OFF
+     * counts the same lines -- and Mac OS X does NOT bracket them with
+     * CUR_LOCK (confirmed live: lock read 0 in every sample). Rebuilding
+     * the sprite on each individual write therefore renders the
+     * intermediate state, where the offset has moved but the line count
+     * has not, and the tail of the 64-row read runs off the end of the
+     * 1KB image into unrelated VRAM -- drawn as a large opaque block.
+     * Real hardware has the same window but only latches the cursor once
+     * a frame, so it is never visible; do the same.
+     */
+    bool cursor_dirty;
     bool have_valid_mode; /* has `mode` ever held a real, valid mode? */
 
     /*
