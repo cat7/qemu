@@ -28,6 +28,9 @@
 #include "hw/misc/macio/macio.h"
 #include "hw/misc/macio/keylargo.h"
 #include "hw/i2c/i2c.h"
+#include "hw/core/irq.h"
+#include "qemu/module.h"
+#include "qom/object.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "qemu/timer.h"
 #include "trace.h"
@@ -288,9 +291,17 @@ static const MemoryRegionOps keylargo_i2s_ops = {
  * sub-address byte, and "combined" does a write of the sub-address followed
  * by a repeated start for the read.
  */
+static void keywest_i2c_update_irq(KeyLargoI2CState *c)
+{
+    if (c->irq) {
+        qemu_set_irq(c->irq, (c->isr & c->ier & KW_I2C_IRQ_MASK) != 0);
+    }
+}
+
 static void keywest_i2c_set_irq(KeyLargoI2CState *c, uint8_t bits)
 {
     c->isr |= bits;
+    keywest_i2c_update_irq(c);
 }
 
 /* Drop the bus without disturbing the control shadow. */
@@ -475,6 +486,7 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
     case KW_I2C_REG_ISR:
         /* Write-1-to-clear. */
         c->isr &= ~(val & KW_I2C_IRQ_MASK);
+        keywest_i2c_update_irq(c);
 
         /*
          * Acknowledging the data interrupt is what lets the byte engine run
@@ -508,6 +520,7 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
 
     case KW_I2C_REG_IER:
         c->ier = val;
+        keywest_i2c_update_irq(c);
         break;
 
     case KW_I2C_REG_ADDR:
@@ -546,6 +559,88 @@ static const MemoryRegionOps keywest_i2c_ops = {
 
 /* ---------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------- */
+/* TAS3001 "deq" audio equalizer                                          */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * The Digital Audio's sound path runs through a TI TAS3001 digital EQ,
+ * which the real PowerMac3,4 device tree lists as the "deq" node on the
+ * KeyLargo I2C bus at i2c-address 0x68 (8-bit) = 0x34 (7-bit). Mac OS X's
+ * AppleLegacyAudio programs it at boot and its failure path is drastic:
+ * repeated failed writes to it were the direct prelude to
+ * ApplePMU::shutdownSystem powering the machine off on 10.4.
+ *
+ * The chip is write-mostly (subaddress + up to a dozen coefficient bytes
+ * per register); nothing reads back audio state during boot. Accepting
+ * and storing the writes is enough to keep the driver satisfied.
+ */
+#define TYPE_TAS3001 "tas3001"
+OBJECT_DECLARE_SIMPLE_TYPE(TAS3001State, TAS3001)
+
+#define TAS3001_MAX_REG_LEN 16
+
+struct TAS3001State {
+    I2CSlave parent_obj;
+    uint8_t subaddr;
+    uint8_t pos;
+    uint8_t regs[0x100][TAS3001_MAX_REG_LEN];
+};
+
+static int tas3001_event(I2CSlave *i2c, enum i2c_event event)
+{
+    TAS3001State *t = TAS3001(i2c);
+
+    if (event == I2C_START_SEND) {
+        t->pos = 0;
+    }
+    return 0;
+}
+
+static int tas3001_send(I2CSlave *i2c, uint8_t data)
+{
+    TAS3001State *t = TAS3001(i2c);
+
+    if (t->pos == 0) {
+        t->subaddr = data;
+    } else if (t->pos - 1 < TAS3001_MAX_REG_LEN) {
+        t->regs[t->subaddr][t->pos - 1] = data;
+    }
+    t->pos++;
+    return 0;
+}
+
+static uint8_t tas3001_recv(I2CSlave *i2c)
+{
+    TAS3001State *t = TAS3001(i2c);
+    uint8_t val = t->regs[t->subaddr][0];
+
+    return val;
+}
+
+static void tas3001_class_init(ObjectClass *klass, const void *data)
+{
+    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
+
+    k->event = tas3001_event;
+    k->send = tas3001_send;
+    k->recv = tas3001_recv;
+}
+
+static const TypeInfo tas3001_info = {
+    .name = TYPE_TAS3001,
+    .parent = TYPE_I2C_SLAVE,
+    .instance_size = sizeof(TAS3001State),
+    .class_init = tas3001_class_init,
+};
+
+static void keylargo_register_types(void)
+{
+    type_register_static(&tas3001_info);
+}
+
+type_init(keylargo_register_types)
+
 KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar)
 {
     KeyLargoState *s = g_new0(KeyLargoState, 1);
@@ -576,6 +671,9 @@ KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar)
     keywest_i2c_init(&s->i2c, owner, "keylargo-i2c", KEYLARGO_I2C_SIZE);
     memory_region_add_subregion(bar, KEYLARGO_I2C_BASE, &s->i2c.mem);
 
+    /* The "deq" TAS3001 audio EQ, at 0x34 like the real machine's. */
+    i2c_slave_create_simple(s->i2c.bus, TYPE_TAS3001, 0x34);
+
     return s;
 }
 
@@ -585,6 +683,7 @@ KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar)
  * configuration EEPROM. Same registers, same 16-byte stride -- firmware
  * addresses it at +3 within each slot, which the register decode ignores.
  */
+
 void keywest_i2c_init(KeyLargoI2CState *c, DeviceState *owner,
                       const char *name, uint64_t size)
 {

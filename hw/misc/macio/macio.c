@@ -380,8 +380,8 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         return;
     }
 
-    keylargo_i2s_register_dma(keylargo_cells_init(DEVICE(s), &s->bar),
-                              &s->dbdma);
+    KeyLargoState *keylargo = keylargo_cells_init(DEVICE(s), &s->bar);
+    keylargo_i2s_register_dma(keylargo, &s->dbdma);
 
     /* OpenPIC */
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
@@ -393,6 +393,13 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sbd = SYS_BUS_DEVICE(&s->escc);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCB_IRQ));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCA_IRQ));
+
+    /*
+     * Keywest I2C interrupt. Open Firmware only ever polls the cell, but
+     * Mac OS X's AppleI2C does interrupt-driven transfers and hangs -- and
+     * on 10.4 eventually powers the machine off -- without it.
+     */
+    keylargo->i2c.irq = qdev_get_gpio_in(pic_dev, NEWWORLD_KEYWEST_IRQ);
 
     /* IDE buses */
     if (!macio_realize_ide(s, &ns->ide[0],

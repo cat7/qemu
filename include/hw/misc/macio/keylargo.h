@@ -109,6 +109,15 @@ typedef struct KeyLargoI2CState {
     MemoryRegion mem;
     const char *name;
     I2CBus *bus;
+    /*
+     * Interrupt output, asserted while (ISR & IER) is nonzero. May be
+     * left unwired (NULL) on cells nothing listens to. Open Firmware
+     * drives the controller purely by polling ISR, but Mac OS X's
+     * AppleI2C does interrupt-mode transfers -- without this line every
+     * transfer it attempts times out ("APPLE I2C WRITE SEMAPHORE
+     * EXCEEDED TIMEOUT" on the kernel console).
+     */
+    qemu_irq irq;
     bool xfer_active;
     uint8_t mode;
     uint8_t control;

@@ -80,6 +80,8 @@
 #define NEWWORLD_IDE2_IRQ      0x15   /* ata-3@21000 */
 #define NEWWORLD_IDE2_DMA_IRQ  0xd
 #define NEWWORLD_IDE2_DMA_CHAN 0xc
+/* i2c@18000: the real PowerMac3,4 tree says interrupts = <0x1a 1> */
+#define NEWWORLD_KEYWEST_IRQ   0x1a
 #define NEWWORLD_EXTING_GPIO1  0x2f
 #define NEWWORLD_EXTING_GPIO9  0x37
 
