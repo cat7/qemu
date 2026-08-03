@@ -167,7 +167,14 @@ static const MemoryRegionOps macio_nvram_ops = {
     .read = macio_nvram_readb,
     .write = macio_nvram_writeb,
     .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
+    /*
+     * A real Apple ROM verifies an erased block with 64-bit reads (its
+     * /nvram package uses xd@), so the window has to accept them -- they
+     * are still serviced a byte at a time via .impl below. Rejecting them
+     * makes the verify read something other than the erased pattern and
+     * the firmware reports "ERASE failure on NVRAM".
+     */
+    .valid.max_access_size = 8,
     .impl.min_access_size = 1,
     .impl.max_access_size = 1,
     .endianness = DEVICE_BIG_ENDIAN,
