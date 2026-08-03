@@ -28,6 +28,8 @@
 #include "hw/misc/macio/macio.h"
 #include "hw/misc/macio/keylargo.h"
 #include "hw/i2c/i2c.h"
+#include "hw/ppc/mac_dbdma.h"
+#include "qemu/timer.h"
 #include "trace.h"
 
 /* ---------------------------------------------------------------------- */
@@ -171,6 +173,99 @@ static void keylargo_i2s_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     default:
         break;
+    }
+}
+
+/*
+ * Decode the playback rate from the serial format register. Bits 31:30 pick
+ * the clock source, 28:24 the MClk divisor and 23:20 the SClk divisor, and
+ * an I2S frame is 64 SClks. The divisor encoding is irregular: 0x14, 0x13
+ * and 0x12 mean divide by 1, 3 and 5, and every other value n means
+ * divide by (n + 1) * 2.
+ */
+static int keylargo_i2s_divisor(uint32_t field)
+{
+    switch (field) {
+    case 0x14: return 1;
+    case 0x13: return 3;
+    case 0x12: return 5;
+    default:   return (field + 1) * 2;
+    }
+}
+
+static int keylargo_i2s_rate(KeyLargoI2SState *c)
+{
+    static const int clock_hz[4] = { 0, 45158400, 49152000, 18432000 };
+    uint32_t fmt = c->serial_format;
+    int src = clock_hz[(fmt >> 30) & 3];
+    int mdiv, sdiv, rate;
+
+    if (!src) {
+        return 44100;
+    }
+    mdiv = keylargo_i2s_divisor((fmt >> 24) & 0x1f);
+    sdiv = keylargo_i2s_divisor((fmt >> 20) & 0x0f);
+    rate = src / (mdiv * sdiv * 64);
+
+    return rate > 0 ? rate : 44100;
+}
+
+/* Bits 1:0 of the word-size register select 16- or 24-bit samples. */
+static int keylargo_i2s_frame_bytes(KeyLargoI2SState *c)
+{
+    return ((c->data_word_sizes & 3) == 3) ? 8 : 4;   /* stereo */
+}
+
+static void keylargo_i2s_out_complete(void *opaque)
+{
+    KeyLargoI2SState *c = opaque;
+    DBDMA_io *io = c->pending_out_io;
+
+    c->pending_out_io = NULL;
+    if (io) {
+        io->dma_end(io);
+    }
+}
+
+/*
+ * Nothing renders the samples yet, but the descriptor still has to be
+ * retired only once its audio would have finished playing. Without that the
+ * firmware's chime ring never stops.
+ */
+static void keylargo_i2s_dma_rw(DBDMA_io *io)
+{
+    KeyLargoI2SState *c = io->opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int rate = keylargo_i2s_rate(c);
+    int frames = io->len / keylargo_i2s_frame_bytes(c);
+    int64_t dur_ns = (int64_t)frames * NANOSECONDS_PER_SECOND / rate;
+
+    trace_keylargo_i2s_dma(c->cell, io->addr, io->len, rate);
+
+    if (c->play_deadline_ns < now) {
+        c->play_deadline_ns = now;       /* the stream had drained */
+    }
+    c->play_deadline_ns += dur_ns;
+
+    c->pending_out_io = io;
+    timer_mod(c->out_complete_timer, c->play_deadline_ns);
+}
+
+static void keylargo_i2s_dma_flush(DBDMA_io *io)
+{
+}
+
+void keylargo_i2s_register_dma(KeyLargoState *s, void *dbdma)
+{
+    int cell;
+
+    for (cell = 0; cell < 2; cell++) {
+        DBDMA_register_channel(dbdma, KEYLARGO_I2S_DMA_OUT(cell), NULL,
+                               keylargo_i2s_dma_rw, keylargo_i2s_dma_flush,
+                               &s->i2s[cell]);
+        DBDMA_register_channel(dbdma, KEYLARGO_I2S_DMA_IN(cell), NULL,
+                               keylargo_i2s_dma_rw, keylargo_i2s_dma_flush,
+                               &s->i2s[cell]);
     }
 }
 
@@ -464,6 +559,9 @@ KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar)
         g_autofree char *name = g_strdup_printf("keylargo-i2s%d", cell);
 
         s->i2s[cell].cell = cell;
+        s->i2s[cell].out_complete_timer =
+            timer_new_ns(QEMU_CLOCK_VIRTUAL, keylargo_i2s_out_complete,
+                         &s->i2s[cell]);
         memory_region_init_io(&s->i2s[cell].mem, OBJECT(owner),
                               &keylargo_i2s_ops, &s->i2s[cell], name,
                               KEYLARGO_I2S_SIZE);

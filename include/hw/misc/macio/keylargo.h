@@ -92,6 +92,17 @@ typedef struct KeyLargoI2SState {
     uint32_t serial_format;
     uint32_t data_word_sizes;
     uint32_t frame_count;
+
+    /*
+     * Sound DMA has to be paced to real playback time. Completing a
+     * descriptor the instant it is handed over makes a looping audio ring
+     * -- which is exactly what the boot chime is -- run as fast as the host
+     * can spin, burning CPU forever instead of playing once.
+     */
+    QEMUTimer *out_complete_timer;
+    struct DBDMA_io *pending_out_io;
+    int64_t play_deadline_ns;
+
 } KeyLargoI2SState;
 
 typedef struct KeyLargoI2CState {
@@ -121,6 +132,11 @@ typedef struct KeyLargoState {
 
 void keywest_i2c_init(KeyLargoI2CState *c, DeviceState *owner,
                       const char *name, uint64_t size);
+/* i2s-a owns DBDMA channels 0 (out) and 1 (in); i2s-b owns 2 and 3. */
+#define KEYLARGO_I2S_DMA_OUT(cell)  ((cell) * 2)
+#define KEYLARGO_I2S_DMA_IN(cell)   ((cell) * 2 + 1)
+
+void keylargo_i2s_register_dma(KeyLargoState *s, void *dbdma);
 void keylargo_i2s_update_clocks(KeyLargoState *s);
 KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar);
 

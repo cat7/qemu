@@ -380,7 +380,8 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         return;
     }
 
-    keylargo_cells_init(DEVICE(s), &s->bar);
+    keylargo_i2s_register_dma(keylargo_cells_init(DEVICE(s), &s->bar),
+                              &s->dbdma);
 
     /* OpenPIC */
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
