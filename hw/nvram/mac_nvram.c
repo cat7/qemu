@@ -43,6 +43,88 @@
 #define DEF_SYSTEM_SIZE 0xc10
 
 /* macio style NVRAM device */
+/*
+ * A real Apple ROM keeps its Open Firmware variables in the boot flash and
+ * maintains them with the Intel command set. Its /nvram package decompiles to
+ *
+ *   erase: 20 -> block, d0 -> block, poll status bit 0x80, ff -> block,
+ *          then verify the block reads all ones
+ *   write: 40 -> byte, data -> byte, poll status, ff -> block, verify
+ *
+ * so the window has to answer those commands. Treated as plain RAM every
+ * erase fails its verify and the firmware reports "ERASE failure on NVRAM",
+ * losing every setting. Erase granularity is 8KB: the ROM's own info property
+ * describes fff04000 as 0x4000 long and its package alternates between two
+ * blocks.
+ */
+#define NVRAM_FLASH_SECTOR   0x2000
+#define NVRAM_FLASH_READY    0x80
+
+enum {
+    NVRAM_FLASH_CMD_NONE        = 0x00,
+    NVRAM_FLASH_CMD_ERASE_SETUP = 0x20,
+    NVRAM_FLASH_CMD_PROGRAM     = 0x40,
+    NVRAM_FLASH_CMD_ERASE_CONF  = 0xd0,
+    NVRAM_FLASH_CMD_READ_ARRAY  = 0xff,
+};
+
+static void macio_nvram_flush(MacIONVRAMState *s, hwaddr addr, int len)
+{
+    if (s->blk) {
+        if (blk_pwrite(s->blk, addr, len, &s->data[addr], 0) < 0) {
+            error_report("%s: cannot write to NVRAM", blk_name(s->blk));
+        }
+    }
+}
+
+/* Returns true if the access was a command rather than plain data. */
+static bool macio_nvram_flash_write(MacIONVRAMState *s, hwaddr addr,
+                                    uint8_t value)
+{
+    if (!s->flash) {
+        return false;
+    }
+
+    switch (s->flash_cmd) {
+    case NVRAM_FLASH_CMD_ERASE_SETUP:
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        if (value == NVRAM_FLASH_CMD_ERASE_CONF) {
+            hwaddr base = addr & ~(hwaddr)(NVRAM_FLASH_SECTOR - 1);
+
+            memset(&s->data[base], 0xff, NVRAM_FLASH_SECTOR);
+            macio_nvram_flush(s, base, NVRAM_FLASH_SECTOR);
+            s->flash_status = NVRAM_FLASH_READY;
+        }
+        return true;
+
+    case NVRAM_FLASH_CMD_PROGRAM:
+        /* Programming can only clear bits, exactly like the real part. */
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        s->data[addr] &= value;
+        macio_nvram_flush(s, addr, 1);
+        s->flash_status = NVRAM_FLASH_READY;
+        return true;
+
+    default:
+        break;
+    }
+
+    switch (value) {
+    case NVRAM_FLASH_CMD_ERASE_SETUP:
+    case NVRAM_FLASH_CMD_PROGRAM:
+        s->flash_cmd = value;
+        s->flash_status = 0;
+        return true;
+    case NVRAM_FLASH_CMD_READ_ARRAY:
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        s->flash_status = 0;
+        return true;
+    default:
+        /* Anything else in the array state is not data: ignore it. */
+        return true;
+    }
+}
+
 static void macio_nvram_writeb(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
 {
@@ -50,6 +132,10 @@ static void macio_nvram_writeb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     trace_macio_nvram_write(addr, value);
+
+    if (macio_nvram_flash_write(s, addr, value)) {
+        return;
+    }
     s->data[addr] = value;
     if (s->blk) {
         if (blk_pwrite(s->blk, addr, 1, &s->data[addr], 0) < 0) {
@@ -67,6 +153,11 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     value = s->data[addr];
+    /* While a command is in flight the part reports its status register. */
+    if (s->flash && s->flash_status) {
+        value = s->flash_status;
+    }
+
     trace_macio_nvram_read(addr, value);
 
     return value;
@@ -140,6 +231,7 @@ static void macio_nvram_unrealizefn(DeviceState *dev)
 static const Property macio_nvram_properties[] = {
     DEFINE_PROP_UINT32("size", MacIONVRAMState, size, 0),
     DEFINE_PROP_UINT32("it_shift", MacIONVRAMState, it_shift, 0),
+    DEFINE_PROP_BOOL("flash", MacIONVRAMState, flash, false),
     DEFINE_PROP_DRIVE("drive", MacIONVRAMState, blk),
 };
 
@@ -313,7 +405,8 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
  * scratch on every run, so nothing a firmware writes -- boot-device,
  * auto-boot?, the lot -- ever survives a restart.
  */
-BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size)
+BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size,
+                                     uint8_t fill)
 {
     struct stat st;
     BlockBackend *blk;
@@ -328,7 +421,15 @@ BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size)
         return NULL;
     }
     if (fstat(fd, &st) == 0 && st.st_size < size) {
-        if (ftruncate(fd, size) != 0) {
+        /*
+         * Flash-backed NVRAM must start out erased (all ones), not zeroed:
+         * firmware tells "never written" from "written and invalid", and a
+         * block of zeroes is neither.
+         */
+        g_autofree uint8_t *blank = g_malloc(size);
+
+        memset(blank, fill, size);
+        if (ftruncate(fd, 0) != 0 || write(fd, blank, size) != size) {
             warn_report("could not size default NVRAM image '%s': %s",
                         filename, strerror(errno));
         }

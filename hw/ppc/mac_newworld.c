@@ -96,6 +96,13 @@
 #define MACIO_BASE 0xf3000000
 #define MACIO_WIN_SIZE 0x01000000
 #define PROM_SIZE (1 * MiB)
+/*
+ * A real Apple ROM stores its Open Firmware variables in the boot flash --
+ * the ROM's own info property lists fff04000 as a 0x4000 nvram section and
+ * its write-characteristic as "flash" -- and reaches it as flat bytes rather
+ * than through the Old World one-byte-per-halfword window.
+ */
+#define NVRAM_FLASH_SIZE 0x4000
 /* The ROM socket's full decode window; only the top PROM_SIZE is populated */
 #define ROM_WINDOW_BASE 0xff800000
 #define ROM_WINDOW_SIZE (8 * MiB)
@@ -190,6 +197,21 @@ static void cpu_kick(void *opaque, int n, int level)
     qemu_cpu_kick(cs);
 }
 
+/* OpenBIOS is an ELF; a real Apple ROM is a flat binary image. */
+static bool firmware_is_elf(const char *filename)
+{
+    uint8_t magic[4];
+    bool is_elf = false;
+    FILE *f = fopen(filename, "rb");
+
+    if (f) {
+        is_elf = fread(magic, 1, sizeof(magic), f) == sizeof(magic) &&
+                 !memcmp(magic, ELFMAG, sizeof(magic));
+        fclose(f);
+    }
+    return is_elf;
+}
+
 static void macio_map_at_hw_base(void *opaque)
 {
     PCIDevice *macio = opaque;
@@ -230,6 +252,7 @@ static void ppc_core99_init(MachineState *machine)
     int i, j, k, ppc_boot_device, machine_arch, bios_size = -1;
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
     MemoryRegion *bios = g_new(MemoryRegion, 1);
+    bool rom_is_flash;
     hwaddr kernel_base = 0, initrd_base = 0, cmdline_base = 0;
     long kernel_size = 0, initrd_size = 0;
     PCIBus *pci_bus;
@@ -284,6 +307,9 @@ static void ppc_core99_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(), 0, machine->ram);
 
     /* allocate and load firmware ROM */
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+    rom_is_flash = filename && !firmware_is_elf(filename);
+
     memory_region_init_rom(bios, NULL, "ppc_core99.bios", PROM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), PROM_BASE, bios);
@@ -306,7 +332,6 @@ static void ppc_core99_init(MachineState *machine)
                                     mirror);
     }
 
-    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     if (filename) {
         /* Load OpenBIOS (ELF) */
         bios_size = load_elf(filename, NULL, NULL, NULL, NULL,
@@ -676,15 +701,23 @@ static void ppc_core99_init(MachineState *machine)
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
-    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
-    qdev_prop_set_uint32(dev, "it_shift", 1);
+    if (rom_is_flash) {
+        /* Flat bytes, flash command set, and erased rather than zeroed. */
+        qdev_prop_set_uint32(dev, "size", NVRAM_FLASH_SIZE);
+        qdev_prop_set_uint32(dev, "it_shift", 0);
+        qdev_prop_set_bit(dev, "flash", true);
+    } else {
+        qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
+        qdev_prop_set_uint32(dev, "it_shift", 1);
+    }
 
     dinfo = drive_get(IF_MTD, 0, 0);
     if (dinfo) {
         qdev_prop_set_drive(dev, "drive", blk_by_legacy_dinfo(dinfo));
     } else {
-        BlockBackend *nvram_blk =
-            macio_nvram_default_blk("nvram.img", MACIO_NVRAM_SIZE);
+        BlockBackend *nvram_blk = rom_is_flash ?
+            macio_nvram_default_blk("nvram-flash.img", NVRAM_FLASH_SIZE, 0xff) :
+            macio_nvram_default_blk("nvram.img", MACIO_NVRAM_SIZE, 0);
 
         if (nvram_blk) {
             qdev_prop_set_drive(dev, "drive", nvram_blk);
@@ -699,7 +732,12 @@ static void ppc_core99_init(MachineState *machine)
      * otherwise the firmware's own persisted variables get overwritten on
      * every boot, which is exactly what we are trying to stop.
      */
-    if (macio_nvram_is_blank(nvr, MACIO_NVRAM_SIZE)) {
+    /*
+     * The Apple ROM lays out and validates its own partitions; only the
+     * OpenBIOS-style NVRAM wants the CHRP ones seeded, and even then only
+     * into a genuinely fresh image.
+     */
+    if (!rom_is_flash && macio_nvram_is_blank(nvr, MACIO_NVRAM_SIZE)) {
         pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
     }
     /* No PCI init: the BIOS will do it */
