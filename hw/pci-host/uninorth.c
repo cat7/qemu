@@ -528,8 +528,10 @@ static void unin_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memory_region_init_io(&s->mem, obj, &unin_ops, s, "unin", 0x1000);
+    keywest_i2c_init(&s->i2c, DEVICE(obj), "unin-i2c", UNINORTH_I2C_SIZE);
 
     sysbus_init_mmio(sbd, &s->mem);
+    sysbus_init_mmio(sbd, &s->i2c.mem);
 }
 
 static void unin_class_init(ObjectClass *klass, const void *data)
