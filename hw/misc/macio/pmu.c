@@ -350,8 +350,21 @@ static void pmu_cmd_get_version(PMUState *s,
                                 const uint8_t *in_data, uint8_t in_len,
                                 uint8_t *out_data, uint8_t *out_len)
 {
+    /*
+     * One byte: Linux's pmu_data_len table gives GET_VERSION (0xea) a
+     * fixed 1-byte reply, and Mac OS X's ApplePMU agrees -- its
+     * getPMUversion() (disassembled from the 10.4 kext) reads exactly one
+     * byte here, and only on pre-KeyLargo PMUs; on this machine it
+     * fetches the full version from PMU RAM instead (see
+     * pmu_cmd_read_pmu_ram below).
+     *
+     * The value: a real PowerMac3,4 publishes pmu-version = 0x00d07e0c in
+     * its device tree, whose low byte -- the part ApplePMU treats as the
+     * PMU type -- is 0x0c. Upstream's 1 here was a placeholder (its own
+     * comment read "??? Check what Apple does").
+     */
     *out_len = 1;
-    *out_data = 1; /* ??? Check what Apple does */
+    *out_data = 0x0c;
 }
 
 static void pmu_cmd_power_events(PMUState *s,
@@ -382,6 +395,28 @@ static void pmu_cmd_power_events(PMUState *s,
         break;
     case PMU_PWR_SET_WAKEUP_EVENTS:
     case PMU_PWR_CLR_WAKEUP_EVENTS:
+        break;
+    /*
+     * The two below are absent from Linux's driver; ApplePMU (10.4,
+     * disassembled) sends both during power-management bring-up.
+     */
+    case PMU_PWR_LAST_SHUTDOWN_CAUSE:
+        /*
+         * whatCausedLastShutdown() expects one cause byte (bit 0x80 =
+         * "the PMU forced the shutdown", which makes it dig further).
+         * We never force one, so answer 0: last shutdown was clean.
+         */
+        *out_len = 1;
+        out_data[0] = 0;
+        break;
+    case PMU_PWR_SERVER_ID:
+        /* With a payload byte it is a set, without one a get;
+         * either way the current ID is returned. */
+        if (in_len >= 2) {
+            s->server_id = in_data[1];
+        }
+        *out_len = 1;
+        out_data[0] = s->server_id;
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -421,6 +456,23 @@ static void pmu_cmd_read_pmu_ram(PMUState *s,
         qemu_log_mask(LOG_GUEST_ERROR,
                       "PMU: READ_PMU_RAM command, invalid len %d, expected 3\n",
                       in_len);
+        return;
+    }
+
+    /*
+     * The full PMU version lives in PMU RAM: Mac OS X's ApplePMU
+     * getPMUversion() (10.4 kext, disassembled) reads 3 bytes at
+     * address 0x80 0x02 on KeyLargo-based machines instead of ever
+     * sending GET_VERSION, stores byte 2 as the PMU type, and firmware
+     * packs the three bytes into the /via-pmu "pmu-version" device tree
+     * property. A real PowerMac3,4's property is 0x00d07e0c, so these
+     * three bytes are d0 7e 0c.
+     */
+    if (in_data[0] == 0x80 && in_data[1] == 0x02 && in_data[2] == 3) {
+        *out_len = 3;
+        out_data[0] = 0xd0;
+        out_data[1] = 0x7e;
+        out_data[2] = 0x0c;
         return;
     }
 
