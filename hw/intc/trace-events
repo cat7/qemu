@@ -365,3 +365,9 @@ loongarch_extioi_writew(uint64_t addr, uint64_t val) "addr: 0x%"PRIx64 "val: 0x%
 # riscv_aplic.c
 riscv_aplic_read(uint64_t offset, unsigned size, uint64_t value) "offset: 0x%" PRIx64 ", size: %u, value: 0x%" PRIx64
 riscv_aplic_write(uint64_t offset, unsigned size, uint64_t value) "offset: 0x%" PRIx64 ", size: %u, value: 0x%" PRIx64
+
+# openpic.c
+openpic_set_irq(int n_irq, int level, uint32_t ivpr) "irq=%d level=%d ivpr=0x%08x"
+openpic_raise_int(int cpu, int n_irq, int next) "cpu=%d irq=%d next=%d"
+openpic_irq_disabled(int n_irq) "irq=%d is masked (IVPR MASK set)"
+openpic_irq_prio_too_low(int n_irq, int prio, int ctpr, int cpu) "irq=%d prio=%d <= ctpr=%d on cpu=%d"

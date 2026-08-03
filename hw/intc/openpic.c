@@ -44,6 +44,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
+#include "trace.h"
 
 /* #define DEBUG_OPENPIC */
 
@@ -290,6 +291,7 @@ static void IRQ_local_pipe(OpenPICState *opp, int n_CPU, int n_IRQ,
     IRQ_check(opp, &dst->raised);
 
     if (active && priority <= dst->ctpr) {
+        trace_openpic_irq_prio_too_low(n_IRQ, priority, dst->ctpr, n_CPU);
         DPRINTF("%s: IRQ %d priority %d too low for ctpr %d on CPU %d",
                 __func__, n_IRQ, priority, dst->ctpr, n_CPU);
         active = 0;
@@ -301,6 +303,7 @@ static void IRQ_local_pipe(OpenPICState *opp, int n_CPU, int n_IRQ,
             DPRINTF("%s: IRQ %d is hidden by servicing IRQ %d on CPU %d",
                     __func__, n_IRQ, dst->servicing.next, n_CPU);
         } else {
+            trace_openpic_raise_int(n_CPU, n_IRQ, dst->raised.next);
             DPRINTF("%s: Raise OpenPIC INT output cpu %d irq %d/%d",
                     __func__, n_CPU, n_IRQ, dst->raised.next);
             qemu_irq_raise(opp->dst[n_CPU].irqs[OPENPIC_OUTPUT_INT]);
@@ -333,6 +336,7 @@ static void openpic_update_irq(OpenPICState *opp, int n_IRQ)
 
     if ((src->ivpr & IVPR_MASK_MASK) && !src->nomask) {
         /* Interrupt source is disabled */
+        trace_openpic_irq_disabled(n_IRQ);
         DPRINTF("%s: IRQ %d is disabled", __func__, n_IRQ);
         active = false;
     }
@@ -396,6 +400,7 @@ static void openpic_set_irq(void *opaque, int n_IRQ, int level)
     }
 
     src = &opp->src[n_IRQ];
+    trace_openpic_set_irq(n_IRQ, level, src->ivpr);
     DPRINTF("openpic: set irq %d = %d ivpr=0x%08x",
             n_IRQ, level, src->ivpr);
     if (src->level) {
