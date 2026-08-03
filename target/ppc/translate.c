@@ -453,6 +453,22 @@ void spr_write_generic(DisasContext *ctx, int sprn, int gprn)
     spr_store_dump_spr(sprn);
 }
 
+/*
+ * MSSCR0's hardware-flush request bit is set by software to ask the cache
+ * hardware to do the work and cleared by the hardware once it has finished.
+ * There is no work to model, but it has to read back as complete: leaving it
+ * set hangs anything that kicks a flush and then polls for it, which is what
+ * Mac OS X's early cache setup on a 74xx does.
+ */
+void spr_write_msscr0(DisasContext *ctx, int sprn, int gprn)
+{
+    TCGv t0 = tcg_temp_new();
+
+    tcg_gen_andi_tl(t0, cpu_gpr[gprn], ~(target_ulong)0x00800000);
+    gen_store_spr(sprn, t0);
+    spr_store_dump_spr(sprn);
+}
+
 void spr_write_generic32(DisasContext *ctx, int sprn, int gprn)
 {
 #ifdef TARGET_PPC64

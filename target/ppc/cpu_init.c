@@ -638,7 +638,7 @@ static void register_74xx_sprs(CPUPPCState *env)
 
     spr_register(env, SPR_MSSCR0, "MSSCR0",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, &spr_write_generic,
+                 &spr_read_generic, &spr_write_msscr0,
                  0x00000000);
     /* Hardware implementation registers */
     spr_register(env, SPR_HID0, "HID0",
