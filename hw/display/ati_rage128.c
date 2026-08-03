@@ -490,6 +490,142 @@ static void ati_rage128_scan_vram_activity(ATIRage128State *s)
     ati_rage128_pick_auto_fb(s, nblocks);
 }
 
+/*
+ * Rebuild and publish the hardware cursor from the CUR_* registers and
+ * the 2bpp image in VRAM. The display backend composites it for us via
+ * qemu_console_set_cursor()/set_mouse(), so nothing is ever drawn into
+ * the guest-visible framebuffer.
+ *
+ * Register semantics are from ATI's own RAGE 128 PRO Register Reference
+ * Guide (RRG-G04500-C rev 1.01), section 3.13 "Hardware Cursor". The
+ * Rage 128 is close to the mach64 here but differs in two ways that
+ * matter, so this is not a straight copy of ati_mach64_cursor_update():
+ *
+ *  - CUR_OFFSET is a plain byte offset into the frame buffer (bits 24:0,
+ *    "16 byte (128 bit) aligned... bits 3:0 of this field are hardwired
+ *    to ZERO"). The mach64's equivalent counts in 8-byte units and its
+ *    code multiplies by 8; doing that here would land 8x too far in.
+ *  - The CLR registers put the colour in the LOW 24 bits -- B at 7:0,
+ *    G at 15:8, R at 23:16 -- whereas the mach64 carries R,G,B up in
+ *    bits 31-8. Decoding the mach64 way swaps and shifts the channels.
+ *
+ * The image is 64 rows of 16 bytes, which CRTC_GEN_CNTL.CRTC_CUR_MODE=0
+ * (the only defined mode) calls "2bpp monochrome 64x64. 2 color,
+ * transparent, inverse". That "2bpp" is the per-pixel bit budget, NOT
+ * the interleaving: unlike the mach64's packed 2-bit pairs, each row
+ * here is two 1-bit planes -- 8 bytes of AND mask, then 8 bytes of XOR
+ * mask, MSB first. Decoding it the mach64 way turns a normal, mostly
+ * transparent arrow into a solid 64x64 block (an all-ones AND byte
+ * reads back as four "invert" pairs, an all-zero XOR byte as four
+ * "colour 0" pairs), which is exactly what it looked like on screen.
+ *
+ * Established by dumping the live sprite out of a Mac OS X 10.3 guest
+ * and rendering it under each candidate layout: this one yields the
+ * standard Mac arrow with 97 of 4096 pixels opaque, the packed reading
+ * yields 4070 of 4096. The register guide does not document the layout
+ * either way, so that experiment is the authority here.
+ *
+ * AND=1 XOR=0 transparent, AND=1 XOR=1 invert, AND=0 XOR=0 colour 0,
+ * AND=0 XOR=1 colour 1. "Invert" (complement the display pixel) has no
+ * QEMUCursor equivalent; approximate it with 50%-alpha black.
+ */
+/*
+ * Publishing the pointer *position* is separate from rebuilding the
+ * sprite, and deliberately is not coalesced to a frame. Position is one
+ * cheap call; the sprite rebuild reads 1KB of VRAM and allocates a
+ * QEMUCursor. Making motion wait for the once-per-frame rebuild ties
+ * pointer responsiveness to a full 800x600x32bpp redraw and shows up as
+ * the pointer stalling for a moment under load. Only the image can tear
+ * (CUR_OFFSET moving before CUR_VERT_OFF catches up), so only the image
+ * needs the frame latch.
+ */
+static void ati_rage128_cursor_set_pos(ATIRage128State *s)
+{
+    uint32_t posn = s->regs[R128_CUR_HORZ_VERT_POSN >> 2];
+    uint32_t offs = s->regs[R128_CUR_HORZ_VERT_OFF >> 2];
+    bool on = (s->regs[R128_CRTC_GEN_CNTL >> 2] & R128_CRTC_CUR_EN) != 0;
+    int x = (int)((posn >> 16) & 0x7ff) - (int)((offs >> 16) & 0x3f);
+    int y = (int)(posn & 0x7ff);
+
+    qemu_console_set_mouse(s->con, x, y, on);
+}
+
+static void ati_rage128_cursor_update(ATIRage128State *s)
+{
+    uint32_t offs = s->regs[R128_CUR_HORZ_VERT_OFF >> 2];
+    uint32_t raw0 = s->regs[R128_CUR_CLR0 >> 2];
+    uint32_t raw1 = s->regs[R128_CUR_CLR1 >> 2];
+    /* QEMUCursor dwords are RGBA byte order, i.e. (a<<24)|(b<<16)|(g<<8)|r. */
+    uint32_t clr0 = 0xff000000u | ((raw0 & 0xff) << 16) |
+                    (((raw0 >> 8) & 0xff) << 8) | ((raw0 >> 16) & 0xff);
+    uint32_t clr1 = 0xff000000u | ((raw1 & 0xff) << 16) |
+                    (((raw1 >> 8) & 0xff) << 8) | ((raw1 >> 16) & 0xff);
+    uint32_t vram_off = s->regs[R128_CUR_OFFSET >> 2] & 0x01fffff0;
+    bool on = (s->regs[R128_CRTC_GEN_CNTL >> 2] & R128_CRTC_CUR_EN) != 0;
+    uint32_t vert_off = offs & 0x3f;
+    uint32_t horz_off = (offs >> 16) & 0x3f;
+    /*
+     * POSN gives the screen position of the *visible* top-left pixel,
+     * and the OFF fields say how far into the 64x64 map that pixel is.
+     * Horizontally the guest moves off the left edge by holding
+     * CUR_HORZ_POSN at 0 and raising CUR_HORZ_OFF, so the map's own
+     * column 0 belongs at POSN - OFF. Vertically it instead advances
+     * CUR_OFFSET by 16 bytes per hidden line and raises CUR_VERT_OFF,
+     * so the data already starts at the first visible row: the sprite
+     * goes at plain CUR_VERT_POSN and is (64 - CUR_VERT_OFF) tall.
+     * Subtracting vert_off here as well would double-compensate. The
+     * screen position itself is applied by ati_rage128_cursor_set_pos().
+     */
+    uint32_t height = 64 - vert_off;
+    const uint8_t *src;
+    QEMUCursor *c;
+    uint32_t px, row;
+
+    /*
+     * Deliberately NOT gated on CUR_LOCK. Skipping the update while the
+     * lock bit is set looks reasonable -- that is what the bit is for --
+     * but it can wedge the pointer permanently: this function is the only
+     * thing that calls qemu_console_set_mouse(), so a skipped update
+     * leaves the last published position on screen, and if the guest then
+     * parks the cursor and stops writing these registers altogether
+     * nothing ever re-publishes. Observed exactly that: registers reading
+     * a settled top-left position while the visible pointer stayed in the
+     * bottom-right corner indefinitely.
+     *
+     * There is nothing to gain in exchange, because Mac OS X never sets
+     * CUR_LOCK (it read 0 in every sampled state). Tearing between the
+     * CUR_OFFSET and CUR_VERT_OFF halves of an update is instead handled
+     * by latching the cursor once per frame, the way the hardware does --
+     * see the cursor_dirty field comment.
+     */
+    if (on) {
+        if ((uint64_t)vram_off + (uint64_t)height * 16 >
+            ATI_RAGE128_VRAM_SIZE) {
+            return;
+        }
+        src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + vram_off;
+        c = cursor_alloc(64, 64);
+        for (row = 0; row < height; row++) {
+            for (px = horz_off; px < 64; px++) {
+                uint32_t byte = px / 8, bit = 7 - (px % 8);
+                uint8_t and_bit = (src[row * 16 + byte] >> bit) & 1;
+                uint8_t xor_bit = (src[row * 16 + 8 + byte] >> bit) & 1;
+                uint32_t val;
+
+                if (and_bit) {
+                    val = xor_bit ? 0x80000000u /* invert */ : 0 /* clear */;
+                } else {
+                    val = xor_bit ? clr1 : clr0;
+                }
+                c->data[row * 64 + px] = val;
+            }
+        }
+        qemu_console_set_cursor(s->con, c);
+        cursor_unref(c);
+    }
+    ati_rage128_cursor_set_pos(s);
+}
+
 static bool ati_rage128_update_display(void *opaque)
 {
     ATIRage128State *s = opaque;
@@ -523,6 +659,11 @@ static bool ati_rage128_update_display(void *opaque)
         mode = s->mode;
     } else {
         s->have_valid_mode = true;
+    }
+
+    if (s->cursor_dirty) {
+        s->cursor_dirty = false;
+        ati_rage128_cursor_update(s);
     }
 
     ati_rage128_scan_vram_activity(s);
@@ -1114,6 +1255,13 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         ati_rage128_update_irq(s);
         break;
     case R128_CRTC_GEN_CNTL:
+        s->regs[base >> 2] = val;
+        s->mode_dirty = true;
+        trace_ati_rage128_mode_reg(ati_rage128_reg_name(base), val);
+        ati_rage128_maybe_capture_mode(s);
+        /* CRTC_CUR_EN lives here, so the sprite goes on and off with it. */
+        s->cursor_dirty = true;
+        break;
     case R128_CRTC_EXT_CNTL:
     case R128_CRTC_H_TOTAL_DISP:
     case R128_CRTC_V_TOTAL_DISP:
@@ -1122,6 +1270,41 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->mode_dirty = true;
         trace_ati_rage128_mode_reg(ati_rage128_reg_name(base), val);
         ati_rage128_maybe_capture_mode(s);
+        break;
+    case R128_CUR_OFFSET:
+    case R128_CUR_HORZ_VERT_POSN:
+    case R128_CUR_HORZ_VERT_OFF:
+        /*
+         * CUR_LOCK is one physical lock bit, readable and writable
+         * through any of these three addresses (RRG-G04500-C 3.13
+         * documents it identically in all three). We keep the registers
+         * as separate words, so mirror bit 31 across them by hand --
+         * otherwise a guest that raises the lock through one register
+         * and drops it through another leaves a stale set copy behind,
+         * and the cursor stays frozen at its last published position
+         * for good.
+         */
+        s->regs[base >> 2] = val;
+        if (base == R128_CUR_HORZ_VERT_POSN) {
+            /* motion only -- no sprite change, so publish straight away */
+            ati_rage128_cursor_set_pos(s);
+        } else {
+            s->cursor_dirty = true;
+        }
+        if (val & R128_CUR_LOCK) {
+            s->regs[R128_CUR_OFFSET >> 2] |= R128_CUR_LOCK;
+            s->regs[R128_CUR_HORZ_VERT_POSN >> 2] |= R128_CUR_LOCK;
+            s->regs[R128_CUR_HORZ_VERT_OFF >> 2] |= R128_CUR_LOCK;
+        } else {
+            s->regs[R128_CUR_OFFSET >> 2] &= ~R128_CUR_LOCK;
+            s->regs[R128_CUR_HORZ_VERT_POSN >> 2] &= ~R128_CUR_LOCK;
+            s->regs[R128_CUR_HORZ_VERT_OFF >> 2] &= ~R128_CUR_LOCK;
+        }
+        break;
+    case R128_CUR_CLR0:
+    case R128_CUR_CLR1:
+        s->regs[base >> 2] = val;
+        s->cursor_dirty = true;
         break;
     case R128_CRTC_OFFSET:
         s->regs[base >> 2] = val & (R128_CRTC_OFFSET_MASK |
