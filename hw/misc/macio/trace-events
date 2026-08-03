@@ -47,3 +47,11 @@ pmu_debug_protocol_cmd_resp_complete(int ier) "Response send complete. IER=0x%02
 dbdma_write(int channel, int reg, uint64_t value) "channel=0x%x reg=0x%x value=0x%"PRIx64
 dbdma_control_write_done(int channel, uint32_t status) "channel=0x%x new_status=0x%08x"
 dbdma_channel_run(int channel, uint16_t command) "channel=0x%x command=0x%04x"
+
+# keylargo.c
+keylargo_fcr_read(uint64_t addr, uint32_t val) "FCR addr=0x%"PRIx64" val=0x%08x"
+keylargo_fcr_write(uint64_t addr, uint32_t val) "FCR addr=0x%"PRIx64" val=0x%08x"
+keylargo_i2s_read(int cell, uint64_t addr, uint32_t val) "I2S%d addr=0x%"PRIx64" val=0x%08x"
+keylargo_i2s_write(int cell, uint64_t addr, uint32_t val) "I2S%d addr=0x%"PRIx64" val=0x%08x"
+keylargo_i2c_read(const char *n, uint64_t addr, uint32_t val) "%s R reg=0x%02"PRIx64" val=0x%02x"
+keylargo_i2c_write(const char *n, uint64_t addr, uint32_t val) "%s W reg=0x%02"PRIx64" val=0x%02x"

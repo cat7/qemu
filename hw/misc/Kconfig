@@ -69,6 +69,7 @@ config MOS6522
 
 config MACIO
     bool
+    select I2C
     select CUDA
     select SWIM3
     select ESCC

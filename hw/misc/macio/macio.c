@@ -34,6 +34,7 @@
 #include "migration/vmstate.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/misc/macio/keylargo.h"
 #include "hw/intc/heathrow_pic.h"
 #include "trace.h"
 
@@ -378,6 +379,8 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     if (!macio_common_realize(d, errp)) {
         return;
     }
+
+    keylargo_cells_init(DEVICE(s), &s->bar);
 
     /* OpenPIC */
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
