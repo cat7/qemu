@@ -216,6 +216,22 @@ static void macio_gpio_reset(DeviceState *dev)
      * start each one up (see hw/ppc/mac_newworld.c cpu_kick()).
      */
     macio_set_gpio(s, 3, true);
+
+    /*
+     * GPIO 9 is the programmer's switch (the real PowerMac3,4 device tree
+     * gives its programmer-switch node interrupt 0x37, which is this line).
+     * The button is pulled up and reads high when nobody is holding it in,
+     * so it has to come out of reset high: a real Apple ROM polls it during
+     * POST and, finding it low, concludes the switch is stuck down, spins
+     * for a five second timeout and then reports the failure -- costing five
+     * seconds of every boot and flagging an error the machine does not have.
+     *
+     * Set the input level directly rather than through macio_set_gpio():
+     * this line's interrupt is edge-triggered on the level going high, which
+     * is how the NMI below injects a press, so going through there would
+     * assert a spurious NMI on every reset.
+     */
+    s->gpio_regs[9] |= IN_DATA;
 }
 
 static void macio_gpio_nmi(NMIState *n)
