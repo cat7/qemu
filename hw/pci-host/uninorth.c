@@ -496,19 +496,45 @@ static const TypeInfo pci_unin_internal_info = {
 static void unin_write(void *opaque, hwaddr addr, uint64_t value,
                        unsigned size)
 {
+    UNINState *s = UNI_NORTH(opaque);
+    unsigned i;
+
     trace_unin_write(addr, value);
+
+    for (i = 0; i < size; i++) {
+        hwaddr a = addr + i;
+
+        if (a < UNIN_REGS_SIZE) {
+            s->regs[a] = value >> (8 * (size - 1 - i));
+        }
+    }
 }
 
 static uint64_t unin_read(void *opaque, hwaddr addr, unsigned size)
 {
+    UNINState *s = UNI_NORTH(opaque);
     uint32_t value;
+    unsigned i;
 
-    switch (addr) {
-    case 0:
+    if (addr == 0) {
         value = UNINORTH_VERSION_10A;
-        break;
-    default:
+    } else {
+        /*
+         * The rest of this window is state the firmware writes and reads
+         * back: HWINIT_STATE at 0x70, and -- the reason this matters -- a
+         * block of memory-controller registers around 0x2000 that a real
+         * Apple ROM programs per chip select while sizing RAM. Reading zero
+         * to all of it leaves the ROM unable to see its own configuration.
+         */
         value = 0;
+        for (i = 0; i < size; i++) {
+            hwaddr a = addr + i;
+
+            value <<= 8;
+            if (a < UNIN_REGS_SIZE) {
+                value |= s->regs[a];
+            }
+        }
     }
 
     trace_unin_read(addr, value);
@@ -527,7 +553,12 @@ static void unin_init(Object *obj)
     UNINState *s = UNI_NORTH(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    memory_region_init_io(&s->mem, obj, &unin_ops, s, "unin", 0x1000);
+    /*
+     * The real uni-n decodes 16MB (its device-tree node reads
+     * "reg f8000000 01000000"), not 4KB -- the memory controller registers
+     * the firmware uses sit above the first page.
+     */
+    memory_region_init_io(&s->mem, obj, &unin_ops, obj, "unin", 0x1000000);
     keywest_i2c_init(&s->i2c, DEVICE(obj), "unin-i2c", UNINORTH_I2C_SIZE);
 
     sysbus_init_mmio(sbd, &s->mem);

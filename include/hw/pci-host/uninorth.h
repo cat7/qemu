@@ -61,6 +61,9 @@ struct UNINState {
     SysBusDevice parent_obj;
 
     MemoryRegion mem;
+/* Everything the firmware touches lives well inside the first 64KB. */
+#define UNIN_REGS_SIZE 0x10000
+    uint8_t regs[UNIN_REGS_SIZE];
     KeyLargoI2CState i2c;
 };
 

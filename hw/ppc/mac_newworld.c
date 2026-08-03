@@ -447,8 +447,9 @@ static void ppc_core99_init(MachineState *machine)
      * the processor module's configuration EEPROM, which a real Apple ROM
      * reads during early bring-up; OpenBIOS never touches it.
      */
-    memory_region_add_subregion(get_system_memory(), UNINORTH_I2C_BASE,
-                                sysbus_mmio_get_region(s, 1));
+    /* Sits inside the uni-n window above, so it needs to win the overlap. */
+    memory_region_add_subregion_overlap(get_system_memory(), UNINORTH_I2C_BASE,
+                                        sysbus_mmio_get_region(s, 1), 1);
 
     /*
      * The processor module carries an SPD-format configuration EEPROM. The
