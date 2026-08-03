@@ -156,6 +156,7 @@ config MAC_NEWWORLD
     select MAC_PMU
     select UNIN_PCI
     select FW_CFG_PPC
+    select AT24C
 
 config E500
     bool

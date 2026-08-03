@@ -64,6 +64,8 @@
 #include "hw/nvram/fw_cfg.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/nvram/eeprom_at24c.h"
+#include "hw/nvram/mac_spd.h"
 #include "hw/ppc/openpic.h"
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"
@@ -88,7 +90,13 @@
 
 #define PROM_FILENAME "openbios-ppc"
 #define PROM_BASE 0xfff00000
+/* KeyLargo/MacIO base decoded by real hardware (and by real Apple ROMs) */
+#define MACIO_BASE 0xf3000000
+#define MACIO_WIN_SIZE 0x01000000
 #define PROM_SIZE (1 * MiB)
+/* The ROM socket's full decode window; only the top PROM_SIZE is populated */
+#define ROM_WINDOW_BASE 0xff800000
+#define ROM_WINDOW_SIZE (8 * MiB)
 
 #define KERNEL_LOAD_ADDR 0x01000000
 #define KERNEL_GAP       0x00100000
@@ -180,6 +188,33 @@ static void cpu_kick(void *opaque, int n, int level)
     qemu_cpu_kick(cs);
 }
 
+static void macio_map_at_hw_base(void *opaque)
+{
+    PCIDevice *macio = opaque;
+
+    pci_default_write_config(macio, PCI_BASE_ADDRESS_0, MACIO_BASE, 4);
+    pci_default_write_config(macio, PCI_COMMAND,
+                             PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER, 2);
+}
+
+typedef struct MacIOHwBaseNotifier {
+    Notifier notifier;
+    PCIDevice *macio;
+} MacIOHwBaseNotifier;
+
+static void macio_arm_hw_base_reset(Notifier *n, void *opaque)
+{
+    MacIOHwBaseNotifier *mn = container_of(n, MacIOHwBaseNotifier, notifier);
+
+    /*
+     * Deferred to machine-init-done on purpose: the sysbus (and with it the
+     * whole device tree) only becomes resettable at the end of machine
+     * creation, so a handler registered during ppc_core99_init() would run
+     * *before* MacIO's own reset and have its config write thrown away.
+     */
+    qemu_register_reset(macio_map_at_hw_base, mn->macio);
+}
+
 /* PowerPC Mac99 hardware initialisation */
 static void ppc_core99_init(MachineState *machine)
 {
@@ -206,6 +241,9 @@ static void ppc_core99_init(MachineState *machine)
     SysBusDevice *s;
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
+    MemoryRegion *macio_win;
+    I2CBus *unin_i2c;
+    MacIOHwBaseNotifier *macio_notifier;
     hwaddr nvram_addr = 0xFFF04000;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
 
@@ -247,6 +285,24 @@ static void ppc_core99_init(MachineState *machine)
     memory_region_init_rom(bios, NULL, "ppc_core99.bios", PROM_SIZE,
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), PROM_BASE, bios);
+
+    /*
+     * The ROM socket decodes 8MB at ROM_WINDOW_BASE (the real machine's
+     * /rom@ff800000 node has ranges ff800000 00800000), but only the top 1MB
+     * is populated, so the part aliases through the rest of the window. A
+     * real Apple ROM makes use of that: after its low-level init it jumps to
+     * code via a window-relative address such as 0xff80b644, which on
+     * hardware is simply offset 0xb644 of the same flash part.
+     */
+    for (i = 0; i < ROM_WINDOW_SIZE / PROM_SIZE - 1; i++) {
+        MemoryRegion *mirror = g_new(MemoryRegion, 1);
+        g_autofree char *name = g_strdup_printf("ppc_core99.bios.mirror%d", i);
+
+        memory_region_init_alias(mirror, NULL, name, bios, 0, PROM_SIZE);
+        memory_region_add_subregion(get_system_memory(),
+                                    ROM_WINDOW_BASE + (hwaddr)i * PROM_SIZE,
+                                    mirror);
+    }
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     if (filename) {
@@ -359,6 +415,36 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_realize_and_unref(s, &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0xf8000000,
                                 sysbus_mmio_get_region(s, 0));
+    /*
+     * UniNorth's own I2C controller. Its bus reaches the DIMM SPD EEPROMs and
+     * the processor module's configuration EEPROM, which a real Apple ROM
+     * reads during early bring-up; OpenBIOS never touches it.
+     */
+    memory_region_add_subregion(get_system_memory(), UNINORTH_I2C_BASE,
+                                sysbus_mmio_get_region(s, 1));
+
+    /*
+     * The processor module carries an SPD-format configuration EEPROM. The
+     * Tangent schematic labels it "ADDRESS = 6 (AC/AD)" next to the module
+     * connector's I2C pins, i.e. 8-bit 0xac/0xad, 7-bit 0x56. A real Apple
+     * ROM reads it during bring-up and refuses to continue without it.
+     */
+    unin_i2c = UNI_NORTH(s)->i2c.bus;
+    at24c_eeprom_init_rom(unin_i2c, 0x56, 256, NULL, 0);
+
+    /*
+     * SPD EEPROMs for the memory slots, at the usual 0x50 + slot. The ROM
+     * walks these to size RAM, so populate one per 256MB of configured
+     * memory using the real machine's DIMM data; -m 768 reproduces the
+     * donor PowerMac3,4 exactly.
+     */
+    for (i = 0; i < MAC_SPD_NUM_DIMMS; i++) {
+        if (machine->ram_size <= (uint64_t)i * MAC_SPD_DIMM_BYTES) {
+            break;
+        }
+        at24c_eeprom_init_rom(unin_i2c, 0x50 + i, MAC_SPD_SIZE,
+                              mac_spd_dimms[i], MAC_SPD_SIZE);
+    }
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;
@@ -417,7 +503,12 @@ static void ppc_core99_init(MachineState *machine)
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
 
     /* MacIO */
-    macio = OBJECT(pci_new(-1, TYPE_NEWWORLD_MACIO));
+    /*
+     * Slot numbers matter to a real Apple ROM, which expects the built-in
+     * devices where the hardware puts them: the PowerMac3,4 device tree has
+     * mac-io@17 and usb@18 / usb@19 on this bus.
+     */
+    macio = OBJECT(pci_new(PCI_DEVFN(0x17, 0), TYPE_NEWWORLD_MACIO));
     dev = DEVICE(macio);
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
@@ -431,6 +522,38 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
 
     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
+
+    /*
+     * Have MacIO come out of reset already decoding at the address real
+     * hardware uses, instead of leaving it to firmware. Registered as a
+     * reset handler because PCI config space (including BARs) is cleared
+     * when the device is reset, which happens after machine init.
+     *
+     * OpenBIOS enumerates the PCI bus and assigns BARs itself, so it never
+     * needed this. A real Apple boot ROM does not: its early hardware-init
+     * code reaches straight for KeyLargo at the hardwired 0xf3000000 (e.g.
+     * the 4.2.8 Tangent ROM polls a status bit at 0xf3010000 long before
+     * any PCI configuration happens) and spins forever if nothing answers.
+     * Firmware that does enumerate simply reassigns the BAR afterwards, so
+     * this is harmless for the OpenBIOS path.
+     */
+    macio_notifier = g_new0(MacIOHwBaseNotifier, 1);
+    macio_notifier->notifier.notify = macio_arm_hw_base_reset;
+    macio_notifier->macio = PCI_DEVICE(macio);
+    qemu_add_machine_init_done_notifier(&macio_notifier->notifier);
+
+    /*
+     * UniNorth's only CPU-visible window into PCI memory space is the
+     * 256MB "PCI hole" at 0x80000000, so a BAR at 0xf3000000 would decode
+     * on the bus but be unreachable from the CPU. Real UniNorth also
+     * forwards the 0xf3000000 range, which is where MacIO lives; add that
+     * window so the BAR above is actually usable.
+     */
+    macio_win = g_new(MemoryRegion, 1);
+    memory_region_init_alias(macio_win, macio, "unin-pci-macio-hole",
+                             pci_address_space(PCI_DEVICE(macio)),
+                             MACIO_BASE, MACIO_WIN_SIZE);
+    memory_region_add_subregion(get_system_memory(), MACIO_BASE, macio_win);
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     for (i = 0; i < 4; i++) {
@@ -508,7 +631,7 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     if (machine->usb) {
-        pci_create_simple(pci_bus, -1, "pci-ohci");
+        pci_create_simple(pci_bus, PCI_DEVFN(0x18, 0), "pci-ohci");
 
         /* U3 needs to use USB for input because Linux doesn't support via-cuda
         on PPC64 */
