@@ -20,6 +20,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 static uint64_t win_base;
 static uint64_t win_size = 0x100;
+static uint64_t code_lo;
+static uint64_t code_hi;
 static GHashTable *seen;
 static GMutex lock;
 
@@ -85,6 +87,10 @@ static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *udata)
         if (qemu_plugin_insn_data(insn, &raw, sizeof(raw)) == sizeof(raw)) {
             rec->bytes = raw;
         }
+        if (code_lo && rec->vaddr >= code_lo && rec->vaddr < code_hi) {
+            qemu_plugin_outs(g_strdup_printf("code: 0x%" PRIx64 " 0x%08x\n",
+                                             rec->vaddr, rec->bytes));
+        }
         qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem,
                                          QEMU_PLUGIN_CB_NO_REGS,
                                          QEMU_PLUGIN_MEM_W, rec);
@@ -103,6 +109,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             win_base = g_ascii_strtoull(tokens[1], NULL, 0);
         } else if (!g_strcmp0(tokens[0], "len")) {
             win_size = g_ascii_strtoull(tokens[1], NULL, 0);
+        } else if (!g_strcmp0(tokens[0], "code_lo")) {
+            code_lo = g_ascii_strtoull(tokens[1], NULL, 0);
+        } else if (!g_strcmp0(tokens[0], "code_hi")) {
+            code_hi = g_ascii_strtoull(tokens[1], NULL, 0);
         } else {
             fprintf(stderr, "regpc: bad option %s\n", opt);
             return -1;
