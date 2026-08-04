@@ -953,8 +953,21 @@ static void mos6522_pmu_reset_hold(Object *obj, ResetType type)
         mdc->parent_phases.hold(obj, type);
     }
 
+    /*
+     * Both timers count at the VIA clock (4.7MHz/6 = ~783kHz). The old
+     * T2 value here, (SCALE_US * 6000) / 4700 = 1276, is the tick
+     * PERIOD in nanoseconds stored into a field consumed as a frequency
+     * in Hz -- making T2 run ~613x too slow. The Mac OS ROM's
+     * Trampoline calibrates the timebase/bus frequencies by counting TB
+     * inside ~1ms T2 one-shot windows; with T2 this slow the window
+     * never closes within its poll budget and the measured frequencies
+     * come out ~700x too small, poisoning the nanokernel's ProcInfo and
+     * storming the decrementer (Mac OS 9's grey-screen boot hang).
+     * cuda.c received the equivalent fix earlier; this is the PMU copy
+     * of the same upstream units mismatch.
+     */
     ms->timers[0].frequency = VIA_TIMER_FREQ;
-    ms->timers[1].frequency = (SCALE_US * 6000) / 4700;
+    ms->timers[1].frequency = VIA_TIMER_FREQ;
 
     s->last_b = ms->b = TACK | TREQ;
 }
