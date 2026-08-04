@@ -658,6 +658,21 @@ static inline void cpu_ppc_store_tb(ppc_tb_t *tb_env, uint64_t vmclk,
 {
     *tb_offsetp = value - ns_to_tb(tb_env->tb_freq, vmclk);
 
+    /*
+     * A guest write repositions the timebase absolutely, so the
+     * monotonic-read watermark must not survive it: firmware handing off
+     * to an OS routinely rewinds TB to zero (Mac OS ROM at DO-QUIESCE,
+     * xnu at boot), and a stale watermark from before the write would
+     * hold every subsequent read at the old, larger value until the
+     * honest timebase caught back up -- freezing guest-visible time for
+     * as long as the machine had been up before the write. Observed
+     * live: a nanokernel decrementer storm (~30k int/s) with mftb
+     * returning a bit-identical value across interrupts, wedging the
+     * Mac OS 9 boot.
+     */
+    tb_env->last_tb = -1;
+    tb_env->last_tb_real_ns = -1;
+
     trace_ppc_tb_store(value, *tb_offsetp);
 }
 
