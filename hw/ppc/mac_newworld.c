@@ -581,6 +581,14 @@ static void ppc_core99_init(MachineState *machine)
         /* Uninorth main bus - this must be last to make it the default */
         uninorth_pci_dev = qdev_new(TYPE_UNI_NORTH_PCI_HOST_BRIDGE);
         qdev_prop_set_uint32(uninorth_pci_dev, "ofw-addr", 0xf2000000);
+        /*
+         * The Apple ROM's device tree carries the real machine's
+         * interrupt-map, so in that mode the slots must interrupt where
+         * that table says they do (see pci_unin_main_real_map_irq()).
+         * OpenBIOS builds its own tree around the legacy 4-line hash,
+         * which stays the default.
+         */
+        qdev_prop_set_bit(uninorth_pci_dev, "real-irq-map", rom_is_flash);
         s = SYS_BUS_DEVICE(uninorth_pci_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf2800000);
@@ -612,6 +620,11 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
     qdev_prop_set_bit(dev, "has-adb", has_adb);
+    /*
+     * The real KeyLargo ATA layout only when the Apple ROM provides the
+     * device tree; OpenBIOS hardcodes the legacy channels/interrupts.
+     */
+    qdev_prop_set_bit(dev, "real-ata", rom_is_flash);
 
     dev = DEVICE(object_resolve_path_component(macio, "escc"));
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
@@ -655,9 +668,27 @@ static void ppc_core99_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(), MACIO_BASE, macio_win);
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
-    for (i = 0; i < 4; i++) {
-        qdev_connect_gpio_out(uninorth_pci_dev, i,
-                              qdev_get_gpio_in(pic_dev, 0x1b + i));
+    if (rom_is_flash) {
+        /*
+         * Real PowerMac3,4 pci@f2000000 interrupt-map, in
+         * pci_unin_main_real_map_irq() index order (slots 0x12-0x15,
+         * 0x18-0x1a); index 7 is the spare for off-map slots and stays
+         * unwired on the real machine too.
+         */
+        static const int real_pci_irqs[7] = {
+            0x34, 0x35, 0x36, 0x3a, 0x1b, 0x1c, 0x3f
+        };
+
+        for (i = 0; i < ARRAY_SIZE(real_pci_irqs); i++) {
+            qdev_connect_gpio_out(uninorth_pci_dev, i,
+                                  qdev_get_gpio_in(pic_dev,
+                                                   real_pci_irqs[i]));
+        }
+    } else {
+        for (i = 0; i < 4; i++) {
+            qdev_connect_gpio_out(uninorth_pci_dev, i,
+                                  qdev_get_gpio_in(pic_dev, 0x1b + i));
+        }
     }
 
     /* TODO: additional PCI buses only wired up for 32-bit machines */

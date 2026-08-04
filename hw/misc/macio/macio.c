@@ -401,26 +401,56 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
      */
     keylargo->i2c.irq = qdev_get_gpio_in(pic_dev, NEWWORLD_KEYWEST_IRQ);
 
-    /* IDE buses */
-    if (!macio_realize_ide(s, &ns->ide[0],
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_IRQ),
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_DMA_IRQ),
-                           NEWWORLD_IDE0_DMA_CHAN, errp)) {
-        return;
-    }
+    /*
+     * IDE buses. With `real-ata` set (Apple ROM machines) the layout is
+     * the real KeyLargo one -- see the NEWWORLD_IDE*_ defines. OpenBIOS
+     * machines instead get the layout OpenBIOS's own hardcoded device
+     * tree describes (two buses at 0x20000/0x21000, DBDMA channels
+     * 0x16/0x1a, interrupts 0xd/0x2 and 0xe/0x3): a guest kernel drives
+     * whatever channels and interrupts the firmware's tree names, so
+     * "hardware-accurate" numbers under OpenBIOS mean the CD/disk DBDMA
+     * completions land where nothing is listening. Found the hard way: a
+     * Mac OS X bootloader loaded from CD crashed through the reset
+     * vector (NIP=0x4) on every OpenBIOS boot, and a bisect landed on
+     * the renumbering commit. The third bus is still created (children
+     * must all be realized) but parked on numbers no OpenBIOS guest is
+     * told about.
+     */
+    {
+        struct {
+            uint32_t addr;
+            int chan;
+            int irq;
+            int dma_irq;
+        } const *layout, real_layout[3] = {
+            { 0x1f000, NEWWORLD_IDE0_DMA_CHAN,
+              NEWWORLD_IDE0_IRQ, NEWWORLD_IDE0_DMA_IRQ },
+            { 0x20000, NEWWORLD_IDE1_DMA_CHAN,
+              NEWWORLD_IDE1_IRQ, NEWWORLD_IDE1_DMA_IRQ },
+            { 0x21000, NEWWORLD_IDE2_DMA_CHAN,
+              NEWWORLD_IDE2_IRQ, NEWWORLD_IDE2_DMA_IRQ },
+        }, legacy_layout[3] = {
+            { 0x20000, 0x16, 0xd, 0x2 },
+            { 0x21000, 0x1a, 0xe, 0x3 },
+            { 0x1f000, NEWWORLD_IDE2_DMA_CHAN,
+              NEWWORLD_IDE2_IRQ, NEWWORLD_IDE2_DMA_IRQ },
+        };
+        int i;
 
-    if (!macio_realize_ide(s, &ns->ide[1],
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_IRQ),
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_DMA_IRQ),
-                           NEWWORLD_IDE1_DMA_CHAN, errp)) {
-        return;
-    }
-
-    if (!macio_realize_ide(s, &ns->ide[2],
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE2_IRQ),
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE2_DMA_IRQ),
-                           NEWWORLD_IDE2_DMA_CHAN, errp)) {
-        return;
+        layout = ns->real_ata ? real_layout : legacy_layout;
+        for (i = 0; i < 3; i++) {
+            qdev_prop_set_uint32(DEVICE(&ns->ide[i]), "addr",
+                                 layout[i].addr);
+            memory_region_add_subregion(&s->bar, layout[i].addr,
+                                        &ns->ide[i].mem);
+            if (!macio_realize_ide(s, &ns->ide[i],
+                                   qdev_get_gpio_in(pic_dev, layout[i].irq),
+                                   qdev_get_gpio_in(pic_dev,
+                                                    layout[i].dma_irq),
+                                   layout[i].chan, errp)) {
+                return;
+            }
+        }
     }
 
     /* Timer */
@@ -482,9 +512,15 @@ static void macio_newworld_init(Object *obj)
 
     object_initialize_child(obj, "gpio", &ns->gpio, TYPE_MACIO_GPIO);
 
-    /* ata-4@1f000, ata-3@20000, ata-3@21000 -- see NEWWORLD_IDE*_IRQ */
+    /*
+     * The three ATA buses. Their addresses depend on the `real-ata`
+     * property, which is not set yet at init time, so the address
+     * assignment and BAR mapping happen in realize.
+     */
     for (i = 0; i < 3; i++) {
-        macio_init_ide(s, &ns->ide[i], i, 0x1f000 + i * 0x1000);
+        g_autofree char *name = g_strdup_printf("ide[%i]", i);
+
+        object_initialize_child(obj, name, &ns->ide[i], TYPE_MACIO_IDE);
     }
 }
 
@@ -535,6 +571,8 @@ static const VMStateDescription vmstate_macio_newworld = {
 static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
+    /* Real KeyLargo ATA layout (Apple ROM) vs the one OpenBIOS describes */
+    DEFINE_PROP_BOOL("real-ata", NewWorldMacIOState, real_ata, true),
 };
 
 static void macio_newworld_class_init(ObjectClass *oc, const void *data)
