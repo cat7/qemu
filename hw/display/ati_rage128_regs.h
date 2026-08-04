@@ -295,6 +295,19 @@
 #define R128_SC_TOP_LEFT             0x16ec
 #define R128_SC_BOTTOM_RIGHT         0x16f0
 #define R128_SRC_SC_BOTTOM_RIGHT     0x16f4
+/*
+ * GUI context ("_C") registers, RRG-G04500-C: write-only aliases of the
+ * corresponding base registers. XFree86's r128 accel and Mac OS X's
+ * driver program per-operation state through these (the OS X driver's
+ * full-screen presentation batches use ONLY this block for GMC/scissor,
+ * so dropping them executes those blits with stale rop/datatype).
+ */
+#define R128_DST_PITCH_OFFSET_C      0x1c80
+#define R128_DP_GUI_MASTER_CNTL_C    0x1c84
+#define R128_SC_TOP_LEFT_C           0x1c88
+#define R128_SC_BOTTOM_RIGHT_C       0x1c8c
+#define R128_CONSTANT_COLOR_C        0x1d34
+#define R128_PLANE_3D_MASK_C         0x1d44
 #define R128_HOST_DATA0              0x17c0
 #define R128_HOST_DATA1              0x17c4
 #define R128_HOST_DATA2              0x17c8

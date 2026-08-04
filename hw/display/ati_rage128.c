@@ -1602,6 +1602,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->src_tile = val >> 31;
         break;
     case R128_DST_PITCH_OFFSET:
+    case R128_DST_PITCH_OFFSET_C:
         s->dst_offset = (val & 0x1fffff) << 5;
         s->dst_pitch = (val & 0x7fe00000) >> 21;
         s->dst_tile = val >> 31;
@@ -1620,6 +1621,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         ati_rage128_2d_blt(s);
         break;
     case R128_DP_GUI_MASTER_CNTL:
+    case R128_DP_GUI_MASTER_CNTL_C:
         s->dp_gui_master_cntl = val & 0xf800000f;
         s->dp_datatype = (val & 0x0f00) >> 8 | (val & 0x30f0) << 4 |
                          (val & 0x4000) << 16;
@@ -1676,6 +1678,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->dp_brush_bkgd_clr = val;
         break;
     case R128_DP_BRUSH_FRGD_CLR:
+    case R128_CONSTANT_COLOR_C:
         s->dp_brush_frgd_clr = val;
         break;
     case R128_DP_CNTL:
@@ -1694,6 +1697,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->dp_mix = val & 0x00ff0700;
         break;
     case R128_DP_WRITE_MASK:
+    case R128_PLANE_3D_MASK_C:
         s->dp_write_mask = val;
         break;
     case R128_DEFAULT_OFFSET:
@@ -1707,6 +1711,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->default_sc_bottom = (val >> 16) & 0x3fff;
         break;
     case R128_SC_TOP_LEFT:
+    case R128_SC_TOP_LEFT_C:
         s->sc_left = val & 0x3fff;
         s->sc_top = (val >> 16) & 0x3fff;
         break;
@@ -1717,6 +1722,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->sc_top = val & 0x3fff;
         break;
     case R128_SC_BOTTOM_RIGHT:
+    case R128_SC_BOTTOM_RIGHT_C:
         s->sc_right = val & 0x3fff;
         s->sc_bottom = (val >> 16) & 0x3fff;
         break;
