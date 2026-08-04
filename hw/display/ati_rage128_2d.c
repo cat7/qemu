@@ -14,6 +14,7 @@
 
 #include "ati_rage128_int.h"
 #include "ati_rage128_regs.h"
+#include "trace.h"
 
 /*
  * 2D GUI (destination datapath) engine. Ported from the real, shipped
@@ -202,8 +203,17 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
         return;
     }
 
-    dst_stride = s->dst_pitch * (bpp / 8);
-    src_stride = s->src_pitch * (bpp / 8);
+    /*
+     * Rage 128 destination/source pitch registers count in units of 8
+     * PIXELS (SRC/DST_PITCH_OFFSET pack pitch/8; a live Mac OS X 10.3
+     * shadow->screen blit carried pitch 0x64/0x68 for its 800px/832px
+     * surfaces). Upstream ati_2d.c encodes the same rule as
+     * "dst_stride *= bpp" for the Rage 128 Pro. Treating them as plain
+     * pixels compressed every blit 8x vertically into a self-overlapping
+     * smear -- the striped-band garbled desktop.
+     */
+    dst_stride = s->dst_pitch * bpp;
+    src_stride = s->src_pitch * bpp;
     if (!dst_stride) {
         return;
     }
@@ -263,6 +273,13 @@ void ati_rage128_2d_blt(ATIRage128State *s)
 {
     uint32_t src_source = s->dp_mix & R128_DP_SRC_SOURCE;
 
+    trace_ati_rage128_2d_blt(s->src_offset, (s->src_x << 16) | s->src_y,
+                             s->dst_offset, (s->dst_x << 16) | s->dst_y,
+                             s->dst_width, s->dst_height,
+                             (s->src_pitch << 16) | s->dst_pitch,
+                             (s->dp_mix >> 16) & 0xff, s->dp_datatype,
+                             src_source >> 8);
+
     if (s->host_data_active) {
         /* A new blt implicitly ends any still-in-progress HOST_DATA
          * transfer, matching upstream's ati_host_data_finish(). */
@@ -306,7 +323,7 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
     }
 
     bypp = bpp / 8;
-    dst_stride = s->dst_pitch * bypp;
+    dst_stride = s->dst_pitch * bpp; /* pitch is in 8-pixel units */
     if (!dst_stride) {
         s->host_data_active = false;
         return false;
