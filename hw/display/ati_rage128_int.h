@@ -75,6 +75,11 @@ typedef struct ATIRage128PM4Parser {
     uint32_t p3_opcode;      /* packet3 2D-draw sub-state */
     uint32_t p3_params[3];
     uint32_t p3_param_idx;
+    /* *_MULTI packet prefix/rect-cycle sub-state */
+    bool p3_need_src_po;
+    bool p3_need_dst_po;
+    bool p3_need_color;
+    uint32_t p3_rect_phase;
 } ATIRage128PM4Parser;
 
 typedef struct ATIRage128Mode {

@@ -1214,6 +1214,8 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
 static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table);
 static void ati_rage128_pm4_run(ATIRage128State *s);
 static void ati_rage128_pm4_fifo_push(ATIRage128State *s, uint32_t val);
+static void ati_rage128_pm4_parse(ATIRage128State *s,
+                                  ATIRage128PM4Parser *p, uint32_t val);
 static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
                                      uint32_t dwords);
 
@@ -1865,6 +1867,23 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
                     }
                 }
                 break;
+            case R128_PM4_OPCODE_PAINT_MULTI:
+            case R128_PM4_OPCODE_BITBLT_MULTI:
+            {
+                /*
+                 * Stateful prefix decode -- reuse the push parser's
+                 * state machine on a scratch parser, like the
+                 * indirect-buffer path does.
+                 */
+                ATIRage128PM4Parser mp = { 0 };
+
+                ati_rage128_pm4_parse(s, &mp, header);
+                for (i = 0; i < count; i++) {
+                    ati_rage128_pm4_parse(s, &mp,
+                                          ati_rage128_pm4_read_ring(s));
+                }
+                break;
+            }
             default:
                 trace_ati_rage128_pm4_unimp(opcode, count);
                 for (i = 0; i < count; i++) {
@@ -1911,9 +1930,15 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
             p->remaining = R128_PM4_PACKET_COUNT(val);
             p->p3_opcode = R128_PM4_PACKET3_OPCODE(val);
             p->p3_param_idx = 0;
+            p->p3_need_src_po = false;
+            p->p3_need_dst_po = false;
+            p->p3_need_color = false;
+            p->p3_rect_phase = 0;
             if (p->p3_opcode != R128_PM4_OPCODE_PAINT &&
                 p->p3_opcode != R128_PM4_OPCODE_BITBLT &&
-                p->p3_opcode != R128_PM4_OPCODE_HOSTDATA_BLT) {
+                p->p3_opcode != R128_PM4_OPCODE_HOSTDATA_BLT &&
+                p->p3_opcode != R128_PM4_OPCODE_PAINT_MULTI &&
+                p->p3_opcode != R128_PM4_OPCODE_BITBLT_MULTI) {
                 trace_ati_rage128_pm4_unimp(p->p3_opcode, p->remaining);
             }
             break;
@@ -1979,6 +2004,63 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
                 if (s->host_data_next >= 4) {
                     ati_rage128_host_data_flush(s);
                     s->host_data_next = 0;
+                }
+            }
+            break;
+        case R128_PM4_OPCODE_PAINT_MULTI:
+        case R128_PM4_OPCODE_BITBLT_MULTI:
+            /*
+             * The *_MULTI packets carry their own engine setup: a
+             * DP_GUI_MASTER_CNTL image, then -- gated by that dword's
+             * own control bits -- SRC/DST_PITCH_OFFSET images and (for
+             * a solid-color PAINT brush) the brush color, then a run
+             * of rectangles. Every prefix dword is an exact register
+             * image, so replay them through the register writeback and
+             * let the ordinary handlers keep the packing semantics in
+             * one place (layout per the Linux DRM driver's
+             * r128_cce_dispatch_clear()/_swap(), confirmed live
+             * against the Mac OS X 10.3 driver's streams).
+             */
+            if (p->p3_param_idx == 0) {
+                ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, val);
+                p->p3_need_src_po =
+                    (p->p3_opcode == R128_PM4_OPCODE_BITBLT_MULTI) &&
+                    (val & R128_GMC_SRC_PITCH_OFFSET_CNTL);
+                p->p3_need_dst_po = val & R128_GMC_DST_PITCH_OFFSET_CNTL;
+                p->p3_need_color =
+                    (p->p3_opcode == R128_PM4_OPCODE_PAINT_MULTI) &&
+                    (val & R128_GMC_BRUSH_DATATYPE_MASK) ==
+                        R128_GMC_BRUSH_SOLID_COLOR;
+                p->p3_param_idx = 1;
+            } else if (p->p3_need_src_po) {
+                ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET, val);
+                p->p3_need_src_po = false;
+            } else if (p->p3_need_dst_po) {
+                ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET, val);
+                p->p3_need_dst_po = false;
+            } else if (p->p3_need_color) {
+                ati_rage128_reg_write32(s, R128_DP_BRUSH_FRGD_CLR, val);
+                p->p3_need_color = false;
+            } else if (p->p3_opcode == R128_PM4_OPCODE_PAINT_MULTI) {
+                /* rect pairs: (x<<16)|y then (w<<16)|h, blts on the 2nd */
+                if (p->p3_rect_phase == 0) {
+                    ati_rage128_reg_write32(s, R128_DST_X_Y, val);
+                    p->p3_rect_phase = 1;
+                } else {
+                    ati_rage128_reg_write32(s, R128_DST_WIDTH_HEIGHT, val);
+                    p->p3_rect_phase = 0;
+                }
+            } else {
+                /* rect triples: src (x<<16)|y, dst (x<<16)|y, (w<<16)|h */
+                if (p->p3_rect_phase == 0) {
+                    ati_rage128_reg_write32(s, R128_SRC_X_Y, val);
+                    p->p3_rect_phase = 1;
+                } else if (p->p3_rect_phase == 1) {
+                    ati_rage128_reg_write32(s, R128_DST_X_Y, val);
+                    p->p3_rect_phase = 2;
+                } else {
+                    ati_rage128_reg_write32(s, R128_DST_WIDTH_HEIGHT, val);
+                    p->p3_rect_phase = 0;
                 }
             }
             break;
