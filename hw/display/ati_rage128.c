@@ -31,6 +31,7 @@
 #include "system/memory.h"
 #include "ui/console.h"
 #include "qom/object.h"
+#include "hw/i2c/i2c.h"
 
 #include "ati_rage128_int.h"
 #include "ati_rage128_regs.h"
@@ -817,6 +818,9 @@ static void ati_rage128_vblank_timer_tick(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t next_blank;
 
+    /* one DDC1 EDID stream bit per vertical sync (see the MONID read) */
+    s->ddc1_pos = (s->ddc1_pos + 1) % (sizeof(s->edid) * 9);
+
     if (s->regs[R128_CRTC_GEN_CNTL >> 2] & R128_CRTC_EN) {
         s->regs[R128_GEN_INT_STATUS >> 2] |= R128_CRTC_VBLANK_INT |
                                              R128_CRTC_VSYNC_INT;
@@ -842,6 +846,55 @@ static void ati_rage128_vblank_timer_tick(void *opaque)
 }
 
 /* ---------------------------------------------------------------- */
+/*
+ * Minimal DDC EEPROM slave for the GPIO_MONID bit-banged bus. Serves
+ * the device's own 128-byte EDID (the same image the hardware I2C
+ * engine answers with): a written byte sets the read offset, reads
+ * return successive EDID bytes.
+ */
+#define TYPE_ATI_RAGE128_DDC "ati-rage128-ddc"
+OBJECT_DECLARE_SIMPLE_TYPE(ATIRage128DDCState, ATI_RAGE128_DDC)
+
+struct ATIRage128DDCState {
+    I2CSlave parent_obj;
+    uint8_t reg;
+    const uint8_t *edid;
+};
+
+static int ati_rage128_ddc_event(I2CSlave *i2c, enum i2c_event event)
+{
+    return 0;
+}
+
+static uint8_t ati_rage128_ddc_recv(I2CSlave *i2c)
+{
+    ATIRage128DDCState *d = ATI_RAGE128_DDC(i2c);
+
+    return d->edid ? d->edid[d->reg++ & 0x7f] : 0xff;
+}
+
+static int ati_rage128_ddc_send(I2CSlave *i2c, uint8_t data)
+{
+    ATI_RAGE128_DDC(i2c)->reg = data;
+    return 0;
+}
+
+static void ati_rage128_ddc_class_init(ObjectClass *oc, const void *data)
+{
+    I2CSlaveClass *k = I2C_SLAVE_CLASS(oc);
+
+    k->event = ati_rage128_ddc_event;
+    k->recv = ati_rage128_ddc_recv;
+    k->send = ati_rage128_ddc_send;
+}
+
+static const TypeInfo ati_rage128_ddc_info = {
+    .name = TYPE_ATI_RAGE128_DDC,
+    .parent = TYPE_I2C_SLAVE,
+    .instance_size = sizeof(ATIRage128DDCState),
+    .class_init = ati_rage128_ddc_class_init,
+};
+
 /* Hardware I2C engine serving EDID (DDC addresses 0xA0/0xA1)       */
 
 static void ati_rage128_i2c_go(ATIRage128State *s)
@@ -989,7 +1042,39 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
          * Y[2:0]; exactly one line driven low = the extended code's
          * two-bit answer on the other two lines.
          */
-        if (s->monitor_connected) {
+        if (((val >> 24) & 0xf) == 0xf) {
+            /*
+             * DDC readback (see the write handler): SDA on Y0, SCL on
+             * Y1, upper pads float high. The Apple-sense answers below
+             * must NOT fire here -- their Y0-clearing ext-code replies
+             * made the ndrv's DDC check read SDA as stuck low, so it
+             * abandoned DDC and fell back to the generic "VGA
+             * Display".
+             *
+             * While the guest merely samples (no SCL clocking), a
+             * floating SDA carries the VESA DDC1 stream: the monitor
+             * shifts the 128-byte EDID out continuously, one bit per
+             * VSYNC, in 9-bit frames (8 data bits MSB first + one
+             * high null bit). The ndrv holds this state and samples
+             * across frames looking for a moving bitstream; a static
+             * level reads as "no DDC monitor". The bit position
+             * advances in the VBLANK timer.
+             */
+            int sda;
+
+            if (en & 1) {
+                sda = a & 1;
+            } else if (s->monid_sda == 0) {
+                sda = 0;      /* DDC2 slave holding the line */
+            } else {
+                uint32_t frame = s->ddc1_pos / 9;
+                uint32_t bit = s->ddc1_pos % 9;
+
+                sda = (bit == 8) ? 1 :
+                      (s->edid[frame % sizeof(s->edid)] >> (7 - bit)) & 1;
+            }
+            y = 0xc | (((en & 2) ? !!(a & 2) : 1) << 1) | sda;
+        } else if (s->monitor_connected) {
             uint32_t drv = en & 7 & ~a;   /* lines driven low */
 
             if ((en & 7) == 0) {
@@ -1634,6 +1719,27 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_CFG_MIRROR_BASE ... R128_CFG_MIRROR_END:
         /* read-only mirror of PCI config space */
+        break;
+    case R128_GPIO_MONID:
+        s->regs[base >> 2] = val;
+        /*
+         * The ndrv's bit-banged DDC (MASK nibble 0xf, distinct from
+         * the Apple-sense probes' 0x7 and the FCode's 0): SDA on pad
+         * 0, SCL on pad 1, open drain -- a pad drives its A-bit level
+         * while its EN bit is set, floats high otherwise. Feed every
+         * edge to the I2C core and keep the resulting SDA level for
+         * MONID_Y readback.
+         */
+        if (((val >> 24) & 0xf) == 0xf) {
+            uint32_t en = (val >> 16) & 0xf;
+            uint32_t a = val & 0xf;
+            int scl = (en & 2) ? !!(a & 2) : 1;
+            int sda = (en & 1) ? !!(a & 1) : 1;
+
+            bitbang_i2c_set(&s->monid_i2c, BITBANG_I2C_SCL, scl);
+            s->monid_sda = bitbang_i2c_set(&s->monid_i2c,
+                                           BITBANG_I2C_SDA, sda);
+        }
         break;
     default:
         s->regs[base >> 2] = val;
@@ -2424,6 +2530,21 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
     };
 
     memcpy(s->edid, rage128_default_edid, sizeof(s->edid));
+
+    /*
+     * The MONID bit-banged DDC bus (see the R128_GPIO_MONID write
+     * handler): Mac OS X's ATI ndrv reads EDID here, not through the
+     * hardware I2C engine.
+     */
+    {
+        I2CBus *ddcbus = i2c_init_bus(DEVICE(dev), "ati-rage128.monid-ddc");
+        I2CSlave *slv = i2c_slave_create_simple(ddcbus,
+                                                TYPE_ATI_RAGE128_DDC, 0x50);
+
+        ATI_RAGE128_DDC(slv)->edid = s->edid;
+        bitbang_i2c_init(&s->monid_i2c, ddcbus);
+        s->monid_sda = 1;
+    }
 }
 
 static void ati_rage128_exit(PCIDevice *dev)
@@ -2507,6 +2628,7 @@ static const TypeInfo ati_rage128_type_info = {
 static void ati_rage128_register_types(void)
 {
     type_register_static(&ati_rage128_type_info);
+    type_register_static(&ati_rage128_ddc_info);
 }
 
 type_init(ati_rage128_register_types)

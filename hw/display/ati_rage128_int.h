@@ -30,6 +30,7 @@
 
 #include "hw/pci/pci_device.h"
 #include "hw/display/edid.h"
+#include "hw/i2c/bitbang_i2c.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -188,6 +189,17 @@ struct ATIRage128State {
     uint8_t i2c_offset;      /* current EDID read offset */
     uint8_t i2c_data_fifo[16];
     int i2c_data_len;
+
+    /*
+     * Second DDC path: Mac OS X's ATI ndrv bit-bangs I2C on the
+     * GPIO_MONID pads (SDA = pad 0, SCL = pad 1), marking them with
+     * MASK nibble 0xf -- distinct from the Apple-sense probes (MASK
+     * 0x7) and the FCode's EN-only convention (MASK 0). Serves the
+     * same 128-byte EDID as the hardware engine above.
+     */
+    bitbang_i2c_interface monid_i2c;
+    int monid_sda;           /* live SDA level fed back into MONID_Y */
+    uint32_t ddc1_pos;       /* VSYNC-clocked DDC1 EDID bitstream position */
     int i2c_data_pos;
 
     /*
