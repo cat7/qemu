@@ -315,8 +315,6 @@
 #define R128_DP_SRC_HOST             0x00000300
 #define R128_DP_SRC_HOST_BYTEALIGN   0x00000400
 #define R128_DP_BYTE_PIX_ORDER       0x40000000
-/* DP_DATATYPE bit 29: byte-reverse incoming host data (RRG-G04500-C) */
-#define R128_DP_HOST_BIG_ENDIAN_EN   0x20000000
 #define R128_SRC_MONO_FRGD_BKGD      0x00000000
 #define R128_SRC_MONO_FRGD           0x00010000
 #define R128_SRC_COLOR                0x00030000
