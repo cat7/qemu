@@ -288,8 +288,14 @@ static void keylargo_i2s_tap_out(KeyLargoI2SState *c, DBDMA_io *io, int rate)
         };
 
         c->voice_rate = rate;
+        /*
+         * "Tumbler" is Apple's name for this TAS3001C-based sound
+         * subsystem (AppleLegacyAudio's Texas driver); the codec sits
+         * on i2s-a, so that cell carries the name.
+         */
         c->voice = audio_be_open_out(c->audio_be, c->voice,
-                                     c->cell ? "kl-i2s1.out" : "kl-i2s0.out",
+                                     c->cell ? "tumbler-i2sb.out"
+                                             : "tumbler.out",
                                      c, keylargo_i2s_audio_cb, &as);
         audio_be_set_active_out(c->audio_be, c->voice, true);
     }
