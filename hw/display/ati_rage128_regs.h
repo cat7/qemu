@@ -90,6 +90,9 @@
 #define R128_SOFT_RESET_GUI          (1u << 0)
 #define R128_PC_NGUI_MODE            0x0180
 #define R128_PC_NGUI_CTLSTAT         0x0184
+/* GUI-engine pixel cache twin of the pair above (SourceFiles ati_regs.h) */
+#define R128_PC_GUI_MODE             0x1744
+#define R128_PC_GUI_CTLSTAT          0x1748
 #define R128_PC_MISC_CTL             0x0188
 #define R128_CRTC_H_TOTAL_DISP       0x0200
 #define R128_CRTC_H_SYNC_STRT_WID    0x0204
