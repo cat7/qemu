@@ -87,31 +87,34 @@ static const MemoryRegionOps keylargo_fcr_ops = {
 /*
  * One byte per pin: extint-gpio0..17 at 0x58..0x69, gpio0..16 at
  * 0x6a..0x7a (levels/extint-events words live at 0x50; plain storage).
- * Bit semantics per Linux's keylargo.h: bit 0 drives the pin when bit 2
- * (output enable) is set; bit 1 reads back the pin level.
+ * Bit semantics per Apple's own AppleLegacyAudio DallasROM.h (the
+ * consumer that bit-bangs these): bit 4 (gpioOS) is the driven output
+ * value, bit 2 (gpioDDR) enables the driver, bit 1 (gpioPIN_RO) reads
+ * back the level on the pin.
  *
- * A pin that is not driven reads back its pull/wired-or level. The
- * speaker-id one-wire bus (extint-gpio16, macio +0x68 on the real
- * PowerMac3,4, "AAPL,driver-name" = .DallasDriver) idles pulled UP: with
- * no DS2430A modeled, a released bus must read high. When this block was
- * an unmodeled hole, every read returned 0 -- to AppleDallasDriver's
- * bit-banged one-wire reset that 0 is a permanent presence pulse, so it
- * saw a speaker EEPROM that answered every reset and then returned
- * garbage, and it retried forever (observed live on the Mac OS X 10.4
- * installer: an endless AppleDallas error storm, then the installer
- * gives up). The other pins keep the old read-as-0 behavior until a
- * consumer gives us a reason to model their pulls.
+ * A pin that is not driven reads back LOW. That polarity matters for
+ * the speaker-id one-wire bus (extint-gpio16, macio +0x68 on the real
+ * PowerMac3,4, "AAPL,driver-name" = .DallasDriver): the bus's pull-up
+ * lives in the Apple Pro Speakers pod, not on the board, and
+ * AppleDallasDriver's very first probe step is "tristate, read: low
+ * means no speaker ROM, done" (AppleDallasDriver.cpp ROMReset()). When
+ * this block was an unmodeled BAR hole the reads came back as bus
+ * master-abort all-ones, and a high idle line means "a ROM might be
+ * present" -- so the driver ran its 10-attempt presence-pulse hunt,
+ * failed it, and was re-invoked forever ("Sound assertion
+ * \"++errorCount > 10\" ... AppleDallasDriver.cpp at line 152" storming
+ * the 10.4 installer's log). Reading low is both electrically right
+ * with no speakers attached and the driver's documented quiet path.
  */
 #define KEYLARGO_GPIO_BASE      0x50
 #define KEYLARGO_GPIO_SIZE      0x30
-#define KEYLARGO_GPIO_OUT_DATA  0x01
 #define KEYLARGO_GPIO_IN_DATA   0x02
 #define KEYLARGO_GPIO_OUT_EN    0x04
-#define KEYLARGO_GPIO_OW_PIN    (0x68 - KEYLARGO_GPIO_BASE)
+#define KEYLARGO_GPIO_OUT_DATA  0x10
 
 static bool keylargo_gpio_pull(unsigned pin)
 {
-    return pin == KEYLARGO_GPIO_OW_PIN;
+    return false;
 }
 
 static uint64_t keylargo_gpio_read(void *opaque, hwaddr addr, unsigned size)
