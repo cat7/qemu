@@ -780,26 +780,30 @@ static void cmd_inquiry(IDEState *s, uint8_t *buf)
 
         buf[0] = 0x05; /* CD-ROM */
         buf[1] = 0x80; /* removable */
-        buf[2] = 0x02; /* ANSI version: SCSI-2 (confirmed to match
-                         * DingusPPC's real ATAPI CdromDrive::inquiry(),
-                         * the proven-working reference for this exact
-                         * machine -- was previously 0x00/"unspecified") */
+        buf[2] = 0x00; /* ISO */
         buf[3] = 0x21; /* ATAPI-2 (XXX: put ATAPI-4 ?) */
         /* buf[size_idx] set below. */
         buf[5] = 0;    /* reserved */
         buf[6] = 0;    /* reserved */
         buf[7] = 0;    /* reserved */
         /*
-         * Real classic Mac OS ATAPI/SCSI driver code applies quirks keyed
-         * on the drive's reported identity, and some real Old World Macs
-         * genuinely shipped a Sony-made CD-ROM here. DingusPPC (the proven
-         * working reference for this exact machine) impersonates this
-         * same real drive rather than a generic "QEMU" identity -- mirror
-         * it for Apple-ROM compatibility.
+         * Keep the stock QEMU identity. An earlier Apple-compatibility
+         * quirk impersonated a real 1993 Sony CDU-8003A CD-ROM here
+         * (mirroring DingusPPC), but Mac OS X 10.4 responds to that
+         * identity by treating the drive as vintage CD hardware: paging
+         * in files that live beyond the CD-sized region of a DVD-sized
+         * install image fails without the device ever being asked, which
+         * killed the installer's WindowServer in _PEFExamineFile with
+         * KERN_MEMORY_ERROR on every boot (verified A/B against the
+         * 10.4.6 install image: Sony identity crashes, stock identity
+         * reaches the installer GUI). Classic Mac OS's drive
+         * qualification is satisfied by the Apple vendor mode pages
+         * (0x30/0x31) below, which it requests explicitly and OS X
+         * never touches.
          */
-        padstr8(buf + 8, 8, "SONY");
-        padstr8(buf + 16, 16, "CD-ROM CDU-8003A");
-        padstr8(buf + 32, 4, "1.9a");
+        padstr8(buf + 8, 8, "QEMU");
+        padstr8(buf + 16, 16, "QEMU DVD-ROM");
+        padstr8(buf + 32, 4, s->version);
         idx = 36;
     }
 
