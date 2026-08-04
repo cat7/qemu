@@ -67,6 +67,19 @@ static int pci_unin_main_real_map_irq(PCIDevice *pci_dev, int irq_num)
     }
 }
 
+/*
+ * Real pci@f4000000 interrupt-map: slot 0x0e -> 0x28, slot 0x0f (the
+ * on-board GMAC) -> 0x29; nothing else lives on this bus.
+ */
+static int pci_unin_internal_real_map_irq(PCIDevice *pci_dev, int irq_num)
+{
+    switch (pci_dev->devfn >> 3) {
+    case 0x0e: return 0;
+    case 0x0f: return 1;
+    default:   return 7;
+    }
+}
+
 static void pci_unin_set_irq(void *opaque, int irq_num, int level)
 {
     UNINHostState *s = opaque;
@@ -282,11 +295,15 @@ static void pci_unin_internal_realize(DeviceState *dev, Error **errp)
     PCIHostState *h = PCI_HOST_BRIDGE(dev);
 
     h->bus = pci_register_root_bus(dev, NULL,
-                                   pci_unin_set_irq, pci_unin_map_irq,
+                                   pci_unin_set_irq,
+                                   s->real_irq_map ?
+                                       pci_unin_internal_real_map_irq :
+                                       pci_unin_map_irq,
                                    s,
                                    &s->pci_mmio,
                                    &s->pci_io,
-                                   PCI_DEVFN(14, 0), 4, TYPE_PCI_BUS);
+                                   PCI_DEVFN(14, 0),
+                                   s->real_irq_map ? 8 : 4, TYPE_PCI_BUS);
 
     pci_create_simple(h->bus, PCI_DEVFN(14, 0), "uni-north-internal-pci");
 }
@@ -303,8 +320,25 @@ static void pci_unin_internal_init(Object *obj)
     memory_region_init_io(&h->data_mem, OBJECT(h), &pci_host_data_le_ops,
                           obj, "unin-pci-conf-data", 0x1000);
 
+    /*
+     * The internal bus previously handed pci_register_root_bus()
+     * pointers to never-initialized regions -- harmless while nothing
+     * lived on the bus, fatal the moment a device (GMAC) does. The real
+     * PowerMac3,4's pci@f4000000 forwards one 16MB memory window at
+     * 0xf5000000 (its own `ranges` property); expose exactly that as
+     * mmio region 2 for the machine to map.
+     */
+    memory_region_init(&s->pci_mmio, OBJECT(s), "unin-internal-pci-mmio",
+                       0x100000000ULL);
+    memory_region_init_io(&s->pci_io, OBJECT(s), &unassigned_io_ops, obj,
+                          "unin-internal-pci-isa-mmio", 0x00800000);
+    memory_region_init_alias(&s->pci_hole, OBJECT(s),
+                             "unin-internal-pci-hole", &s->pci_mmio,
+                             0xf5000000ULL, 0x01000000ULL);
+
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
+    sysbus_init_mmio(sbd, &s->pci_hole);
 
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
 }
@@ -514,11 +548,17 @@ static const TypeInfo pci_unin_agp_info = {
     .class_init    = pci_unin_agp_class_init,
 };
 
+static const Property pci_unin_internal_props[] = {
+    /* Route slots per the real PowerMac3,4 interrupt-map (Apple ROM mode) */
+    DEFINE_PROP_BOOL("real-irq-map", UNINHostState, real_irq_map, false),
+};
+
 static void pci_unin_internal_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = pci_unin_internal_realize;
+    device_class_set_props(dc, pci_unin_internal_props);
 }
 
 static const TypeInfo pci_unin_internal_info = {

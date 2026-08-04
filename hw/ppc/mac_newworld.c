@@ -573,10 +573,14 @@ static void ppc_core99_init(MachineState *machine)
         /* Uninorth internal bus */
         uninorth_internal_dev = qdev_new(
                                 TYPE_UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE);
+        qdev_prop_set_bit(uninorth_internal_dev, "real-irq-map",
+                          rom_is_flash);
         s = SYS_BUS_DEVICE(uninorth_internal_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf4800000);
         sysbus_mmio_map(s, 1, 0xf4c00000);
+        /* The real pci@f4000000's one memory window (its ranges prop) */
+        sysbus_mmio_map(s, 2, 0xf5000000);
 
         /* Uninorth main bus - this must be last to make it the default */
         uninorth_pci_dev = qdev_new(TYPE_UNI_NORTH_PCI_HOST_BRIDGE);
@@ -703,9 +707,17 @@ static void ppc_core99_init(MachineState *machine)
         }
 
         /* Uninorth internal bus */
-        for (i = 0; i < 4; i++) {
-            qdev_connect_gpio_out(uninorth_internal_dev, i,
-                                  qdev_get_gpio_in(pic_dev, 0x1b + i));
+        if (rom_is_flash) {
+            /* Real pci@f4000000 interrupt-map: slots 0x0e/0x0f */
+            qdev_connect_gpio_out(uninorth_internal_dev, 0,
+                                  qdev_get_gpio_in(pic_dev, 0x28));
+            qdev_connect_gpio_out(uninorth_internal_dev, 1,
+                                  qdev_get_gpio_in(pic_dev, 0x29));
+        } else {
+            for (i = 0; i < 4; i++) {
+                qdev_connect_gpio_out(uninorth_internal_dev, i,
+                                      qdev_get_gpio_in(pic_dev, 0x1b + i));
+            }
         }
     }
 
@@ -798,7 +810,21 @@ static void ppc_core99_init(MachineState *machine)
         graphic_depth = 15;
     }
 
-    pci_init_nic_devices(pci_bus, mc->default_nic);
+    /*
+     * With the Apple ROM providing the device tree, the on-board GMAC
+     * must sit where that tree says it does: pci@f4000000, slot 0x0f
+     * (verified against a real PowerMac3,4's ethernet@f node; our
+     * sungem is the same 106b:0021 part). OpenBIOS machines keep the
+     * default placement its own tree describes.
+     */
+    if (rom_is_flash && uninorth_internal_dev) {
+        PCIBus *internal_bus =
+            PCI_HOST_BRIDGE(uninorth_internal_dev)->bus;
+
+        pci_init_nic_in_slot(internal_bus, mc->default_nic, NULL, "f");
+    } else {
+        pci_init_nic_devices(pci_bus, mc->default_nic);
+    }
 
     /* The NewWorld NVRAM is not located in the MacIO device */
     if (kvm_enabled() && qemu_real_host_page_size() > 4096) {
