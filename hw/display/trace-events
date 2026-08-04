@@ -162,6 +162,7 @@ ati_rage128_i2c(uint8_t addr, uint8_t count, int receive, int nack, uint8_t edid
 ati_rage128_aper_endian(uint32_t aper0, uint32_t aper1, int reg_swap) "APER_0_ENDIAN=%u APER_1_ENDIAN=%u REG_ENDIAN=%d"
 ati_rage128_bm_desc(uint32_t reg_off, uint32_t sysaddr, uint32_t ctrl) "reg_off=0x%x sysaddr=0x%x ctrl=0x%08x"
 ati_rage128_pm4_unimp(uint32_t opcode, uint32_t count) "PM4 packet3 opcode=0x%02x count=%u (unimplemented, skipped)"
+ati_rage128_2d_blt(uint32_t soff, uint32_t sxy, uint32_t doff, uint32_t dxy, uint32_t w, uint32_t h, uint32_t pitches, uint32_t rop, uint32_t datatype, uint32_t src) "blt src off=0x%x xy=0x%08x -> dst off=0x%x xy=0x%08x wh=%ux%u pitches=0x%08x rop=0x%02x dt=0x%x srcsel=%u"
 ati_rage128_auto_fb(uint32_t off, uint32_t w, uint32_t h, uint32_t bpp_or_size, int valid, uint32_t score) "off=0x%x %ux%u bpp/size=%u valid=%d score=%u"
 ati_rage128_pm4_indirect(uint32_t offset, uint32_t dwords, uint32_t first) "IB dispatch: card-addr=0x%x dwords=%u first=0x%08x"
 ati_rage128_monid(uint32_t raw, uint32_t y) "GPIO_MONID probe raw=0x%08x -> Y=0x%x"
