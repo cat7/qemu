@@ -118,6 +118,16 @@ typedef struct KeyLargoI2SState {
     uint32_t fifo_rptr;
     uint32_t fifo_wptr;
     uint32_t fifo_count;
+    /*
+     * Playout cushion (same shape as awacs.c): a freshly (re)started
+     * stream only begins draining once the FIFO holds a real cushion of
+     * audio, so the backend never underruns between the guest's bursty
+     * DMA pushes -- an underrun makes CoreAudio loop its stale ring
+     * buffer (heard as the last fraction of a second repeating) and
+     * every restart pops.
+     */
+    bool prebuffering;
+    int64_t last_push_ns;
 } KeyLargoI2SState;
 
 typedef struct KeyLargoI2CState {

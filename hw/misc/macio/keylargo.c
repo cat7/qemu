@@ -238,9 +238,36 @@ static void keylargo_i2s_out_complete(void *opaque)
  */
 #define KL_I2S_FRAME_BYTES 4
 
+/*
+ * Playout cushion (ported from awacs.c, where these values are
+ * ear-verified): target FIFO depth before a freshly (re)started stream
+ * begins draining, and how long to keep waiting for it once the guest
+ * stops pushing (so a short final burst still plays out).
+ */
+#define KL_I2S_PREBUF_NS        (30 * 1000 * 1000)
+#define KL_I2S_PREBUF_GIVEUP_NS (50 * 1000 * 1000)
+
 static void keylargo_i2s_audio_cb(void *opaque, int avail)
 {
     KeyLargoI2SState *c = opaque;
+
+    if (c->fifo_count == 0) {
+        /* Stream drained (or never started): next data prebuffers. */
+        c->prebuffering = true;
+        return;
+    }
+    if (c->prebuffering) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int rate = c->voice_rate ? c->voice_rate : 44100;
+        uint32_t want = (uint64_t)rate * KL_I2S_FRAME_BYTES *
+                        KL_I2S_PREBUF_NS / NANOSECONDS_PER_SECOND;
+
+        if (c->fifo_count < want &&
+            now - c->last_push_ns < KL_I2S_PREBUF_GIVEUP_NS) {
+            return;
+        }
+        c->prebuffering = false;
+    }
 
     avail -= avail % KL_I2S_FRAME_BYTES;
     while (avail >= KL_I2S_FRAME_BYTES &&
@@ -298,8 +325,10 @@ static void keylargo_i2s_tap_out(KeyLargoI2SState *c, DBDMA_io *io, int rate)
                                              : "tumbler.out",
                                      c, keylargo_i2s_audio_cb, &as);
         audio_be_set_active_out(c->audio_be, c->voice, true);
+        c->prebuffering = true;
     }
 
+    c->last_push_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     while (remaining > 0) {
         int len = MIN(remaining, (int)sizeof(buf));
         int i;
