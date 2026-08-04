@@ -332,6 +332,14 @@ static void ohci_roothub_reset(OHCIState *ohci)
             usb_port_reset(&port->port);
         }
     }
+    /*
+     * One pause after a controller reset: Mac OS 9 and early Mac OS X
+     * (10.0-10.2) probe the root hub straight after resetting the
+     * controller and miss attached devices if the ports report ready
+     * instantly -- their USB stacks then wedge during boot-time input
+     * device discovery. Real hardware needs time here too.
+     */
+    g_usleep(50000);
     ohci_stop_endpoints(ohci);
 }
 
