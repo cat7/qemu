@@ -227,6 +227,80 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
         sc_bottom = 0x3fff;
     }
 
+    /*
+     * Row-wise fast paths for the four ops that carry essentially all of
+     * an accelerated desktop's traffic (full-surface copies and fills,
+     * issued every frame): straight copy, solid fill, clear to 0/1. The
+     * general per-pixel read-modify-write loop below costs several calls
+     * per pixel, which at 800x600x32bpp per frame is the difference
+     * between a fluid desktop and a sluggish one. Semantics mirror the
+     * general loop exactly (same scissor clip, no write-mask/color-
+     * compare handling there either); vertical direction is honored so
+     * overlapping scrolls stay correct, horizontal overlap is memmove's
+     * problem. 24bpp stays on the general path.
+     */
+    if ((rop == 0xcc || rop == 0xf0 || rop == 0x00 || rop == 0xff) &&
+        bpp != 24) {
+        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+        int bypp = bpp / 8;
+        int x0 = MAX((int)s->dst_x, sc_left);
+        int x1 = MIN((int)s->dst_x + width - 1, sc_right);
+        int y0 = MAX((int)s->dst_y, sc_top);
+        int y1 = MIN((int)s->dst_y + height - 1, sc_bottom);
+        int n = x1 - x0 + 1;
+
+        if (n <= 0 || y1 < y0) {
+            return;
+        }
+        for (y = 0; y < y1 - y0 + 1; y++) {
+            int dy = top_to_bottom ? y0 + y : y1 - y;
+            uint64_t daddr = (uint64_t)s->dst_offset +
+                             (uint64_t)dy * dst_stride +
+                             (uint64_t)x0 * bypp;
+
+            if (daddr + (uint64_t)n * bypp > ATI_RAGE128_VRAM_SIZE) {
+                continue;
+            }
+            if (rop == 0xcc) {
+                int sy = (int)s->src_y + (dy - (int)s->dst_y);
+                int sx = (int)s->src_x + (x0 - (int)s->dst_x);
+                uint64_t saddr = (uint64_t)s->src_offset +
+                                 (uint64_t)sy * src_stride +
+                                 (uint64_t)sx * bypp;
+
+                if (sy < 0 || sx < 0 ||
+                    saddr + (uint64_t)n * bypp > ATI_RAGE128_VRAM_SIZE) {
+                    continue;
+                }
+                memmove(vram + daddr, vram + saddr, (size_t)n * bypp);
+            } else if (rop == 0x00) {
+                memset(vram + daddr, 0, (size_t)n * bypp);
+            } else if (rop == 0xff) {
+                memset(vram + daddr, 0xff, (size_t)n * bypp);
+            } else {
+                uint32_t color = s->dp_brush_frgd_clr;
+
+                if (bypp == 4) {
+                    uint32_t *p = (uint32_t *)(vram + daddr);
+
+                    for (x = 0; x < n; x++) {
+                        stl_le_p(p + x, color);
+                    }
+                } else if (bypp == 2) {
+                    uint16_t *p = (uint16_t *)(vram + daddr);
+
+                    for (x = 0; x < n; x++) {
+                        stw_le_p(p + x, color);
+                    }
+                } else {
+                    memset(vram + daddr, color, (size_t)n);
+                }
+            }
+        }
+        ati_rage128_2d_mark_rows_dirty(s, s->dst_offset, dst_stride, y0, y1);
+        return;
+    }
+
     for (y = 0; y < height; y++) {
         int dy = top_to_bottom ? (int)s->dst_y + y
                                : (int)s->dst_y + height - 1 - y;
