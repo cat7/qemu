@@ -51,6 +51,8 @@ dbdma_channel_run(int channel, uint16_t command) "channel=0x%x command=0x%04x"
 # keylargo.c
 keylargo_fcr_read(uint64_t addr, uint32_t val) "FCR addr=0x%"PRIx64" val=0x%08x"
 keylargo_fcr_write(uint64_t addr, uint32_t val) "FCR addr=0x%"PRIx64" val=0x%08x"
+keylargo_gpio_read(uint64_t addr, uint8_t val) "GPIO addr=0x%"PRIx64" val=0x%02x"
+keylargo_gpio_write(uint64_t addr, uint8_t val) "GPIO addr=0x%"PRIx64" val=0x%02x"
 keylargo_i2s_read(int cell, uint64_t addr, uint32_t val) "I2S%d addr=0x%"PRIx64" val=0x%08x"
 keylargo_i2s_write(int cell, uint64_t addr, uint32_t val) "I2S%d addr=0x%"PRIx64" val=0x%08x"
 keylargo_i2s_dma(int cell, uint64_t addr, int len, int rate) "I2S%d dma addr=0x%"PRIx64" len=%d rate=%d"

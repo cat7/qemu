@@ -81,6 +81,74 @@ static const MemoryRegionOps keylargo_fcr_ops = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* GPIOs                                                                  */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * One byte per pin: extint-gpio0..17 at 0x58..0x69, gpio0..16 at
+ * 0x6a..0x7a (levels/extint-events words live at 0x50; plain storage).
+ * Bit semantics per Linux's keylargo.h: bit 0 drives the pin when bit 2
+ * (output enable) is set; bit 1 reads back the pin level.
+ *
+ * A pin that is not driven reads back its pull/wired-or level. The
+ * speaker-id one-wire bus (extint-gpio16, macio +0x68 on the real
+ * PowerMac3,4, "AAPL,driver-name" = .DallasDriver) idles pulled UP: with
+ * no DS2430A modeled, a released bus must read high. When this block was
+ * an unmodeled hole, every read returned 0 -- to AppleDallasDriver's
+ * bit-banged one-wire reset that 0 is a permanent presence pulse, so it
+ * saw a speaker EEPROM that answered every reset and then returned
+ * garbage, and it retried forever (observed live on the Mac OS X 10.4
+ * installer: an endless AppleDallas error storm, then the installer
+ * gives up). The other pins keep the old read-as-0 behavior until a
+ * consumer gives us a reason to model their pulls.
+ */
+#define KEYLARGO_GPIO_BASE      0x50
+#define KEYLARGO_GPIO_SIZE      0x30
+#define KEYLARGO_GPIO_OUT_DATA  0x01
+#define KEYLARGO_GPIO_IN_DATA   0x02
+#define KEYLARGO_GPIO_OUT_EN    0x04
+#define KEYLARGO_GPIO_OW_PIN    (0x68 - KEYLARGO_GPIO_BASE)
+
+static bool keylargo_gpio_pull(unsigned pin)
+{
+    return pin == KEYLARGO_GPIO_OW_PIN;
+}
+
+static uint64_t keylargo_gpio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    KeyLargoState *s = opaque;
+    uint8_t v = s->gpio[addr];
+    bool level;
+
+    if (v & KEYLARGO_GPIO_OUT_EN) {
+        level = v & KEYLARGO_GPIO_OUT_DATA;
+    } else {
+        level = keylargo_gpio_pull(addr);
+    }
+    v = (v & ~KEYLARGO_GPIO_IN_DATA) |
+        (level ? KEYLARGO_GPIO_IN_DATA : 0);
+    trace_keylargo_gpio_read(KEYLARGO_GPIO_BASE + addr, v);
+    return v;
+}
+
+static void keylargo_gpio_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned size)
+{
+    KeyLargoState *s = opaque;
+
+    trace_keylargo_gpio_write(KEYLARGO_GPIO_BASE + addr, (uint8_t)value);
+    s->gpio[addr] = value & ~KEYLARGO_GPIO_IN_DATA;
+}
+
+static const MemoryRegionOps keylargo_gpio_ops = {
+    .read = keylargo_gpio_read,
+    .write = keylargo_gpio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = { .min_access_size = 1, .max_access_size = 1 },
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* ---------------------------------------------------------------------- */
 /* I2S cells                                                              */
 /* ---------------------------------------------------------------------- */
 
@@ -649,6 +717,10 @@ KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar)
     memory_region_init_io(&s->fcr_mem, OBJECT(owner), &keylargo_fcr_ops, s,
                           "keylargo-fcr", KEYLARGO_FCR_SIZE);
     memory_region_add_subregion(bar, KEYLARGO_FCR_BASE, &s->fcr_mem);
+
+    memory_region_init_io(&s->gpio_mem, OBJECT(owner), &keylargo_gpio_ops, s,
+                          "keylargo-gpio", KEYLARGO_GPIO_SIZE);
+    memory_region_add_subregion(bar, KEYLARGO_GPIO_BASE, &s->gpio_mem);
 
     for (cell = 0; cell < 2; cell++) {
         g_autofree char *name = g_strdup_printf("keylargo-i2s%d", cell);

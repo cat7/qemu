@@ -132,6 +132,8 @@ typedef struct KeyLargoI2CState {
 typedef struct KeyLargoState {
     MemoryRegion fcr_mem;
     uint32_t fcr[7];               /* MBCR 0x34, FCR0..FCR5 0x38..0x4c */
+    MemoryRegion gpio_mem;
+    uint8_t gpio[0x30];            /* extint-gpio0.. at 0x58, gpio0.. at 0x6a */
     KeyLargoI2SState i2s[2];
     KeyLargoI2CState i2c;
 } KeyLargoState;
