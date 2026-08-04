@@ -1108,6 +1108,19 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         /* pixel cache idle: BUSY (bit 31) clear */
         val = s->regs[base >> 2] & 0x3fffffff;
         break;
+    case R128_PC_GUI_CTLSTAT:
+        /*
+         * GUI-engine pixel cache: same instantly-coherent answer as the
+         * NGUI twin above, and additionally the low flush-request bits
+         * read back as already-completed. Mac OS X 10.4's ATI driver
+         * writes 0xff here (flush everything) and waits for the
+         * self-clearing bits; leaving the raw value readable parked its
+         * accelerated presentation path -- the desktop stayed composed
+         * in the staging buffer and the visible screen kept the stale
+         * loginwindow backdrop.
+         */
+        val = s->regs[base >> 2] & 0x3fffff00;
+        break;
     case R128_GUI_STAT:
         /* engine idle, all 64 command FIFO entries free */
         val = 0x40;
