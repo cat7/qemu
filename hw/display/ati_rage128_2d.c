@@ -406,6 +406,36 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
     if (src_datatype == R128_SRC_COLOR) {
         pix_count = sizeof(pix_buf) / bypp;
         memcpy(pix_buf, s->host_data_acc, sizeof(s->host_data_acc));
+        /*
+         * HOST_BIG_ENDIAN_EN (DP_DATATYPE bit 29, RRG-G04500-C): the
+         * host pushes big-endian pixels and the engine byte-reverses
+         * them on the way in -- per 16-bit word at 15/16bpp, per dword
+         * at 32bpp. Mac OS X sets this for its host-data transfers;
+         * skipping the swap crossed the red/blue channels of every
+         * host-sourced paint (a purple desktop until VRAM-to-VRAM
+         * repaints happened to overwrite it).
+         */
+        if (s->dp_datatype & R128_DP_HOST_BIG_ENDIAN_EN) {
+            unsigned i;
+
+            if (bypp == 2) {
+                for (i = 0; i + 1 < sizeof(pix_buf); i += 2) {
+                    uint8_t t = pix_buf[i];
+
+                    pix_buf[i] = pix_buf[i + 1];
+                    pix_buf[i + 1] = t;
+                }
+            } else if (bypp == 4) {
+                for (i = 0; i + 3 < sizeof(pix_buf); i += 4) {
+                    uint8_t t0 = pix_buf[i], t1 = pix_buf[i + 1];
+
+                    pix_buf[i] = pix_buf[i + 3];
+                    pix_buf[i + 1] = pix_buf[i + 2];
+                    pix_buf[i + 2] = t1;
+                    pix_buf[i + 3] = t0;
+                }
+            }
+        }
     } else {
         uint32_t byte_pix_order = s->dp_datatype & R128_DP_BYTE_PIX_ORDER;
         uint32_t fg = s->dp_src_frgd_clr;
