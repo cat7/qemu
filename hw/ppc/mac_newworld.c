@@ -88,21 +88,22 @@
  * The frequencies a real PowerMac3,4 (Digital Audio) publishes in its own
  * device tree, taken verbatim from an lsprop dump of /cpus/PowerPC,G4@0:
  *
- *   timebase-frequency  0x01fbf711    33,224,977 Hz
- *   clock-frequency     0x1bd0c4a9   466,978,473 Hz
- *   bus-frequency       0x07efdc44   132,899,908 Hz
+ *   timebase-frequency  0x01fbf711    33,290,001 Hz
+ *   clock-frequency     0x1bd0c4a9   466,666,665 Hz
+ *   bus-frequency       0x07efdc44   133,160,004 Hz
  *
- * These are not round numbers because the real clocks are not: the bus runs
- * a shade under 133MHz and the timebase is exactly bus/4, as on every 60x-bus
- * PowerPC. Keeping that ratio matters -- guests derive one from the other.
+ * These are what the real firmware measured on real silicon, so they are not
+ * quite the nominal 33.33/466.67/133.33MHz round numbers -- but the exact
+ * timebase = bus/4 relationship holds, as on every 60x-bus PowerPC, and
+ * guests derive one frequency from the other, so keep the set consistent.
  *
  * The previous values here (25MHz / 900MHz / 100MHz) were round stand-ins,
  * with the 900MHz CPU figure picked to convince Mac OS X it was running on a
  * supported machine rather than to describe any real hardware.
  */
-#define TBFREQ    33224977UL
-#define CLOCKFREQ 466978473UL
-#define BUSFREQ   132899908UL
+#define TBFREQ    33290001UL
+#define CLOCKFREQ 466666665UL
+#define BUSFREQ   133160004UL
 
 #define NDRV_VGA_FILENAME "qemu_vga.ndrv"
 
@@ -296,6 +297,21 @@ static void ppc_core99_init(MachineState *machine)
         cpu_ppc_tb_init(&cpus[i]->env, TBFREQ);
 
         /*
+         * The Apple ROM derives the CPU clock itself: it measures the bus
+         * clock against a timer and multiplies by the PLL ratio it reads
+         * from HID1[0:3] (PLL_CFG). QEMU's 74xx resets HID1 to 0, whose
+         * decode made Open Firmware report a 1.2GHz processor. A 466MHz
+         * Digital Audio runs 3.5x on a 133MHz bus, and MPC7400EC Table 14
+         * gives PLL_CFG 0b1110 for 3.5x -- with this in place OF computes
+         * ~465MHz on its own. Set the default too: SPRs snap back to
+         * their registered defaults on every machine reset.
+         */
+        if (PPC_INPUT(&cpus[i]->env) != PPC_FLAGS_INPUT_970) {
+            cpus[i]->env.spr_cb[SPR_HID1].default_value = 0xE0000000;
+            cpus[i]->env.spr[SPR_HID1] = 0xE0000000;
+        }
+
+        /*
          * Secondary CPUs share the primary's timebase offset: real
          * hardware has one timebase counter shared by all CPUs, each
          * with its own decrementer.
@@ -477,16 +493,56 @@ static void ppc_core99_init(MachineState *machine)
 
     /*
      * SPD EEPROMs for the memory slots, at the usual 0x50 + slot. The ROM
-     * walks these to size RAM, so populate one per 256MB of configured
-     * memory using the real machine's DIMM data; -m 768 reproduces the
-     * donor PowerMac3,4 exactly.
+     * sizes RAM from these alone -- it never asks QEMU -- so the sticks
+     * must add up to the configured memory or the guest sees the donor
+     * machine's RAM instead of -m (observed: -m 1024 booting as 768MB,
+     * the donor's 3x256MB). Synthesize an SPD image per stick from the
+     * donor 256MB module, patching the geometry bytes (3 rows, 4 cols,
+     * 5 ranks, 31 bank density) and re-summing the byte-63 checksum.
      */
-    for (i = 0; i < MAC_SPD_NUM_DIMMS; i++) {
-        if (machine->ram_size <= (uint64_t)i * MAC_SPD_DIMM_BYTES) {
-            break;
+    {
+        static const struct {
+            unsigned mb, rows, cols, ranks, density;
+        } spd_geom[] = {
+            { 512, 13, 10, 2, 0x40 },
+            { 256, 13, 10, 1, 0x40 },
+            { 128, 12, 10, 1, 0x20 },
+            {  64, 12,  9, 1, 0x10 },
+            {  32, 11,  9, 1, 0x08 },
+        };
+        uint64_t left = machine->ram_size;
+        int slot = 0;
+        unsigned g = 0;
+
+        while (left && slot < MAC_SPD_NUM_DIMMS &&
+               g < ARRAY_SIZE(spd_geom)) {
+            uint8_t spd[MAC_SPD_SIZE];
+            unsigned sum, b;
+
+            if (left < (uint64_t)spd_geom[g].mb * MiB) {
+                g++;
+                continue;
+            }
+            memcpy(spd, mac_spd_dimm0, MAC_SPD_SIZE);
+            spd[3] = spd_geom[g].rows;
+            spd[4] = spd_geom[g].cols;
+            spd[5] = spd_geom[g].ranks;
+            spd[31] = spd_geom[g].density;
+            for (sum = 0, b = 0; b < 63; b++) {
+                sum += spd[b];
+            }
+            spd[63] = sum & 0xff;
+            at24c_eeprom_init_rom(unin_i2c, 0x50 + slot, MAC_SPD_SIZE,
+                                  spd, MAC_SPD_SIZE);
+            left -= (uint64_t)spd_geom[g].mb * MiB;
+            slot++;
         }
-        at24c_eeprom_init_rom(unin_i2c, 0x50 + i, MAC_SPD_SIZE,
-                              mac_spd_dimms[i], MAC_SPD_SIZE);
+        if (left) {
+            warn_report("mac99: %" PRIu64 "MB of RAM not representable as "
+                        "1-3 PowerMac3,4 DIMMs; the firmware will see %"
+                        PRIu64 "MB", left / MiB,
+                        (machine->ram_size - left) / MiB);
+        }
     }
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
