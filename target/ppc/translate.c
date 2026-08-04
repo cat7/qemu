@@ -459,14 +459,22 @@ void spr_write_generic(DisasContext *ctx, int sprn, int gprn)
  * There is no work to model, but it has to read back as complete: leaving it
  * set hangs anything that kicks a flush and then polls for it, which is what
  * Mac OS X's early cache setup on a 74xx does.
+ *
+ * Model the self-clearing on the READ side, not the write side. Stripping
+ * the bit as it was written (the first attempt) means the register never
+ * holds what software stored: any code that writes MSSCR0 and compares the
+ * readback -- or simply relies on its full value surviving -- sees silent
+ * corruption. That variant broke Mac OS X 10.4 far downstream of here (its
+ * WindowServer died with a pager error while the 10.3 boot was unaffected).
+ * Storing everything and masking the flush bit out of reads keeps both
+ * behaviours: polls observe an instantly-completed flush, and every other
+ * bit round-trips exactly as written.
  */
-void spr_write_msscr0(DisasContext *ctx, int sprn, int gprn)
+void spr_read_msscr0(DisasContext *ctx, int gprn, int sprn)
 {
-    TCGv t0 = tcg_temp_new();
-
-    tcg_gen_andi_tl(t0, cpu_gpr[gprn], ~(target_ulong)0x00800000);
-    gen_store_spr(sprn, t0);
-    spr_store_dump_spr(sprn);
+    gen_load_spr(cpu_gpr[gprn], sprn);
+    tcg_gen_andi_tl(cpu_gpr[gprn], cpu_gpr[gprn],
+                    ~(target_ulong)0x00800000);
 }
 
 void spr_write_generic32(DisasContext *ctx, int sprn, int gprn)
