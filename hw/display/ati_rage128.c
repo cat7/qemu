@@ -1346,6 +1346,18 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     }
     case R128_GEN_INT_CNTL:
         s->regs[base >> 2] = val;
+        /*
+         * GUI_IDLE fires when the engine drains; every operation here
+         * completes synchronously, so the engine is idle the moment the
+         * guest asks to hear about it. Mac OS X's driver arms this
+         * before waiting out its big (full-screen) transfers -- without
+         * the interrupt the wait times out, the driver declares the
+         * engine hung and resets the CCE in a loop, and the transfer
+         * (the desktop wallpaper, most visibly) never lands.
+         */
+        if (val & R128_GUI_IDLE_INT) {
+            s->regs[R128_GEN_INT_STATUS >> 2] |= R128_GUI_IDLE_INT;
+        }
         ati_rage128_update_irq(s);
         break;
     case R128_GEN_INT_STATUS:
