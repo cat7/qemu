@@ -27,6 +27,11 @@
 #define PMU_READ_NVRAM             0x3b  /* read non-volatile RAM */
 #define PMU_SET_RTC                0x30  /* set real-time clock */
 #define PMU_READ_RTC               0x38  /* read real-time clock */
+/* Apple names (PowerPrivEqu.a): pramWrite/xPramWrite/pramRead/xPramRead */
+#define PMU_PRAM_WRITE             0x31  /* write the legacy 20 PRAM bytes */
+#define PMU_XPRAM_WRITE            0x32  /* write extended PRAM byte(s) */
+#define PMU_PRAM_READ              0x39  /* read the legacy 20 PRAM bytes */
+#define PMU_XPRAM_READ             0x3a  /* read extended PRAM byte(s) */
 #define PMU_SET_VOLBUTTON          0x40  /* set volume up/down position */
 #define PMU_BACKLIGHT_BRIGHT       0x41  /* set backlight brightness */
 #define PMU_GET_VOLBUTTON          0x48  /* get volume up/down position */
@@ -235,6 +240,18 @@ struct PMUState {
 
     /* PMU_POWER_EVENTS server ID (set/queried by Mac OS X's ApplePMU) */
     uint8_t server_id;
+
+    /*
+     * PRAM, stored by the PMU itself on PMU-equipped machines: the
+     * legacy 20-byte clock-chip block (commands 0x31 pramWrite /
+     * 0x39 pramRead) and the 256-byte extended PRAM (0x32 xPramWrite /
+     * 0x3a xPramRead). Command names and semantics per Apple's own
+     * Power Manager equates (PowerPrivEqu.a). Classic Mac OS reads
+     * these during early boot and write-verifies what it initializes;
+     * a PMU that forgets writes fails that verify forever.
+     */
+    uint8_t pram[20];
+    uint8_t xpram[256];
 
     /* GPIO */
     MacIOGPIOState *gpio;

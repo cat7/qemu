@@ -425,6 +425,95 @@ static void pmu_cmd_power_events(PMUState *s,
     }
 }
 
+/*
+ * PRAM lives in the PMU on PMU-equipped machines. Apple's Power Manager
+ * equates (PowerPrivEqu.a) name these pramWrite (0x31) / pramRead (0x39)
+ * for the legacy 20-byte clock-chip block and xPramWrite (0x32) /
+ * xPramRead (0x3a) for the extended 256 bytes. Classic Mac OS reads
+ * them during early boot and write-verifies whatever it initializes, so
+ * the storage must round-trip.
+ */
+static void pmu_cmd_pram_write(PMUState *s,
+                               const uint8_t *in_data, uint8_t in_len,
+                               uint8_t *out_data, uint8_t *out_len)
+{
+    if (in_len != sizeof(s->pram)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "PMU: pramWrite command, invalid len: %d want: 20\n",
+                      in_len);
+        return;
+    }
+    memcpy(s->pram, in_data, sizeof(s->pram));
+}
+
+static void pmu_cmd_pram_read(PMUState *s,
+                              const uint8_t *in_data, uint8_t in_len,
+                              uint8_t *out_data, uint8_t *out_len)
+{
+    memcpy(out_data, s->pram, sizeof(s->pram));
+    *out_len = sizeof(s->pram);
+}
+
+static void pmu_cmd_xpram_write(PMUState *s,
+                                const uint8_t *in_data, uint8_t in_len,
+                                uint8_t *out_data, uint8_t *out_len)
+{
+    unsigned int addr, count;
+
+    /* variable-length command: offset, count, data bytes */
+    if (in_len < 2) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "PMU: xPramWrite command, invalid len: %d\n", in_len);
+        return;
+    }
+    addr = in_data[0];
+    count = in_data[1];
+    if (count != in_len - 2u || addr + count > sizeof(s->xpram)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "PMU: xPramWrite bad range %u+%u (len %d)\n",
+                      addr, count, in_len);
+        return;
+    }
+    memcpy(&s->xpram[addr], &in_data[2], count);
+}
+
+static void pmu_cmd_xpram_read(PMUState *s,
+                               const uint8_t *in_data, uint8_t in_len,
+                               uint8_t *out_data, uint8_t *out_len)
+{
+    unsigned int addr, count;
+
+    if (in_len != 2) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "PMU: xPramRead command, invalid len: %d want: 2\n",
+                      in_len);
+        return;
+    }
+    addr = in_data[0];
+    count = in_data[1];
+    if (addr + count > sizeof(s->xpram) || count > 128) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "PMU: xPramRead bad range %u+%u\n", addr, count);
+        return;
+    }
+    memcpy(out_data, &s->xpram[addr], count);
+    *out_len = count;
+}
+
+/*
+ * Subsystem power control (Apple: powerCntl 0x10 / power1Cntl 0x11) and
+ * the volume/brightness pair (0x40/0x41): accepted and remembered
+ * nowhere -- none of the controlled subsystems (screen, charger, media
+ * bay, backlight) has an equivalent to switch in this machine model.
+ * Accepting them silences the unknown-command path for commands classic
+ * Mac OS sends during every boot.
+ */
+static void pmu_cmd_accept(PMUState *s,
+                           const uint8_t *in_data, uint8_t in_len,
+                           uint8_t *out_data, uint8_t *out_len)
+{
+}
+
 static void pmu_cmd_get_cover(PMUState *s,
                               const uint8_t *in_data, uint8_t in_len,
                               uint8_t *out_data, uint8_t *out_len)
@@ -501,6 +590,14 @@ static const PMUCmdHandler PMUCmdHandlers[] = {
     { PMU_SHUTDOWN, "SHUTDOWN", pmu_cmd_shutdown },
     { PMU_READ_RTC, "GET RTC", pmu_cmd_get_rtc },
     { PMU_SET_RTC, "SET RTC", pmu_cmd_set_rtc },
+    { PMU_PRAM_WRITE, "PRAM WRITE", pmu_cmd_pram_write },
+    { PMU_PRAM_READ, "PRAM READ", pmu_cmd_pram_read },
+    { PMU_XPRAM_WRITE, "XPRAM WRITE", pmu_cmd_xpram_write },
+    { PMU_XPRAM_READ, "XPRAM READ", pmu_cmd_xpram_read },
+    { PMU_POWER_CTRL0, "POWER CTRL0", pmu_cmd_accept },
+    { PMU_POWER_CTRL, "POWER CTRL", pmu_cmd_accept },
+    { PMU_SET_VOLBUTTON, "SET VOLBUTTON", pmu_cmd_accept },
+    { PMU_BACKLIGHT_BRIGHT, "SET BACKLIGHT", pmu_cmd_accept },
     { PMU_SYSTEM_READY, "SYSTEM READY", pmu_cmd_system_ready },
     { PMU_GET_VERSION, "GET VERSION", pmu_cmd_get_version },
     { PMU_POWER_EVENTS, "POWER EVENTS", pmu_cmd_power_events },
@@ -729,7 +826,7 @@ static const VMStateDescription vmstate_pmu_adb = {
 
 static const VMStateDescription vmstate_pmu = {
     .name = "pmu",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(mos6522_pmu.parent_obj, PMUState, 0, vmstate_mos6522,
@@ -748,6 +845,8 @@ static const VMStateDescription vmstate_pmu = {
         VMSTATE_UINT32(tick_offset, PMUState),
         VMSTATE_TIMER_PTR(one_sec_timer, PMUState),
         VMSTATE_INT64(one_sec_target, PMUState),
+        VMSTATE_BUFFER_V(pram, PMUState, 2),
+        VMSTATE_BUFFER_V(xpram, PMUState, 2),
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * const []) {
