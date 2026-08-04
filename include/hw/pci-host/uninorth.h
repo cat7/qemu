@@ -51,7 +51,8 @@ struct UNINHostState {
     PCIHostState parent_obj;
 
     uint32_t ofw_addr;
-    qemu_irq irqs[4];
+    bool real_irq_map;
+    qemu_irq irqs[8];
     MemoryRegion pci_mmio;
     MemoryRegion pci_hole;
     MemoryRegion pci_io;

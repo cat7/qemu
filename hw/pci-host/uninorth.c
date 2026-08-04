@@ -36,6 +36,37 @@ static int pci_unin_map_irq(PCIDevice *pci_dev, int irq_num)
     return (irq_num + (pci_dev->devfn >> 3)) & 3;
 }
 
+/*
+ * Slot-to-line mapping of the real PowerMac3,4's 33MHz PCI bus
+ * (pci@f2000000), from a real machine's interrupt-map property:
+ *
+ *   slot 0x12 -> 0x34    slot 0x15 -> 0x3a    slot 0x1a -> 0x3f
+ *   slot 0x13 -> 0x35    slot 0x18 -> 0x1b
+ *   slot 0x14 -> 0x36    slot 0x19 -> 0x1c
+ *
+ * The Apple ROM hands the guest exactly that table, so when it provides
+ * the device tree the devices must interrupt on those OpenPIC inputs --
+ * the driver unmasks what the tree says, not what our default hash
+ * picks. (Observed live: Mac OS X's Rage 128 driver at slot 0x15
+ * enabled its VBLANK interrupt and waited forever while we pulsed
+ * 0x1c.) The returned index is the position in the machine's wiring
+ * array, which connects them in the order listed above; unknown slots
+ * get the unwired spare line 7.
+ */
+static int pci_unin_main_real_map_irq(PCIDevice *pci_dev, int irq_num)
+{
+    switch (pci_dev->devfn >> 3) {
+    case 0x12: return 0;
+    case 0x13: return 1;
+    case 0x14: return 2;
+    case 0x15: return 3;
+    case 0x18: return 4;
+    case 0x19: return 5;
+    case 0x1a: return 6;
+    default:   return 7;
+    }
+}
+
 static void pci_unin_set_irq(void *opaque, int irq_num, int level)
 {
     UNINHostState *s = opaque;
@@ -120,11 +151,15 @@ static void pci_unin_main_realize(DeviceState *dev, Error **errp)
     PCIHostState *h = PCI_HOST_BRIDGE(dev);
 
     h->bus = pci_register_root_bus(dev, NULL,
-                                   pci_unin_set_irq, pci_unin_map_irq,
+                                   pci_unin_set_irq,
+                                   s->real_irq_map ?
+                                       pci_unin_main_real_map_irq :
+                                       pci_unin_map_irq,
                                    s,
                                    &s->pci_mmio,
                                    &s->pci_io,
-                                   PCI_DEVFN(11, 0), 4, TYPE_PCI_BUS);
+                                   PCI_DEVFN(11, 0),
+                                   s->real_irq_map ? 8 : 4, TYPE_PCI_BUS);
 
     pci_create_simple(h->bus, PCI_DEVFN(11, 0), "uni-north-pci");
 
@@ -426,6 +461,8 @@ static const TypeInfo unin_internal_pci_host_info = {
 
 static const Property pci_unin_main_pci_host_props[] = {
     DEFINE_PROP_UINT32("ofw-addr", UNINHostState, ofw_addr, -1),
+    /* Route slots per the real PowerMac3,4 interrupt-map (Apple ROM mode) */
+    DEFINE_PROP_BOOL("real-irq-map", UNINHostState, real_irq_map, false),
 };
 
 static void pci_unin_main_class_init(ObjectClass *klass, const void *data)
