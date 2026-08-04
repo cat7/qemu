@@ -217,6 +217,8 @@
 #define R128_PM4_OPCODE_PAINT         0x91
 #define R128_PM4_OPCODE_BITBLT        0x92
 #define R128_PM4_OPCODE_HOSTDATA_BLT  0x94
+#define R128_PM4_OPCODE_PAINT_MULTI   0x9a
+#define R128_PM4_OPCODE_BITBLT_MULTI  0x9b
 
 /*
  * PIO alternative submission path for the same PM4 stream: undocumented
@@ -319,6 +321,8 @@
 #define R128_GMC_DST_PITCH_OFFSET_CNTL 0x00000002
 #define R128_GMC_SRC_CLIPPING        0x00000004
 #define R128_GMC_DST_CLIPPING        0x00000008
+#define R128_GMC_BRUSH_DATATYPE_MASK 0x000000f0
+#define R128_GMC_BRUSH_SOLID_COLOR   0x000000d0
 #define R128_GMC_ROP3_MASK           0x00ff0000
 #define R128_ROP3_BLACKNESS          0x00000000
 #define R128_ROP3_SRCCOPY            0x00cc0000
