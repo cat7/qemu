@@ -98,20 +98,42 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
         break;
     }
 
-    /*
-     * Engine writes go straight through the RAM pointer, bypassing the
-     * MemoryRegion accessors that would otherwise set the dirty bits, so
-     * mark the touched pixel by hand. Without this, everything the 2D
-     * engine draws is invisible to dirty tracking: the display refresh
-     * has no reason to repaint those scanlines, and -- because this
-     * device reuses DIRTY_MEMORY_VGA to find the live framebuffer --
-     * an accelerated desktop looks like a completely idle region of
-     * VRAM. Observed live on Mac OS X 10.3, which draws through the
-     * engine: the CRTC described a valid 800x600x32bpp framebuffer that
-     * the scanner scored as dead, so the auto-detect heuristic
-     * overrode it and put a garbled 1024x768 guess on screen instead.
-     */
-    memory_region_set_dirty(&s->vram, addr, bpp / 8);
+}
+
+/*
+ * Engine writes go straight through the RAM pointer, bypassing the
+ * MemoryRegion accessors that would otherwise set the dirty bits, so the
+ * operations mark their destination by hand. Without this, everything the
+ * 2D engine draws is invisible to dirty tracking: the display refresh has
+ * no reason to repaint those scanlines, and -- because this device reuses
+ * DIRTY_MEMORY_VGA to find the live framebuffer -- an accelerated desktop
+ * looks like a completely idle region of VRAM (observed live on Mac OS X
+ * 10.3: a valid, actively-drawn 800x600 desktop scored as dead and was
+ * overridden by a garbled auto-detect guess).
+ *
+ * Marking happens ONCE PER OPERATION over the touched row span, not per
+ * pixel: memory_region_set_dirty() is a global-state call, and issuing it
+ * for every pixel of every blit made the whole guest visibly slower. The
+ * span may over-mark the row edges; over-marking is harmless.
+ */
+static void ati_rage128_2d_mark_rows_dirty(ATIRage128State *s,
+                                           uint32_t offset, uint32_t stride,
+                                           int y0, int y1)
+{
+    hwaddr start, len;
+
+    if (y1 < y0 || !stride) {
+        return;
+    }
+    start = offset + (hwaddr)y0 * stride;
+    len = (hwaddr)(y1 - y0 + 1) * stride;
+    if (start >= ATI_RAGE128_VRAM_SIZE) {
+        return;
+    }
+    if (start + len > ATI_RAGE128_VRAM_SIZE) {
+        len = ATI_RAGE128_VRAM_SIZE - start;
+    }
+    memory_region_set_dirty(&s->vram, start, len);
 }
 
 static uint32_t ati_rage128_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,
@@ -230,6 +252,11 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
                                        bpp, result);
         }
     }
+
+    ati_rage128_2d_mark_rows_dirty(s, s->dst_offset, dst_stride,
+                                   MAX((int)s->dst_y, sc_top),
+                                   MIN((int)s->dst_y + height - 1,
+                                       sc_bottom));
 }
 
 void ati_rage128_2d_blt(ATIRage128State *s)
@@ -358,6 +385,10 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
             row++;
         }
     }
+    ati_rage128_2d_mark_rows_dirty(s, s->dst_offset, dst_stride,
+                                   (int)s->dst_y + (int)s->host_data_row,
+                                   (int)s->dst_y + (int)row);
+
     s->host_data_row = row;
     s->host_data_col = col;
     if (s->host_data_row >= s->dst_height) {
