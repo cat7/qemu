@@ -633,6 +633,9 @@ static void ppc_core99_init(MachineState *machine)
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
 
+    qdev_prop_set_uint32(DEVICE(object_resolve_path_component(macio, "gpio")),
+                         "nb-cpus", machine->smp.cpus);
+
     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
 
     /*

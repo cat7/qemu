@@ -134,11 +134,28 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
             ibit = s->gpio_regs[addr] & IN_DATA;
         }
 
-        if (addr == (KL_GPIO_RESET_CPU1 - KEYLARGO_GPIO_EXTINT_0)) {
+        /*
+         * The CPU1-3 soft-reset aliases only exist on boards that have
+         * those CPUs. On boards that do not, the same pins carry real,
+         * unrelated functions -- on the PowerMac3,4 extint-gpio16 is the
+         * speaker-id Dallas one-wire bus, and routing its writes through
+         * the CPU3-reset alias turned AppleDallasDriver's tristate into
+         * "input reads high": a phantom always-present speaker ROM whose
+         * presence hunt then failed forever ("Sound assertion
+         * \"++errorCount > 10\" ... AppleDallasDriver.cpp at line 152"
+         * storming the OS X installer until ApplePMU shut the machine
+         * down). An undriven pin with no device attached reads low (the
+         * one-wire pull-up lives in the speaker pod), which is also the
+         * plain-storage behavior below.
+         */
+        if (s->nb_cpus > 1 &&
+            addr == (KL_GPIO_RESET_CPU1 - KEYLARGO_GPIO_EXTINT_0)) {
             macio_set_gpio(s, 4, !(value & OUT_ENABLE) || (ibit != 0));
-        } else if (addr == (KL_GPIO_RESET_CPU2 - KEYLARGO_GPIO_EXTINT_0)) {
+        } else if (s->nb_cpus > 2 &&
+                   addr == (KL_GPIO_RESET_CPU2 - KEYLARGO_GPIO_EXTINT_0)) {
             macio_set_gpio(s, 15, !(value & OUT_ENABLE) || (ibit != 0));
-        } else if (addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
+        } else if (s->nb_cpus > 3 &&
+                   addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
             macio_set_gpio(s, 16, !(value & OUT_ENABLE) || (ibit != 0));
         } else {
             s->gpio_regs[addr] = value | ibit;
@@ -190,6 +207,11 @@ static void macio_gpio_init(Object *obj)
                           "gpio", 0x30);
     sysbus_init_mmio(sbd, &s->gpiomem);
 }
+
+static const Property macio_gpio_properties[] = {
+    /* CPUs actually present: gates the CPU1-3 soft-reset pin aliases */
+    DEFINE_PROP_UINT32("nb-cpus", MacIOGPIOState, nb_cpus, 1),
+};
 
 static const VMStateDescription vmstate_macio_gpio = {
     .name = "macio_gpio",
@@ -247,6 +269,7 @@ static void macio_gpio_class_init(ObjectClass *oc, const void *data)
 
     device_class_set_legacy_reset(dc, macio_gpio_reset);
     dc->vmsd = &vmstate_macio_gpio;
+    device_class_set_props(dc, macio_gpio_properties);
     nc->raise_nmi = macio_gpio_nmi;
 }
 

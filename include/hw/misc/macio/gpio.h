@@ -52,6 +52,7 @@ struct MacIOGPIOState {
     qemu_irq gpio_extirqs[KEYLARGO_GPIO_EXTINT_CNT];
     uint8_t gpio_levels[8];
     uint8_t gpio_regs[36];
+    uint32_t nb_cpus;
 };
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state);
