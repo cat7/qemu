@@ -33,6 +33,7 @@
 #include "qom/object.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "qemu/timer.h"
+#include "system/dma.h"
 #include "trace.h"
 
 /* ---------------------------------------------------------------------- */
@@ -235,6 +236,80 @@ static void keylargo_i2s_out_complete(void *opaque)
  * retired only once its audio would have finished playing. Without that the
  * firmware's chime ring never stops.
  */
+#define KL_I2S_FRAME_BYTES 4
+
+static void keylargo_i2s_audio_cb(void *opaque, int avail)
+{
+    KeyLargoI2SState *c = opaque;
+
+    avail -= avail % KL_I2S_FRAME_BYTES;
+    while (avail >= KL_I2S_FRAME_BYTES &&
+           c->fifo_count >= KL_I2S_FRAME_BYTES) {
+        uint8_t staging[4096];
+        int chunk = MIN(avail, (int)sizeof(staging));
+        size_t written;
+        int i;
+
+        chunk = MIN(chunk, (int)c->fifo_count);
+        chunk -= chunk % KL_I2S_FRAME_BYTES;
+        for (i = 0; i < chunk; i++) {
+            staging[i] = c->out_fifo[c->fifo_rptr];
+            c->fifo_rptr = (c->fifo_rptr + 1) % sizeof(c->out_fifo);
+        }
+        c->fifo_count -= chunk;
+
+        written = audio_be_write(c->audio_be, c->voice, staging, chunk);
+        written -= written % KL_I2S_FRAME_BYTES;
+        avail -= written;
+        if (written < (size_t)chunk) {
+            c->fifo_rptr = (c->fifo_rptr + sizeof(c->out_fifo) -
+                            (chunk - written)) % sizeof(c->out_fifo);
+            c->fifo_count += chunk - written;
+            break;
+        }
+    }
+}
+
+static void keylargo_i2s_tap_out(KeyLargoI2SState *c, DBDMA_io *io, int rate)
+{
+    uint8_t buf[4096];
+    hwaddr addr = io->addr;
+    int remaining = io->len;
+
+    if (!c->audio_be) {
+        return;
+    }
+    if (!c->voice || c->voice_rate != rate) {
+        struct audsettings as = {
+            .freq = rate,
+            .nchannels = 2,
+            .fmt = AUDIO_FORMAT_S16,
+            .big_endian = true,      /* I2S frames are big-endian S16 */
+        };
+
+        c->voice_rate = rate;
+        c->voice = audio_be_open_out(c->audio_be, c->voice,
+                                     c->cell ? "kl-i2s1.out" : "kl-i2s0.out",
+                                     c, keylargo_i2s_audio_cb, &as);
+        audio_be_set_active_out(c->audio_be, c->voice, true);
+    }
+
+    while (remaining > 0) {
+        int len = MIN(remaining, (int)sizeof(buf));
+        int i;
+
+        dma_memory_read(&address_space_memory, addr, buf, len,
+                        MEMTXATTRS_UNSPECIFIED);
+        for (i = 0; i < len && c->fifo_count < sizeof(c->out_fifo); i++) {
+            c->out_fifo[c->fifo_wptr] = buf[i];
+            c->fifo_wptr = (c->fifo_wptr + 1) % sizeof(c->out_fifo);
+            c->fifo_count++;
+        }
+        addr += len;
+        remaining -= len;
+    }
+}
+
 static void keylargo_i2s_dma_rw(DBDMA_io *io)
 {
     KeyLargoI2SState *c = io->opaque;
@@ -244,6 +319,10 @@ static void keylargo_i2s_dma_rw(DBDMA_io *io)
     int64_t dur_ns = (int64_t)frames * NANOSECONDS_PER_SECOND / rate;
 
     trace_keylargo_i2s_dma(c->cell, io->addr, io->len, rate);
+
+    if (io->is_dma_out && keylargo_i2s_frame_bytes(c) == KL_I2S_FRAME_BYTES) {
+        keylargo_i2s_tap_out(c, io, rate);
+    }
 
     if (c->play_deadline_ns < now) {
         c->play_deadline_ns = now;       /* the stream had drained */

@@ -13,6 +13,7 @@
 
 #include "system/memory.h"
 #include "hw/i2c/i2c.h"
+#include "qemu/audio.h"
 
 /* FCR1 bits (Linux keylargo.h, Apple AudioI2SHardwareConstants.h) */
 #define KL1_AUDIO_CELL_ENABLE       0x00000040
@@ -103,6 +104,20 @@ typedef struct KeyLargoI2SState {
     struct DBDMA_io *pending_out_io;
     int64_t play_deadline_ns;
 
+    /*
+     * Host playback: the paced DMA above already throttles the guest to
+     * real time, so the samples only need tapping into a FIFO that the
+     * audio backend's pull callback drains (same shape as awacs.c, which
+     * needed the FIFO for the same reason: the backend pulls on its own
+     * schedule).
+     */
+    AudioBackend *audio_be;      /* borrowed from the owning device */
+    SWVoiceOut *voice;
+    int voice_rate;
+    uint8_t out_fifo[0x80000];
+    uint32_t fifo_rptr;
+    uint32_t fifo_wptr;
+    uint32_t fifo_count;
 } KeyLargoI2SState;
 
 typedef struct KeyLargoI2CState {

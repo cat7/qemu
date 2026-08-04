@@ -32,6 +32,7 @@
 #include "hw/intc/heathrow_pic.h"
 #include "hw/misc/macio/cuda.h"
 #include "hw/misc/macio/gpio.h"
+#include "qemu/audio.h"
 #include "hw/misc/macio/pmu.h"
 #include "hw/net/bmac.h"
 #include "hw/scsi/mesh.h"
@@ -170,6 +171,7 @@ struct NewWorldMacIOState {
     bool has_pmu;
     bool has_adb;
     bool real_ata;
+    AudioBackend *audio_be;
     OpenPICState pic;
     MACIOIDEState ide[3];
     MacIOGPIOState gpio;

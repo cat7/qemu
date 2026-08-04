@@ -381,6 +381,12 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     }
 
     KeyLargoState *keylargo = keylargo_cells_init(DEVICE(s), &s->bar);
+
+    if (!audio_be_check(&ns->audio_be, errp)) {
+        return;
+    }
+    keylargo->i2s[0].audio_be = ns->audio_be;
+    keylargo->i2s[1].audio_be = ns->audio_be;
     keylargo_i2s_register_dma(keylargo, &s->dbdma);
 
     /* OpenPIC */
@@ -570,6 +576,7 @@ static const VMStateDescription vmstate_macio_newworld = {
 
 static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
+    DEFINE_AUDIO_PROPERTIES(NewWorldMacIOState, audio_be),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
     /* Real KeyLargo ATA layout (Apple ROM) vs the one OpenBIOS describes */
     DEFINE_PROP_BOOL("real-ata", NewWorldMacIOState, real_ata, true),
