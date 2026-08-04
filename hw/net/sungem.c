@@ -203,6 +203,18 @@ struct gem_rxd {
 #define RXDCTRL_ALTMAC    0x2000000000000000ULL  /* Matched ALT MAC */
 
 
+/*
+ * PHY types supported by GMAC variants (ported from the user's prepared
+ * SourceFiles GMAC-ethernet work; IDs per Broadcom datasheets, the
+ * BCM5401 revision per a real PowerMac3,4's ethernet-phy/phy-id 0x6053).
+ */
+typedef enum {
+    PHY_TYPE_BCM5201 = 0,   /* 10/100 PHY - ID 0x00406210 */
+    PHY_TYPE_BCM5400 = 1,   /* Gigabit PHY - ID 0x00206040 - PowerMac3,3 */
+    PHY_TYPE_BCM5401 = 2,   /* Gigabit PHY - ID 0x00206053 - PowerMac3,4 */
+    PHY_TYPE_BCM5411 = 3,   /* Gigabit PHY - ID 0x00206070 - K2 */
+} PhyType;
+
 struct SunGEMState {
     PCIDevice pdev;
 
@@ -217,6 +229,7 @@ struct SunGEMState {
     NICState *nic;
     NICConf conf;
     uint32_t phy_addr;
+    uint32_t phy_type;
 
     uint32_t gregs[SUNGEM_MMIO_GREG_SIZE >> 2];
     uint32_t txdmaregs[SUNGEM_MMIO_TXDMA_SIZE >> 2];
@@ -766,8 +779,53 @@ static uint16_t __sungem_mii_read(SunGEMState *s, uint8_t phy_addr,
     if (phy_addr != s->phy_addr) {
         return 0xffff;
     }
+    /* Gigabit PHY emulation (BCM5400/5401/5411) for PowerMac3,3+ */
+    if (s->phy_type >= PHY_TYPE_BCM5400) {
+        switch (reg_addr) {
+        case MII_BMCR:
+            return 0x1140;  /* Auto-neg enable, 1000Mbps, Full duplex */
+        case MII_BMSR:
+            if (qemu_get_queue(s->nic)->link_down) {
+                return MII_BMSR_100TX_FD | MII_BMSR_AUTONEG |
+                       MII_BMSR_EXTCAP | MII_BMSR_EXTSTAT;
+            } else {
+                return MII_BMSR_100TX_FD | MII_BMSR_AN_COMP |
+                       MII_BMSR_AUTONEG | MII_BMSR_LINK_ST |
+                       MII_BMSR_EXTCAP | MII_BMSR_EXTSTAT;
+            }
+        case MII_PHYID1:
+            return 0x0020;  /* Broadcom */
+        case MII_PHYID2:
+            if (s->phy_type == PHY_TYPE_BCM5401) {
+                /* rev 3, matching the real PowerMac3,4 phy-id */
+                return 0x6053;
+            } else if (s->phy_type == PHY_TYPE_BCM5411) {
+                return 0x6070;
+            }
+            return 0x6040;  /* BCM5400 */
+        case MII_ANAR:
+            return MII_ANAR_TXFD | MII_ANAR_TX | MII_ANAR_10FD |
+                   MII_ANAR_10 | MII_ANAR_CSMACD;
+        case MII_ANLPAR:
+            return MII_ANLPAR_ACK | MII_ANLPAR_TXFD | MII_ANLPAR_TX |
+                   MII_ANLPAR_10FD | MII_ANLPAR_10;
+        case MII_ANER:
+            return 0x0004;  /* Link partner supports next page */
+        case MII_CTRL1000:
+            return 0x0300;  /* Advertise 1000BASE-T full & half */
+        case MII_STAT1000:
+            return 0x7c00;  /* Partner capable of 1000BASE-T full & half */
+        case MII_EXTSTAT:
+            return 0x3000;  /* 1000BASE-T full & half capable */
+        case 0x18: /* BCM54xx Auxiliary Control/Status */
+            return 0x000a;  /* 1000BASE-T Full Duplex */
+        default:
+            return 0;
+        }
+    }
+
     /* Primitive emulation of a BCM5201 to please the driver,
-     * ID is 0x00406210. TODO: Do a gigabit PHY like BCM5400
+     * ID is 0x00406210.
      */
     switch (reg_addr) {
     case MII_BMCR:
@@ -1427,6 +1485,8 @@ static const Property sungem_properties[] = {
      * override.
      */
     DEFINE_PROP_UINT32("phy_addr", SunGEMState, phy_addr, 0),
+    /* 0=BCM5201 10/100, 1=BCM5400, 2=BCM5401 (real PowerMac3,4), 3=BCM5411 */
+    DEFINE_PROP_UINT32("phy_type", SunGEMState, phy_type, PHY_TYPE_BCM5401),
 };
 
 static const VMStateDescription vmstate_sungem = {
