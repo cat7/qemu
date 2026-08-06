@@ -1240,10 +1240,10 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         val = 0x10101010;
         break;
     case R128_DST_OFFSET:
-        val = s->dst_offset;
+        val = s->dst_offset_reg;
         break;
     case R128_DST_PITCH:
-        val = s->dst_pitch | (s->dst_tile << 16);
+        val = s->dst_pitch_reg | (s->dst_tile_reg << 16);
         break;
     case R128_DST_WIDTH:
         val = s->dst_width;
@@ -1273,10 +1273,10 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
               ((s->dp_mix & R128_DP_SRC_SOURCE) << 16);
         break;
     case R128_SRC_OFFSET:
-        val = s->src_offset;
+        val = s->src_offset_reg;
         break;
     case R128_SRC_PITCH:
-        val = s->src_pitch | (s->src_tile << 16);
+        val = s->src_pitch_reg | (s->src_tile_reg << 16);
         break;
     case R128_DP_BRUSH_BKGD_CLR:
         val = s->dp_brush_bkgd_clr;
@@ -1312,22 +1312,22 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         val = s->default_sc_right | (s->default_sc_bottom << 16);
         break;
     case R128_SC_TOP:
-        val = s->sc_top;
+        val = s->sc_top_reg;
         break;
     case R128_SC_LEFT:
-        val = s->sc_left;
+        val = s->sc_left_reg;
         break;
     case R128_SC_BOTTOM:
-        val = s->sc_bottom;
+        val = s->sc_bottom_reg;
         break;
     case R128_SC_RIGHT:
-        val = s->sc_right;
+        val = s->sc_right_reg;
         break;
     case R128_SRC_SC_BOTTOM:
-        val = s->src_sc_bottom;
+        val = s->src_sc_bottom_reg;
         break;
     case R128_SRC_SC_RIGHT:
-        val = s->src_sc_right;
+        val = s->src_sc_right_reg;
         break;
     case R128_CFG_MIRROR_BASE ... R128_CFG_MIRROR_END:
         val = pci_default_read_config(dev, base - R128_CFG_MIRROR_BASE, 4);
@@ -1345,6 +1345,62 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
                                   ATIRage128PM4Parser *p, uint32_t val);
 static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
                                      uint32_t dwords);
+
+/*
+ * Re-derive the effective 2D pitch/offset and scissors from the register
+ * values, honouring DP_GUI_MASTER_CNTL's per-operation source selects.
+ *
+ * Those GMC bits pick where each value comes from; they do not move it.
+ * Applying them destructively (writing DEFAULT_* into the effective field on
+ * a GMC write) loses the register underneath, so whether a blit saw the
+ * right pitch came down to whether the driver wrote SRC_PITCH before or
+ * after the GMC dword. Recomputing instead means either order works, and a
+ * surface's pitch can no longer leak into the next, differently sized one.
+ */
+static void ati_rage128_resolve_gui_context(ATIRage128State *s)
+{
+    uint32_t gmc = s->dp_gui_master_cntl;
+
+    if (gmc & R128_GMC_SRC_PITCH_OFFSET_CNTL) {
+        s->src_offset = s->src_offset_reg;
+        s->src_pitch = s->src_pitch_reg;
+        s->src_tile = s->src_tile_reg;
+    } else {
+        s->src_offset = s->default_offset;
+        s->src_pitch = s->default_pitch;
+        s->src_tile = 0;
+    }
+
+    if (gmc & R128_GMC_DST_PITCH_OFFSET_CNTL) {
+        s->dst_offset = s->dst_offset_reg;
+        s->dst_pitch = s->dst_pitch_reg;
+        s->dst_tile = s->dst_tile_reg;
+    } else {
+        s->dst_offset = s->default_offset;
+        s->dst_pitch = s->default_pitch;
+        s->dst_tile = 0;
+    }
+
+    if (gmc & R128_GMC_SRC_CLIPPING) {
+        s->src_sc_right = s->src_sc_right_reg;
+        s->src_sc_bottom = s->src_sc_bottom_reg;
+    } else {
+        s->src_sc_right = s->default_sc_right;
+        s->src_sc_bottom = s->default_sc_bottom;
+    }
+
+    if (gmc & R128_GMC_DST_CLIPPING) {
+        s->sc_top = s->sc_top_reg;
+        s->sc_left = s->sc_left_reg;
+        s->sc_right = s->sc_right_reg;
+        s->sc_bottom = s->sc_bottom_reg;
+    } else {
+        s->sc_top = 0;
+        s->sc_left = 0;
+        s->sc_right = s->default_sc_right;
+        s->sc_bottom = s->default_sc_bottom;
+    }
+}
 
 static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                                     uint32_t val)
@@ -1571,11 +1627,13 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         ati_rage128_pm4_fifo_push(s, val);
         break;
     case R128_DST_OFFSET:
-        s->dst_offset = val & 0xfffffff0;
+        s->dst_offset_reg = val & 0xfffffff0;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_PITCH:
-        s->dst_pitch = val & 0x3fff;
-        s->dst_tile = (val >> 16) & 1;
+        s->dst_pitch_reg = val & 0x3fff;
+        s->dst_tile_reg = (val >> 16) & 1;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_WIDTH:
         s->dst_width = val & 0x3fff;
@@ -1597,15 +1655,17 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->dst_y = val & 0x3fff;
         break;
     case R128_SRC_PITCH_OFFSET:
-        s->src_offset = (val & 0x1fffff) << 5;
-        s->src_pitch = (val & 0x7fe00000) >> 21;
-        s->src_tile = val >> 31;
+        s->src_offset_reg = (val & 0x1fffff) << 5;
+        s->src_pitch_reg = (val & 0x7fe00000) >> 21;
+        s->src_tile_reg = val >> 31;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_PITCH_OFFSET:
     case R128_DST_PITCH_OFFSET_C:
-        s->dst_offset = (val & 0x1fffff) << 5;
-        s->dst_pitch = (val & 0x7fe00000) >> 21;
-        s->dst_tile = val >> 31;
+        s->dst_offset_reg = (val & 0x1fffff) << 5;
+        s->dst_pitch_reg = (val & 0x7fe00000) >> 21;
+        s->dst_tile_reg = val >> 31;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_Y_X:
         s->src_x = val & 0x3fff;
@@ -1626,24 +1686,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->dp_datatype = (val & 0x0f00) >> 8 | (val & 0x30f0) << 4 |
                          (val & 0x4000) << 16;
         s->dp_mix = (val & R128_GMC_ROP3_MASK) | (val & 0x7000000) >> 16;
-        if (!(val & R128_GMC_SRC_PITCH_OFFSET_CNTL)) {
-            s->src_offset = s->default_offset;
-            s->src_pitch = s->default_pitch;
-        }
-        if (!(val & R128_GMC_DST_PITCH_OFFSET_CNTL)) {
-            s->dst_offset = s->default_offset;
-            s->dst_pitch = s->default_pitch;
-        }
-        if (!(val & R128_GMC_SRC_CLIPPING)) {
-            s->src_sc_right = s->default_sc_right;
-            s->src_sc_bottom = s->default_sc_bottom;
-        }
-        if (!(val & R128_GMC_DST_CLIPPING)) {
-            s->sc_top = 0;
-            s->sc_left = 0;
-            s->sc_right = s->default_sc_right;
-            s->sc_bottom = s->default_sc_bottom;
-        }
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_WIDTH_X:
         s->dst_x = val & 0x3fff;
@@ -1668,11 +1711,13 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->dst_height = (val >> 16) & 0x3fff;
         break;
     case R128_SRC_OFFSET:
-        s->src_offset = val & 0xfffffff0;
+        s->src_offset_reg = val & 0xfffffff0;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_PITCH:
-        s->src_pitch = val & 0x3fff;
-        s->src_tile = (val >> 16) & 1;
+        s->src_pitch_reg = val & 0x3fff;
+        s->src_tile_reg = (val >> 16) & 1;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DP_BRUSH_BKGD_CLR:
         s->dp_brush_bkgd_clr = val;
@@ -1702,45 +1747,57 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_DEFAULT_OFFSET:
         s->default_offset = val & 0xfffffff0;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DEFAULT_PITCH:
         s->default_pitch = val & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DEFAULT_SC_BOTTOM_RIGHT:
         s->default_sc_right = val & 0x3fff;
         s->default_sc_bottom = (val >> 16) & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_TOP_LEFT:
     case R128_SC_TOP_LEFT_C:
-        s->sc_left = val & 0x3fff;
-        s->sc_top = (val >> 16) & 0x3fff;
+        s->sc_left_reg = val & 0x3fff;
+        s->sc_top_reg = (val >> 16) & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_LEFT:
-        s->sc_left = val & 0x3fff;
+        s->sc_left_reg = val & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_TOP:
-        s->sc_top = val & 0x3fff;
+        s->sc_top_reg = val & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_BOTTOM_RIGHT:
     case R128_SC_BOTTOM_RIGHT_C:
-        s->sc_right = val & 0x3fff;
-        s->sc_bottom = (val >> 16) & 0x3fff;
+        s->sc_right_reg = val & 0x3fff;
+        s->sc_bottom_reg = (val >> 16) & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_RIGHT:
-        s->sc_right = val & 0x3fff;
+        s->sc_right_reg = val & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_BOTTOM:
-        s->sc_bottom = val & 0x3fff;
+        s->sc_bottom_reg = val & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_SC_BOTTOM_RIGHT:
-        s->src_sc_right = val & 0x3fff;
-        s->src_sc_bottom = (val >> 16) & 0x3fff;
+        s->src_sc_right_reg = val & 0x3fff;
+        s->src_sc_bottom_reg = (val >> 16) & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_SC_RIGHT:
-        s->src_sc_right = val & 0x3fff;
+        s->src_sc_right_reg = val & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_SC_BOTTOM:
-        s->src_sc_bottom = val & 0x3fff;
+        s->src_sc_bottom_reg = val & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_HOST_DATA0:
     case R128_HOST_DATA1:
