@@ -242,6 +242,7 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     uint8_t rop = (s->dp_mix >> 16) & 0xff;
     bool left_to_right = s->dp_cntl & R128_DST_X_LEFT_TO_RIGHT;
     bool top_to_bottom = s->dp_cntl & R128_DST_Y_TOP_TO_BOTTOM;
+    bool overlaps;
     int width = s->dst_width;
     int height = s->dst_height;
     uint32_t dst_stride, src_stride;
@@ -274,6 +275,28 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     if (sc_right == 0 && sc_bottom == 0) {
         sc_right = 0x3fff;
         sc_bottom = 0x3fff;
+    }
+
+    /*
+     * Pick a non-destructive direction when a copy overlaps itself.
+     *
+     * Mac OS never varies the direction bits -- DP_CNTL reads 0x0107,
+     * left-to-right and top-to-bottom, for every blit, including the six
+     * overlapping down-and-right copies a single diagonal window drag
+     * produces. Real hardware clearly does not corrupt those, so the
+     * engine must order the copy itself rather than trusting the driver.
+     * Walking forward regardless re-read rows that had already been
+     * overwritten, smearing repeated fragments across a window whenever
+     * it was dragged anything other than exactly horizontally.
+     */
+    overlaps = s->src_offset == s->dst_offset &&
+               (int)s->dst_x < (int)s->src_x + width &&
+               (int)s->src_x < (int)s->dst_x + width &&
+               (int)s->dst_y < (int)s->src_y + height &&
+               (int)s->src_y < (int)s->dst_y + height;
+    if (overlaps) {
+        left_to_right = s->dst_x <= s->src_x;
+        top_to_bottom = s->dst_y <= s->src_y;
     }
 
     for (y = 0; y < height; y++) {
@@ -316,6 +339,166 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     }
 }
 
+
+static uint32_t ati_rage128_scale_texel(const uint8_t *row, int sx,
+                                        unsigned dt)
+{
+    int y, u, v, r, g, b;
+
+    switch (dt) {
+    case R128_SCALE_DT_YUYV422:
+    case R128_SCALE_DT_UYVY422:
+    {
+        const uint8_t *p = row + (sx & ~1) * 2;
+
+        if (dt == R128_SCALE_DT_YUYV422) {      /* Y0 U Y1 V */
+            y = p[(sx & 1) ? 2 : 0];
+            u = p[1];
+            v = p[3];
+        } else {                                /* U Y0 V Y1 ('2vuy') */
+            y = p[(sx & 1) ? 3 : 1];
+            u = p[0];
+            v = p[2];
+        }
+        break;
+    }
+    case R128_SCALE_DT_AYUV444:
+        y = row[sx * 4 + 1];
+        u = row[sx * 4 + 2];
+        v = row[sx * 4 + 3];
+        break;
+    case R128_SCALE_DT_Y8:
+        y = row[sx];
+        u = v = 128;
+        break;
+    case R128_SCALE_DT_ARGB8888:
+        return ldl_be_p(row + sx * 4) & 0xffffff;
+    case R128_SCALE_DT_RGB565:
+    {
+        uint16_t px = lduw_be_p(row + sx * 2);
+
+        return (((px >> 11) & 0x1f) << 19) | (((px >> 5) & 0x3f) << 10) |
+               ((px & 0x1f) << 3);
+    }
+    case R128_SCALE_DT_ARGB1555:
+    {
+        uint16_t px = lduw_be_p(row + sx * 2);
+
+        return (((px >> 10) & 0x1f) << 19) | (((px >> 5) & 0x1f) << 11) |
+               ((px & 0x1f) << 3);
+    }
+    default:
+        return 0;
+    }
+
+    y = (y - 16) * 298;
+    u -= 128;
+    v -= 128;
+    r = (y + 409 * v + 128) >> 8;
+    g = (y - 100 * u - 208 * v + 128) >> 8;
+    b = (y + 516 * u + 128) >> 8;
+    r = MIN(MAX(r, 0), 255);
+    g = MIN(MAX(g, 0), 255);
+    b = MIN(MAX(b, 0), 255);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+/*
+ * CNTL_SCALING: a scaled, optionally YUV-converting copy from a source
+ * image in VRAM into the destination rectangle. This is how Mac OS plays
+ * video on this card -- the counterpart of the mach64's scaler pipe, and
+ * it carries the same parameters for the same movie.
+ *
+ * Nearest-neighbour: the increments are DDA accumulator steps with 12
+ * fractional bits, sitting at bits 19:4 exactly as the mach64's do.
+ * Reading them unshifted gives a sixteen-fold downscale, which cannot be
+ * right when the source and destination are the same size.
+ */
+void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t dst_xy = pkt[R128_SCALE_PKT_DST_X_Y];
+    uint32_t dst_hw = pkt[R128_SCALE_PKT_DST_H_W];
+    uint32_t sc_tl = pkt[R128_SCALE_PKT_SC_TL];
+    uint32_t sc_br = pkt[R128_SCALE_PKT_SC_BR];
+    unsigned dt = pkt[R128_SCALE_PKT_DATATYPE] & 0xf;
+    uint32_t src_off = pkt[R128_SCALE_PKT_OFFSET] & ~7u;
+    uint32_t src_pitch = (pkt[R128_SCALE_PKT_PITCH] & 0x3fff) * 8;
+    uint32_t x_inc = pkt[R128_SCALE_PKT_X_INC] >> 4;
+    uint32_t y_inc = pkt[R128_SCALE_PKT_Y_INC] >> 4;
+    int dst_x = (dst_xy >> 16) & 0x3fff, dst_y = dst_xy & 0x3fff;
+    int w = dst_hw & 0x3fff, h = (dst_hw >> 16) & 0x3fff;
+    int sc_left = sc_tl & 0x3fff, sc_top = (sc_tl >> 16) & 0x3fff;
+    int sc_right = sc_br & 0x3fff, sc_bottom = (sc_br >> 16) & 0x3fff;
+    int bpp = ati_rage128_bpp_from_dp_datatype(s);
+    /*
+     * The packet carries its own pitch/offset for both source and
+     * destination -- its context dword sets both PITCH_OFFSET_CNTL bits,
+     * which is precisely what those bits mean. Using the engine's
+     * left-over state instead sent every scaled frame to wherever the
+     * previous operation happened to be pointing.
+     */
+    uint32_t dpo = pkt[R128_SCALE_PKT_DST_PITCH_OFF];
+    uint32_t dst_off = (dpo & R128_PITCH_OFFSET_OFF_MASK) <<
+                       R128_PITCH_OFFSET_OFF_SHIFT;
+    uint32_t dst_stride = (dpo >> R128_PITCH_OFFSET_PITCH_SHIFT) * bpp;
+    int src_bpp, x, y;
+
+    trace_ati_rage128_scale(dst_x, dst_y, w, h, src_off, src_pitch,
+                            x_inc, y_inc, dt);
+    if (!bpp || !dst_stride || !x_inc || !y_inc || !src_pitch ||
+        w <= 0 || h <= 0) {
+        return;
+    }
+
+    switch (dt) {
+    case R128_SCALE_DT_Y8:
+        src_bpp = 1;
+        break;
+    case R128_SCALE_DT_ARGB1555:
+    case R128_SCALE_DT_RGB565:
+    case R128_SCALE_DT_YUYV422:
+    case R128_SCALE_DT_UYVY422:
+        src_bpp = 2;
+        break;
+    case R128_SCALE_DT_ARGB8888:
+    case R128_SCALE_DT_AYUV444:
+        src_bpp = 4;
+        break;
+    default:
+        trace_ati_rage128_scale_unimp(dt);
+        return;
+    }
+
+    for (y = 0; y < h; y++) {
+        int dy = dst_y + y;
+        uint32_t sy = ((uint32_t)y * y_inc) >> 12;
+        const uint8_t *row;
+
+        if (dy < sc_top || dy > sc_bottom) {
+            continue;
+        }
+        row = vram + src_off + sy * src_pitch * (uint32_t)src_bpp;
+        if (src_off + (sy + 1) * src_pitch * (uint32_t)src_bpp >
+            ATI_RAGE128_VRAM_SIZE) {
+            break;
+        }
+        for (x = 0; x < w; x++) {
+            int dx = dst_x + x;
+            uint32_t sx = ((uint32_t)x * x_inc) >> 12;
+
+            if (dx < sc_left || dx > sc_right) {
+                continue;
+            }
+            if ((sx + 1) * (uint32_t)src_bpp > src_pitch * (uint32_t)src_bpp) {
+                break;
+            }
+            ati_rage128_2d_write_pixel(s, dst_off, dst_stride, dx, dy, bpp,
+                                       ati_rage128_scale_texel(row, sx, dt));
+        }
+    }
+}
+
 void ati_rage128_2d_blt(ATIRage128State *s)
 {
     uint32_t src_source = s->dp_mix & R128_DP_SRC_SOURCE;
@@ -323,9 +506,8 @@ void ati_rage128_2d_blt(ATIRage128State *s)
     trace_ati_rage128_2d_blt(s->src_offset, (s->src_x << 16) | s->src_y,
                              s->dst_offset, (s->dst_x << 16) | s->dst_y,
                              s->dst_width, s->dst_height,
-                             (s->src_pitch << 16) | s->dst_pitch,
                              (s->dp_mix >> 16) & 0xff, s->dp_datatype,
-                             src_source >> 8);
+                             src_source >> 8, s->dp_cntl);
 
     if (s->host_data_active) {
         /* A new blt implicitly ends any still-in-progress HOST_DATA

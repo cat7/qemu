@@ -572,4 +572,72 @@
 #define R128_I2C_EN                  (1 << 17)
 #define R128_I2C_TIME_LIMIT_SHIFT    24
 
+
+/*
+ * CNTL_SCALING (packet-3 opcode 0x96): the scaled blit Mac OS uses for
+ * video on this card, the counterpart of the mach64's scaler pipe. A
+ * 16-dword packet; the layout below was established from a live capture
+ * of QuickTime playback and cross-checked against the mach64, which
+ * drives the same movie through its own scaler with identical
+ * parameters (the X/Y DDA increments are literally the same values).
+ *
+ *   [0]  GUI_MASTER_CNTL         [3]  SC_TOP_LEFT
+ *   [4]  SC_BOTTOM_RIGHT         [8]  source datatype
+ *   [9]  source offset (bytes)   [10] source pitch, in 8-pixel units
+ *   [12] X increment             [13] Y increment
+ *   [14] DST_X_Y   (X high)      [15] DST_HEIGHT_WIDTH (height high)
+ *
+ * Self-consistency check that pins four of those at once: the scissors
+ * in [3]/[4] exactly bound the rectangle that [14] and [15] describe.
+ */
+#define R128_PM4_OPCODE_SCALING       0x96
+#define R128_SCALE_PKT_DWORDS         16
+#define R128_SCALE_PKT_GMC            0
+#define R128_SCALE_PKT_SRC_PITCH_OFF  1
+#define R128_SCALE_PKT_DST_PITCH_OFF  2
+#define R128_SCALE_PKT_SC_TL          3
+#define R128_SCALE_PKT_SC_BR          4
+#define R128_SCALE_PKT_DATATYPE       8
+#define R128_SCALE_PKT_OFFSET         9
+#define R128_SCALE_PKT_PITCH          10
+#define R128_SCALE_PKT_X_INC          12
+#define R128_SCALE_PKT_Y_INC          13
+#define R128_SCALE_PKT_DST_X_Y        14
+#define R128_SCALE_PKT_DST_H_W        15
+
+/*
+ * Scaler source datatypes. The two 4:2:2 codes are named inconsistently
+ * between the tables in xf86-video-r128's own header, so trust the
+ * behaviour instead: the mach64 uses code 12 for this same movie and
+ * renders correctly as UYVY ('2vuy', the classic Mac 4:2:2 layout).
+ */
+/*
+ * PITCH_OFFSET packing, as Linux's r128 driver builds it:
+ * (pitch << 21) | (offset >> 5), pitch counting 8-pixel units. Verified
+ * against the captured packet, where the source form decodes to pitch
+ * 192 and offset 0x1fda000 -- the same offset the packet also carries
+ * separately, and the same pitch.
+ */
+#define R128_PITCH_OFFSET_PITCH_SHIFT 21
+#define R128_PITCH_OFFSET_OFF_MASK    0x001fffff
+#define R128_PITCH_OFFSET_OFF_SHIFT   5
+
+/*
+ * Blit directions also have a second, differently packed home. Leaving
+ * it undecoded left the direction stale, so an overlapping copy with a
+ * vertical component duplicated rows -- visible as repeated fragments
+ * when a window is dragged anything other than exactly horizontally.
+ */
+#define R128_DP_CNTL_XDIR_YDIR_YMAJOR 0x16d0
+#define R128_DST_Y_DIR_TOP_TO_BOTTOM  0x00008000
+#define R128_DST_X_DIR_LEFT_TO_RIGHT  0x80000000
+
+#define R128_SCALE_DT_ARGB1555        3
+#define R128_SCALE_DT_RGB565          4
+#define R128_SCALE_DT_ARGB8888        6
+#define R128_SCALE_DT_Y8              8
+#define R128_SCALE_DT_YUYV422         11
+#define R128_SCALE_DT_UYVY422         12
+#define R128_SCALE_DT_AYUV444         14
+
 #endif /* ATI_RAGE128_REGS_H */

@@ -59,7 +59,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIRage128State, ATI_RAGE128)
  *   Expansion ROM: 128KB
  */
 #define ATI_RAGE128_APER_SIZE   (64 * 1024 * 1024)
-#define ATI_RAGE128_VRAM_SIZE   (16 * 1024 * 1024)
+/*
+ * 32MB, which is what the retail Rage 128 Pro this device models carries
+ * and what the rest of the code already assumes: the 64MB aperture is
+ * described, and mapped, as two 32MB images of the frame buffer.
+ *
+ * With only 16MB the upper half of the guest's frame-buffer memory did
+ * not exist. Mac OS allocates its offscreen surfaces from the top, so
+ * everything it staged there was silently lost -- captured live, the
+ * video scaler's source sat at 0x1fda000 (31.85MB) and the blits around
+ * it addressed 0x1fd9500 and 0x1ff3f00, all beyond the end of VRAM.
+ */
+#define ATI_RAGE128_VRAM_SIZE   (32 * 1024 * 1024)
 #define ATI_RAGE128_MMIO_SIZE   (16 * 1024)
 #define ATI_RAGE128_IO_SIZE     256
 #define ATI_RAGE128_NUM_REGS    (ATI_RAGE128_MMIO_SIZE / 4)
@@ -75,6 +86,7 @@ typedef struct ATIRage128PM4Parser {
     uint32_t p1_reg2;
     uint32_t p3_opcode;      /* packet3 2D-draw sub-state */
     uint32_t p3_params[8];
+    uint32_t p3_scale[16];      /* R128_SCALE_PKT_DWORDS */
     uint32_t p3_param_idx;
     uint32_t p3_total;       /* payload dwords the packet3 declared */
 } ATIRage128PM4Parser;
@@ -279,6 +291,7 @@ const char *ati_rage128_reg_name(uint32_t base);
 
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
+void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt);
 bool ati_rage128_host_data_flush(ATIRage128State *s);
 
 /*

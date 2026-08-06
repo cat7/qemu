@@ -1155,6 +1155,20 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
     case R128_DP_SRC_BKGD_CLR:
         val = s->dp_src_bkgd_clr;
         break;
+    case R128_DP_CNTL_XDIR_YDIR_YMAJOR:
+        /*
+         * The same two directions as DP_CNTL, in different bit
+         * positions. Keep DP_CNTL as the canonical copy so the 2D engine
+         * has one place to look.
+         */
+        s->dp_cntl &= ~(R128_DST_X_LEFT_TO_RIGHT | R128_DST_Y_TOP_TO_BOTTOM);
+        if (val & R128_DST_X_DIR_LEFT_TO_RIGHT) {
+            s->dp_cntl |= R128_DST_X_LEFT_TO_RIGHT;
+        }
+        if (val & R128_DST_Y_DIR_TOP_TO_BOTTOM) {
+            s->dp_cntl |= R128_DST_Y_TOP_TO_BOTTOM;
+        }
+        break;
     case R128_DP_CNTL:
         val = s->dp_cntl;
         break;
@@ -1994,6 +2008,25 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
                     }
                 }
                 break;
+            case R128_PM4_OPCODE_SCALING:
+                if (count >= R128_SCALE_PKT_DWORDS) {
+                    uint32_t pkt[R128_SCALE_PKT_DWORDS];
+
+                    for (i = 0; i < R128_SCALE_PKT_DWORDS; i++) {
+                        pkt[i] = ati_rage128_pm4_read_ring(s);
+                    }
+                    ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL,
+                                            pkt[R128_SCALE_PKT_GMC]);
+                    ati_rage128_reg_write32(s, R128_SC_TOP_LEFT,
+                                            pkt[R128_SCALE_PKT_SC_TL]);
+                    ati_rage128_reg_write32(s, R128_SC_BOTTOM_RIGHT,
+                                            pkt[R128_SCALE_PKT_SC_BR]);
+                    ati_rage128_2d_scale(s, pkt);
+                }
+                for (i = R128_SCALE_PKT_DWORDS; i < count; i++) {
+                    ati_rage128_pm4_read_ring(s);
+                }
+                break;
             case R128_PM4_OPCODE_HOSTDATA_BLT:
                 if (count >= 8) {
                     /*
@@ -2152,7 +2185,8 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
             if (p->p3_opcode != R128_PM4_OPCODE_PAINT &&
                 p->p3_opcode != R128_PM4_OPCODE_PAINT_MULTI &&
                 p->p3_opcode != R128_PM4_OPCODE_BITBLT &&
-                p->p3_opcode != R128_PM4_OPCODE_HOSTDATA_BLT) {
+                p->p3_opcode != R128_PM4_OPCODE_HOSTDATA_BLT &&
+                p->p3_opcode != R128_PM4_OPCODE_SCALING) {
                 trace_ati_rage128_pm4_unimp(p->p3_opcode, p->remaining);
             }
             break;
@@ -2295,6 +2329,21 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
                     s->dst_height = p->p3_params[3] & 0x3fff;
                     s->dst_width = (p->p3_params[3] >> 16) & 0x3fff;
                     ati_rage128_2d_blt(s);
+                }
+            }
+            break;
+        case R128_PM4_OPCODE_SCALING:
+            /* see the ring parser's copy for the packet layout */
+            if (p->p3_param_idx < R128_SCALE_PKT_DWORDS) {
+                p->p3_scale[p->p3_param_idx++] = val;
+                if (p->p3_param_idx == R128_SCALE_PKT_DWORDS) {
+                    ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL,
+                                    p->p3_scale[R128_SCALE_PKT_GMC]);
+                    ati_rage128_reg_write32(s, R128_SC_TOP_LEFT,
+                                    p->p3_scale[R128_SCALE_PKT_SC_TL]);
+                    ati_rage128_reg_write32(s, R128_SC_BOTTOM_RIGHT,
+                                    p->p3_scale[R128_SCALE_PKT_SC_BR]);
+                    ati_rage128_2d_scale(s, p->p3_scale);
                 }
             }
             break;
