@@ -11,6 +11,7 @@ adb_device_kbd_request_change_addr_and_handler(int devaddr, int handler) "change
 adb_device_mouse_handle_event(int kind, int axis_or_button, int value, int down) "kind %d axis_or_button %d value %d down %d"
 adb_device_mouse_flush(void) "flush"
 adb_device_mouse_writereg(int reg, uint8_t val) "reg %d val 0x%2.2x"
+adb_device_mouse_extended_info(uint8_t res, uint8_t class, uint8_t buttons) "extended-protocol info: %u cpi class %u buttons %u"
 adb_device_mouse_readreg(int reg, uint8_t val0, uint8_t val1) "reg %d obuf[0] 0x%2.2x obuf[1] 0x%2.2x"
 adb_device_mouse_request_change_addr(int devaddr) "change addr to 0x%x"
 adb_device_mouse_request_change_addr_and_handler(int devaddr, int handler) "change addr and handler to 0x%x, 0x%x"
