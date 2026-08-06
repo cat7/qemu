@@ -273,6 +273,26 @@ struct ATIRage128State {
     uint32_t default_offset, default_pitch;
     uint32_t default_sc_bottom, default_sc_right;
 
+    /*
+     * The pitch/offset and scissor fields above are the EFFECTIVE values the
+     * drawing code uses; these are the register values they derive from.
+     * DP_GUI_MASTER_CNTL's SRC/DST_PITCH_OFFSET_CNTL and SRC/DST_CLIPPING
+     * bits SELECT, per operation, whether the effective value comes from the
+     * source/destination registers or from DEFAULT_* -- a selection, not a
+     * transfer. Folding it straight into the effective field on every GMC
+     * write destroys the register behind it, so the result then depends on
+     * the order the driver happens to write things in. Mac OS X hits exactly
+     * that: it programs the separate SRC_PITCH/SRC_OFFSET registers rather
+     * than the packed SRC_PITCH_OFFSET, and every PAINT/BITBLT packet
+     * carries its own GMC dword, so a blit could run with a pitch left over
+     * from an earlier, differently sized surface. One 8-pixel pitch unit of
+     * staleness shears the copy by 8 pixels per row.
+     */
+    uint32_t src_offset_reg, src_pitch_reg, src_tile_reg;
+    uint32_t dst_offset_reg, dst_pitch_reg, dst_tile_reg;
+    uint32_t sc_top_reg, sc_left_reg, sc_bottom_reg, sc_right_reg;
+    uint32_t src_sc_bottom_reg, src_sc_right_reg;
+
     /* HOST_DATA0-7/LAST accumulator, same protocol as upstream */
     bool host_data_active;
     uint32_t host_data_row, host_data_col, host_data_next;
