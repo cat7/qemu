@@ -656,9 +656,14 @@ static void register_74xx_sprs(CPUPPCState *env)
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
 
+    /*
+     * A storing write handler, so the L2-enable sequence can read back what
+     * it just wrote; see spr_read_l2cr() for why the invalidate handshake
+     * bits are masked out of reads instead of out of writes.
+     */
     spr_register(env, SPR_L2CR, "L2CR",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, spr_access_nop,
+                 &spr_read_l2cr, &spr_write_generic,
                  0x00000000);
 }
 

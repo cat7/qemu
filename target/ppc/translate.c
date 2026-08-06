@@ -477,6 +477,35 @@ void spr_read_msscr0(DisasContext *ctx, int gprn, int sprn)
                     ~(target_ulong)0x00800000);
 }
 
+/*
+ * L2CR drives the 74xx's external L2 cache. Writes have to stick: the
+ * standard bring-up sequence enables the cache and then reads L2CR back to
+ * confirm the write took, so discarding it (the generic upstream default,
+ * harmless for targets that never read it back) makes that check fail --
+ * the real PowerMac3,4 ROM's power-on self test reports an external cache
+ * failure. Same bug and same fix as SPR_L2CR on the 750.
+ *
+ * The global-invalidate handshake still has to look finished, though. L2IP
+ * is hardware status that is set while an invalidate runs and cleared when
+ * it completes, and on the 7450 family L2I itself is cleared by hardware at
+ * completion; there is no cache to invalidate here, so both must read back
+ * clear or a firmware poll loop spins forever.
+ *
+ * Mask on the read side rather than stripping the bits as they are written,
+ * for the reason spelled out above spr_read_msscr0(): write-side masking
+ * stops the register holding what software stored, which breaks anything
+ * comparing a readback and corrupts the bits that should round-trip.
+ */
+#define L2CR_L2I    0x00200000  /* global invalidate    */
+#define L2CR_L2IP   0x00000400  /* invalidate in progress */
+
+void spr_read_l2cr(DisasContext *ctx, int gprn, int sprn)
+{
+    gen_load_spr(cpu_gpr[gprn], sprn);
+    tcg_gen_andi_tl(cpu_gpr[gprn], cpu_gpr[gprn],
+                    ~(target_ulong)(L2CR_L2I | L2CR_L2IP));
+}
+
 void spr_write_generic32(DisasContext *ctx, int sprn, int gprn)
 {
 #ifdef TARGET_PPC64
