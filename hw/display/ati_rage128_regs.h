@@ -302,6 +302,21 @@
 #define R128_DST_HEIGHT_Y            0x15a0
 #define R128_SRC_OFFSET              0x15ac
 #define R128_SRC_PITCH               0x15b0
+/*
+ * Colour compare: a per-pixel test that suppresses the write. Mac OS
+ * uses it to repaint a text field's background without disturbing the
+ * glyphs already in it, so leaving it unimplemented erased the text.
+ */
+#define R128_CLR_CMP_CNTL            0x15c0
+#define R128_CLR_CMP_CLR_SRC         0x15c4
+#define R128_CLR_CMP_CLR_DST         0x15c8
+#define R128_CLR_CMP_MASK            0x15cc
+#define R128_CLR_CMP_FN_MASK         0x00000007
+#define R128_CLR_CMP_FN_FALSE        0
+#define R128_CLR_CMP_FN_TRUE         1
+#define R128_CLR_CMP_FN_NOT_EQUAL    4
+#define R128_CLR_CMP_FN_EQUAL        5
+#define R128_CLR_CMP_SRC_SOURCE      0x01000000
 #define R128_DP_SRC_FRGD_CLR         0x15d8
 #define R128_DP_SRC_BKGD_CLR         0x15dc
 #define R128_SC_LEFT                 0x1640

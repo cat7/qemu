@@ -2596,6 +2596,24 @@ static void ati_rage128_aper1_write(void *opaque, hwaddr addr, uint64_t data,
             vram[off] = (data >> (8 * (size - 1 - i))) & 0xff;
         }
     }
+    /*
+     * Diagnostic: CPU stores into the frame buffer bypass the drawing
+     * engine entirely, so nothing else in this device can see them. Some
+     * guest text is drawn this way.
+     */
+    if (trace_event_get_state_backends(TRACE_ATI_RAGE128_APER_WR)) {
+        uint32_t crtc = s->regs[R128_CRTC_OFFSET >> 2] & 0x7ffffff;
+        uint32_t pitch = (s->regs[R128_CRTC_PITCH >> 2] & 0x7ff) * 8;
+        int px = -1, py = -1;
+
+        if (pitch && addr >= crtc) {
+            uint32_t rel = addr - crtc;
+
+            py = rel / (pitch * 4);
+            px = (rel % (pitch * 4)) / 4;
+        }
+        trace_ati_rage128_aper_wr(1, (uint32_t)addr, size, data, px, py);
+    }
     /* keep the dirty-bitmap framebuffer scanner seeing these writes */
     memory_region_set_dirty(&s->vram, addr & ~7ull, 8);
 }

@@ -503,11 +503,14 @@ void ati_rage128_2d_blt(ATIRage128State *s)
 {
     uint32_t src_source = s->dp_mix & R128_DP_SRC_SOURCE;
 
-    trace_ati_rage128_2d_blt(s->src_offset, (s->src_x << 16) | s->src_y,
-                             s->dst_offset, (s->dst_x << 16) | s->dst_y,
+    trace_ati_rage128_2d_blt((s->src_x << 16) | s->src_y,
+                             (s->dst_x << 16) | s->dst_y,
                              s->dst_width, s->dst_height,
                              (s->dp_mix >> 16) & 0xff, s->dp_datatype,
-                             src_source >> 8, s->dp_cntl);
+                             src_source >> 8,
+                             s->regs[R128_CLR_CMP_CNTL >> 2],
+                             s->regs[R128_CLR_CMP_CLR_DST >> 2],
+                             s->dp_write_mask);
 
     if (s->host_data_active) {
         /* A new blt implicitly ends any still-in-progress HOST_DATA
