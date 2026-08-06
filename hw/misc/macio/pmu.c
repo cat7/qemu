@@ -774,11 +774,43 @@ static void pmu_update(PMUState *s)
     }
 }
 
+/*
+ * The 6522 hangs off a 783.36kHz VIA clock and the bus stretches every
+ * access out to a whole VIA cycle, so a register read or write costs the
+ * CPU ~1.28us on real hardware.  Mac OS 9's Trampoline turns that into a
+ * measuring stick: it calibrates the bus and decrementer clocks by counting
+ * timebase ticks across a few hundred back-to-back VIA reads and assuming
+ * each one took exactly one stretched cycle (the classic TimeVIADB idiom).
+ * QEMU's MMIO is essentially free, which collapses the window and hands the
+ * ROM a clock rate orders of magnitude too low - it then programs the Time
+ * Manager with zero periods and drowns in decrementer exceptions.  Burn the
+ * wall time the real bus would have burnt; the timebase is derived from it.
+ *
+ * Spin rather than sleep: at this scale every sleep primitive overshoots by
+ * more than the delay itself.  Deadline off the realtime clock so the loop
+ * still terminates under icount, where virtual time does not advance here.
+ */
+static void mos6522_pmu_stretch_cycle(PMUState *s)
+{
+    int64_t end;
+
+    if (!s->access_stretch_ns) {
+        return;
+    }
+
+    end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + s->access_stretch_ns;
+    while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < end) {
+        /* wait out the VIA cycle */
+    }
+}
+
 static uint64_t mos6522_pmu_read(void *opaque, hwaddr addr, unsigned size)
 {
     PMUState *s = opaque;
     MOS6522PMUState *mps = &s->mos6522_pmu;
     MOS6522State *ms = MOS6522(mps);
+
+    mos6522_pmu_stretch_cycle(s);
 
     addr = (addr >> 9) & 0xf;
     return mos6522_read(ms, addr, size);
@@ -790,6 +822,8 @@ static void mos6522_pmu_write(void *opaque, hwaddr addr, uint64_t val,
     PMUState *s = opaque;
     MOS6522PMUState *mps = &s->mos6522_pmu;
     MOS6522State *ms = MOS6522(mps);
+
+    mos6522_pmu_stretch_cycle(s);
 
     addr = (addr >> 9) & 0xf;
     mos6522_write(ms, addr, val, size);
@@ -913,6 +947,8 @@ static void pmu_init(Object *obj)
 
 static const Property pmu_properties[] = {
     DEFINE_PROP_BOOL("has-adb", PMUState, has_adb, true),
+    /* One 783.36kHz VIA cycle; 0 disables the stretch entirely */
+    DEFINE_PROP_UINT32("access-stretch-ns", PMUState, access_stretch_ns, 1276),
 };
 
 static void pmu_class_init(ObjectClass *oc, const void *data)
