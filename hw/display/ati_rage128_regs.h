@@ -119,6 +119,21 @@
 #define R128_CUR_HORZ_VERT_OFF       0x0268
 #define R128_CUR_CLR0                0x026c
 #define R128_CUR_CLR1                0x0270
+
+/* Hardware cursor field layout (RRG-G04500-C 3.13) */
+#define R128_CUR_OFFSET_MASK         0x01fffff0 /* [24:0], [3:0] hardwired 0 */
+#define R128_CUR_LOCK                (1u << 31) /* atomic shape/move update */
+#define R128_CUR_VERT_POSN_MASK      0x7ff      /* [10:0] */
+#define R128_CUR_HORZ_POSN_SHIFT     16         /* [26:16] */
+#define R128_CUR_HORZ_POSN_MASK      0x7ff
+#define R128_CUR_VERT_OFF_MASK       0x3f       /* [5:0] */
+#define R128_CUR_HORZ_OFF_SHIFT      16         /* [21:16] */
+#define R128_CUR_HORZ_OFF_MASK       0x3f
+/* 64x64 pixels, 16 bytes per row: 8 of AND mask then 8 of XOR mask */
+#define R128_CUR_WIDTH               64
+#define R128_CUR_HEIGHT              64
+#define R128_CUR_ROW_BYTES           16
+#define R128_CUR_IMAGE_BYTES         (R128_CUR_HEIGHT * R128_CUR_ROW_BYTES)
 #define R128_DAC_EXT_CNTL            0x0280
 #define R128_DDA_CONFIG              0x02e0
 #define R128_DDA_ON_OFF              0x02e4
@@ -237,6 +252,39 @@
  */
 #define R128_PM4_OPCODE_PAINT_MULTI   0x9a
 #define R128_PM4_OPCODE_BITBLT        0x92
+/*
+ * CNTL_BITBLT_MULTI: BITBLT carrying its own destination pitch/offset, so
+ * a run of copies can share one context dword. Mac OS X issues exactly one
+ * of these per frame of a window drag -- while it went unimplemented the
+ * copy simply never happened, and every later blit out of the driver's
+ * offscreen surface propagated whatever stale content was left there.
+ * That was the garbled window contents on this card.
+ *
+ * Two header dwords and then a RUN of rectangles, three dwords each -- the
+ * MULTI is not decoration:
+ *   [0]      GMC (DP_GUI_MASTER_CNTL)
+ *   [1]      SRC_PITCH_OFFSET (observed 0x10000400 = offset 0x8000, pitch
+ *            128 -- the screen; see the ring parser for why this is the
+ *            source and not the destination)
+ *   [2+3k]   SRC_X_Y
+ *   [3+3k]   DST_X_Y
+ *   [4+3k]   DST_WIDTH_HEIGHT
+ * X/WIDTH live in the HIGH half and Y/HEIGHT in the low half, the same way
+ * round as PAINT_MULTI and plain BITBLT on this driver.
+ *
+ * Captured live, iTunes sends 29 dwords = 2 + NINE rectangles, and they
+ * tile one window exactly: 590x1, 594x1, 596x1, 598x2, then 600x390, then
+ * 598x2, 596x1, 594x1, 590x1, with the destination Y running 10, 11, 12,
+ * 13, 15, 405, 407, 408, 409 -- contiguous, narrow at top and bottom and
+ * wide in between. That is a rounded-corner window, the same shape the
+ * BITBLT and PAINT_MULTI comments describe. Handling only the first
+ * rectangle copied a single 1-pixel-high strip and threw away the 600x390
+ * body, which is why window CHROME came out right while the CONTENTS were
+ * garbage.
+ */
+#define R128_PM4_OPCODE_BITBLT_MULTI  0x9b
+/* header dwords plus at least one 3-dword rectangle */
+#define R128_BITBLT_MULTI_MIN_DWORDS  5
 #define R128_PM4_OPCODE_HOSTDATA_BLT  0x94
 
 /*

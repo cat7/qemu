@@ -491,6 +491,8 @@ static void ati_rage128_scan_vram_activity(ATIRage128State *s)
     ati_rage128_pick_auto_fb(s, nblocks);
 }
 
+static void ati_rage128_cursor_update(ATIRage128State *s);
+
 static bool ati_rage128_update_display(void *opaque)
 {
     ATIRage128State *s = opaque;
@@ -633,6 +635,7 @@ static bool ati_rage128_update_display(void *opaque)
     default:
         break;
     }
+    ati_rage128_cursor_update(s);
     qemu_console_update_full(s->con);
 
     return true;
@@ -1105,10 +1108,10 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         val = 0x40;
         break;
     case R128_DST_OFFSET:
-        val = s->dst_offset;
+        val = s->dst_offset_reg;
         break;
     case R128_DST_PITCH:
-        val = s->dst_pitch | (s->dst_tile << 16);
+        val = s->dst_pitch_reg | (s->dst_tile_reg << 16);
         break;
     case R128_DST_WIDTH:
         val = s->dst_width;
@@ -1137,11 +1140,29 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
               (s->dp_mix & R128_DP_ROP3) |
               ((s->dp_mix & R128_DP_SRC_SOURCE) << 16);
         break;
+    /*
+     * The packed PITCH_OFFSET form and the separate PITCH/OFFSET
+     * registers are two views of one piece of state on real silicon, so
+     * a read through either has to see what was written through the
+     * other. Mac OS X programs the separate registers exclusively, which
+     * left the packed ones reading a permanent zero.
+     */
+    case R128_SRC_PITCH_OFFSET:
+        val = (s->src_offset_reg >> 5) |
+              (s->src_pitch_reg << R128_PITCH_OFFSET_PITCH_SHIFT) |
+              (s->src_tile_reg << 31);
+        break;
+    case R128_DST_PITCH_OFFSET:
+    case R128_DST_PITCH_OFFSET_C:
+        val = (s->dst_offset_reg >> 5) |
+              (s->dst_pitch_reg << R128_PITCH_OFFSET_PITCH_SHIFT) |
+              (s->dst_tile_reg << 31);
+        break;
     case R128_SRC_OFFSET:
-        val = s->src_offset;
+        val = s->src_offset_reg;
         break;
     case R128_SRC_PITCH:
-        val = s->src_pitch | (s->src_tile << 16);
+        val = s->src_pitch_reg | (s->src_tile_reg << 16);
         break;
     case R128_DP_BRUSH_BKGD_CLR:
         val = s->dp_brush_bkgd_clr;
@@ -1191,22 +1212,22 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         val = s->default_sc_right | (s->default_sc_bottom << 16);
         break;
     case R128_SC_TOP:
-        val = s->sc_top;
+        val = s->sc_top_reg;
         break;
     case R128_SC_LEFT:
-        val = s->sc_left;
+        val = s->sc_left_reg;
         break;
     case R128_SC_BOTTOM:
-        val = s->sc_bottom;
+        val = s->sc_bottom_reg;
         break;
     case R128_SC_RIGHT:
-        val = s->sc_right;
+        val = s->sc_right_reg;
         break;
     case R128_SRC_SC_BOTTOM:
-        val = s->src_sc_bottom;
+        val = s->src_sc_bottom_reg;
         break;
     case R128_SRC_SC_RIGHT:
-        val = s->src_sc_right;
+        val = s->src_sc_right_reg;
         break;
     case R128_CFG_MIRROR_BASE ... R128_CFG_MIRROR_END:
         val = pci_default_read_config(dev, base - R128_CFG_MIRROR_BASE, 4);
@@ -1223,9 +1244,91 @@ static void ati_rage128_pm4_fifo_push(ATIRage128State *s, uint32_t val);
 static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
                                      uint32_t dwords);
 
+/*
+ * Re-derive the effective 2D pitch/offset and scissors from the register
+ * values, honouring DP_GUI_MASTER_CNTL's per-operation source selects.
+ *
+ * Those GMC bits pick where each value comes from; they do not move it.
+ * Applying them destructively (writing DEFAULT_* into the effective field
+ * on a GMC write) loses the register underneath, so whether a blit saw the
+ * right pitch came down to whether the driver wrote SRC_PITCH before or
+ * after the GMC dword. Recomputing instead means either order works, and a
+ * surface's pitch can no longer leak into the next, differently sized one.
+ */
+static void ati_rage128_resolve_gui_context(ATIRage128State *s)
+{
+    uint32_t gmc = s->dp_gui_master_cntl;
+
+    if (gmc & R128_GMC_SRC_PITCH_OFFSET_CNTL) {
+        s->src_offset = s->src_offset_reg;
+        s->src_pitch = s->src_pitch_reg;
+        s->src_tile = s->src_tile_reg;
+    } else {
+        s->src_offset = s->default_offset;
+        s->src_pitch = s->default_pitch;
+        s->src_tile = 0;
+    }
+
+    if (gmc & R128_GMC_DST_PITCH_OFFSET_CNTL) {
+        s->dst_offset = s->dst_offset_reg;
+        s->dst_pitch = s->dst_pitch_reg;
+        s->dst_tile = s->dst_tile_reg;
+    } else {
+        s->dst_offset = s->default_offset;
+        s->dst_pitch = s->default_pitch;
+        s->dst_tile = 0;
+    }
+
+    if (gmc & R128_GMC_SRC_CLIPPING) {
+        s->src_sc_right = s->src_sc_right_reg;
+        s->src_sc_bottom = s->src_sc_bottom_reg;
+    } else {
+        s->src_sc_right = s->default_sc_right;
+        s->src_sc_bottom = s->default_sc_bottom;
+    }
+
+    if (gmc & R128_GMC_DST_CLIPPING) {
+        s->sc_top = s->sc_top_reg;
+        s->sc_left = s->sc_left_reg;
+        s->sc_right = s->sc_right_reg;
+        s->sc_bottom = s->sc_bottom_reg;
+    } else {
+        s->sc_top = 0;
+        s->sc_left = 0;
+        s->sc_right = s->default_sc_right;
+        s->sc_bottom = s->default_sc_bottom;
+    }
+}
+
 static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                                     uint32_t val)
 {
+    /*
+     * Diagnostic: the 2D source/destination context. Mac OS X programs
+     * essentially all of this through the CCE (a whole window drag issues
+     * ~180 MMIO register writes, nearly all of them CUR_OFFSET), and PM4
+     * type-0 packets reach the register file through this function rather
+     * than through the MMIO ops -- so the MMIO trace never sees them.
+     * Tracing here catches both paths.
+     */
+    switch (base) {
+    case R128_SRC_OFFSET:
+    case R128_SRC_PITCH:
+    case R128_SRC_PITCH_OFFSET:
+    case R128_DST_OFFSET:
+    case R128_DST_PITCH:
+    case R128_DST_PITCH_OFFSET:
+    case R128_DST_PITCH_OFFSET_C:
+    case R128_DEFAULT_OFFSET:
+    case R128_DEFAULT_PITCH:
+    case R128_DP_GUI_MASTER_CNTL:
+    case R128_DP_GUI_MASTER_CNTL_C:
+        trace_ati_rage128_ctx_write(ati_rage128_reg_name(base), base, val);
+        break;
+    default:
+        break;
+    }
+
     switch (base) {
     case R128_MM_INDEX:
         s->regs[base >> 2] = val;
@@ -1261,6 +1364,12 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         ati_rage128_update_irq(s);
         break;
     case R128_CRTC_GEN_CNTL:
+        s->regs[base >> 2] = val;
+        s->mode_dirty = true;
+        trace_ati_rage128_mode_reg(ati_rage128_reg_name(base), val);
+        ati_rage128_maybe_capture_mode(s);
+        ati_rage128_cursor_update(s);   /* carries CRTC_CUR_EN */
+        break;
     case R128_CRTC_EXT_CNTL:
     case R128_CRTC_H_TOTAL_DISP:
     case R128_CRTC_V_TOTAL_DISP:
@@ -1269,6 +1378,14 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->mode_dirty = true;
         trace_ati_rage128_mode_reg(ati_rage128_reg_name(base), val);
         ati_rage128_maybe_capture_mode(s);
+        break;
+    case R128_CUR_OFFSET:
+    case R128_CUR_HORZ_VERT_POSN:
+    case R128_CUR_HORZ_VERT_OFF:
+    case R128_CUR_CLR0:
+    case R128_CUR_CLR1:
+        s->regs[base >> 2] = val;
+        ati_rage128_cursor_update(s);
         break;
     case R128_CRTC_OFFSET:
         s->regs[base >> 2] = val & (R128_CRTC_OFFSET_MASK |
@@ -1416,11 +1533,13 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         ati_rage128_pm4_fifo_push(s, val);
         break;
     case R128_DST_OFFSET:
-        s->dst_offset = val & 0xfffffff0;
+        s->dst_offset_reg = val & 0xfffffff0;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_PITCH:
-        s->dst_pitch = val & 0x3fff;
-        s->dst_tile = (val >> 16) & 1;
+        s->dst_pitch_reg = val & 0x3fff;
+        s->dst_tile_reg = (val >> 16) & 1;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_WIDTH:
         s->dst_width = val & 0x3fff;
@@ -1442,15 +1561,17 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->dst_y = val & 0x3fff;
         break;
     case R128_SRC_PITCH_OFFSET:
-        s->src_offset = (val & 0x1fffff) << 5;
-        s->src_pitch = (val & 0x7fe00000) >> 21;
-        s->src_tile = val >> 31;
+        s->src_offset_reg = (val & 0x1fffff) << 5;
+        s->src_pitch_reg = (val & 0x7fe00000) >> 21;
+        s->src_tile_reg = val >> 31;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_PITCH_OFFSET:
     case R128_DST_PITCH_OFFSET_C:
-        s->dst_offset = (val & 0x1fffff) << 5;
-        s->dst_pitch = (val & 0x7fe00000) >> 21;
-        s->dst_tile = val >> 31;
+        s->dst_offset_reg = (val & 0x1fffff) << 5;
+        s->dst_pitch_reg = (val & 0x7fe00000) >> 21;
+        s->dst_tile_reg = val >> 31;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_Y_X:
         s->src_x = val & 0x3fff;
@@ -1483,24 +1604,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                          (val & 0x0f00) >> 8 | (val & 0x30f0) << 4 |
                          (val & 0x4000) << 16;
         s->dp_mix = (val & R128_GMC_ROP3_MASK) | (val & 0x7000000) >> 16;
-        if (!(val & R128_GMC_SRC_PITCH_OFFSET_CNTL)) {
-            s->src_offset = s->default_offset;
-            s->src_pitch = s->default_pitch;
-        }
-        if (!(val & R128_GMC_DST_PITCH_OFFSET_CNTL)) {
-            s->dst_offset = s->default_offset;
-            s->dst_pitch = s->default_pitch;
-        }
-        if (!(val & R128_GMC_SRC_CLIPPING)) {
-            s->src_sc_right = s->default_sc_right;
-            s->src_sc_bottom = s->default_sc_bottom;
-        }
-        if (!(val & R128_GMC_DST_CLIPPING)) {
-            s->sc_top = 0;
-            s->sc_left = 0;
-            s->sc_right = s->default_sc_right;
-            s->sc_bottom = s->default_sc_bottom;
-        }
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_WIDTH_X:
         s->dst_x = val & 0x3fff;
@@ -1525,11 +1629,13 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->dst_height = (val >> 16) & 0x3fff;
         break;
     case R128_SRC_OFFSET:
-        s->src_offset = val & 0xfffffff0;
+        s->src_offset_reg = val & 0xfffffff0;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_PITCH:
-        s->src_pitch = val & 0x3fff;
-        s->src_tile = (val >> 16) & 1;
+        s->src_pitch_reg = val & 0x3fff;
+        s->src_tile_reg = (val >> 16) & 1;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DP_BRUSH_BKGD_CLR:
         s->dp_brush_bkgd_clr = val;
@@ -1560,45 +1666,57 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_DEFAULT_OFFSET:
         s->default_offset = val & 0xfffffff0;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DEFAULT_PITCH:
         s->default_pitch = val & 0x3fff;
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_DEFAULT_SC_BOTTOM_RIGHT:
         s->default_sc_right = sextract32(val, 0, 14);
         s->default_sc_bottom = sextract32(val, 16, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_TOP_LEFT:
     case R128_SC_TOP_LEFT_C:
-        s->sc_left = sextract32(val, 0, 14);
-        s->sc_top = sextract32(val, 16, 14);
+        s->sc_left_reg = sextract32(val, 0, 14);
+        s->sc_top_reg = sextract32(val, 16, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_LEFT:
-        s->sc_left = sextract32(val, 0, 14);
+        s->sc_left_reg = sextract32(val, 0, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_TOP:
-        s->sc_top = sextract32(val, 0, 14);
+        s->sc_top_reg = sextract32(val, 0, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_BOTTOM_RIGHT:
     case R128_SC_BOTTOM_RIGHT_C:
-        s->sc_right = sextract32(val, 0, 14);
-        s->sc_bottom = sextract32(val, 16, 14);
+        s->sc_right_reg = sextract32(val, 0, 14);
+        s->sc_bottom_reg = sextract32(val, 16, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_RIGHT:
-        s->sc_right = sextract32(val, 0, 14);
+        s->sc_right_reg = sextract32(val, 0, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SC_BOTTOM:
-        s->sc_bottom = sextract32(val, 0, 14);
+        s->sc_bottom_reg = sextract32(val, 0, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_SC_BOTTOM_RIGHT:
-        s->src_sc_right = sextract32(val, 0, 14);
-        s->src_sc_bottom = sextract32(val, 16, 14);
+        s->src_sc_right_reg = sextract32(val, 0, 14);
+        s->src_sc_bottom_reg = sextract32(val, 16, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_SC_RIGHT:
-        s->src_sc_right = sextract32(val, 0, 14);
+        s->src_sc_right_reg = sextract32(val, 0, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_SRC_SC_BOTTOM:
-        s->src_sc_bottom = sextract32(val, 0, 14);
+        s->src_sc_bottom_reg = sextract32(val, 0, 14);
+        ati_rage128_resolve_gui_context(s);
         break;
     case R128_HOST_DATA0:
     case R128_HOST_DATA1:
@@ -1964,6 +2082,56 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
                 }
                 break;
             }
+            case R128_PM4_OPCODE_BITBLT_MULTI:
+                /*
+                 * The save-under half of a window drag: two header dwords
+                 * and then a RUN of three-dword rectangles -- the MULTI is
+                 * not decoration. See ati_rage128_regs.h for the layout.
+                 * iTunes sends nine rectangles in one 29-dword packet,
+                 * tiling a rounded-corner window, so stopping after the
+                 * first copied a 1-pixel strip and dropped the 600x390
+                 * body: chrome came out right, contents did not.
+                 *
+                 * The pitch/offset dword is the SOURCE, not the
+                 * destination, and the packet's own GMC settles that: it
+                 * carries SRC_PITCH_OFFSET_CNTL set with
+                 * DST_PITCH_OFFSET_CNTL CLEAR, i.e. "source from
+                 * SRC_PITCH_OFFSET, destination from DEFAULT_*". Feeding it
+                 * to DST_PITCH_OFFSET wrote a register the engine had been
+                 * told to ignore. Live, the dword is 0x10000400 (offset
+                 * 0x8000, pitch 128 -- the screen) while DEFAULT_* points
+                 * at the offscreen surface: screen to offscreen, which is
+                 * what saving under a window is.
+                 */
+                if (count >= R128_BITBLT_MULTI_MIN_DWORDS) {
+                    uint32_t gmc = ati_rage128_pm4_read_ring(s);
+                    uint32_t spo = ati_rage128_pm4_read_ring(s);
+
+                    ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, gmc);
+                    ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET, spo);
+                    for (i = 2; i + 3 <= (int)count; i += 3) {
+                        uint32_t src_x_y = ati_rage128_pm4_read_ring(s);
+                        uint32_t dst_x_y = ati_rage128_pm4_read_ring(s);
+                        uint32_t dst_w_h = ati_rage128_pm4_read_ring(s);
+
+                        s->src_y = src_x_y & 0x3fff;
+                        s->src_x = (src_x_y >> 16) & 0x3fff;
+                        s->dst_y = dst_x_y & 0x3fff;
+                        s->dst_x = (dst_x_y >> 16) & 0x3fff;
+                        s->dst_height = dst_w_h & 0x3fff;
+                        s->dst_width = (dst_w_h >> 16) & 0x3fff;
+                        ati_rage128_2d_blt(s);
+                    }
+                    for (; i < (int)count; i++) {
+                        ati_rage128_pm4_read_ring(s);
+                    }
+                } else {
+                    for (i = 0; i < (int)count; i++) {
+                        ati_rage128_pm4_read_ring(s);
+                    }
+                }
+                break;
+
             case R128_PM4_OPCODE_BITBLT:
                 /*
                  * Four dwords: context, SRC_X_Y, DST_X_Y,
@@ -2185,6 +2353,7 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
             if (p->p3_opcode != R128_PM4_OPCODE_PAINT &&
                 p->p3_opcode != R128_PM4_OPCODE_PAINT_MULTI &&
                 p->p3_opcode != R128_PM4_OPCODE_BITBLT &&
+                p->p3_opcode != R128_PM4_OPCODE_BITBLT_MULTI &&
                 p->p3_opcode != R128_PM4_OPCODE_HOSTDATA_BLT &&
                 p->p3_opcode != R128_PM4_OPCODE_SCALING) {
                 trace_ati_rage128_pm4_unimp(p->p3_opcode, p->remaining);
@@ -2315,6 +2484,34 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
                 p->p3_param_idx = 2;   /* next rectangle pair */
             }
             break;
+        case R128_PM4_OPCODE_BITBLT_MULTI:
+            /*
+             * Same packet as the ring parser's copy; see there for the
+             * layout. The rectangle run is longer than p3_params, so each
+             * three-dword rectangle is gathered in place and issued as
+             * soon as it completes rather than buffering the packet.
+             */
+            if (p->p3_param_idx == 0) {
+                ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, val);
+            } else if (p->p3_param_idx == 1) {
+                ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET, val);
+            } else {
+                unsigned slot = (p->p3_param_idx - 2) % 3;
+
+                p->p3_params[slot] = val;
+                if (slot == 2) {
+                    s->src_y = p->p3_params[0] & 0x3fff;
+                    s->src_x = (p->p3_params[0] >> 16) & 0x3fff;
+                    s->dst_y = p->p3_params[1] & 0x3fff;
+                    s->dst_x = (p->p3_params[1] >> 16) & 0x3fff;
+                    s->dst_height = p->p3_params[2] & 0x3fff;
+                    s->dst_width = (p->p3_params[2] >> 16) & 0x3fff;
+                    ati_rage128_2d_blt(s);
+                }
+            }
+            p->p3_param_idx++;
+            break;
+
         case R128_PM4_OPCODE_BITBLT:
             /* see the ring parser's copy of this case for the layout */
             if (p->p3_param_idx < 4) {
@@ -2618,6 +2815,81 @@ static void ati_rage128_aper1_write(void *opaque, hwaddr addr, uint64_t data,
     memory_region_set_dirty(&s->vram, addr & ~7ull, 8);
 }
 
+/*
+ * Diagnostic window over part of aperture 0 (see the fillwatch fields).
+ * Aperture 0 applies no endian swap, so this has to behave exactly like
+ * the RAM alias it replaces: on a big-endian guest a store's most
+ * significant byte lands at the lowest address, which is what writing
+ * lane i as byte (size-1-i) of a DEVICE_BIG_ENDIAN access does.
+ */
+static uint64_t ati_rage128_fillwatch_read(void *opaque, hwaddr addr,
+                                           unsigned size)
+{
+    ATIRage128State *s = opaque;
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t base = s->fillwatch_off + (uint32_t)addr;
+    uint64_t val = 0;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        if (base + i < ATI_RAGE128_VRAM_SIZE) {
+            val |= (uint64_t)vram[base + i] << (8 * (size - 1 - i));
+        }
+    }
+    return val;
+}
+
+static void ati_rage128_fillwatch_write(void *opaque, hwaddr addr,
+                                        uint64_t data, unsigned size)
+{
+    ATIRage128State *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t base = s->fillwatch_off + (uint32_t)addr;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        if (base + i < ATI_RAGE128_VRAM_SIZE) {
+            vram[base + i] = (data >> (8 * (size - 1 - i))) & 0xff;
+        }
+    }
+    memory_region_set_dirty(&s->vram, base & ~7ull, 8);
+
+    /*
+     * Coalesce. A strided fill writes each row as one contiguous run and
+     * then jumps, so the run length and the jump to the next run's start
+     * are exactly the geometry we are trying to recover: the delta
+     * between successive run starts IS the stride the CPU is filling at.
+     */
+    if (s->fw_active && base == s->fw_run_end) {
+        s->fw_run_end = base + size;
+        return;
+    }
+    if (s->fw_active) {
+        trace_ati_rage128_fillwatch(s->fw_run_start,
+                                    s->fw_run_end - s->fw_run_start,
+                                    base - s->fw_run_start);
+    }
+    s->fw_run_start = base;
+    s->fw_run_end = base + size;
+    s->fw_active = true;
+}
+
+static const MemoryRegionOps ati_rage128_fillwatch_ops = {
+    .read = ati_rage128_fillwatch_read,
+    .write = ati_rage128_fillwatch_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
+
 static const MemoryRegionOps ati_rage128_aper1_ops = {
     .read = ati_rage128_aper1_read,
     .write = ati_rage128_aper1_write,
@@ -2662,10 +2934,136 @@ static void ati_rage128_reset_hold(Object *obj, ResetType type)
 }
 
 /*
- * Host-driven pointer for this display (see the header). The guest
- * neither programs this card's cursor registers nor draws a software
- * cursor here, so we publish a plain arrow of our own and move it; the
- * UI composites it exactly as it does a real hardware cursor.
+ * Hardware cursor. CRTC_CUR_MODE 0 -- the only mode the chip defines --
+ * is a 64x64 two-colour image with transparent and inverting codes
+ * (RRG-G04500-C 3.13). The image sits at CUR_OFFSET in the frame buffer
+ * as 16 bytes per row: eight bytes of AND mask followed by eight of XOR
+ * mask, most significant bit leftmost. (AND,XOR) selects CUR_CLR0,
+ * CUR_CLR1, "leave the destination alone" or "invert it".
+ *
+ * That layout was confirmed against the live image Mac OS X programs on
+ * this card rather than assumed: decoded any other plausible way -- as
+ * separate AND/XOR planes, or as the mach64's packed 2bpp -- the same
+ * 1024 bytes come out as noise, and this way they come out as the Mac
+ * arrow. Note also that CUR_CLR0/1 are plain 0x00RRGGBB here, NOT the
+ * mach64's colour-in-bits-31:8 layout; the two decodes are not
+ * interchangeable. QEMUCursor data is RGBA byte order, i.e. a dword of
+ * (a << 24) | (b << 16) | (g << 8) | r (ui/cursor.c).
+ *
+ * "Invert the destination" has no QEMUCursor equivalent, so it becomes
+ * 50%-alpha black -- the same approximation the mach64 uses, and the
+ * classic Mac cursors only use that code to soften edges.
+ */
+static void ati_rage128_cursor_update(ATIRage128State *s)
+{
+    uint32_t posn = s->regs[R128_CUR_HORZ_VERT_POSN >> 2];
+    uint32_t coff = s->regs[R128_CUR_HORZ_VERT_OFF >> 2];
+    uint32_t offs = s->regs[R128_CUR_OFFSET >> 2];
+    uint32_t raw0 = s->regs[R128_CUR_CLR0 >> 2];
+    uint32_t raw1 = s->regs[R128_CUR_CLR1 >> 2];
+    uint32_t clr0 = 0xff000000u | ((raw0 & 0xff) << 16) |
+                    (raw0 & 0xff00) | ((raw0 >> 16) & 0xff);
+    uint32_t clr1 = 0xff000000u | ((raw1 & 0xff) << 16) |
+                    (raw1 & 0xff00) | ((raw1 >> 16) & 0xff);
+    uint32_t vram_off = offs & R128_CUR_OFFSET_MASK;
+    unsigned horz_off = (coff >> R128_CUR_HORZ_OFF_SHIFT) &
+                        R128_CUR_HORZ_OFF_MASK;
+    unsigned vert_off = coff & R128_CUR_VERT_OFF_MASK;
+    bool on = (s->regs[R128_CRTC_GEN_CNTL >> 2] & R128_CRTC_CUR_EN) != 0;
+    const uint8_t *src;
+    uint32_t sum = 0;
+    QEMUCursor *c;
+    unsigned row, px;
+    int x, y;
+
+    if (!s->con) {
+        return;
+    }
+    /*
+     * Host-side tracking owns the pointer when it is running (see the
+     * host_cursor_last_ns comment): let it, rather than fighting it with a
+     * hardware cursor the guest may not be keeping up to date.
+     */
+    if (s->host_cursor_active) {
+        return;
+    }
+    /*
+     * CUR_LOCK freezes all three of CUR_OFFSET/POSN/OFF so the driver can
+     * change shape and position together; publishing a half-updated
+     * cursor is exactly the tearing the bit exists to prevent.
+     */
+    if ((offs | posn | coff) & R128_CUR_LOCK) {
+        return;
+    }
+    if (!on) {
+        if (s->hw_cursor_on) {
+            s->hw_cursor_on = false;
+            s->hw_cursor_sum = 0;
+            qemu_console_set_mouse(s->con, 0, 0, false);
+        }
+        return;
+    }
+    if ((uint64_t)vram_off + R128_CUR_IMAGE_BYTES > ATI_RAGE128_VRAM_SIZE) {
+        return;
+    }
+    src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + vram_off;
+
+    /*
+     * CUR_HORZ_OFF says which column of the map is drawn at CUR_HORZ_POSN,
+     * so the image's own left edge belongs at POSN - OFF. Vertically the
+     * driver does it differently: to push the cursor off the top it
+     * advances CUR_OFFSET by 16 bytes per hidden row *as well as* raising
+     * CUR_VERT_OFF, so the data already begins at the first visible row.
+     * The top edge is therefore CUR_VERT_POSN with no correction, and the
+     * final CUR_VERT_OFF rows of the map are simply not part of the
+     * cursor ("Height of cursor is (64-CUR_VERT_OFF)").
+     */
+    x = (int)((posn >> R128_CUR_HORZ_POSN_SHIFT) & R128_CUR_HORZ_POSN_MASK) -
+        (int)horz_off;
+    y = (int)(posn & R128_CUR_VERT_POSN_MASK);
+
+    for (row = 0; row < R128_CUR_IMAGE_BYTES; row++) {
+        sum = (sum << 1 | sum >> 31) ^ src[row];
+    }
+    sum ^= clr0 ^ clr1 ^ (uint32_t)horz_off ^ ((uint32_t)vert_off << 8);
+
+    if (s->hw_cursor_on && sum == s->hw_cursor_sum) {
+        /* Same image: a move only, so don't re-upload it. */
+        qemu_console_set_mouse(s->con, x, y, true);
+        return;
+    }
+
+    c = cursor_alloc(R128_CUR_WIDTH, R128_CUR_HEIGHT);
+    for (row = 0; row < R128_CUR_HEIGHT; row++) {
+        for (px = 0; px < R128_CUR_WIDTH; px++) {
+            const uint8_t *line = src + row * R128_CUR_ROW_BYTES;
+            unsigned bit = 7 - (px & 7);
+            unsigned and_bit = (line[px >> 3] >> bit) & 1;
+            unsigned xor_bit = (line[8 + (px >> 3)] >> bit) & 1;
+            uint32_t val;
+
+            if (row >= R128_CUR_HEIGHT - vert_off || px < horz_off) {
+                val = 0;                        /* outside the cursor */
+            } else if (!and_bit) {
+                val = xor_bit ? clr1 : clr0;
+            } else {
+                val = xor_bit ? 0x80000000u : 0;    /* invert : transparent */
+            }
+            c->data[row * R128_CUR_WIDTH + px] = val;
+        }
+    }
+    qemu_console_set_cursor(s->con, c);
+    cursor_unref(c);
+    s->hw_cursor_on = true;
+    s->hw_cursor_sum = sum;
+    qemu_console_set_mouse(s->con, x, y, true);
+}
+
+/*
+ * Host-driven pointer for this display (see the header), used only while
+ * the guest's own hardware cursor is switched off -- Mac OS X does drive
+ * these registers, so once it has, the real cursor wins and this stands
+ * aside rather than fighting it for the console cursor.
  */
 void ati_rage128_host_cursor(int x, int y, bool on)
 {
@@ -2688,6 +3086,8 @@ void ati_rage128_host_cursor(int x, int y, bool on)
     if (!s->con) {
         return;
     }
+    s->host_cursor_active = true;
+    s->hw_cursor_on = false;
 
     if (on && !s->host_cursor_published) {
         QEMUCursor *c = cursor_alloc(16, 16);
@@ -2751,6 +3151,20 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
                           "ati-rage128-aper1", ATI_RAGE128_VRAM_SIZE);
     memory_region_add_subregion(&s->aper, ATI_RAGE128_APER_SIZE / 2,
                                 &s->vram_aper1);
+    /*
+     * Optional diagnostic overlay on aperture 0 (see the fillwatch fields
+     * in the header). Higher priority than the RAM alias underneath, so
+     * stores in this range come to us instead of landing silently.
+     */
+    if (s->fillwatch_size &&
+        (uint64_t)s->fillwatch_off + s->fillwatch_size <=
+        ATI_RAGE128_VRAM_SIZE) {
+        memory_region_init_io(&s->vram_watch, obj,
+                              &ati_rage128_fillwatch_ops, s,
+                              "ati-rage128-fillwatch", s->fillwatch_size);
+        memory_region_add_subregion_overlap(&s->aper, s->fillwatch_off,
+                                            &s->vram_watch, 1);
+    }
 
     memory_region_init_io(&s->mmio, obj, &ati_rage128_mmio_ops, s,
                           "ati-rage128-mmio", ATI_RAGE128_MMIO_SIZE);
@@ -2860,6 +3274,12 @@ static const VMStateDescription vmstate_ati_rage128 = {
 };
 
 static const Property ati_rage128_properties[] = {
+    /*
+     * Diagnostic only: lay an instrumented window over part of aperture 0
+     * so CPU fills of that VRAM range become traceable. Off by default.
+     */
+    DEFINE_PROP_UINT32("fillwatch", ATIRage128State, fillwatch_off, 0),
+    DEFINE_PROP_UINT32("fillwatch-size", ATIRage128State, fillwatch_size, 0),
     DEFINE_PROP_BOOL("monitor-connected", ATIRage128State,
                      monitor_connected, true),
     DEFINE_EDID_PROPERTIES(ATIRage128State, edid_info),

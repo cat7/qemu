@@ -279,6 +279,70 @@ struct ATIRage128State {
     uint32_t default_offset, default_pitch;
     int32_t default_sc_bottom, default_sc_right;
 
+    /*
+     * The pitch/offset and scissor fields above are the EFFECTIVE values
+     * the drawing code uses; these are the register values they are
+     * derived from. DP_GUI_MASTER_CNTL's SRC/DST_PITCH_OFFSET_CNTL and
+     * SRC/DST_CLIPPING bits select, per operation, whether the effective
+     * value comes from the source/destination registers or from the
+     * DEFAULT_* ones -- a selection, not a transfer. Folding it straight
+     * into the effective field on every GMC write (which is what this
+     * used to do) destroys the register behind it, so the result depends
+     * on the order the driver happens to write things in. Mac OS X hits
+     * exactly that: it programs the separate SRC_PITCH/SRC_OFFSET
+     * registers rather than the packed SRC_PITCH_OFFSET, and every
+     * PAINT/BITBLT packet carries its own GMC dword, so a blit could run
+     * with a pitch left over from an earlier, differently sized surface.
+     * One 8-pixel pitch unit of staleness shears the copy by 8 pixels per
+     * row -- the diagonally streaked window contents on the Rage.
+     */
+    uint32_t src_offset_reg, src_pitch_reg, src_tile_reg;
+    uint32_t dst_offset_reg, dst_pitch_reg, dst_tile_reg;
+    int32_t sc_top_reg, sc_left_reg, sc_bottom_reg, sc_right_reg;
+    int32_t src_sc_bottom_reg, src_sc_right_reg;
+
+    /*
+     * Diagnostic: CPU stores into the frame buffer go through aperture 0,
+     * which is a plain RAM alias, so nothing in this device can see them
+     * -- and that is exactly the path that fills the driver's offscreen
+     * staging surface. Setting the "fillwatch"/"fillwatch-size" properties
+     * lays an instrumented IO window over that range of aperture 0 so the
+     * fills become visible. Writes are coalesced into contiguous runs and
+     * traced one line per run, so a full surface fill costs a line per row
+     * rather than one per store.
+     */
+    MemoryRegion vram_watch;
+    uint32_t fillwatch_off, fillwatch_size;
+    uint32_t fw_run_start, fw_run_end;
+    bool fw_active;
+
+    /*
+     * Hardware cursor (CUR_* registers). hw_cursor_on tracks whether the
+     * guest's own cursor is live, so the host-driven fallback pointer
+     * stands aside rather than fighting it for the console cursor.
+     * hw_cursor_sum is a checksum of the published image, so a shape
+     * change made by writing VRAM alone is still picked up without
+     * re-uploading an unchanged cursor on every frame.
+     */
+    bool hw_cursor_on;
+    uint32_t hw_cursor_sum;
+    /*
+     * When the mach64's host-side pointer tracking is driving this display
+     * (its host-cursor-tracking property, which the Mac OS 9 launcher turns
+     * on), it owns the console cursor for good and the guest's own hardware
+     * cursor must stand aside -- under Mac OS 9 the guest barely updates the
+     * CUR_* registers on this card, so publishing them leaves a pointer
+     * frozen at a stale position. Under Mac OS X, where tracking is off and
+     * the guest drives the registers properly, the hardware cursor wins.
+     *
+     * Ownership is a latch, NOT a timeout. Expiring it after a second of no
+     * host updates meant that whenever the pointer sat still on the other
+     * display the hardware cursor took the console back and redisplayed its
+     * stale position -- a ghost pointer left behind on this screen, plus an
+     * artefact as the handover happened on the way across.
+     */
+    bool host_cursor_active;
+
     /* HOST_DATA0-7/LAST accumulator, same protocol as upstream */
     bool host_data_active;
     uint32_t host_data_row, host_data_col, host_data_next;
