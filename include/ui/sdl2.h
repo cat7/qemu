@@ -46,6 +46,22 @@ struct sdl2_console {
     SDL_GLContext winctx;
     QKbdState *kbd;
     bool has_dmabuf;
+    /*
+     * Guest-drawn cursor state. Per console, not global: with more than
+     * one graphics device each has its own cursor, its own position and
+     * its own idea of whether it is currently showing one. Sharing these
+     * let one console's updates corrupt the other's motion deltas.
+     */
+    bool guest_cursor;
+    int guest_x, guest_y;
+    SDL_Cursor *guest_sprite;
+    SDL_Surface *guest_sprite_surface;
+    /*
+     * The same cursor as a texture, so it can be drawn inside the window
+     * rather than as the host pointer -- see sdl2_2d_update().
+     */
+    SDL_Texture *cursor_texture;
+    int cursor_w, cursor_h, cursor_hot_x, cursor_hot_y;
 #ifdef CONFIG_OPENGL
     QemuGLShader *gls;
     egl_fb guest_fb;
@@ -70,6 +86,7 @@ void sdl2_2d_switch(DisplayChangeListener *dcl,
                     DisplaySurface *new_surface);
 void sdl2_2d_refresh(DisplayChangeListener *dcl);
 void sdl2_2d_redraw(struct sdl2_console *scon);
+void sdl2_2d_present(struct sdl2_console *scon);
 bool sdl2_2d_check_format(DisplayChangeListener *dcl,
                           pixman_format_code_t format);
 
