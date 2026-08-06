@@ -54,6 +54,36 @@ struct MouseState {
      * such guests: -global adb-mouse.motion-scale=2.
      */
     uint8_t motion_scale;
+    /*
+     * Offer the Extended Apple Mouse Protocol (handler 4) when a guest
+     * asks for it. Only Mac OS X actually needs it (it scales pointer
+     * speed by the resolution we declare in register 1; the classic
+     * protocol's implied 200 cpi halves its pointer speed given our
+     * counts are host pixels). Classic Mac OS works fine on the plain
+     * protocol, so this can be turned off wholesale --
+     * -global adb-mouse.extended-protocol=off -- to keep a guest on the
+     * classic handler if its extended-protocol driver misbehaves.
+     */
+    bool extended_protocol;
+    /*
+     * Handler ID reported after reset. Real Apple ADB mice report 2
+     * (Classic Apple Mouse Protocol, 200 counts per inch); 1 is the
+     * 100 cpi variant. Classic Mac OS builds its pointer-acceleration
+     * curve from this: with handler 1 the guest's curve was measured
+     * (live, Mac OS 9.2) to hold just ONE segment ending at 1.49
+     * counts per frame, so every faster movement fell through to the
+     * table terminator and produced a CONSTANT ~1.07 px per report --
+     * a 63-count report moved the cursor exactly as far as a 2-count
+     * one, capping the pointer at about 90 px/s however fast the mouse
+     * was moved.
+     *
+     * Mac OS X wants 1 instead: its AppleADBMouse Type 4 personality
+     * matches "3-01" (address 3, default handler 1) and negotiates the
+     * extended protocol from there; with 2 it stays on the classic
+     * path and halves its pointer speed. Hence the property -- classic
+     * Mac OS is this machine's primary guest, so 2 is the default.
+     */
+    uint8_t default_handler;
 };
 
 
@@ -165,8 +195,47 @@ static int adb_mouse_poll(ADBDevice *d, uint8_t *obuf)
         dy = 63;
     }
 
+    /*
+     * Report what accumulated since the last poll and DISCARD any
+     * excess -- never carry a remainder into the next poll. A real ADB
+     * mouse counts encoder pulses into a register that the host reads
+     * and clears; it cannot bank motion it had no room to report, and
+     * DingusPPC's AdbMouse::get_register_0() likewise zeroes x_rel/y_rel
+     * after clamping.
+     *
+     * Subtracting only the reported amount (as this did) turns one fast
+     * flick into a backlog delivered 63 counts at a time over many
+     * polls. Two symptoms follow, both reported live: the pointer keeps
+     * gliding for a second or more after the hand stops, and tracking
+     * feels far too slow -- because the guest never sees a *fast*
+     * delta, only a long stream of moderate ones, so classic Mac OS's
+     * acceleration curve never engages and everything moves 1:1.
+     * Raising motion-scale made it worse, which is the signature of a
+     * backlog rather than a scaling problem.
+     */
+    /*
+     * Report what accumulated since the last poll, keeping at most one
+     * further poll's worth of overflow.
+     *
+     * Unbounded carry (the original `s->dx -= dx`) turned a single fast
+     * flick into a backlog dribbled out 63 counts at a time over many
+     * polls: the pointer kept gliding for a second after the hand
+     * stopped, and the guest never saw a fast delta so its acceleration
+     * curve never engaged. Discarding the overflow entirely (as
+     * DingusPPC and real hardware do -- their counters are read-and-
+     * cleared) removes the drift but throws away most of a fast flick,
+     * because our deltas are host pixels already accelerated by the
+     * host WM, which overshoot the classic protocol's +-63 far more
+     * often than a real 200 cpi mouse ever would.
+     *
+     * Keeping a single poll of slack splits the difference: brief
+     * bursts survive into the next poll (~20 ms later), while nothing
+     * can accumulate into visible post-motion drift.
+     */
     s->dx -= dx;
     s->dy -= dy;
+    s->dx = MIN(MAX(s->dx, -63), 63);
+    s->dy = MIN(MAX(s->dy, -63), 63);
     s->last_buttons_state = s->buttons_state;
 
     dx &= 0x7f;
@@ -291,7 +360,8 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
                  * 0x5f: Microspeed mouse
                  * 0x66: Microspeed mouse
                  */
-                if (buf[2] == 1 || buf[2] == 2 || buf[2] == 4) {
+                if (buf[2] == 1 || buf[2] == 2 ||
+                    (buf[2] == 4 && s->extended_protocol)) {
                     d->handler = buf[2];
                 }
 
@@ -319,15 +389,43 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
              * not be 'tpad' (that selects the trackpad code path).
              */
             if (d->handler == 4) {
-                obuf[0] = 'Q';
-                obuf[1] = 'E';
-                obuf[2] = 'M';
-                obuf[3] = 'U';
+                /*
+                 * Bytes 0-3 device identifier, 4-5 resolution in counts
+                 * per inch (big-endian), 6 device class, 7 button count
+                 * (byte roles confirmed against NetBSD's adbms_init_mouse(),
+                 * which reads sc_class = buffer[6], sc_buttons = buffer[7]).
+                 *
+                 * The class byte selects how the driver INTERPRETS the
+                 * motion data -- drivers keep separate classes for mouse,
+                 * trackball, tablet and trackpad, and a tablet is decoded
+                 * as absolute coordinates rather than relative deltas.
+                 * This used to report 1 on the assumption that 1 meant
+                 * "mouse"; 0 is the standard relative-mouse class (first
+                 * in every driver's class enumeration), and reporting a
+                 * non-mouse class is a plausible cause of a guest that
+                 * honours our button bits while discarding our deltas.
+                 *
+                 * The identifier is what a real Apple mouse reports:
+                 * drivers match known identifiers to pick a decode path,
+                 * and an unknown one risks a quirk path. It must not be
+                 * 'tpad' -- that selects the trackpad code.
+                 *
+                 * Resolution stays 100: our counts are host pixels
+                 * (~100 per inch of physical travel), and guests that
+                 * normalise pointer speed by this value -- Mac OS X's
+                 * AppleADBMouse does -- then track 1:1.
+                 */
+                obuf[0] = 'a';
+                obuf[1] = 'p';
+                obuf[2] = 'p';
+                obuf[3] = 'l';
                 obuf[4] = 0;
-                obuf[5] = 100;
-                obuf[6] = 1;    /* device class: mouse */
+                obuf[5] = 100;  /* counts per inch */
+                obuf[6] = 0;    /* device class: relative mouse */
                 obuf[7] = 2;    /* buttons */
                 olen = 8;
+                trace_adb_device_mouse_extended_info(obuf[5], obuf[6],
+                                                     obuf[7]);
             }
             break;
         case 3:
@@ -336,7 +434,9 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
             olen = 2;
             break;
         }
-        trace_adb_device_mouse_readreg(reg, obuf[0], obuf[1]);
+        if (olen > 0) {
+            trace_adb_device_mouse_readreg(reg, obuf[0], obuf[1]);
+        }
         break;
     }
     return olen;
@@ -371,7 +471,7 @@ static void adb_mouse_reset(DeviceState *dev)
      * only know the classic protocol simply run us as the 100 cpi
      * classic mouse, which matches our units anyway.
      */
-    d->handler = 1;
+    d->handler = s->default_handler;
     d->devaddr = ADB_DEVID_MOUSE;
     s->last_buttons_state = s->buttons_state = 0;
     s->dx = s->dy = s->dz = 0;
@@ -413,6 +513,8 @@ static void adb_mouse_initfn(Object *obj)
 }
 
 static const Property adb_mouse_properties[] = {
+    DEFINE_PROP_BOOL("extended-protocol", MouseState, extended_protocol, true),
+    DEFINE_PROP_UINT8("default-handler", MouseState, default_handler, 1),
     DEFINE_PROP_UINT8("motion-scale", MouseState, motion_scale, 1),
 };
 
