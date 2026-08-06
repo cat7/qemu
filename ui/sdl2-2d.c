@@ -51,8 +51,36 @@ void sdl2_2d_update(DisplayChangeListener *dcl,
     SDL_UpdateTexture(scon->texture, &rect,
                       surface_data(surf) + surface_data_offset,
                       surface_stride(surf));
+    sdl2_2d_present(scon);
+}
+
+/*
+ * Draw the current frame, with the guest's own cursor composited on top
+ * of it. Drawing the cursor here rather than shaping the host pointer
+ * is what lets the pointer be grabbed in SDL's relative mode: relative
+ * mode reports unbounded motion (so the guest pointer is not stuck at
+ * the window edge, which matters as soon as the guest desktop spans more
+ * than one window) but gives the host pointer no position to be drawn at.
+ */
+void sdl2_2d_present(struct sdl2_console *scon)
+{
+    if (!scon->texture || !scon->real_renderer) {
+        return;
+    }
+
     SDL_RenderClear(scon->real_renderer);
     SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
+
+    if (scon->guest_cursor && scon->cursor_texture) {
+        SDL_Rect crect;
+
+        crect.x = scon->guest_x - scon->cursor_hot_x;
+        crect.y = scon->guest_y - scon->cursor_hot_y;
+        crect.w = scon->cursor_w;
+        crect.h = scon->cursor_h;
+        SDL_RenderCopy(scon->real_renderer, scon->cursor_texture, NULL, &crect);
+    }
+
     SDL_RenderPresent(scon->real_renderer);
 }
 
