@@ -30,6 +30,7 @@
 
 #include "hw/pci/pci_device.h"
 #include "hw/display/edid.h"
+#include "hw/i2c/bitbang_i2c.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -73,8 +74,9 @@ typedef struct ATIRage128PM4Parser {
     uint32_t p1_reg1;        /* packet1's two register offsets */
     uint32_t p1_reg2;
     uint32_t p3_opcode;      /* packet3 2D-draw sub-state */
-    uint32_t p3_params[3];
+    uint32_t p3_params[8];
     uint32_t p3_param_idx;
+    uint32_t p3_total;       /* payload dwords the packet3 declared */
 } ATIRage128PM4Parser;
 
 typedef struct ATIRage128Mode {
@@ -172,6 +174,21 @@ struct ATIRage128State {
     int i2c_data_pos;
 
     /*
+     * Second DDC path: the ATI Mac drivers (Mac OS X's ndrv on mac99,
+     * and -- observed live on g3beige -- the classic Mac OS 9 driver
+     * and the card FCode too) bit-bang I2C on the GPIO_MONID pads
+     * (SDA = pad 0, SCL = pad 1), marking them with MASK nibble 0xf --
+     * distinct from the Apple-sense probes (MASK 0x7) and the FCode's
+     * EN-only convention (MASK 0). Serves the same 128-byte EDID as
+     * the hardware engine above.
+     */
+    bool host_cursor_published;   /* synthetic arrow handed to the UI */
+    bitbang_i2c_interface monid_i2c;
+    int monid_sda;           /* live SDA level fed back into MONID_Y */
+    uint32_t ddc1_pos;       /* DDC1 EDID bitstream position (in bits) */
+    uint32_t ddc1_half;      /* half-bit phase: 2 manual VSYNC pulses/bit */
+
+    /*
      * PM4/CCE GUI command-FIFO ring buffer -- the mechanism the real
      * Mac driver actually uses for register/2D submission on this
      * card (distinct from, and used after, the older one-shot
@@ -236,11 +253,19 @@ struct ATIRage128State {
     uint32_t dp_gui_master_cntl;
     uint32_t dp_brush_bkgd_clr, dp_brush_frgd_clr;
     uint32_t dp_src_frgd_clr, dp_src_bkgd_clr;
-    uint32_t sc_top, sc_left, sc_bottom, sc_right;
-    uint32_t src_sc_bottom, src_sc_right;
+    /*
+     * Scissors are SIGNED 14-bit fields -- the register guide gives the
+     * range as -8192..8191 ("Destination left scissor", RAGE 128 VR/GL
+     * Register Reference Manual 7.6). Holding them unsigned turned a
+     * legitimately negative left/top edge -- what the driver programs
+     * for a window hanging off the left or top of the screen -- into a
+     * huge positive one, which clips the whole drawing away.
+     */
+    int32_t sc_top, sc_left, sc_bottom, sc_right;
+    int32_t src_sc_bottom, src_sc_right;
     uint32_t dp_cntl, dp_datatype, dp_mix, dp_write_mask;
     uint32_t default_offset, default_pitch;
-    uint32_t default_sc_bottom, default_sc_right;
+    int32_t default_sc_bottom, default_sc_right;
 
     /* HOST_DATA0-7/LAST accumulator, same protocol as upstream */
     bool host_data_active;
@@ -255,5 +280,14 @@ const char *ati_rage128_reg_name(uint32_t base);
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
 bool ati_rage128_host_data_flush(ATIRage128State *s);
+
+/*
+ * Show/position a host-driven pointer on this card's console. Used by
+ * the mach64's host-cursor-tracking workaround once the pointer crosses
+ * onto this display: this device has no hardware-cursor emulation and
+ * the guest never drives one here, so without it the pointer would
+ * simply vanish on the second screen.
+ */
+void ati_rage128_host_cursor(int x, int y, bool on);
 
 #endif /* ATI_RAGE128_INT_H */

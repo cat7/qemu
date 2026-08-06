@@ -14,6 +14,7 @@
 
 #include "ati_rage128_int.h"
 #include "ati_rage128_regs.h"
+#include "trace.h"
 
 /*
  * 2D GUI (destination datapath) engine. Ported from the real, shipped
@@ -149,6 +150,92 @@ static uint32_t ati_rage128_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,
     return result;
 }
 
+
+/*
+ * Pattern ("brush") lookup for one destination pixel.
+ *
+ * Returns false when the pixel must be left untouched -- that is what
+ * the transparent "_LA" (leave alone) brush types mean, and it is what
+ * turns a rectangle stamped with a 50% dither into a dotted outline
+ * rather than a solid block.
+ *
+ * The mono pattern lives in BRUSH_DATA0.. as a bitmap, one row per
+ * byte for the 8-wide forms and one row per dword for the 32-wide ones,
+ * MSB first within a byte (the same order the mono host-data expander
+ * uses). BRUSH_Y_X gives the pattern origin.
+ */
+static bool ati_rage128_2d_brush(ATIRage128State *s, int x, int y, int bpp,
+                                 uint32_t *pat)
+{
+    unsigned type = (s->dp_datatype & R128_DP_BRUSH_DATATYPE) >>
+                    R128_DP_BRUSH_DATATYPE_SHIFT;
+    uint32_t yx = s->regs[R128_BRUSH_Y_X >> 2];
+    int bx = x - (int)(yx & 0xffff);
+    int by = y - (int)((yx >> 16) & 0xffff);
+    const uint32_t *data = &s->regs[R128_BRUSH_DATA0 >> 2];
+    bool transparent = false;
+    int pw, ph, bit;
+
+    switch (type) {
+    case R128_BRUSH_SOLID_COLOR:
+    case R128_BRUSH_NONE:
+    default:
+        *pat = s->dp_brush_frgd_clr;
+        return true;
+
+    case R128_BRUSH_8X8_COLOR:
+        *pat = data[((by & 7) * 8 + (bx & 7)) & 63];
+        return true;
+    case R128_BRUSH_1X8_COLOR:
+        *pat = data[by & 7];
+        return true;
+
+    case R128_BRUSH_8X8_MONO_FG_LA:
+        transparent = true;
+        /* fall through */
+    case R128_BRUSH_8X8_MONO_FG_BG:
+        pw = 8; ph = 8;
+        break;
+    case R128_BRUSH_1X8_MONO_FG_LA:
+        transparent = true;
+        /* fall through */
+    case R128_BRUSH_1X8_MONO_FG_BG:
+        pw = 1; ph = 8;
+        break;
+    case R128_BRUSH_32X1_MONO_FG_LA:
+        transparent = true;
+        /* fall through */
+    case R128_BRUSH_32X1_MONO_FG_BG:
+        pw = 32; ph = 1;
+        break;
+    case R128_BRUSH_32X32_MONO_FG_LA:
+        transparent = true;
+        /* fall through */
+    case R128_BRUSH_32X32_MONO_FG_BG:
+        pw = 32; ph = 32;
+        break;
+    }
+
+    bx &= pw - 1;
+    by &= ph - 1;
+    if (pw == 32) {
+        bit = (data[by] >> (31 - bx)) & 1;
+    } else {
+        /* eight rows of eight bits: four rows to a dword, low byte first */
+        bit = (data[by >> 2] >> ((by & 3) * 8 + (7 - bx))) & 1;
+    }
+
+    if (bit) {
+        *pat = s->dp_brush_frgd_clr;
+        return true;
+    }
+    if (transparent) {
+        return false;
+    }
+    *pat = s->dp_brush_bkgd_clr;
+    return true;
+}
+
 static void ati_rage128_2d_do_blt(ATIRage128State *s)
 {
     int bpp = ati_rage128_bpp_from_dp_datatype(s);
@@ -165,8 +252,17 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
         return;
     }
 
-    dst_stride = s->dst_pitch * (bpp / 8);
-    src_stride = s->src_pitch * (bpp / 8);
+    /*
+     * Rage 128 destination/source pitch registers count in units of 8
+     * PIXELS (SRC/DST_PITCH_OFFSET pack pitch/8; a live Mac OS X 10.3
+     * shadow->screen blit carried pitch 0x64/0x68 for its 800px/832px
+     * surfaces). Upstream ati_2d.c encodes the same rule as
+     * "dst_stride *= bpp" for the Rage 128 Pro. Treating them as plain
+     * pixels compressed every blit 8x vertically into a self-overlapping
+     * smear -- the striped-band garbled desktop.
+     */
+    dst_stride = s->dst_pitch * bpp;
+    src_stride = s->src_pitch * bpp;
     if (!dst_stride) {
         return;
     }
@@ -196,10 +292,13 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
                                    : (int)s->src_x + width - 1 - x;
             uint32_t src_pixel = 0;
             uint32_t dst_pixel;
-            uint32_t pat_pixel = s->dp_brush_frgd_clr;
+            uint32_t pat_pixel;
             uint32_t result;
 
             if (dx < sc_left || dx > sc_right) {
+                continue;
+            }
+            if (!ati_rage128_2d_brush(s, dx, dy, bpp, &pat_pixel)) {
                 continue;
             }
             if (rop != 0xf0) {
@@ -220,6 +319,13 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
 void ati_rage128_2d_blt(ATIRage128State *s)
 {
     uint32_t src_source = s->dp_mix & R128_DP_SRC_SOURCE;
+
+    trace_ati_rage128_2d_blt(s->src_offset, (s->src_x << 16) | s->src_y,
+                             s->dst_offset, (s->dst_x << 16) | s->dst_y,
+                             s->dst_width, s->dst_height,
+                             (s->src_pitch << 16) | s->dst_pitch,
+                             (s->dp_mix >> 16) & 0xff, s->dp_datatype,
+                             src_source >> 8);
 
     if (s->host_data_active) {
         /* A new blt implicitly ends any still-in-progress HOST_DATA
@@ -252,7 +358,28 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
     int bpp = ati_rage128_bpp_from_dp_datatype(s);
     uint32_t src_datatype = s->dp_datatype & R128_DP_SRC_DATATYPE;
     uint32_t dst_stride;
-    uint8_t pix_buf[16]; /* 128 bits */
+    /*
+     * One accumulator holds 128 bits. As COLOUR data that is at most 16
+     * pixels (8bpp); expanded from MONOCHROME it is 128 pixels of up to
+     * four bytes each. Sizing this for the colour case only -- as it was
+     * -- let the mono expander below run 128 pixels into a 16-byte
+     * buffer, smashing the stack: a guest-triggered abort, seen live
+     * (SIGABRT via __stack_chk_fail) the first time Mac OS issued a mono
+     * host-data blit on this card.
+     */
+    uint8_t pix_buf[128 * 4];
+    /*
+     * Which expanded pixels must not be written at all. Source datatype
+     * MONO_FRGD ("foreground / leave alone") paints only the set bits and
+     * leaves the destination untouched everywhere else -- the same
+     * transparency the "_LA" brush types have. Painting the clear bits
+     * with the background colour instead turned every submenu arrow into
+     * a solid black square, the glyph's cell filled in rather than
+     * masked.
+     */
+    bool pix_skip[128];
+    uint32_t acc[4];
+    int sc_left, sc_top, sc_right, sc_bottom;
     unsigned bypp, pix_count, idx, row, col;
 
     if (!s->host_data_active) {
@@ -264,15 +391,52 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
     }
 
     bypp = bpp / 8;
-    dst_stride = s->dst_pitch * bypp;
+    dst_stride = s->dst_pitch * bpp; /* pitch is in 8-pixel units */
     if (!dst_stride) {
         s->host_data_active = false;
         return false;
     }
 
+    /*
+     * HOST_BIG_ENDIAN_EN: the payload was written by a big-endian host
+     * and has to be converted, by PIXEL size -- a full dword swap for
+     * 32bpp, a swap within each halfword for 16bpp, nothing for 8bpp
+     * (where byte order inside a dword is already the pixel order).
+     * The Mac driver relies on this: it byte-swaps its COMMAND dwords in
+     * software so the little-endian command fetch reads them correctly,
+     * then ships bitmap payload verbatim and leaves the conversion to
+     * the chip. Without it every host-supplied pixel lands reversed.
+     */
+    if ((s->dp_datatype & R128_HOST_BIG_ENDIAN_EN) &&
+        src_datatype == R128_SRC_COLOR) {
+        unsigned w;
+
+        /*
+         * Colour payload only. A monochrome source is a bitmask, not
+         * pixels -- there is no pixel size to swap by, and its bit order
+         * is already spelled out by BYTE_PIX_ORDER below, so leave it
+         * alone rather than guess.
+         */
+        for (w = 0; w < ARRAY_SIZE(acc); w++) {
+            uint32_t v = s->host_data_acc[w];
+
+            if (bpp == 32) {
+                acc[w] = bswap32(v);
+            } else if (bpp == 16) {
+                acc[w] = ((v & 0x00ff00ffu) << 8) | ((v & 0xff00ff00u) >> 8);
+            } else {
+                acc[w] = v;
+            }
+        }
+    } else {
+        memcpy(acc, s->host_data_acc, sizeof(acc));
+    }
+
+    memset(pix_skip, 0, sizeof(pix_skip));
+
     if (src_datatype == R128_SRC_COLOR) {
-        pix_count = sizeof(pix_buf) / bypp;
-        memcpy(pix_buf, s->host_data_acc, sizeof(s->host_data_acc));
+        pix_count = sizeof(acc) / bypp;
+        memcpy(pix_buf, acc, sizeof(acc));
     } else {
         uint32_t byte_pix_order = s->dp_datatype & R128_DP_BYTE_PIX_ORDER;
         uint32_t fg = s->dp_src_frgd_clr;
@@ -281,14 +445,18 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
 
         /* Expand the 128 accumulated monochrome bits to bypp-sized
          * foreground/background pixels. */
+        bool transparent = src_datatype == R128_SRC_MONO_FRGD;
+
         for (word = 0; word < 4; word++) {
             for (byte = 0; byte < 4; byte++) {
-                uint8_t byte_val = s->host_data_acc[word] >> (byte * 8);
+                uint8_t byte_val = acc[word] >> (byte * 8);
 
                 for (bit = 0; bit < 8; bit++) {
                     bool is_fg = byte_val &
                                  (1u << (byte_pix_order ? bit : 7 - bit));
                     uint32_t color = is_fg ? fg : bg;
+
+                    pix_skip[pidx / bypp] = !is_fg && transparent;
 
                     switch (bypp) {
                     case 1:
@@ -305,7 +473,33 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
                 }
             }
         }
-        pix_count = sizeof(pix_buf) / bypp;
+        /*
+         * 128 bits in, one pixel out per bit. This used to be recomputed
+         * as sizeof(pix_buf) / bypp, i.e. the COLOUR pixel count, so all
+         * but the first few expanded pixels of every chunk were silently
+         * dropped -- monochrome text and icons came out mangled.
+         */
+        pix_count = 128;
+    }
+
+    /*
+     * The destination scissors apply here just as they do to an ordinary
+     * blit. That matters more than it sounds: the Mac driver pads every
+     * host-data blit's WIDTH up to a multiple of four pixels -- one
+     * 128-bit accumulator chunk -- and relies on the scissors to throw
+     * the padding away. Captured live, 1061 of 1613 host-data blits
+     * overhang their clip rectangle, including a 1028-pixel-wide blit on
+     * a 1024-pixel screen. The padding dwords are junk, so drawing them
+     * put one to four columns of speckled garbage down the right-hand
+     * edge of every icon, button, glyph run and menu.
+     */
+    sc_left = s->sc_left;
+    sc_top = s->sc_top;
+    sc_right = s->sc_right;
+    sc_bottom = s->sc_bottom;
+    if (sc_right == 0 && sc_bottom == 0) {
+        sc_right = 0x3fff;
+        sc_bottom = 0x3fff;
     }
 
     row = s->host_data_row;
@@ -316,8 +510,17 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
         unsigned i;
 
         for (i = 0; i < n; i++) {
+            int dx = (int)(s->dst_x + col + i);
+            int dy = (int)(s->dst_y + row);
             uint32_t color;
 
+            if (dx < sc_left || dx > sc_right ||
+                dy < sc_top || dy > sc_bottom) {
+                continue;
+            }
+            if (pix_skip[idx + i]) {
+                continue;       /* mask bit clear: leave the destination */
+            }
             switch (bypp) {
             case 1:
                 color = pix_buf[(idx + i) * bypp];

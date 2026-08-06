@@ -144,6 +144,7 @@ config ATI_RAGE128
     default y if PCI_DEVICES
     depends on PCI
     select EDID
+    select BITBANG_I2C
 
 config MACFB
     bool

@@ -37,6 +37,16 @@
 #define R128_GPIO_MONID              0x0068
 #define R128_SEPROM_CNTL             0x006c
 /*
+ * The retail card's FCode drives 0x6C as a second GPIO port ("GPIO
+ * MONID B": A [3:0], Y [11:8] read-only, EN [19:16], MASK [27:24] --
+ * same lane layout as GPIO_MONID) for its DDC/EDID path: its word
+ * 0x918 sets MASK=0xf, toggles CRTC_OFFSET bit 23 and expects pad 3
+ * (Y bit 3) to follow -- a cable/DDC presence handshake -- before the
+ * bulk EDID read. The RRG names 0x6C SEPROM_CNTL; both uses share the
+ * pads on real silicon.
+ */
+#define R128_GPIO_MONIDB             0x006c
+/*
  * The hardware I2C engine (0x0090/0x0094/0x0098) is NOT documented in
  * RRG-G04500-C at all, but the OEM Mac FCode ROM's constant table
  * includes all three offsets and XFree86's r128_reg.h names them
@@ -215,6 +225,17 @@
  * generation's PM4 parser).
  */
 #define R128_PM4_OPCODE_PAINT         0x91
+/*
+ * PAINT_MULTI: the same solid-fill operation as PAINT, but carrying
+ * several rectangles in one packet -- the payload is consecutive
+ * (DST_Y_X, DST_HEIGHT_WIDTH) pairs, with the drawing context set up
+ * beforehand through ordinary register writes (the Mac driver programs
+ * it via the GUI context "_C" aliases). Classic Mac OS paints every
+ * window panel, button and dialog background with these, so dropping
+ * them leaves only text and lines on screen -- the long-standing
+ * "ghost window" rendering on this card.
+ */
+#define R128_PM4_OPCODE_PAINT_MULTI   0x9a
 #define R128_PM4_OPCODE_BITBLT        0x92
 #define R128_PM4_OPCODE_HOSTDATA_BLT  0x94
 
@@ -263,6 +284,15 @@
 #define R128_DST_Y_X                 0x1438
 #define R128_DST_HEIGHT_WIDTH        0x143c
 #define R128_DP_GUI_MASTER_CNTL      0x146c
+/*
+ * GUI_MASTER_CNTL bit 31: the packet carries the brush pattern and
+ * origin inline, rather than the driver having pre-loaded the
+ * BRUSH_DATA registers. Mac OS sets it on every patterned PAINT.
+ */
+#define R128_GMC_LD_BRUSH_Y_X        0x80000000
+#define R128_BRUSH_Y_X               0x1474
+#define R128_BRUSH_DATA0             0x1480   /* .. BRUSH_DATA63 at 0x157c */
+#define R128_BRUSH_DATA63            0x157c
 #define R128_DP_BRUSH_BKGD_CLR       0x1478
 #define R128_DP_BRUSH_FRGD_CLR       0x147c
 #define R128_DST_WIDTH_X             0x1588
@@ -290,6 +320,19 @@
 #define R128_SC_TOP_LEFT             0x16ec
 #define R128_SC_BOTTOM_RIGHT         0x16f0
 #define R128_SRC_SC_BOTTOM_RIGHT     0x16f4
+/*
+ * GUI context ("_C") registers, RRG-G04500-C: write-only aliases of the
+ * corresponding base registers. XFree86's r128 accel and Mac OS X's
+ * driver program per-operation state through these (the OS X driver's
+ * full-screen presentation batches use ONLY this block for GMC/scissor,
+ * so dropping them executes those blits with stale rop/datatype).
+ */
+#define R128_DST_PITCH_OFFSET_C      0x1c80
+#define R128_DP_GUI_MASTER_CNTL_C    0x1c84
+#define R128_SC_TOP_LEFT_C           0x1c88
+#define R128_SC_BOTTOM_RIGHT_C       0x1c8c
+#define R128_CONSTANT_COLOR_C        0x1d34
+#define R128_PLANE_3D_MASK_C         0x1d44
 #define R128_HOST_DATA0              0x17c0
 #define R128_HOST_DATA1              0x17c4
 #define R128_HOST_DATA2              0x17c8
@@ -304,12 +347,53 @@
 
 #define R128_DP_DST_DATATYPE         0x0000000f
 #define R128_DP_BRUSH_DATATYPE       0x00000f00
+#define R128_DP_BRUSH_DATATYPE_SHIFT 8
+/*
+ * Brush (pattern) types, DP_DATATYPE bits 11:8 -- the same codes
+ * GUI_MASTER_CNTL carries in bits 7:4. The "_LA" ("leave alone")
+ * variants are transparent: where the pattern bit is 0 the destination
+ * is not touched at all. Mac OS draws its drag-selection marquee as one
+ * big DSTINVERT rectangle stamped through an 8x8 MONO_FG_LA brush, so
+ * treating every brush as solid inverted the WHOLE rectangle instead of
+ * a dotted outline -- leaving olive-green (inverted desktop purple)
+ * blocks behind on screen.
+ */
+#define R128_BRUSH_8X8_MONO_FG_BG    0
+#define R128_BRUSH_8X8_MONO_FG_LA    1
+#define R128_BRUSH_1X8_MONO_FG_BG    4
+#define R128_BRUSH_1X8_MONO_FG_LA    5
+#define R128_BRUSH_32X1_MONO_FG_BG   6
+#define R128_BRUSH_32X1_MONO_FG_LA   7
+#define R128_BRUSH_32X32_MONO_FG_BG  8
+#define R128_BRUSH_32X32_MONO_FG_LA  9
+#define R128_BRUSH_8X8_COLOR         10
+#define R128_BRUSH_1X8_COLOR         12
+#define R128_BRUSH_SOLID_COLOR       13
+#define R128_BRUSH_NONE              15
 #define R128_DP_SRC_DATATYPE         0x00030000
 #define R128_DP_ROP3                 0x00ff0000
 #define R128_DP_SRC_SOURCE           0x00000700
 #define R128_DP_SRC_HOST             0x00000300
 #define R128_DP_SRC_HOST_BYTEALIGN   0x00000400
 #define R128_DP_BYTE_PIX_ORDER       0x40000000
+/*
+ * "Host data is big endian" -- the chip byte-swaps every pixel the host
+ * feeds it through the HOST_DATA registers or a HOSTDATA_BLT payload,
+ * by pixel size. A big-endian driver that byte-swaps its COMMAND dwords
+ * in software (so the little-endian command fetch reads them right) can
+ * then ship bitmap payload verbatim and let the chip convert it.
+ * Confirmed against xf86-video-r128's r128_reg.h.
+ */
+#define R128_HOST_BIG_ENDIAN_EN      0x20000000
+/*
+ * The fields DP_GUI_MASTER_CNTL aliases into DP_DATATYPE. Everything
+ * outside this mask -- HOST_BIG_ENDIAN_EN above, in particular -- has no
+ * counterpart in GUI_MASTER_CNTL and must survive a write to it.
+ */
+#define R128_DP_DATATYPE_GMC_ALIAS   (R128_DP_DST_DATATYPE | \
+                                      R128_DP_BRUSH_DATATYPE | \
+                                      R128_DP_SRC_DATATYPE | \
+                                      R128_DP_BYTE_PIX_ORDER)
 #define R128_SRC_MONO_FRGD_BKGD      0x00000000
 #define R128_SRC_MONO_FRGD           0x00010000
 #define R128_SRC_COLOR                0x00030000
