@@ -418,4 +418,123 @@
 #define ATI_ONE_OVER_AREA_UC      0x700
 #define ATI_SETUP_CNTL            0x704
 
+
+/*
+ * Overlay / scaler (register block 1). Addresses are the block-1 dword
+ * offsets from the mach64 Register Reference Guide (RRG-G02700) times
+ * four -- e.g. OVERLAY_SCALE_CNTL is documented as MM:1_09, block 1
+ * dword 9, i.e. byte offset 0x24 within a block that starts at 0x400.
+ *
+ * Layouts, from the guide and confirmed against the sequence
+ * xf86-video-mach64's Xv driver emits (ATIMach64SetOverlay):
+ *   OVERLAY_Y_X_START / _END   X in the HIGH half, Y in the low one;
+ *                              both coordinates INCLUSIVE
+ *   OVERLAY_SCALE_INC          HORZ_INC high, VERT_INC low, each a
+ *                              4.12 integer.fraction accumulator step
+ *   SCALER_HEIGHT_WIDTH        source WIDTH high, HEIGHT low
+ *   VIDEO_FORMAT               source pixel format in bits 19:16
+ *   SCALER_BUF0_OFFSET/_PITCH  source in VRAM (the BUF0_* registers at
+ *                              1_20h are the CAPTURE buffers, not this)
+ */
+#define ATI_OVERLAY_Y_X_START        0x0400
+#define ATI_OVERLAY_Y_X_END          0x0404
+#define ATI_OVERLAY_VIDEO_KEY_CLR    0x0408
+#define ATI_OVERLAY_VIDEO_KEY_MSK    0x040c
+#define ATI_OVERLAY_GRAPHICS_KEY_CLR 0x0410
+#define ATI_OVERLAY_GRAPHICS_KEY_MSK 0x0414
+#define ATI_OVERLAY_KEY_CNTL         0x0418
+#define ATI_OVERLAY_SCALE_INC        0x0420
+#define ATI_OVERLAY_SCALE_CNTL       0x0424
+#define ATI_SCALER_HEIGHT_WIDTH      0x0428
+#define ATI_SCALER_BUF0_OFFSET       0x0434
+#define ATI_SCALER_BUF1_OFFSET       0x0438
+#define ATI_SCALER_BUF_PITCH         0x043c
+#define ATI_VIDEO_FORMAT             0x0448
+
+/* OVERLAY_SCALE_CNTL */
+#define ATI_SCALE_PIX_EXPAND         0x00000001
+#define ATI_OVERLAY_EN               0x40000000
+#define ATI_SCALE_EN                 0x80000000
+
+/* VIDEO_FORMAT: SCALER_IN, bits 19:16 */
+#define ATI_SCALER_IN_MASK           0x000f0000
+#define ATI_SCALER_IN_SHIFT          16
+#define ATI_SCALER_IN_15BPP          0x3
+#define ATI_SCALER_IN_16BPP          0x4
+#define ATI_SCALER_IN_32BPP          0x6
+#define ATI_SCALER_IN_VYUY422        0xb
+#define ATI_SCALER_IN_YVYU422        0xc
+
+/*
+ * OVERLAY_KEY_CNTL: the graphics compare function decides, per pixel,
+ * whether the graphics plane or the scaler output wins.
+ */
+#define ATI_GRAPHIC_KEY_FN_MASK      0x00000070
+#define ATI_GRAPHIC_KEY_FN_FALSE     0x00000000
+#define ATI_GRAPHIC_KEY_FN_TRUE      0x00000010
+#define ATI_GRAPHIC_KEY_FN_EQ        0x00000040
+#define ATI_GRAPHIC_KEY_FN_NE        0x00000050
+
+
+/*
+ * Scaler pipe ("Scaler Pipe (GT only)" in the mach64 Register Reference
+ * Guide, RRG-G02700 chapter 6). This is what Mac OS actually drives for
+ * QuickTime video -- NOT the overlay: a live trace of a playback shows
+ * these registers written before every frame and no access at all to the
+ * overlay block.
+ *
+ * Every one of them is ALIASED onto a 3D texture or colour-interpolator
+ * register (the guide: "the color interpolator DDAs are reused to
+ * function as a counter/accumulator for the scaler source memory address
+ * generator"), so each has two addresses. We store registers per
+ * address, so read both and take whichever the guest actually wrote.
+ */
+#define ATI_SCALE_Y_OFF           0x1C0   /* alias TEX_0_OFF          */
+#define ATI_SCALE_WIDTH           0x1DC   /* alias TEX_7_OFF          */
+#define ATI_SCALE_HEIGHT          0x1E0   /* alias TEX_8_OFF          */
+#define ATI_SCALE_Y_PITCH         0x1EC   /* alias at 0x350           */
+#define ATI_SCALE_Y_PITCH_A       0x350
+#define ATI_SCALE_X_INC           0x1F0   /* alias at 0x3C0           */
+#define ATI_SCALE_X_INC_A         0x3C0
+#define ATI_SCALE_Y_INC           0x1F4   /* alias at 0x3CC           */
+#define ATI_SCALE_Y_INC_A         0x3CC
+#define ATI_SCALE_VACC            0x1F8
+#define ATI_SCALE_HACC            0x3C8   /* alias RED_START          */
+
+/* SCALE_3D_CNTL (0x1FC) */
+#define ATI_SCALE_3D_FCN_MASK     0x000000c0
+#define ATI_SCALE_3D_FCN_SCALE    0x00000040
+#define ATI_SCALE_PIX_REP         0x00000100
+#define ATI_APPLE_YUV_MODE        0x00100000
+
+/*
+ * DP_SRC foreground source 5 selects the scaler pipe. Our other
+ * FRGD_SRC codes stop at PATTERN (4).
+ */
+#define ATI_FRGD_SRC_SCALE        5
+
+/*
+ * DP_SCALE_PIX_WIDTH -- the scaler/3D source format, a separate field
+ * from the destination and host widths in DP_PIX_WIDTH.
+ */
+#define ATI_DP_SCALE_PIX_WIDTH_SHIFT 28   /* DP_PIX_WIDTH bits 31:28 */
+#define ATI_SCALE_PIX_8BPP        2
+#define ATI_SCALE_PIX_1555        3
+#define ATI_SCALE_PIX_565         4
+#define ATI_SCALE_PIX_8888        6
+#define ATI_SCALE_PIX_332         7
+#define ATI_SCALE_PIX_Y8          8
+#define ATI_SCALE_PIX_YUYV422     11
+/*
+ * 12 is listed as reserved in RRG-G02700, which documents the earlier
+ * 264VT/3D RAGE -- but DP_SCALE_PIX_WIDTH is a Rage Pro (GTB) field and
+ * the Rage 128, which shares this numbering, defines 11 = VYUY422 and
+ * 12 = YVYU422. Its X driver maps FOURCC UYVY onto the latter, and UYVY
+ * is '2vuy', the classic Mac 4:2:2 format. Mac OS QuickTime is observed
+ * using exactly this code.
+ */
+#define ATI_SCALE_PIX_UYVY422     12
+#define ATI_SCALE_PIX_AYUV444     14
+#define ATI_SCALE_PIX_4444        15
+
 #endif /* ATI_MACH64_REGS_H */

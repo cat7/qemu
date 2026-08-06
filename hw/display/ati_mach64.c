@@ -37,6 +37,7 @@
 #include "qom/object.h"
 
 #include "ati_mach64_int.h"
+#include "ati_rage128_int.h"
 #include "ati_mach64_regs.h"
 #include "trace.h"
 
@@ -289,6 +290,222 @@ static void ati_mach64_draw_24bpp(ATIMach64State *s, DisplaySurface *ds,
     }
 }
 
+
+/*
+ * Hardware video overlay (the "scaler").
+ *
+ * Mac OS plays QuickTime through this rather than through the draw
+ * engine: it points the scaler at a YUV 4:2:2 buffer in VRAM, gives a
+ * destination window on screen and a scale factor, and the CRTC
+ * substitutes scaled video for graphics inside that window. With none of
+ * it modelled the guest's movie was simply invisible -- video played
+ * black while the transport controls animated normally.
+ *
+ * Only the parts a player actually programs are implemented: a single
+ * buffer, nearest-neighbour scaling from the 4.12 accumulator steps, the
+ * packed 4:2:2 and direct-colour source formats, and the graphics colour
+ * key. Interpolation coefficients, the second buffer, planar YUV and the
+ * capture path are ignored.
+ */
+/*
+ * ARGB8888 into a shadow surface. Only needed when the overlay is up:
+ * without it this mode is mapped straight out of VRAM.
+ */
+static void ati_mach64_draw_32bpp(ATIMach64State *s, DisplaySurface *ds,
+                                  const ATIMach64Mode *mode)
+{
+    uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+                   mode->fb_offset;
+    uint32_t *dst;
+    int y;
+
+    for (y = 0; y < mode->height; y++) {
+        int x;
+
+        dst = (uint32_t *)((uint8_t *)surface_data(ds) +
+                           y * surface_stride(ds));
+        for (x = 0; x < mode->width; x++) {
+            /*
+             * VRAM holds big-endian xRGB -- bytes X,R,G,B, which is why
+             * the zero-copy path can hand it to pixman as b8g8r8x8. The
+             * shadow surface is host-native, so the pixels need the same
+             * conversion every other depth here does. A plain memcpy
+             * (what this was) put the unused X byte in the blue channel
+             * and swapped red with green: the whole screen turned olive
+             * the instant an overlay switched this path on.
+             */
+            dst[x] = 0xff000000u | (ldl_be_p(src + x * 4) & 0xffffff);
+        }
+        src += mode->pitch;
+    }
+}
+
+static bool ati_mach64_overlay_active(ATIMach64State *s)
+{
+    uint32_t cntl = s->regs[ATI_OVERLAY_SCALE_CNTL >> 2];
+
+    if ((cntl & (ATI_SCALE_EN | ATI_OVERLAY_EN)) !=
+        (ATI_SCALE_EN | ATI_OVERLAY_EN)) {
+        return false;
+    }
+    /*
+     * Require a configuration that could actually produce pixels before
+     * believing the enable bits. Engaging the overlay switches the whole
+     * display to a composited shadow surface, so a stray value in these
+     * registers must not be able to change how the screen is rendered --
+     * and stray values are reachable here, because a bus-master
+     * descriptor aimed at the block-1 register window writes straight
+     * into this same array.
+     */
+    return s->regs[ATI_OVERLAY_SCALE_INC >> 2] != 0 &&
+           (s->regs[ATI_SCALER_BUF_PITCH >> 2] & 0xfff) != 0 &&
+           (s->regs[ATI_SCALER_HEIGHT_WIDTH >> 2] & 0x07ff07ff) != 0;
+}
+
+static uint32_t ati_mach64_overlay_texel(ATIMach64State *s, unsigned fmt,
+                                         const uint8_t *row, int sx)
+{
+    int y, u, v, r, g, b;
+
+    switch (fmt) {
+    case ATI_SCALER_IN_VYUY422:   /* Y0 U Y1 V in memory order (YUY2) */
+    case ATI_SCALER_IN_YVYU422:   /* U Y0 V Y1 in memory order (UYVY) */
+    {
+        const uint8_t *pair = row + (sx & ~1) * 2;
+        bool odd = sx & 1;
+
+        if (fmt == ATI_SCALER_IN_VYUY422) {
+            y = pair[odd ? 2 : 0];
+            u = pair[1];
+            v = pair[3];
+        } else {
+            y = pair[odd ? 3 : 1];
+            u = pair[0];
+            v = pair[2];
+        }
+        /* BT.601, the conversion the scaler's colour-space unit does */
+        y = (y - 16) * 298;
+        u -= 128;
+        v -= 128;
+        r = (y + 409 * v + 128) >> 8;
+        g = (y - 100 * u - 208 * v + 128) >> 8;
+        b = (y + 516 * u + 128) >> 8;
+        break;
+    }
+    case ATI_SCALER_IN_32BPP:
+        return ldl_be_p(row + sx * 4) & 0xffffff;
+    case ATI_SCALER_IN_16BPP:
+    case ATI_SCALER_IN_15BPP:
+    {
+        uint16_t px = lduw_be_p(row + sx * 2);
+
+        if (fmt == ATI_SCALER_IN_16BPP) {
+            r = ((px >> 11) & 0x1f) << 3;
+            g = ((px >> 5) & 0x3f) << 2;
+            b = (px & 0x1f) << 3;
+        } else {
+            r = ((px >> 10) & 0x1f) << 3;
+            g = ((px >> 5) & 0x1f) << 3;
+            b = (px & 0x1f) << 3;
+        }
+        break;
+    }
+    default:
+        return 0;
+    }
+
+    r = MIN(MAX(r, 0), 255);
+    g = MIN(MAX(g, 0), 255);
+    b = MIN(MAX(b, 0), 255);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+static void ati_mach64_overlay_composite(ATIMach64State *s, DisplaySurface *ds,
+                                         const ATIMach64Mode *mode)
+{
+    uint32_t start = s->regs[ATI_OVERLAY_Y_X_START >> 2];
+    uint32_t end = s->regs[ATI_OVERLAY_Y_X_END >> 2];
+    uint32_t inc = s->regs[ATI_OVERLAY_SCALE_INC >> 2];
+    uint32_t hw = s->regs[ATI_SCALER_HEIGHT_WIDTH >> 2];
+    uint32_t keyc = s->regs[ATI_OVERLAY_GRAPHICS_KEY_CLR >> 2] & 0xffffff;
+    uint32_t keym = s->regs[ATI_OVERLAY_GRAPHICS_KEY_MSK >> 2] & 0xffffff;
+    uint32_t keyfn = s->regs[ATI_OVERLAY_KEY_CNTL >> 2] &
+                     ATI_GRAPHIC_KEY_FN_MASK;
+    unsigned fmt = (s->regs[ATI_VIDEO_FORMAT >> 2] & ATI_SCALER_IN_MASK) >>
+                   ATI_SCALER_IN_SHIFT;
+    uint32_t offset = s->regs[ATI_SCALER_BUF0_OFFSET >> 2];
+    uint32_t pitch = s->regs[ATI_SCALER_BUF_PITCH >> 2] & 0xfff;
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    /* both ends inclusive, X in the high half */
+    int x0 = (start >> 16) & 0x7ff, y0 = start & 0x7ff;
+    int x1 = (end >> 16) & 0x7ff, y1 = end & 0x7ff;
+    int src_w = (hw >> 16) & 0x7ff, src_h = hw & 0x7ff;
+    uint32_t h_inc = (inc >> 16) & 0xffff, v_inc = inc & 0xffff;
+    int bypp = (fmt == ATI_SCALER_IN_32BPP) ? 4 :
+               (fmt == ATI_SCALER_IN_VYUY422 ||
+                fmt == ATI_SCALER_IN_YVYU422) ? 2 : 2;
+    int x, y;
+
+    trace_ati_mach64_overlay(x0, y0, x1, y1, src_w, src_h, h_inc, v_inc,
+                             offset, pitch);
+    trace_ati_mach64_overlay_cfg(s->regs[ATI_OVERLAY_SCALE_CNTL >> 2], fmt,
+                                 keyfn);
+    if (!h_inc || !v_inc) {
+        trace_ati_mach64_overlay_skip("zero scale increment");
+        return;
+    }
+    if (!pitch) {
+        trace_ati_mach64_overlay_skip("zero source pitch");
+        return;
+    }
+    if (src_w <= 0 || src_h <= 0) {
+        trace_ati_mach64_overlay_skip("empty source rectangle");
+        return;
+    }
+    if (x1 < x0 || y1 < y0) {
+        trace_ati_mach64_overlay_skip("empty destination rectangle");
+        return;
+    }
+    x1 = MIN(x1, (int)mode->width - 1);
+    y1 = MIN(y1, (int)mode->height - 1);
+
+    for (y = y0; y <= y1; y++) {
+        uint32_t *dst = (uint32_t *)((uint8_t *)surface_data(ds) +
+                                     y * surface_stride(ds));
+        /* 4.12 accumulator: twelve fractional bits */
+        int sy = ((y - y0) * v_inc) >> 12;
+        const uint8_t *row;
+
+        if (sy >= src_h) {
+            break;
+        }
+        row = vram + offset + (uint32_t)sy * pitch;
+        if (offset + (uint32_t)(sy + 1) * pitch > ATI_MACH64_VRAM_SIZE) {
+            break;
+        }
+        for (x = x0; x <= x1; x++) {
+            int sx = ((x - x0) * h_inc) >> 12;
+
+            if (sx >= src_w) {
+                break;
+            }
+            if (keyfn == ATI_GRAPHIC_KEY_FN_EQ &&
+                (dst[x] & keym & 0xffffff) != (keyc & keym)) {
+                continue;   /* graphics wins here */
+            }
+            if (keyfn == ATI_GRAPHIC_KEY_FN_NE &&
+                (dst[x] & keym & 0xffffff) == (keyc & keym)) {
+                continue;
+            }
+            if ((uint32_t)(sx + 1) * bypp > pitch) {
+                break;
+            }
+            dst[x] = 0xff000000u |
+                     ati_mach64_overlay_texel(s, fmt, row, sx);
+        }
+    }
+}
+
 static bool ati_mach64_update_display(void *opaque)
 {
     ATIMach64State *s = opaque;
@@ -296,7 +513,7 @@ static bool ati_mach64_update_display(void *opaque)
     DisplaySurface *ds;
     uint8_t *ptr;
     uint32_t pix_fmt;
-    bool shadow;
+    bool shadow, overlay;
 
     ati_mach64_get_mode(s, &mode);
     trace_ati_mach64_update(mode.width, mode.height, mode.bpp,
@@ -316,6 +533,21 @@ static bool ati_mach64_update_display(void *opaque)
      * still renders straight out of VRAM with no copy.
      */
     shadow = (pix_fmt != ATI_PIX_FMT_ARGB8888);
+    /*
+     * ARGB8888 normally renders straight out of VRAM with no copy, but
+     * the overlay has to be composited over the graphics, so while it is
+     * running that mode needs a shadow surface too. Switching the
+     * overlay on or off therefore changes the surface type, which means
+     * the surface must be rebuilt at the transition.
+     */
+    overlay = ati_mach64_overlay_active(s);
+    if (overlay) {
+        shadow = true;
+    }
+    if (overlay != s->overlay_shown) {
+        s->overlay_shown = overlay;
+        s->mode_dirty = true;
+    }
 
     if (memcmp(&s->mode, &mode, sizeof(mode)) != 0 || s->mode_dirty) {
         s->mode = mode;
@@ -347,8 +579,15 @@ static bool ati_mach64_update_display(void *opaque)
         case ATI_PIX_FMT_RGB888:
             ati_mach64_draw_24bpp(s, ds, &mode);
             break;
+        case ATI_PIX_FMT_ARGB8888:
+            /* only reached with the overlay up -- see `shadow` above */
+            ati_mach64_draw_32bpp(s, ds, &mode);
+            break;
         default:
             break;
+        }
+        if (overlay) {
+            ati_mach64_overlay_composite(s, ds, &mode);
         }
     }
     qemu_console_update_full(s->con);
@@ -387,7 +626,8 @@ static void ati_mach64_cursor_update(ATIMach64State *s)
     uint32_t clr1 = 0xff000000u | (((raw1 >> 8) & 0xff) << 16) |
                     (((raw1 >> 16) & 0xff) << 8) | ((raw1 >> 24) & 0xff);
     uint32_t vram_off = (s->regs[ATI_CUR_OFFSET >> 2] & 0xfffff) * 8;
-    bool on = (s->regs[ATI_GEN_TEST_CNTL >> 2] & ATI_GEN_CUR_ENABLE) != 0;
+    bool on = (s->regs[ATI_GEN_TEST_CNTL >> 2] & ATI_GEN_CUR_ENABLE) != 0 &&
+              !s->host_cursor_elsewhere;
     /*
      * The guest positions the cursor IMAGE at POSN minus the
      * HORZ/VERT_OFF clip offsets -- i.e. OFF acts as a hotspot-style
@@ -482,12 +722,129 @@ static void ati_mach64_cursor_update(ATIMach64State *s)
  * globals; ADB's own existing path is unaffected and still separately
  * delivers real button transitions to the ADB device model.
  */
+
+/*
+ * Classic Mac OS keeps every attached display in a linked list of
+ * GDevice records, each carrying its rectangle in GLOBAL desktop
+ * coordinates -- so the guest's own arrangement (which screen is left
+ * of which, set in the Monitors control panel) can be read straight out
+ * of guest memory rather than assumed. DeviceList (low memory 0x8A8) is
+ * a handle to the first GDevice; gdRect sits at offset 0x22 (top, left,
+ * bottom, right as big-endian int16) and gdNextGD, itself a handle, at
+ * 0x1E.
+ */
+#define MAC_LOWMEM_DEVICELIST 0x8a8
+#define MAC_LOWMEM_CRSRPIN    0x834
+#define MAC_GDEVICE_GDPMAP    0x16
+#define MAC_GDEVICE_GDNEXTGD  0x1e
+#define MAC_GDEVICE_GDRECT    0x22
+#define MAC_MAX_SCREENS       4
+
+typedef struct MacScreen {
+    int x0, y0, x1, y1;
+    uint32_t base;      /* PixMap baseAddr, i.e. which card owns it */
+} MacScreen;
+
+static bool mac_read_be32(uint32_t addr, uint32_t *out)
+{
+    uint32_t v;
+
+    if (!addr || addr >= 0x10000000) {
+        return false;
+    }
+    if (address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                           &v, 4) != MEMTX_OK) {
+        return false;
+    }
+    *out = be32_to_cpu(v);
+    return true;
+}
+
+static int mac_read_screens(MacScreen *scr, int max)
+{
+    uint32_t handle, gd;
+    int n = 0;
+
+    if (!mac_read_be32(MAC_LOWMEM_DEVICELIST, &handle) ||
+        !mac_read_be32(handle, &gd)) {
+        return 0;
+    }
+    while (gd && n < max) {
+        uint16_t raw[4];
+        uint32_t nexth, pmh, pm;
+        int16_t r[4];
+        int i;
+
+        if (address_space_read(&address_space_memory, gd + MAC_GDEVICE_GDRECT,
+                               MEMTXATTRS_UNSPECIFIED, raw, 8) != MEMTX_OK) {
+            break;
+        }
+        for (i = 0; i < 4; i++) {
+            r[i] = (int16_t)be16_to_cpu(raw[i]);
+        }
+        /* top, left, bottom, right -- reject anything implausible */
+        if (r[2] <= r[0] || r[3] <= r[1] ||
+            r[2] - r[0] > 4096 || r[3] - r[1] > 4096) {
+            break;
+        }
+        scr[n].y0 = r[0];
+        scr[n].x0 = r[1];
+        scr[n].y1 = r[2];
+        scr[n].x1 = r[3];
+        scr[n].base = 0;
+        if (mac_read_be32(gd + MAC_GDEVICE_GDPMAP, &pmh) &&
+            mac_read_be32(pmh, &pm)) {
+            mac_read_be32(pm, &scr[n].base);
+        }
+        n++;
+
+        if (!mac_read_be32(gd + MAC_GDEVICE_GDNEXTGD, &nexth) ||
+            !mac_read_be32(nexth, &gd)) {
+            break;
+        }
+    }
+    return n;
+}
+
+
+/*
+ * Which of the guest's screens is this card driving? Matching the
+ * GDevice's PixMap baseAddr against our own VRAM aperture is exact; the
+ * mode-size comparison is only a fallback for when the PixMap could not
+ * be read, and it prefers the screen at the desktop origin since two
+ * heads may well be running the same resolution.
+ */
+static int mac_find_own_screen(ATIMach64State *s, const MacScreen *scr, int n,
+                               const ATIMach64Mode *mode)
+{
+    PCIDevice *pdev = PCI_DEVICE(s);
+    uint64_t vbase = pdev->io_regions[0].addr;
+    uint64_t vsize = pdev->io_regions[0].size;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        if (vbase != PCI_BAR_UNMAPPED && scr[i].base >= vbase &&
+            scr[i].base < vbase + vsize) {
+            return i;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        if (scr[i].x0 == 0 && scr[i].y0 == 0 &&
+            scr[i].x1 == (int)mode->width && scr[i].y1 == (int)mode->height) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
                                          QemuInputEvent *evt)
 {
     ATIMach64State *s = ATI_MACH64(dev);
     ATIMach64Mode mode;
     uint32_t point_be;
+    int old_x, old_y;
+    bool was_elsewhere;
 
     ati_mach64_get_mode(s, &mode);
     if (!ati_mach64_mode_valid(s, &mode)) {
@@ -520,6 +877,9 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
         return;
     }
 
+    old_x = s->host_cursor_x;
+    old_y = s->host_cursor_y;
+    was_elsewhere = s->host_cursor_elsewhere;
     if (evt->rel.axis == INPUT_AXIS_X) {
         s->host_cursor_x += evt->rel.value;
     } else if (evt->rel.axis == INPUT_AXIS_Y) {
@@ -528,19 +888,95 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
         return;
     }
 
-    if (s->host_cursor_x < 0) {
-        s->host_cursor_x = 0;
-    } else if (s->host_cursor_x >= (int)mode.width) {
-        s->host_cursor_x = mode.width - 1;
-    }
-    if (s->host_cursor_y < 0) {
-        s->host_cursor_y = 0;
-    } else if (s->host_cursor_y >= (int)mode.height) {
-        s->host_cursor_y = mode.height - 1;
-    }
+    /*
+     * Track across the WHOLE desktop, not just this card's screen.
+     * Clamping to our own mode (as this used to) silently discarded any
+     * motion past our edge, so on a multi-head setup the pointer could
+     * never reach the second display at all. The guest's own GDevice
+     * list gives the real arrangement, so the position published here
+     * stays in the global coordinates Mac OS hit-tests clicks against.
+     */
+    {
+        MacScreen scr[MAC_MAX_SCREENS];
+        int n = mac_read_screens(scr, MAC_MAX_SCREENS);
+        int mine = mac_find_own_screen(s, scr, n, &mode);
+        int here = -1, i;
 
-    s->regs[ATI_CUR_HORZ_VERT_POSN >> 2] =
-        ((uint32_t)s->host_cursor_y << 16) | (uint32_t)s->host_cursor_x;
+        if (mine < 0) {
+            /* No usable desktop map -- behave as the single-screen code did */
+            s->host_cursor_elsewhere = false;
+            s->host_cursor_x = MIN(MAX(s->host_cursor_x, 0),
+                                   (int)mode.width - 1);
+            s->host_cursor_y = MIN(MAX(s->host_cursor_y, 0),
+                                   (int)mode.height - 1);
+            s->regs[ATI_CUR_HORZ_VERT_POSN >> 2] =
+                ((uint32_t)s->host_cursor_y << 16) | (uint32_t)s->host_cursor_x;
+        } else {
+            /*
+             * Keep CrsrPin -- the rectangle the Cursor Manager pins the
+             * mouse to -- covering the whole desktop. Normally the
+             * guest's own cursor task widens it when a second screen
+             * appears, but this workaround exists precisely because that
+             * task does not run, so it was left describing the main
+             * screen alone (measured live: GrayRgn spanned 2048 px while
+             * CrsrPin still stopped at 1024). Toolbox paths that clamp a
+             * reported point to CrsrPin then fold anything happening on
+             * the second screen back onto the first.
+             */
+            int px0 = scr[0].x0, py0 = scr[0].y0;
+            int px1 = scr[0].x1, py1 = scr[0].y1;
+            uint16_t pin[4];
+
+            for (i = 1; i < n; i++) {
+                px0 = MIN(px0, scr[i].x0);
+                py0 = MIN(py0, scr[i].y0);
+                px1 = MAX(px1, scr[i].x1);
+                py1 = MAX(py1, scr[i].y1);
+            }
+            pin[0] = cpu_to_be16(py0);
+            pin[1] = cpu_to_be16(px0);
+            pin[2] = cpu_to_be16(py1);
+            pin[3] = cpu_to_be16(px1);
+            address_space_write(&address_space_memory, MAC_LOWMEM_CRSRPIN,
+                                MEMTXATTRS_UNSPECIFIED, pin, sizeof(pin));
+
+            for (i = 0; i < n; i++) {
+                if (s->host_cursor_x >= scr[i].x0 &&
+                    s->host_cursor_x <  scr[i].x1 &&
+                    s->host_cursor_y >= scr[i].y0 &&
+                    s->host_cursor_y <  scr[i].y1) {
+                    here = i;
+                    break;
+                }
+            }
+            /*
+             * The union of the screens is not necessarily a rectangle, so
+             * rather than clamp to a bounding box that may contain dead
+             * space, simply refuse a step that would leave the desktop --
+             * the same pinning behaviour Mac OS applies via CrsrPin.
+             */
+            if (here < 0) {
+                s->host_cursor_x = old_x;
+                s->host_cursor_y = old_y;
+                return;
+            }
+
+            s->host_cursor_elsewhere = (here != mine);
+            if (here == mine) {
+                s->regs[ATI_CUR_HORZ_VERT_POSN >> 2] =
+                    ((uint32_t)(s->host_cursor_y - scr[mine].y0) << 16) |
+                    (uint32_t)(s->host_cursor_x - scr[mine].x0);
+                if (was_elsewhere) {
+                    ati_rage128_host_cursor(0, 0, false);
+                }
+            } else {
+                /* Off our head: park our sprite and light up the other card */
+                s->regs[ATI_CUR_HORZ_VERT_POSN >> 2] = 0x07ff07ff;
+                ati_rage128_host_cursor(s->host_cursor_x - scr[here].x0,
+                                        s->host_cursor_y - scr[here].y0, true);
+            }
+        }
+    }
 
     point_be = cpu_to_be32(((uint32_t)(uint16_t)s->host_cursor_y << 16) |
                            (uint32_t)(uint16_t)s->host_cursor_x);

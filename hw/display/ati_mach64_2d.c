@@ -407,6 +407,217 @@ static inline uint32_t ati_mach64_2d_src_color(const ATIMach64State *s,
     }
 }
 
+
+/* An aliased scaler register: take whichever address the guest wrote. */
+static uint32_t ati_mach64_scale_reg(ATIMach64State *s, uint32_t a,
+                                     uint32_t b)
+{
+    uint32_t v = s->regs[a >> 2];
+
+    return v ? v : s->regs[b >> 2];
+}
+
+static uint32_t ati_mach64_scale_texel(const uint8_t *row, int sx,
+                                       unsigned fmt, bool apple_yuv)
+{
+    int y, u, v, r, g, b;
+
+    switch (fmt) {
+    case ATI_SCALE_PIX_YUYV422:
+    case ATI_SCALE_PIX_UYVY422:
+    {
+        /* packed 4:2:2; the chroma pair is shared between two luma */
+        const uint8_t *p = row + (sx & ~1) * 2;
+
+        if (fmt == ATI_SCALE_PIX_YUYV422) {      /* Y0 U Y1 V */
+            y = p[(sx & 1) ? 2 : 0];
+            u = p[1];
+            v = p[3];
+        } else {                                 /* U Y0 V Y1 ('2vuy') */
+            y = p[(sx & 1) ? 3 : 1];
+            u = p[0];
+            v = p[2];
+        }
+        break;
+    }
+    case ATI_SCALE_PIX_AYUV444:
+        y = row[sx * 4 + 1];
+        u = row[sx * 4 + 2];
+        v = row[sx * 4 + 3];
+        break;
+    case ATI_SCALE_PIX_Y8:
+        y = row[sx];
+        u = v = 128;
+        break;
+    case ATI_SCALE_PIX_8888:
+        return ldl_be_p(row + sx * 4) & 0xffffff;
+    case ATI_SCALE_PIX_565:
+    {
+        uint16_t px = lduw_be_p(row + sx * 2);
+
+        return (((px >> 11) & 0x1f) << 19) | (((px >> 5) & 0x3f) << 10) |
+               ((px & 0x1f) << 3);
+    }
+    case ATI_SCALE_PIX_1555:
+    {
+        uint16_t px = lduw_be_p(row + sx * 2);
+
+        return (((px >> 10) & 0x1f) << 19) | (((px >> 5) & 0x1f) << 11) |
+               ((px & 0x1f) << 3);
+    }
+    default:
+        return 0;
+    }
+
+    /*
+     * APPLE_YUV_MODE means the chroma arrives signed, with an offset of
+     * zero rather than 128 (RRG-G02700, SCALE_3D_CNTL field j) -- which
+     * is exactly the mode a Mac driver would select.
+     */
+    if (apple_yuv) {
+        u = (int8_t)u;
+        v = (int8_t)v;
+    } else {
+        u -= 128;
+        v -= 128;
+    }
+    y = (y - 16) * 298;
+    r = (y + 409 * v + 128) >> 8;
+    g = (y - 100 * u - 208 * v + 128) >> 8;
+    b = (y + 516 * u + 128) >> 8;
+    r = MIN(MAX(r, 0), 255);
+    g = MIN(MAX(g, 0), 255);
+    b = MIN(MAX(b, 0), 255);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+/*
+ * The scaler pipe: a scaled (and optionally YUV-converted) copy from a
+ * source image in VRAM to the destination rectangle. Mac OS drives this
+ * for QuickTime playback, selecting it with DP_SRC foreground source 5
+ * and SCALE_3D_CNTL's function field.
+ *
+ * Source stepping uses the documented DDA: SCALE_X_INC / SCALE_Y_INC are
+ * accumulator increments with 12 fractional bits, started from
+ * SCALE_HACC / SCALE_VACC. Nearest-neighbour only -- the real pipe reads
+ * two source lines per destination line and runs a 2-tap blend, which is
+ * not modelled.
+ *
+ * Returns true when the operation was a scaler op (handled or rejected),
+ * so the caller leaves the ordinary blit paths alone.
+ */
+static bool ati_mach64_2d_scale(ATIMach64State *s, uint32_t frgd_src,
+                                int dst_x, int dst_y, int w, int h,
+                                uint32_t dst_base, int dst_pitch, int bpp,
+                                int sc_left, int sc_right,
+                                int sc_top, int sc_bottom)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t cntl3d = s->regs[ATI_SCALE_3D_CNTL >> 2];
+    uint32_t pix_width = s->regs[ATI_DP_PIX_WIDTH >> 2];
+    uint32_t src_off = s->regs[ATI_SCALE_Y_OFF >> 2] & ~7u;
+    uint32_t src_pitch = ati_mach64_scale_reg(s, ATI_SCALE_Y_PITCH,
+                                              ATI_SCALE_Y_PITCH_A) & 0xfff;
+    int src_w = s->regs[ATI_SCALE_WIDTH >> 2] & 0xfff;
+    int src_h = s->regs[ATI_SCALE_HEIGHT >> 2] & 0xfff;
+    uint32_t x_inc = ati_mach64_scale_reg(s, ATI_SCALE_X_INC,
+                                          ATI_SCALE_X_INC_A);
+    uint32_t y_inc = ati_mach64_scale_reg(s, ATI_SCALE_Y_INC,
+                                          ATI_SCALE_Y_INC_A);
+    uint32_t hacc = s->regs[ATI_SCALE_HACC >> 2];
+    uint32_t vacc = s->regs[ATI_SCALE_VACC >> 2];
+    unsigned fmt = (pix_width >> ATI_DP_SCALE_PIX_WIDTH_SHIFT) & 0xf;
+    bool apple_yuv = (cntl3d & ATI_APPLE_YUV_MODE) != 0;
+    int src_bpp;
+    int x, y;
+
+    if (frgd_src != ATI_FRGD_SRC_SCALE) {
+        return false;
+    }
+    /*
+     * The increments carry 12 fractional bits but sit in the upper part
+     * of the register (as the equivalent RAGE 128 field does, at bits
+     * 19:4). Reading them unshifted gives a ~16x downscale, which cannot
+     * be right for the captured frames: source and destination are both
+     * 190x240 there, so the step has to be ~1.0 -- and >> 4 yields
+     * 0.995. Anything that leaves a zero step would draw nothing.
+     */
+    x_inc >>= 4;
+    y_inc >>= 4;
+
+    trace_ati_mach64_scale(dst_x, dst_y, w, h, src_w, src_h, src_off,
+                           src_pitch, x_inc, y_inc);
+    trace_ati_mach64_scale_cfg(cntl3d, pix_width, fmt, apple_yuv);
+
+    if (!x_inc || !y_inc || !src_pitch || src_w <= 0 || src_h <= 0) {
+        trace_ati_mach64_2d_drop("scale: incomplete setup", dst_x, dst_y,
+                                 w, h, sc_right, sc_bottom, frgd_src,
+                                 src_off);
+        return true;
+    }
+
+    switch (fmt) {
+    case ATI_SCALE_PIX_8BPP:
+    case ATI_SCALE_PIX_332:
+    case ATI_SCALE_PIX_Y8:
+        src_bpp = 1;
+        break;
+    case ATI_SCALE_PIX_1555:
+    case ATI_SCALE_PIX_565:
+    case ATI_SCALE_PIX_4444:
+    case ATI_SCALE_PIX_YUYV422:
+    case ATI_SCALE_PIX_UYVY422:
+        src_bpp = 2;
+        break;
+    case ATI_SCALE_PIX_8888:
+    case ATI_SCALE_PIX_AYUV444:
+        src_bpp = 4;
+        break;
+    default:
+        trace_ati_mach64_2d_drop("scale: unknown source pixel width",
+                                 dst_x, dst_y, w, h, sc_right, sc_bottom,
+                                 fmt, pix_width);
+        return true;
+    }
+
+    for (y = 0; y < h; y++) {
+        int dy = dst_y + y;
+        uint32_t sy = (vacc + (uint32_t)y * y_inc) >> 12;
+        const uint8_t *row;
+
+        if (dy < sc_top || dy > sc_bottom) {
+            continue;
+        }
+        if (sy >= (uint32_t)src_h) {
+            break;
+        }
+        row = vram + src_off + sy * (uint32_t)src_pitch * src_bpp;
+        if (src_off + (sy + 1) * (uint32_t)src_pitch * src_bpp >
+            ATI_MACH64_VRAM_SIZE) {
+            break;
+        }
+        for (x = 0; x < w; x++) {
+            int dx = dst_x + x;
+            uint32_t sx = (hacc + (uint32_t)x * x_inc) >> 12;
+            uint32_t color;
+
+            if (dx < sc_left || dx > sc_right || sx >= (uint32_t)src_w) {
+                continue;
+            }
+            uint8_t *dp = vram + dst_base +
+                ((uint64_t)dy * dst_pitch + dx) * bpp;
+            int b;
+
+            color = ati_mach64_scale_texel(row, sx, fmt, apple_yuv);
+            /* destination pixels are big-endian, as everywhere else here */
+            for (b = 0; b < bpp; b++) {
+                dp[bpp - 1 - b] = (color >> (8 * b)) & 0xff;
+            }
+        }
+    }
+    return true;
+}
+
 void ati_mach64_2d_op(ATIMach64State *s)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
@@ -500,6 +711,12 @@ void ati_mach64_2d_op(ATIMach64State *s)
     if (w == 0 || h == 0) {
         trace_ati_mach64_2d_drop("zero-size", dst_x, dst_y, w, h,
                                  sc_right, sc_bottom, dp_src, dst_base);
+        return;
+    }
+
+    if (ati_mach64_2d_scale(s, frgd_src, dst_x, dst_y, w, h, dst_base,
+                            dst_pitch, bpp, sc_left, sc_right, sc_top,
+                            sc_bottom)) {
         return;
     }
 
@@ -727,10 +944,37 @@ void ati_mach64_2d_op(ATIMach64State *s)
 
                 if (src_linear) {
                     soff = src_base + ((uint64_t)ry * w + x) * bpp;
+                } else if (src_rot) {
+                    /*
+                     * Rotated pattern (trajectory 4): the first segment
+                     * runs SRC_WIDTH1 pixels from SRC_X (to the
+                     * pattern's right edge), then X wraps to
+                     * SRC_X_START with a period of (SRC_X -
+                     * SRC_X_START) + SRC_WIDTH1 = the full pattern
+                     * width; same for Y. Apple's NDRV stamps the
+                     * desktop PixPat exactly this way: SRC_Y_X is the
+                     * tile phase (dst mod tile size) and
+                     * SRC_HEIGHT1_WIDTH1 the remaining extent to the
+                     * tile edge, so phase + extent = the tile's full
+                     * period on every stamp. Wrapping back to SRC_X
+                     * with period SRC_WIDTH1 instead (as trajectory 3
+                     * does) re-tiles a shrunken sub-window of the
+                     * pattern -- seen as the flattened/banded "Aaron"
+                     * desktop at Thousands.
+                     */
+                    int px = (src_x - src_xs) + src_w1;
+                    int py = (src_y - src_ys) + src_h1;
+                    int sx = px > 0 ? src_xs + ((src_x - src_xs) + x) % px
+                                    : src_x + x;
+                    int sy = py > 0 ? src_ys + ((src_y - src_ys) + ry) % py
+                                    : src_y + ry;
+
+                    soff = src_base +
+                           ((uint64_t)sy * src_pitch + sx) * bpp;
                 } else {
-                    int sx = src_x + (src_w1 > 0 ? (x + src_xs) % src_w1 : x);
-                    int sy = src_y + ((src_patt || src_rot) && src_h1 > 0 ?
-                                      (ry + src_ys) % src_h1 : ry);
+                    int sx = src_x + (src_w1 > 0 ? x % src_w1 : x);
+                    int sy = src_y + (src_patt && src_h1 > 0 ?
+                                      ry % src_h1 : ry);
 
                     soff = src_base +
                            ((uint64_t)sy * src_pitch + sx) * bpp;

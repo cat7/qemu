@@ -129,6 +129,7 @@ struct ATIMach64State {
 
     ATIMach64Mode mode;
     bool mode_dirty;
+    bool overlay_shown;   /* the video overlay was composited last frame */
 
     /*
      * Real hardware fires a VBLANK interrupt from the CRTC continuously
@@ -161,6 +162,7 @@ struct ATIMach64State {
      */
     QemuInputHandlerState *cursor_hs;
     bool host_cursor_tracking;
+    bool host_cursor_elsewhere;   /* pointer is on another card's screen */
     int host_cursor_x;
     int host_cursor_y;
     bool monitor_connected;
