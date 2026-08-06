@@ -36,6 +36,7 @@
 #include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "system/dma.h"
 #include "trace.h"
 
@@ -140,6 +141,9 @@ static void awacs_audio_callback(void *opaque, int avail)
         s->out_fifo_count -= chunk;
 
         written = audio_be_write(s->audio_be, s->voice, staging, chunk);
+        if (s->dump_fp && written) {
+            fwrite(staging, 1, written, s->dump_fp);
+        }
         trace_awacs_cb_write(chunk, written, s->out_fifo_count);
         /* Only advance by whole frames; hold back any partial-frame
          * tail the backend accepted so the stream never desyncs. */
@@ -349,6 +353,8 @@ static void awacs_dma_flush(DBDMA_io *io)
      * or reprogrammed. Already-buffered FIFO audio is left to drain
      * naturally.
      */
+    trace_awacs_dma_flush(!!s->pending_out_io, s->out_fifo_count,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (s->pending_out_io) {
         timer_del(s->out_complete_timer);
         awacs_out_complete(s);
@@ -562,9 +568,23 @@ static void awacs_init(Object *obj)
     sysbus_init_irq(sbd, &s->dma_irq);
 }
 
+static void awacs_dump_open(AWACSState *s)
+{
+    if (s->dump_path && *s->dump_path) {
+        s->dump_fp = fopen(s->dump_path, "wb");
+        if (!s->dump_fp) {
+            warn_report("awacs: cannot open dumpfile %s", s->dump_path);
+        } else {
+            setvbuf(s->dump_fp, NULL, _IOFBF, 1 << 16);
+        }
+    }
+}
+
 static void awacs_realize(DeviceState *dev, Error **errp)
 {
     AWACSState *s = AWACS(dev);
+
+    awacs_dump_open(s);
 
     if (!audio_be_check(&s->audio_be, errp)) {
         return;
@@ -603,6 +623,7 @@ static const VMStateDescription vmstate_awacs = {
 };
 
 static const Property awacs_properties[] = {
+    DEFINE_PROP_STRING("dumpfile", AWACSState, dump_path),
     DEFINE_AUDIO_PROPERTIES(AWACSState, audio_be),
 };
 

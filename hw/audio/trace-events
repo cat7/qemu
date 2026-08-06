@@ -67,6 +67,7 @@ awacs_set_rate(int sr_id, int rate) "sr_id=%d rate=%d"
 awacs_open_voice(int rate) "rate=%d"
 awacs_dma_out(uint64_t addr, int len, int rate, int64_t now_ns) "addr=0x%"PRIx64" len=%d rate=%d now=%"PRId64
 awacs_out_complete_fire(int64_t now_ns) "now=%"PRId64
+awacs_dma_flush(int pending, int fifo, int64_t now_ns) "channel flush/stop: pending_io=%d fifo=%d now=%"PRId64
 awacs_fifo_overflow(int dropped) "dropped=%d bytes"
 awacs_mmio_write(uint64_t addr, uint64_t val, unsigned size) "addr=0x%"PRIx64" val=0x%"PRIx64" size=%u"
 awacs_cb(int avail, int fifo_count, int64_t now_ns) "avail=%d fifo=%d now=%"PRId64

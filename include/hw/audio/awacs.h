@@ -171,6 +171,16 @@ struct AWACSState {
      */
 #define AWACS_OUT_FIFO_SIZE (512 * 1024)
     uint8_t out_fifo[AWACS_OUT_FIFO_SIZE];
+
+    /*
+     * Diagnostic: when the "dumpfile" property is set, every byte actually
+     * handed to the audio backend is appended here. Unlike running with
+     * `-audiodev wav`, this records the stream in the REAL configuration --
+     * with coreaudio attached and pacing us -- so an artefact that only
+     * appears against a live device is still captured.
+     */
+    char *dump_path;
+    FILE *dump_fp;
     uint32_t out_fifo_rptr;
     uint32_t out_fifo_wptr;
     uint32_t out_fifo_count;
