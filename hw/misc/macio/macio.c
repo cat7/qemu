@@ -394,14 +394,14 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     if (!macio_realize_ide(s, &ns->ide[0],
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_IRQ),
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_DMA_IRQ),
-                           0x16, errp)) {
+                           0x0b, errp)) {
         return;
     }
 
     if (!macio_realize_ide(s, &ns->ide[1],
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_IRQ),
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_DMA_IRQ),
-                           0x1a, errp)) {
+                           0x0d, errp)) {
         return;
     }
 
