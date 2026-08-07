@@ -27,9 +27,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
+#include "qemu/error-report.h"
 #include "hw/ppc/mac_newworld_pm34.h"
 #include "hw/ppc/mac_newworld_pm36.h"
 #include "hw/misc/macio/mac99_pm36_i2c.h"
+#include "hw/nvram/eeprom_at24c.h"
+#include "hw/nvram/mac_spd.h"
 #include "target/ppc/cpu.h"
 
 /*
@@ -95,15 +99,77 @@ void pm36_add_config_eeprom(I2CBus *bus)
     pm34_add_config_eeprom(bus);
 }
 
+#define PM36_SPD_NUM_DIMMS 4
+
 /*
- * Unconfirmed/placeholder: real SPD data transcription is Stage 6 of the
- * mac99 PowerMac3,6 plan. Reuse PowerMac3,4's synthesis so machine init
- * doesn't crash before then; this needs replacing with real PowerMac3,6
- * SPD geometry (4 DIMM slots, not 3) once that stage lands.
+ * SPD EEPROMs for the memory slots, same mechanism as PowerMac3,4's (see
+ * pm34_add_spd_dimms()): synthesize a per-slot image from a donor module,
+ * patching geometry bytes (3 rows, 4 cols, 5 ranks, 31 bank density) and
+ * re-summing the byte-63 checksum. PowerMac3,6 has 4 slots, not 3.
+ *
+ * pm36_spd_dimm0 is transcribed verbatim from a real PowerMac3,6's own
+ * /memory@0/dimm-info (~/Downloads/device-tree-powermac3,6-smp.txt) -- a
+ * real 512MB DDR module, checksum-validated against its own stored byte 63
+ * (0x47) during transcription. Its geometry bytes (rows=13, cols=10,
+ * ranks=2, density=0x40) turn out numerically identical to PowerMac3,4's
+ * 512MB entry, so the same spd_geom[] table is reused rather than
+ * duplicated with different values that aren't actually different.
  */
 void pm36_add_spd_dimms(I2CBus *bus, uint64_t ram_size)
 {
-    pm34_add_spd_dimms(bus, ram_size);
+    static const uint8_t pm36_spd_dimm0[MAC_SPD_SIZE] = {
+        0x80, 0x08, 0x07, 0x0d, 0x0a, 0x02, 0x40, 0x00, 0x04, 0x75, 0x75, 0x00,
+        0x82, 0x08, 0x00, 0x01, 0x0e, 0x04, 0x0c, 0x01, 0x02, 0x20, 0x00, 0xa0,
+        0x75, 0x00, 0x00, 0x50, 0x3c, 0x50, 0x2d, 0x40, 0xa0, 0xa0, 0x50, 0x50,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x4b, 0x34, 0x32, 0x75, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x47, 0x7f, 0x7f, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    static const struct {
+        unsigned mb, rows, cols, ranks, density;
+    } spd_geom[] = {
+        { 512, 13, 10, 2, 0x40 },
+        { 256, 13, 10, 1, 0x40 },
+        { 128, 12, 10, 1, 0x20 },
+        {  64, 12,  9, 1, 0x10 },
+        {  32, 11,  9, 1, 0x08 },
+    };
+    uint64_t left = ram_size;
+    int slot = 0;
+    unsigned g = 0;
+
+    while (left && slot < PM36_SPD_NUM_DIMMS &&
+           g < ARRAY_SIZE(spd_geom)) {
+        uint8_t spd[MAC_SPD_SIZE];
+        unsigned sum, b;
+
+        if (left < (uint64_t)spd_geom[g].mb * MiB) {
+            g++;
+            continue;
+        }
+        memcpy(spd, pm36_spd_dimm0, MAC_SPD_SIZE);
+        spd[3] = spd_geom[g].rows;
+        spd[4] = spd_geom[g].cols;
+        spd[5] = spd_geom[g].ranks;
+        spd[31] = spd_geom[g].density;
+        for (sum = 0, b = 0; b < 63; b++) {
+            sum += spd[b];
+        }
+        spd[63] = sum & 0xff;
+        at24c_eeprom_init_rom(bus, 0x50 + slot, MAC_SPD_SIZE, spd, MAC_SPD_SIZE);
+        left -= (uint64_t)spd_geom[g].mb * MiB;
+        slot++;
+    }
+    if (left) {
+        warn_report("mac99: %" PRIu64 "MB of RAM not representable as "
+                    "1-4 PowerMac3,6 DIMMs; the firmware will see %"
+                    PRIu64 "MB", left / MiB, (ram_size - left) / MiB);
+    }
 }
 
 /*
