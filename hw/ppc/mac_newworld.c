@@ -978,6 +978,25 @@ static int core99_kvm_type(MachineState *machine, const char *arg)
     return 2;
 }
 
+#ifndef TARGET_PPC64
+/*
+ * PowerMac3,6's real CPU is a 7455, not the 7400 every other mac99 config
+ * defaults to. Hooking get_default_cpu_type (rather than setting cpu_type
+ * directly somewhere in ppc_core99_init) means an explicit "-cpu" still
+ * wins, the same as it does for every other machine -- QEMU only calls this
+ * when the user didn't ask for a specific CPU.
+ */
+static const char *core99_get_default_cpu_type(const MachineState *ms)
+{
+    Core99MachineState *cms = CORE99_MACHINE((MachineState *)ms);
+
+    if (cms->model == CORE99_MODEL_PM36) {
+        return POWERPC_CPU_TYPE_NAME("7455_v2.1");
+    }
+    return POWERPC_CPU_TYPE_NAME("7400_v2.9");
+}
+#endif
+
 static void core99_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -996,6 +1015,7 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("970fx_v3.1");
 #else
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("7400_v2.9");
+    mc->get_default_cpu_type = core99_get_default_cpu_type;
 #endif
     mc->default_ram_id = "ppc_core99.ram";
     mc->ignore_boot_device_suffixes = true;
