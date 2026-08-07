@@ -208,9 +208,6 @@ struct PMUState {
     MemoryRegion mem;
     uint64_t frequency;
 
-    /* Wall time a bus-stretched 6522 access costs, in nanoseconds */
-    uint32_t access_stretch_ns;
-
     /* PMU state */
     MOS6522PMUState mos6522_pmu;
 
