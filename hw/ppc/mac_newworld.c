@@ -68,6 +68,7 @@
 #include "hw/misc/macio/macio.h"
 #include "hw/nvram/eeprom_at24c.h"
 #include "hw/ppc/mac_newworld_pm34.h"
+#include "hw/ppc/mac_newworld_pm36.h"
 #include "hw/ppc/openpic.h"
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"
@@ -118,11 +119,17 @@ typedef enum {
     CORE99_VIA_CONFIG_PMU_ADB
 } Core99ViaConfig;
 
+typedef enum {
+    CORE99_MODEL_PM34 = 0,
+    CORE99_MODEL_PM36
+} Core99Model;
+
 struct Core99MachineState {
     /*< private >*/
     MachineState parent;
 
     Core99ViaConfig via_config;
+    Core99Model model;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -236,6 +243,96 @@ static void macio_arm_hw_base_reset(Notifier *n, void *opaque)
     qemu_register_reset(macio_map_at_hw_base, mn->macio);
 }
 
+/*
+ * Dispatch to the matching per-model file (mac_newworld_pm34.c /
+ * mac_newworld_pm36.c) for whatever piece of setup needs to match real
+ * hardware for the selected model.
+ */
+static uint32_t core99_tbfreq(Core99Model model)
+{
+    return model == CORE99_MODEL_PM36 ? pm36_tbfreq() : pm34_tbfreq();
+}
+
+static uint32_t core99_clockfreq(Core99Model model)
+{
+    return model == CORE99_MODEL_PM36 ? pm36_clockfreq() : pm34_clockfreq();
+}
+
+static uint32_t core99_busfreq(Core99Model model)
+{
+    return model == CORE99_MODEL_PM36 ? pm36_busfreq() : pm34_busfreq();
+}
+
+static void core99_cpu_defaults(Core99Model model, PowerPCCPU *cpu)
+{
+    if (model == CORE99_MODEL_PM36) {
+        pm36_cpu_defaults(cpu);
+    } else {
+        pm34_cpu_defaults(cpu);
+    }
+}
+
+static void core99_add_config_eeprom(Core99Model model, I2CBus *bus)
+{
+    if (model == CORE99_MODEL_PM36) {
+        pm36_add_config_eeprom(bus);
+    } else {
+        pm34_add_config_eeprom(bus);
+    }
+}
+
+static void core99_add_spd_dimms(Core99Model model, I2CBus *bus,
+                                 uint64_t ram_size)
+{
+    if (model == CORE99_MODEL_PM36) {
+        pm36_add_spd_dimms(bus, ram_size);
+    } else {
+        pm34_add_spd_dimms(bus, ram_size);
+    }
+}
+
+static void core99_place_gmac(Core99Model model, PCIBus *internal_bus,
+                              const char *default_nic)
+{
+    if (model == CORE99_MODEL_PM36) {
+        pm36_place_gmac(internal_bus, default_nic);
+    } else {
+        pm34_place_gmac(internal_bus, default_nic);
+    }
+}
+
+static void core99_internal_bus_irq_map(Core99Model model,
+                                        DeviceState *uninorth_internal_dev,
+                                        DeviceState *pic_dev)
+{
+    if (model == CORE99_MODEL_PM36) {
+        pm36_internal_bus_irq_map(uninorth_internal_dev, pic_dev);
+    } else {
+        pm34_internal_bus_irq_map(uninorth_internal_dev, pic_dev);
+    }
+}
+
+static void core99_pci_irq_map(Core99Model model,
+                               DeviceState *uninorth_pci_dev,
+                               DeviceState *pic_dev)
+{
+    if (model == CORE99_MODEL_PM36) {
+        pm36_pci_irq_map(uninorth_pci_dev, pic_dev);
+    } else {
+        pm34_pci_irq_map(uninorth_pci_dev, pic_dev);
+    }
+}
+
+static int core99_macio_devfn(Core99Model model)
+{
+    return model == CORE99_MODEL_PM36 ? pm36_macio_devfn() : pm34_macio_devfn();
+}
+
+static int core99_usb_devfn(Core99Model model)
+{
+    return model == CORE99_MODEL_PM36 ? pm36_usb_devfn() : pm34_usb_devfn();
+}
+
 /* PowerPC Mac99 hardware initialisation */
 static void ppc_core99_init(MachineState *machine)
 {
@@ -267,17 +364,18 @@ static void ppc_core99_init(MachineState *machine)
     I2CBus *unin_i2c;
     MacIOHwBaseNotifier *macio_notifier;
     hwaddr nvram_addr = 0xFFF04000;
-    uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : pm34_tbfreq();
+    uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq()
+                                    : core99_tbfreq(core99_machine->model);
 
     /* init CPUs */
     cpus = g_new0(PowerPCCPU *, machine->smp.cpus);
     for (i = 0; i < machine->smp.cpus; i++) {
         cpus[i] = POWERPC_CPU(cpu_create(machine->cpu_type));
 
-        cpu_ppc_tb_init(&cpus[i]->env, pm34_tbfreq());
+        cpu_ppc_tb_init(&cpus[i]->env, core99_tbfreq(core99_machine->model));
 
         if (PPC_INPUT(&cpus[i]->env) != PPC_FLAGS_INPUT_970) {
-            pm34_cpu_defaults(cpus[i]);
+            core99_cpu_defaults(core99_machine->model, cpus[i]);
         }
 
         /*
@@ -452,8 +550,8 @@ static void ppc_core99_init(MachineState *machine)
                                         sysbus_mmio_get_region(s, 1), 1);
 
     unin_i2c = UNI_NORTH(s)->i2c.bus;
-    pm34_add_config_eeprom(unin_i2c);
-    pm34_add_spd_dimms(unin_i2c, machine->ram_size);
+    core99_add_config_eeprom(core99_machine->model, unin_i2c);
+    core99_add_spd_dimms(core99_machine->model, unin_i2c, machine->ram_size);
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;
@@ -529,7 +627,8 @@ static void ppc_core99_init(MachineState *machine)
      * devices where the hardware puts them: the PowerMac3,4 device tree has
      * mac-io@17 and usb@18 / usb@19 on this bus.
      */
-    macio = OBJECT(pci_new(pm34_macio_devfn(), TYPE_NEWWORLD_MACIO));
+    macio = OBJECT(pci_new(core99_macio_devfn(core99_machine->model),
+                          TYPE_NEWWORLD_MACIO));
     dev = DEVICE(macio);
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
@@ -596,7 +695,7 @@ static void ppc_core99_init(MachineState *machine)
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     if (rom_is_flash) {
-        pm34_pci_irq_map(uninorth_pci_dev, pic_dev);
+        core99_pci_irq_map(core99_machine->model, uninorth_pci_dev, pic_dev);
     } else {
         for (i = 0; i < 4; i++) {
             qdev_connect_gpio_out(uninorth_pci_dev, i,
@@ -614,7 +713,8 @@ static void ppc_core99_init(MachineState *machine)
 
         /* Uninorth internal bus */
         if (rom_is_flash) {
-            pm34_internal_bus_irq_map(uninorth_internal_dev, pic_dev);
+            core99_internal_bus_irq_map(core99_machine->model,
+                                        uninorth_internal_dev, pic_dev);
         } else {
             for (i = 0; i < 4; i++) {
                 qdev_connect_gpio_out(uninorth_internal_dev, i,
@@ -683,7 +783,8 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     if (machine->usb) {
-        pci_create_simple(pci_bus, pm34_usb_devfn(), "pci-ohci");
+        pci_create_simple(pci_bus, core99_usb_devfn(core99_machine->model),
+                          "pci-ohci");
 
         /* U3 needs to use USB for input because Linux doesn't support via-cuda
         on PPC64 */
@@ -717,7 +818,8 @@ static void ppc_core99_init(MachineState *machine)
         PCIBus *internal_bus =
             PCI_HOST_BRIDGE(uninorth_internal_dev)->bus;
 
-        pm34_place_gmac(internal_bus, mc->default_nic);
+        core99_place_gmac(core99_machine->model, internal_bus,
+                         mc->default_nic);
     } else {
         pci_init_nic_devices(pci_bus, mc->default_nic);
     }
@@ -813,8 +915,10 @@ static void ppc_core99_init(MachineState *machine)
         fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_KVM_PID, getpid());
     }
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, tbfreq);
-    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ, pm34_clockfreq());
-    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ, pm34_busfreq());
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ,
+                  core99_clockfreq(core99_machine->model));
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ,
+                  core99_busfreq(core99_machine->model));
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
     /* MacOS NDRV VGA driver */
@@ -931,6 +1035,40 @@ static void core99_set_via_config(Object *obj, const char *value, Error **errp)
     }
 }
 
+static char *core99_get_model(Object *obj, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    switch (cms->model) {
+    default:
+    case CORE99_MODEL_PM34:
+        return g_strdup("pm34");
+
+    case CORE99_MODEL_PM36:
+        return g_strdup("pm36");
+    }
+}
+
+/*
+ * "pm34"/"pm36" rather than the real "3,4"/"3,6" model numbers: -M's option
+ * string is comma-separated, so a literal comma in a property value needs
+ * doubling (-M mac99,model=3,,6) to parse at all -- not what anyone would
+ * type unprompted. Avoid the footgun entirely instead of documenting it.
+ */
+static void core99_set_model(Object *obj, const char *value, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    if (!strcmp(value, "pm34")) {
+        cms->model = CORE99_MODEL_PM34;
+    } else if (!strcmp(value, "pm36")) {
+        cms->model = CORE99_MODEL_PM36;
+    } else {
+        error_setg(errp, "Invalid model value");
+        error_append_hint(errp, "Valid values are pm34 and pm36.\n");
+    }
+}
+
 static void core99_instance_init(Object *obj)
 {
     Core99MachineState *cms = CORE99_MACHINE(obj);
@@ -942,6 +1080,16 @@ static void core99_instance_init(Object *obj)
     object_property_set_description(obj, "via",
                                     "Set VIA configuration. "
                                     "Valid values are cuda, pmu and pmu-adb");
+
+    /* Default model is PowerMac3,4 (Digital Audio) */
+    cms->model = CORE99_MODEL_PM34;
+    object_property_add_str(obj, "model", core99_get_model,
+                            core99_set_model);
+    object_property_set_description(obj, "model",
+                                    "Set the real PowerMac model to emulate "
+                                    "(pm34 = PowerMac3,4 Digital Audio, "
+                                    "pm36 = PowerMac3,6 Mirrored Drive "
+                                    "Doors). Valid values are pm34 and pm36");
 }
 
 static const TypeInfo core99_machine_info = {

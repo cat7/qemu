@@ -79,6 +79,7 @@ ppc_ss.add(when: 'CONFIG_MAC_OLDWORLD', if_true: files('mac_oldworld.c'))
 ppc_ss.add(when: 'CONFIG_MAC_NEWWORLD', if_true: files(
   'mac_newworld.c',
   'mac_newworld_pm34.c',
+  'mac_newworld_pm36.c',
 ))
 # e500
 ppc_ss.add(when: 'CONFIG_E500PLAT', if_true: files('e500plat.c'))
