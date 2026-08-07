@@ -76,7 +76,10 @@ ppc_ss.add(when: 'CONFIG_RS6000_MC', if_true: files('rs6000_mc.c'))
 # OldWorld PowerMac
 ppc_ss.add(when: 'CONFIG_MAC_OLDWORLD', if_true: files('mac_oldworld.c'))
 # NewWorld PowerMac
-ppc_ss.add(when: 'CONFIG_MAC_NEWWORLD', if_true: files('mac_newworld.c'))
+ppc_ss.add(when: 'CONFIG_MAC_NEWWORLD', if_true: files(
+  'mac_newworld.c',
+  'mac_newworld_pm34.c',
+))
 # e500
 ppc_ss.add(when: 'CONFIG_E500PLAT', if_true: files('e500plat.c'))
 ppc_ss.add(when: 'CONFIG_MPC8544DS', if_true: files('mpc8544ds.c'))
