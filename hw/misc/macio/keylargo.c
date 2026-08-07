@@ -426,6 +426,8 @@ static void keywest_i2c_abort(KeyLargoI2CState *c)
         c->xfer_active = false;
     }
     c->status &= ~KW_I2C_STAT_BUSY;
+    c->manual_addr_pending = false;
+    c->manual_byte_delivered = false;
 }
 
 static void keywest_i2c_stop(KeyLargoI2CState *c)
@@ -586,6 +588,23 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
             }
         }
 
+        /*
+         * DUMB mode's START: a bare start condition, address unknown to the
+         * controller yet (real hardware calls this "manual" mode -- Linux's
+         * kw_i2c_xfer() refuses it outright, it's an Apple-firmware-only
+         * path). Unlike XADDR there is no ADDR/SUBADDR to address the bus
+         * with here, so keywest_i2c_start() doesn't apply; just open the
+         * transfer and wait for the driver to hand the address byte to
+         * KW_I2C_REG_DATA itself, the same way every later byte of a manual
+         * transfer already arrives.
+         */
+        if ((rising & KW_I2C_CTL_START) &&
+            (c->mode & KW_I2C_MODE_MODE_MASK) == KW_I2C_MODE_DUMB) {
+            keywest_i2c_abort(c);
+            c->manual_addr_pending = true;
+            keywest_i2c_set_irq(c, KW_I2C_IRQ_START);
+        }
+
         if (rising & KW_I2C_CTL_STOP) {
             keywest_i2c_stop(c);
             keywest_i2c_set_irq(c, KW_I2C_IRQ_STOP);
@@ -611,14 +630,23 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
          * the fresh notification away and stall the transfer.
          */
         if ((val & KW_I2C_IRQ_DATA) && c->xfer_active) {
-            if ((c->mode & KW_I2C_MODE_MODE_MASK) == KW_I2C_MODE_COMBINED &&
-                (c->addr & 1)) {
+            int mode = c->mode & KW_I2C_MODE_MODE_MASK;
+            bool manual_read = mode == KW_I2C_MODE_DUMB && (c->addr & 1);
+
+            if ((mode == KW_I2C_MODE_COMBINED && (c->addr & 1)) ||
+                (manual_read && c->manual_byte_delivered)) {
                 /*
                  * Combined mode is the register-read form: sub-address write,
                  * repeated start, one data byte, stop. The controller closes
                  * the transfer out by itself once the driver has taken that
                  * byte -- the Apple ROM reads it and then waits for the stop
                  * interrupt without ever writing a STOP of its own.
+                 *
+                 * DUMB (manual) mode reads do the same, confirmed live, just
+                 * one ack later: the address-ack's IRQ_DATA is "empty" (see
+                 * the DATA-register case), so it's the driver's *second* ack
+                 * -- after actually consuming the byte this first ack
+                 * delivers below -- that should auto-stop.
                  */
                 keywest_i2c_stop(c);
                 keywest_i2c_set_irq(c, KW_I2C_IRQ_STOP);
@@ -626,6 +654,9 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
                 if (c->addr & 1) {
                     c->data = i2c_recv(c->bus);
                     c->status |= KW_I2C_STAT_LAST_AAK;
+                }
+                if (manual_read) {
+                    c->manual_byte_delivered = true;
                 }
                 keywest_i2c_set_irq(c, KW_I2C_IRQ_DATA);
             }
@@ -647,7 +678,32 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
 
     case KW_I2C_REG_DATA:
         c->data = val;
-        if (c->xfer_active && !(c->addr & 1) && i2c_send(c->bus, val) == 0) {
+        if (c->manual_addr_pending) {
+            /*
+             * The byte the driver hands over right after START is the
+             * manual-mode address+R/W byte, not payload -- open the bus
+             * with it now, the same ack/nak and auto-abort-on-NAK contract
+             * as every other addressing path here.
+             */
+            c->manual_addr_pending = false;
+            c->addr = val;
+            if (i2c_start_transfer(c->bus, val >> 1, val & 1) == 0) {
+                c->xfer_active = true;
+                c->status |= KW_I2C_STAT_BUSY | KW_I2C_STAT_LAST_AAK;
+                if (val & 1) {
+                    c->status |= KW_I2C_STAT_LAST_RW;
+                } else {
+                    c->status &= ~KW_I2C_STAT_LAST_RW;
+                }
+                c->manual_byte_delivered = false;
+                keywest_i2c_set_irq(c, KW_I2C_IRQ_DATA);
+            } else {
+                c->status &= ~KW_I2C_STAT_LAST_AAK;
+                keywest_i2c_stop(c);
+                keywest_i2c_set_irq(c, KW_I2C_IRQ_DATA | KW_I2C_IRQ_STOP);
+            }
+        } else if (c->xfer_active && !(c->addr & 1) &&
+                  i2c_send(c->bus, val) == 0) {
             c->status |= KW_I2C_STAT_LAST_AAK;
             keywest_i2c_set_irq(c, KW_I2C_IRQ_DATA);
         } else {

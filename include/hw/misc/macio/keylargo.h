@@ -144,6 +144,23 @@ typedef struct KeyLargoI2CState {
      */
     qemu_irq irq;
     bool xfer_active;
+    /*
+     * DUMB ("manual") mode's START control bit asserts a bare I2C start
+     * condition with no address yet -- unlike XADDR, which addresses the
+     * bus itself from the ADDR/SUBADDR registers. This is set between a
+     * START and the driver's first DATA write, which supplies the address
+     * byte by hand; see keywest_i2c_write()'s CONTROL and DATA cases.
+     */
+    bool manual_addr_pending;
+    /*
+     * DUMB mode's read completion is one ISR-ack later than every other
+     * mode's: the address-ack fires IRQ_DATA "empty" first (no byte pre-
+     * fetched, unlike XADDR-triggered reads), the driver's first ack of
+     * that is what actually clocks the byte in, and only its *second* ack
+     * (once the driver has consumed it) should auto-stop the bus. This
+     * distinguishes those two acks; see keywest_i2c_write()'s ISR case.
+     */
+    bool manual_byte_delivered;
     uint8_t mode;
     uint8_t control;
     uint8_t status;
