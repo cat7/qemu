@@ -656,10 +656,20 @@ static void ppc_core99_init(MachineState *machine)
      * Firmware that does enumerate simply reassigns the BAR afterwards, so
      * this is harmless for the OpenBIOS path.
      */
-    macio_notifier = g_new0(MacIOHwBaseNotifier, 1);
-    macio_notifier->notifier.notify = macio_arm_hw_base_reset;
-    macio_notifier->macio = PCI_DEVICE(macio);
-    qemu_add_machine_init_done_notifier(&macio_notifier->notifier);
+    /*
+     * Apple ROM only. This is NOT harmless under OpenBIOS: the notifier arms a
+     * *reset* handler, so the BAR is forced back to the hardware base on every
+     * subsequent reset too, behind the back of firmware that had legitimately
+     * assigned it somewhere else. Classic Mac OS then loads over PIO and wedges
+     * the moment it touches MacIO again. Bisected to this commit; gating it
+     * here restores the OpenBIOS boot.
+     */
+    if (rom_is_flash) {
+        macio_notifier = g_new0(MacIOHwBaseNotifier, 1);
+        macio_notifier->notifier.notify = macio_arm_hw_base_reset;
+        macio_notifier->macio = PCI_DEVICE(macio);
+        qemu_add_machine_init_done_notifier(&macio_notifier->notifier);
+    }
 
     /*
      * UniNorth's only CPU-visible window into PCI memory space is the
