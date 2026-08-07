@@ -436,8 +436,18 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
             { 0x21000, NEWWORLD_IDE2_DMA_CHAN,
               NEWWORLD_IDE2_IRQ, NEWWORLD_IDE2_DMA_IRQ },
         }, legacy_layout[3] = {
-            { 0x20000, 0x16, 0xd, 0x2 },
-            { 0x21000, 0x1a, 0xe, 0x3 },
+            /*
+             * OpenBIOS's hardcoded device tree names the DBDMA registers by
+             * byte offset, and it inherited those offsets from the era when
+             * DBDMA_CHANNEL_SHIFT was 7: channels 0x16/0x1a landed at
+             * 0x8b00/0x8d00. With the stride corrected to the real-hardware
+             * 0x100, the same channel numbers move to 0x9600/0x9a00, where
+             * no OpenBIOS guest is looking -- classic Mac OS then loads via
+             * PIO and wedges the moment it tries to DMA. Pick the channel
+             * numbers that reproduce the offsets OpenBIOS advertises.
+             */
+            { 0x20000, 0x0b, 0xd, 0x2 },
+            { 0x21000, 0x0d, 0xe, 0x3 },
             { 0x1f000, NEWWORLD_IDE2_DMA_CHAN,
               NEWWORLD_IDE2_IRQ, NEWWORLD_IDE2_DMA_IRQ },
         };
