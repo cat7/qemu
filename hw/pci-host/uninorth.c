@@ -280,7 +280,7 @@ static void pci_unin_agp_init(Object *obj)
     /* Uninorth AGP bus */
     memory_region_init_io(&h->conf_mem, OBJECT(h), &pci_host_conf_le_ops,
                           obj, "unin-agp-conf-idx", 0x1000);
-    memory_region_init_io(&h->data_mem, OBJECT(h), &pci_host_data_le_ops,
+    memory_region_init_io(&h->data_mem, OBJECT(h), &unin_data_ops,
                           obj, "unin-agp-conf-data", 0x1000);
 
     sysbus_init_mmio(sbd, &h->conf_mem);
