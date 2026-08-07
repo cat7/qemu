@@ -29,6 +29,7 @@
 #include "qemu/osdep.h"
 #include "hw/ppc/mac_newworld_pm34.h"
 #include "hw/ppc/mac_newworld_pm36.h"
+#include "hw/misc/macio/mac99_pm36_i2c.h"
 #include "target/ppc/cpu.h"
 
 /*
@@ -105,9 +106,16 @@ void pm36_add_spd_dimms(I2CBus *bus, uint64_t ram_size)
     pm34_add_spd_dimms(bus, ram_size);
 }
 
+/*
+ * Confirmed live on real PowerMac3,6 hardware's UniNorth I2C bus, addresses
+ * converted from the device tree's 8-bit convention to 7-bit the same way
+ * as the existing PowerMac3,4 config EEPROM comment does.
+ */
 void pm36_add_i2c_peripherals(I2CBus *bus)
 {
-    g_assert_not_reached();
+    i2c_slave_create_simple(bus, TYPE_ADM1030, 0x2c);
+    i2c_slave_create_simple(bus, TYPE_CY2213, 0x65);
+    i2c_slave_create_simple(bus, TYPE_DS1775, 0x49);
 }
 
 /*

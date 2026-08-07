@@ -553,6 +553,10 @@ static void ppc_core99_init(MachineState *machine)
     core99_add_config_eeprom(core99_machine->model, unin_i2c);
     core99_add_spd_dimms(core99_machine->model, unin_i2c, machine->ram_size);
 
+    if (core99_machine->model == CORE99_MODEL_PM36) {
+        pm36_add_i2c_peripherals(unin_i2c);
+    }
+
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;
         /* 970 gets a U3 bus */
