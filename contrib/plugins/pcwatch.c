@@ -22,6 +22,9 @@ static int n_targets;
 static GHashTable *seen;
 static GMutex lock;
 static struct qemu_plugin_register *lr_handle;
+static struct qemu_plugin_register *r3_handle;
+static struct qemu_plugin_register *r4_handle;
+static struct qemu_plugin_register *r5_handle;
 
 static void find_lr(void)
 {
@@ -35,9 +38,30 @@ static void find_lr(void)
             &g_array_index(regs, qemu_plugin_reg_descriptor, i);
         if (d->name && !g_strcmp0(d->name, "lr")) {
             lr_handle = d->handle;
-            return;
+        } else if (d->name && !g_strcmp0(d->name, "r3")) {
+            r3_handle = d->handle;
+        } else if (d->name && !g_strcmp0(d->name, "r4")) {
+            r4_handle = d->handle;
+        } else if (d->name && !g_strcmp0(d->name, "r5")) {
+            r5_handle = d->handle;
         }
     }
+}
+
+static uint64_t read_reg(struct qemu_plugin_register *h)
+{
+    uint64_t v = 0;
+    if (!h) {
+        return 0;
+    }
+    GByteArray *buf = g_byte_array_new();
+    if (qemu_plugin_read_register(h, buf) > 0) {
+        for (guint i = 0; i < buf->len; i++) {
+            v = (v << 8) | buf->data[i];
+        }
+    }
+    g_byte_array_free(buf, TRUE);
+    return v;
 }
 
 struct insn_rec {
@@ -62,19 +86,15 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata)
     g_hash_table_insert(seen, (gpointer)rec->vaddr, GUINT_TO_POINTER(count + 1));
     g_mutex_unlock(&lock);
 
-    uint64_t lr = 0;
-    if (lr_handle) {
-        GByteArray *buf = g_byte_array_new();
-        if (qemu_plugin_read_register(lr_handle, buf) > 0) {
-            for (guint i = 0; i < buf->len; i++) {
-                lr = (lr << 8) | buf->data[i];
-            }
-        }
-        g_byte_array_free(buf, TRUE);
-    }
+    uint64_t lr = read_reg(lr_handle);
+    uint64_t r3 = read_reg(r3_handle);
+    uint64_t r4 = read_reg(r4_handle);
+    uint64_t r5 = read_reg(r5_handle);
 
     qemu_plugin_outs(g_strdup_printf(
-        "pcwatch: pc=0x%" PRIx64 " lr=0x%" PRIx64 "\n", rec->vaddr, lr));
+        "pcwatch: pc=0x%" PRIx64 " lr=0x%" PRIx64
+        " r3=0x%" PRIx64 " r4=0x%" PRIx64 " r5=0x%" PRIx64 "\n",
+        rec->vaddr, lr, r3, r4, r5));
 }
 
 static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *udata)
