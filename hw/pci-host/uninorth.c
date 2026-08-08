@@ -136,11 +136,36 @@ static uint64_t unin_data_read(void *opaque, hwaddr addr,
 {
     UNINHostState *s = opaque;
     PCIHostState *phb = PCI_HOST_BRIDGE(s);
+    uint32_t config_addr = unin_get_config_reg(phb->config_reg, addr);
     uint32_t val;
 
-    val = pci_data_read(phb->bus,
-                        unin_get_config_reg(phb->config_reg, addr),
-                        len);
+    /*
+     * Real PowerMac PCI bridges legitimately have some genuinely
+     * unpopulated device numbers -- e.g. this project's own real-hardware
+     * device-tree dump confirms the internal bus's own bridge
+     * self-function sits at device 14, leaving device 11 truly empty
+     * there, the same device number AppleMacRiscPCI::configure() checks
+     * on every bridge (main/internal/AGP alike) for an AGP capability.
+     * Its capability-chain walker, findPCICapability(), has no defense
+     * against a genuine "no device" response: an all-1s PCI_STATUS
+     * falsely looks like "capability list present" (its bit 0x10), and
+     * the chain it then tries to walk never finds the byte-0 terminator
+     * its only loop-exit test looks for, spinning forever. This is
+     * presumably a dormant kernel bug real hardware never exercises for
+     * reasons specific to that silicon this emulation doesn't replicate
+     * -- confirmed via live kernel-symbol tracing during a genuine OS X
+     * 10.0.3/10.1.3 boot hang, see the mac99 project notes. Report a
+     * clean, capability-free response instead of the generic empty-slot
+     * sentinel whenever nothing is actually at the target devfn, letting
+     * the capability walker's own early-exit path do the right thing.
+     */
+    if (!pci_find_device(phb->bus, (config_addr >> 16) & 0xff,
+                         (config_addr >> 8) & 0xff)) {
+        trace_unin_data_read(addr, len, 0);
+        return 0;
+    }
+
+    val = pci_data_read(phb->bus, config_addr, len);
     trace_unin_data_read(addr, len, val);
     return val;
 }
@@ -317,7 +342,7 @@ static void pci_unin_internal_init(Object *obj)
     /* Uninorth internal bus */
     memory_region_init_io(&h->conf_mem, OBJECT(h), &pci_host_conf_le_ops,
                           obj, "unin-pci-conf-idx", 0x1000);
-    memory_region_init_io(&h->data_mem, OBJECT(h), &pci_host_data_le_ops,
+    memory_region_init_io(&h->data_mem, OBJECT(h), &unin_data_ops,
                           obj, "unin-pci-conf-data", 0x1000);
 
     /*
