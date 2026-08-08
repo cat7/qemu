@@ -640,10 +640,15 @@ static void register_74xx_sprs(CPUPPCState *env)
                  SPR_NOACCESS, SPR_NOACCESS,
                  &spr_read_msscr0, &spr_write_generic,
                  0x00000000);
-    /* Hardware implementation registers */
+    /*
+     * Hardware implementation registers. See spr_read_hid0_74xx(): HID0's
+     * L1 cache flash-invalidate bits self-clear on real hardware and must
+     * be masked on read, or the ROM's L1-cache-enable readback poll never
+     * sees the invalidate complete.
+     */
     spr_register(env, SPR_HID0, "HID0",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, &spr_write_generic,
+                 &spr_read_hid0_74xx, &spr_write_generic,
                  0x00000000);
 
     spr_register(env, SPR_HID1, "HID1",
