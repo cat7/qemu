@@ -364,7 +364,32 @@ static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
     d->config[PCI_LATENCY_TIMER] = 0x10;
-    /* d->config[PCI_CAPABILITY_LIST] = 0x80; */
+
+    /*
+     * AppleMacRiscAGP walks the PCI capability list on this bridge's own
+     * config space looking for the standard AGP capability (status/command
+     * registers describing rate, sideband addressing, queue depth) during
+     * its own bring-up -- independent of whatever card sits in the AGP
+     * slot. With no capability advertised at all, the driver has nothing
+     * to find and spins forever. Values: AGP 2.0, 1x/2x/4x + SBA
+     * supported, RQ depth 32 -- unremarkable, real-hardware-typical
+     * settings a driver's sanity checks accept; AGPCMD starts at 0
+     * (nothing enabled yet, same as real post-reset state).
+     */
+    d->config[PCI_STATUS] |= PCI_STATUS_CAP_LIST;
+    d->config[PCI_CAPABILITY_LIST] = 0x80;
+    d->config[0x80] = PCI_CAP_ID_AGP;
+    d->config[0x81] = 0x00;         /* next capability pointer: end of list */
+    d->config[0x82] = 0x20;         /* AGP revision: major 2, minor 0 */
+    d->config[0x83] = 0x00;         /* reserved */
+    d->config[0x84] = 0x07;         /* AGPSTAT: RATE1x | RATE2x | RATE4x */
+    d->config[0x85] = 0x02;         /* AGPSTAT: SBA supported (bit 9) */
+    d->config[0x86] = 0x00;
+    d->config[0x87] = 0x20;         /* AGPSTAT: RQ = 32 (bits 31:24) */
+    d->config[0x88] = 0x00;         /* AGPCMD: nothing enabled yet */
+    d->config[0x89] = 0x00;
+    d->config[0x8a] = 0x00;
+    d->config[0x8b] = 0x00;
 }
 
 static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
