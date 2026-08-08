@@ -588,6 +588,24 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
         /* hid specific requests */
     case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
         switch (value >> 8) {
+        case USB_DT_HID:
+            /*
+             * The HID class descriptor itself (as opposed to its Report
+             * sub-descriptor, case 0x22 below) -- Mac OS X 10.0/10.1's USB
+             * stack requests this explicitly during enumeration, and stalls
+             * out the whole device if it isn't answered. It's the first
+             * "other" descriptor attached to this interface.
+             */
+            if (dev->config && dev->config->nif &&
+                dev->config->ifs[0].ndesc &&
+                dev->config->ifs[0].descs[0].data) {
+                const uint8_t *hid_desc = dev->config->ifs[0].descs[0].data;
+                int hid_len = MIN(hid_desc[0], length);
+                memcpy(data, hid_desc, hid_len);
+                p->actual_length = hid_len;
+                break;
+            }
+            goto fail;
         case 0x22:
             if (hs->kind == HID_MOUSE) {
                 memcpy(data, qemu_mouse_hid_report_descriptor,
