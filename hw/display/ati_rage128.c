@@ -2596,6 +2596,34 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
      */
     pci_config_set_interrupt_pin(dev->config, 1);
 
+    /*
+     * The AGP capability this device's class comment flags as absent:
+     * device ID 0x5046 identifies this specifically as the AGP-only
+     * Rage 128 Pro variant, and Apple's AGP driver stack expects an
+     * AGP part to publish one on its own function, independent of the
+     * bridge's. Same fields/values as the matching bridge-side fix in
+     * hw/pci-host/uninorth.c's unin_agp_pci_host_realize(): AGP 2.0,
+     * 1x/2x/4x + SBA supported, RQ depth 32, nothing enabled yet.
+     */
+    {
+        uint8_t *cap;
+        int off = pci_add_capability(dev, PCI_CAP_ID_AGP, 0, 0xc, errp);
+        if (off < 0) {
+            return;
+        }
+        cap = dev->config + off;
+        cap[0x02] = 0x20;  /* AGP revision: major 2, minor 0 */
+        cap[0x03] = 0x00;  /* reserved */
+        cap[0x04] = 0x07;  /* AGPSTAT: RATE1x | RATE2x | RATE4x */
+        cap[0x05] = 0x02;  /* AGPSTAT: SBA supported (bit 9) */
+        cap[0x06] = 0x00;
+        cap[0x07] = 0x20;  /* AGPSTAT: RQ = 32 (bits 31:24) */
+        cap[0x08] = 0x00;  /* AGPCMD: nothing enabled yet */
+        cap[0x09] = 0x00;
+        cap[0x0a] = 0x00;
+        cap[0x0b] = 0x00;
+    }
+
     memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
 
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
