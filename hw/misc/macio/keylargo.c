@@ -634,6 +634,7 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
             bool manual_read = mode == KW_I2C_MODE_DUMB && (c->addr & 1);
 
             if ((mode == KW_I2C_MODE_COMBINED && (c->addr & 1)) ||
+                (mode == KW_I2C_MODE_STANDARD && (c->addr & 1)) ||
                 (manual_read && c->manual_byte_delivered)) {
                 /*
                  * Combined mode is the register-read form: sub-address write,
@@ -641,6 +642,16 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
                  * the transfer out by itself once the driver has taken that
                  * byte -- the Apple ROM reads it and then waits for the stop
                  * interrupt without ever writing a STOP of its own.
+                 *
+                 * Plain STANDARD mode never sends a sub-address at all (see
+                 * keywest_i2c_start()) -- it's a bare "current address read"
+                 * of whatever byte the target device's own internal pointer
+                 * is sitting on. Confirmed live against the PowerMac3,6 ROM's
+                 * ADM1030 probe: it addresses for read with mode=STANDARD and
+                 * never writes a STOP itself either, so without this the
+                 * transfer free-runs forever, reading device memory
+                 * sequentially -- same one-byte-then-stop contract as
+                 * COMBINED's read leg, just without the write leg first.
                  *
                  * DUMB (manual) mode reads do the same, confirmed live, just
                  * one ack later: the address-ack's IRQ_DATA is "empty" (see

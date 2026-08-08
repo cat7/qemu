@@ -52,7 +52,17 @@ static int regfile_i2c_event(I2CSlave *i2c, enum i2c_event event)
 {
     RegFileI2CState *s = REGFILE_I2C_BASE(i2c);
 
-    if (event == I2C_START_SEND) {
+    /*
+     * Reset on I2C_FINISH too, not just I2C_START_SEND: a targeted read
+     * (STANDARDSUB mode, "write the register pointer, repeated start, read
+     * the byte") opens with I2C_START_RECV, which never touches this flag.
+     * Without also clearing it at the end of the PREVIOUS transaction, the
+     * pointer-setting byte of every read after the first gets treated as a
+     * data write into whatever register the pointer was last left at,
+     * instead of repositioning it -- the same reset-on-both-events pattern
+     * hw/nvram/eeprom_at24c.c already uses for the identical reason.
+     */
+    if (event == I2C_START_SEND || event == I2C_FINISH) {
         s->have_pointer = false;
     }
     return 0;
@@ -118,23 +128,46 @@ static const TypeInfo regfile_i2c_base_info = {
 /* ---------------------------------------------------------------------- */
 
 /*
- * Register offsets for the manufacturer/product ID pair are a best-effort
- * placeholder, not confirmed against a live boot trace (unlike the I2C
- * protocol work elsewhere in this project) -- the real device tree only
- * confirms the VALUES (company-id 0x41 = Analog Devices, device-id 0x30),
- * not which register address the real ROM reads them from. Revisit if a
- * live trace shows the ROM probing somewhere else.
+ * A live boot trace (real PowerMac3,6 ROM) shows the full sequence: write
+ * real ADM1030 config registers (0x00 Config1, 0x01 Config2, 0x16/0x1a
+ * THERM limits, 0x22 fan speed config, 0x23 filter, 0x24/0x25 Tmin/Trange
+ * -- matches the datasheet's own "Automatic Fan Speed Control Mode" setup
+ * sequence and the real Linux adm1031 driver's init path, which does the
+ * same read-modify-write dance on 0x00/0x01), then set the read pointer to
+ * 0x3e and read it -- with the STANDARD-mode auto-stop fix in keylargo.c,
+ * this is a normal single-byte "current address read" of the Company ID,
+ * exactly as the real ADM1030 datasheet (Table 16) describes it: reads are
+ * always one byte. Power-on defaults below are transcribed directly from
+ * that same table (Rev 3, April 2012) rather than guessed.
  */
+#define ADM1030_REG_DEVICE_ID  0x3d
 #define ADM1030_REG_COMPANY_ID 0x3e
-#define ADM1030_REG_PRODUCT_ID 0x3f
-
+#define ADM1030_REG_THERM_REV  0x3f
 static void adm1030_reset(DeviceState *dev)
 {
     RegFileI2CState *s = REGFILE_I2C_BASE(dev);
 
-    memset(s->regs, 0, sizeof(s->regs));
+    memset(s->regs, 0xff, sizeof(s->regs));
+    s->regs[0x00] = 0x90; /* Configuration Register 1 */
+    s->regs[0x01] = 0x7f; /* Configuration Register 2 */
+    s->regs[0x02] = 0x00; /* Status Register 1 */
+    s->regs[0x03] = 0x00; /* Status Register 2 */
+    s->regs[0x06] = 0x00; /* Extended Temperature Resolution */
+    s->regs[0x10] = 0xff; /* Fan Tach High Limit */
+    s->regs[0x14] = 0x3c; /* Local Temp High Limit, 60C */
+    s->regs[0x15] = 0x00; /* Local Temp Low Limit, 0C */
+    s->regs[0x16] = 0x46; /* Local Temp Therm Limit, 70C */
+    s->regs[0x18] = 0x50; /* Remote Temp High Limit, 80C */
+    s->regs[0x19] = 0x00; /* Remote Temp Low Limit, 0C */
+    s->regs[0x1a] = 0x64; /* Remote Temp Therm Limit, 100C */
+    s->regs[0x20] = 0x5d; /* Fan Characteristics Register 1 */
+    s->regs[0x22] = 0x05; /* Fan Speed Config Register */
+    s->regs[0x23] = 0x50; /* Fan Filter Register */
+    s->regs[0x24] = 0x41; /* Local Temp Tmin/Trange */
+    s->regs[0x25] = 0x61; /* Remote Temp Tmin/Trange */
+    s->regs[ADM1030_REG_DEVICE_ID] = 0x30;
     s->regs[ADM1030_REG_COMPANY_ID] = 0x41;
-    s->regs[ADM1030_REG_PRODUCT_ID] = 0x30;
+    s->regs[ADM1030_REG_THERM_REV] = 0x80;
     s->pointer = 0;
     s->have_pointer = false;
 }
