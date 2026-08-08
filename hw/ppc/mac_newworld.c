@@ -849,8 +849,16 @@ static void ppc_core99_init(MachineState *machine)
     if (dinfo) {
         qdev_prop_set_drive(dev, "drive", blk_by_legacy_dinfo(dinfo));
     } else {
+        /*
+         * Per-model default filenames: PowerMac3,4 and PowerMac3,6 have
+         * different NVRAM contents (different device trees, SPD data,
+         * etc), so sharing one file between models run from the same
+         * directory would silently cross-contaminate their PRAM/NVRAM.
+         */
+        const char *flash_name = core99_machine->model == CORE99_MODEL_PM36 ?
+            "nvram-flash-36.img" : "nvram-flash-34.img";
         BlockBackend *nvram_blk = rom_is_flash ?
-            macio_nvram_default_blk("nvram-flash.img", NVRAM_FLASH_SIZE, 0xff) :
+            macio_nvram_default_blk(flash_name, NVRAM_FLASH_SIZE, 0xff) :
             macio_nvram_default_blk("nvram.img", MACIO_NVRAM_SIZE, 0);
 
         if (nvram_blk) {
