@@ -692,11 +692,42 @@ static void unin_init(Object *obj)
     sysbus_init_mmio(sbd, &s->i2c.mem);
 }
 
+static ResettablePhases unin_parent_phases;
+
+static void unin_reset_hold(Object *obj, ResetType type)
+{
+    UNINState *s = UNI_NORTH(obj);
+
+    if (unin_parent_phases.hold) {
+        unin_parent_phases.hold(obj, type);
+    }
+
+    /*
+     * s->regs[] is where the firmware's own state lives -- HWINIT_STATE at
+     * offset 0x70 among it (see the comment in unin_read()). A guest-
+     * triggered restart (PMU/CUDA -> qemu_system_reset_request()) re-runs
+     * the ROM's reset-vector code from scratch, but without this, this
+     * same device object's regs[] carries over whatever the PREVIOUS boot
+     * session's firmware already wrote there. The ROM's own early sanity
+     * check on HWINIT_STATE reads that stale "already initialized" value,
+     * takes its fatal-error branch, and hangs forever in a `b .` loop --
+     * confirmed live, NIP parked at that exact instruction after a
+     * guest-initiated restart, on an OS X 10.0 desktop that had booted
+     * and run normally beforehand. Real hardware's electrical reset would
+     * clear this register on every reset, cold or warm; this array
+     * previously had no reset() handler at all, so it never did here.
+     */
+    memset(s->regs, 0, sizeof(s->regs));
+}
+
 static void unin_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
+    resettable_class_set_parent_phases(rc, NULL, unin_reset_hold, NULL,
+                                       &unin_parent_phases);
 }
 
 static const TypeInfo unin_info = {
