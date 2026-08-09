@@ -178,6 +178,40 @@ static void cpu_kick(void *opaque, int n, int level)
     }
 
     /*
+     * XNU's secondary-CPU start protocol (osfmk/ppc/cpu.c cpu_start(),
+     * unchanged across the PowerPC era -- decoded from the 10.2 kernel's
+     * own disassembly and verified live on a 10.4 boot): the kernel
+     * installs a ResetHandler at physical 0x100 that reads a 3-word start
+     * block in low memory --
+     *
+     *   0xF0: type       1 = start request (2/3 = other reset kinds)
+     *   0xF4: entry      physical address to jump to
+     *   0xF8: argument    per_proc pointer, wanted in r3
+     *
+     * -- clears the type word, and branches to [0xF4] with r3 = [0xF8],
+     * translation off. Whoever answers the physical reset is expected to
+     * enter that handler at 0x100.
+     *
+     * The catch is timing: the kernel pulses this soft-reset line as an
+     * assert/deassert pair, and the FIRST release edge fires before it
+     * has written the block (observed live: block still 0 on the first
+     * kick, valid 1/entry on the next). So a release with no valid block
+     * yet is not a signal to run -- it means "not ready, keep waiting."
+     * Leave the CPU halted on that edge; the real start edge, once the
+     * block is populated, releases it into the kernel's own ResetHandler
+     * at 0x100, which then does the [0xF4]/r3 dispatch itself.
+     *
+     * (Re-entering the ROM reset vector at kernel time, as this function
+     * used to, dead-ends every way: the hard-reset path trips UniNorth's
+     * HWINIT_STATE sanity check and hangs at a `b .`, and the soft-reset
+     * path lands in the ROM's SCC serial command monitor no kernel talks
+     * to -- both observed live.)
+     */
+    if (ldl_phys(cs->as, 0xf0) != 1 || ldl_phys(cs->as, 0xf4) == 0) {
+        return;
+    }
+
+    /*
      * Re-sync this CPU's timebase offset with the primary CPU's before
      * starting it, in case of any drift while it was halted.
      */
@@ -189,31 +223,17 @@ static void cpu_kick(void *opaque, int n, int level)
     }
 
     /*
-     * Real hardware wires every CPU's reset vector the same way -- high
-     * ROM alias, matching ppc_core99_reset()'s PROM_BASE + 0x100 for the
-     * primary CPU. The ROM's own permanent secondary-CPU spin/mailbox
-     * routine lives there (verified against the real ROM image: CPU-id
-     * probing followed by a wait loop). Parking the woken CPU at plain
-     * low-RAM 0x100 instead used to work only by accident, while that
-     * address still held whatever the ROM last wrote there -- by the
-     * time the kernel does its own SMP bring-up, RAM at 0x100 has long
-     * since been reused for boot data, and the CPU executed garbage
-     * (observed: both CPUs converging on an identical illegal-instruction
-     * Program exception, stuck spinning at NIP 0x2020).
+     * Enter at the low-memory reset vector with translation off and
+     * exceptions vectored low (excp_prefix 0, i.e. MSR[IP]=0): the kernel
+     * has installed both its ResetHandler at 0x100 and its real exception
+     * handlers at the low vectors (0x300 DSI, 0x400 ISI, ...), and
+     * _start_cpu takes faults before its MMU is up. Leaving excp_prefix
+     * at the ROM alias a previous reset/probe left behind sent those
+     * early faults into the ROM's SCC monitor instead (observed live:
+     * CPU1 dispatched correctly but immediately bounced to 0xfff0ad6c).
      */
-    /*
-     * The reset vector's very first branch (0xfff00114: bne cr7,
-     * 0xfff0020c) reads SRR1 into CR7, not HID0 -- with SRR1 left at its
-     * default zero, CR7.EQ is clear and this branch unconditionally
-     * takes the hard-reset path (the long, racy cold-init chain)
-     * regardless of what HID0[NHR] below says. Set both: SRR1 so the
-     * CR7 check falls through, HID0[NHR] so the reset vector's second
-     * branch takes the short soft-reset dispatch instead.
-     */
-    cpu->env.spr[SPR_SRR1] = 0x2;
-    cpu->env.spr[SPR_HID0] |= 0x00010000;  /* HID0[NHR], bit 15 (IBM numbering) */
-    cpu->env.excp_prefix = PROM_BASE;
-    cpu->env.nip = PROM_BASE + 0x100;
+    cpu->env.excp_prefix = 0;
+    cpu->env.nip = 0x100;
     cpu->env.msr = 0;
 
     cs->halted = 0;
