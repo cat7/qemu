@@ -201,6 +201,17 @@ static void cpu_kick(void *opaque, int n, int level)
      * (observed: both CPUs converging on an identical illegal-instruction
      * Program exception, stuck spinning at NIP 0x2020).
      */
+    /*
+     * The reset vector's very first branch (0xfff00114: bne cr7,
+     * 0xfff0020c) reads SRR1 into CR7, not HID0 -- with SRR1 left at its
+     * default zero, CR7.EQ is clear and this branch unconditionally
+     * takes the hard-reset path (the long, racy cold-init chain)
+     * regardless of what HID0[NHR] below says. Set both: SRR1 so the
+     * CR7 check falls through, HID0[NHR] so the reset vector's second
+     * branch takes the short soft-reset dispatch instead.
+     */
+    cpu->env.spr[SPR_SRR1] = 0x2;
+    cpu->env.spr[SPR_HID0] |= 0x00010000;  /* HID0[NHR], bit 15 (IBM numbering) */
     cpu->env.excp_prefix = PROM_BASE;
     cpu->env.nip = PROM_BASE + 0x100;
     cpu->env.msr = 0;
