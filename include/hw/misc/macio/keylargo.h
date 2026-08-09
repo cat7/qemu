@@ -145,6 +145,22 @@ typedef struct KeyLargoI2CState {
     qemu_irq irq;
     bool xfer_active;
     /*
+     * The vCPU whose transfer is currently on the bus (valid only while
+     * xfer_active). Open Firmware's I2C probing is bare-metal register
+     * pokes with no software semaphore, so on a cold SMP boot both CPUs
+     * can address this single physical controller within microseconds
+     * of each other; this is what lets keywest_i2c_write() tell "my own
+     * follow-up write" apart from "the other CPU is still waiting its
+     * turn" instead of one tearing down the other's in-flight transfer.
+     * See the pending_* fields and keywest_i2c_promote_pending().
+     */
+    CPUState *owner;
+    bool pending_valid;
+    CPUState *pending_owner;
+    uint8_t pending_mode;
+    uint8_t pending_addr;
+    uint8_t pending_subaddr;
+    /*
      * DUMB ("manual") mode's START control bit asserts a bare I2C start
      * condition with no address yet -- unlike XADDR, which addresses the
      * bus itself from the ADDR/SUBADDR registers. This is set between a

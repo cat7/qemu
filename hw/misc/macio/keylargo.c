@@ -28,6 +28,7 @@
 #include "hw/misc/macio/macio.h"
 #include "hw/misc/macio/keylargo.h"
 #include "hw/i2c/i2c.h"
+#include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "qemu/module.h"
 #include "qom/object.h"
@@ -425,16 +426,20 @@ static void keywest_i2c_abort(KeyLargoI2CState *c)
         i2c_end_transfer(c->bus);
         c->xfer_active = false;
     }
+    c->owner = NULL;
     c->status &= ~KW_I2C_STAT_BUSY;
     c->manual_addr_pending = false;
     c->manual_byte_delivered = false;
 }
+
+static void keywest_i2c_promote_pending(KeyLargoI2CState *c);
 
 static void keywest_i2c_stop(KeyLargoI2CState *c)
 {
     keywest_i2c_abort(c);
     /* Let the next transfer's XADDR register as a rising edge again. */
     c->control = 0;
+    keywest_i2c_promote_pending(c);
 }
 
 /*
@@ -444,7 +449,7 @@ static void keywest_i2c_stop(KeyLargoI2CState *c)
  * KeyLargo's I2C only reaches the modem and CardBus slots -- this correctly
  * reports a NAK rather than pretending a device answered.
  */
-static bool keywest_i2c_start(KeyLargoI2CState *c)
+static bool keywest_i2c_start(KeyLargoI2CState *c, CPUState *owner)
 {
     int mode = c->mode & KW_I2C_MODE_MODE_MASK;
     bool recv = c->addr & 1;
@@ -463,12 +468,14 @@ static bool keywest_i2c_start(KeyLargoI2CState *c)
         return false;
     }
     c->xfer_active = true;
+    c->owner = owner;
     c->status |= KW_I2C_STAT_BUSY;
 
     if (mode == KW_I2C_MODE_STANDARDSUB || mode == KW_I2C_MODE_COMBINED) {
         if (i2c_send(c->bus, c->subaddr) < 0) {
             i2c_end_transfer(c->bus);
             c->xfer_active = false;
+            c->owner = NULL;
             return false;
         }
     }
@@ -477,11 +484,55 @@ static bool keywest_i2c_start(KeyLargoI2CState *c)
         if (i2c_start_transfer(c->bus, c->addr >> 1, true) != 0) {
             i2c_end_transfer(c->bus);
             c->xfer_active = false;
+            c->owner = NULL;
             return false;
         }
     }
 
     return true;
+}
+
+/*
+ * Service the CPU that lost the address-phase race while another CPU's
+ * transfer was in flight (see the "contended" branch of
+ * keywest_i2c_write()). Replays its staged mode/addr/subaddr exactly as a
+ * live XADDR write would have, now that the bus is free -- same ack/nak,
+ * same IRQ bits, same auto-abort-on-NAK contract.
+ */
+static void keywest_i2c_promote_pending(KeyLargoI2CState *c)
+{
+    bool ack;
+
+    if (!c->pending_valid) {
+        return;
+    }
+
+    c->pending_valid = false;
+    c->mode = c->pending_mode;
+    c->addr = c->pending_addr;
+    c->subaddr = c->pending_subaddr;
+
+    ack = keywest_i2c_start(c, c->pending_owner);
+
+    if (ack) {
+        c->status |= KW_I2C_STAT_LAST_AAK;
+    } else {
+        c->status &= ~KW_I2C_STAT_LAST_AAK;
+    }
+    if (c->addr & 1) {
+        c->status |= KW_I2C_STAT_LAST_RW;
+    } else {
+        c->status &= ~KW_I2C_STAT_LAST_RW;
+    }
+    if (ack && (c->addr & 1)) {
+        c->data = i2c_recv(c->bus);
+    }
+    keywest_i2c_set_irq(c, KW_I2C_IRQ_ADDR | (ack ? KW_I2C_IRQ_DATA : 0));
+
+    if (!ack) {
+        keywest_i2c_stop(c);
+        keywest_i2c_set_irq(c, KW_I2C_IRQ_STOP);
+    }
 }
 
 static uint64_t keywest_i2c_read(void *opaque, hwaddr addr, unsigned size)
@@ -532,6 +583,53 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
 
     trace_keylargo_i2c_write(c->name, addr & ~0xfULL, val);
 
+    /*
+     * Real hardware is a single physical controller shared by both CPUs;
+     * Apple's own drivers serialize access to it with a software semaphore
+     * (see the "APPLE I2C WRITE SEMAPHORE" trace text below) before ever
+     * touching these registers. Open Firmware's bare-metal probing has no
+     * such guard, so on a cold SMP boot both CPUs can hit this controller
+     * within microseconds of each other. Letting the second CPU's writes
+     * fall through to the normal handling below would tear down or
+     * corrupt the first CPU's in-flight transfer via keywest_i2c_start()'s
+     * unconditional abort -- both CPUs would then freeze permanently,
+     * each waiting on a STOP interrupt neither could ever generate. So
+     * while another CPU owns the bus, stage this one's address/mode setup
+     * instead and defer the actual start until the bus frees up naturally
+     * (see keywest_i2c_promote_pending(), called from keywest_i2c_stop()).
+     * Anything else -- STATUS/ISR/IER pokes, DATA payload bytes -- only
+     * makes sense once a CPU already owns a transfer, which by definition
+     * this one doesn't yet, so those are simply dropped. (A narrow gap
+     * remains if the owning transfer finishes naturally in between this
+     * CPU's own MODE/ADDR/SUBADDR writes -- the ones staged so far are
+     * orphaned in the pending_* shadow rather than flushed live. That
+     * loses at most one I2C transaction's addressing, not a hang, and
+     * cold-boot probing here is a short atomic-looking write sequence, so
+     * it's accepted rather than adding a second full shadow/flush path.)
+     */
+    if (c->xfer_active && c->owner != current_cpu) {
+        switch (addr & ~0xfULL) {
+        case KW_I2C_REG_MODE:
+            c->pending_mode = val;
+            break;
+        case KW_I2C_REG_ADDR:
+            c->pending_addr = val;
+            break;
+        case KW_I2C_REG_SUBADDR:
+            c->pending_subaddr = val;
+            break;
+        case KW_I2C_REG_CONTROL:
+            if (val & KW_I2C_CTL_XADDR) {
+                c->pending_valid = true;
+                c->pending_owner = current_cpu;
+            }
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
     switch (addr & ~0xfULL) {
     case KW_I2C_REG_MODE:
         c->mode = val;
@@ -551,7 +649,7 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         c->control = val;
 
         if (rising & KW_I2C_CTL_XADDR) {
-            bool ack = keywest_i2c_start(c);
+            bool ack = keywest_i2c_start(c, current_cpu);
 
             if (ack) {
                 c->status |= KW_I2C_STAT_LAST_AAK;
@@ -700,6 +798,7 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
             c->addr = val;
             if (i2c_start_transfer(c->bus, val >> 1, val & 1) == 0) {
                 c->xfer_active = true;
+                c->owner = current_cpu;
                 c->status |= KW_I2C_STAT_BUSY | KW_I2C_STAT_LAST_AAK;
                 if (val & 1) {
                     c->status |= KW_I2C_STAT_LAST_RW;
