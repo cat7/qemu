@@ -1401,6 +1401,37 @@ static NetClientInfo net_sungem_info = {
     .link_status_changed = sungem_set_link_status,
 };
 
+/*
+ * QEMU's generic qemu_macaddr_default_if_unset() falls back to the
+ * synthetic 52:54:00 QEMU/Red Hat OUI. Every real Mac using this chip
+ * (the on-board GMAC integrated into UniNorth) ships with Apple's own
+ * registered 00:30:65 OUI -- confirmed against the real PowerMac3,4
+ * (Digital Audio) device-tree dump's local-mac-address property.
+ *
+ * By the time a PCI NIC's realize() runs, `-nic`'s own command-line
+ * parsing (net.c) has already called qemu_macaddr_default_if_unset()
+ * on the NICInfo before qdev_set_nic_properties() ever reaches us, so
+ * conf.macaddr is never still all-zero here -- it already reads
+ * 52:54:00:12:34:<n>. Detect that exact auto-assigned signature (the
+ * same first-5-byte check net.c itself uses to recognise its own
+ * defaults) rather than testing for zero, and swap in the Apple OUI
+ * with the same last byte so we don't reintroduce a collision.
+ */
+static void sungem_macaddr_default_if_unset(MACAddr *macaddr)
+{
+    static const MACAddr qemu_default = { .a = { 0x52, 0x54, 0x00, 0x12, 0x34, 0 } };
+
+    if (memcmp(macaddr->a, &qemu_default.a, sizeof(qemu_default.a) - 1) != 0) {
+        return;
+    }
+    macaddr->a[0] = 0x00;
+    macaddr->a[1] = 0x30;
+    macaddr->a[2] = 0x65;
+    macaddr->a[3] = 0x12;
+    macaddr->a[4] = 0x34;
+    /* macaddr->a[5] left as whatever net.c's free-index allocator picked */
+}
+
 static void sungem_realize(PCIDevice *pci_dev, Error **errp)
 {
     DeviceState *dev = DEVICE(pci_dev);
@@ -1454,7 +1485,7 @@ static void sungem_realize(PCIDevice *pci_dev, Error **errp)
 
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->sungem);
 
-    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    sungem_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&net_sungem_info, &s->conf,
                           object_get_typename(OBJECT(dev)),
                           dev->id, &dev->mem_reentrancy_guard, s);
