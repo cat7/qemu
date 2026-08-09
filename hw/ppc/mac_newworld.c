@@ -81,6 +81,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/cpu.h"
+#include "qemu/timer.h"
 #include "trace.h"
 
 #define MAX_IDE_BUS 3
@@ -207,6 +208,96 @@ static void cpu_kick(void *opaque, int n, int level)
     cs->halted = 0;
     cs->exception_index = -1;
     qemu_cpu_kick(cs);
+}
+
+typedef struct CpuProbeWakeState {
+    PowerPCCPU *cpu;
+    QEMUTimer *rehalt_timer;
+} CpuProbeWakeState;
+
+static void cpu_probe_wake_rehalt(void *opaque)
+{
+    CPUState *cs = opaque;
+
+    /*
+     * Force the probed CPU back to halted regardless of what the ROM's
+     * trampoline (see cpu_probe_wake() below) went on to do -- it has no
+     * business still running once the real ROM's own 64us probe window
+     * (see cpu-probe? in the ROM) has elapsed.
+     */
+    cs->halted = 1;
+    qemu_cpu_kick(cs);
+}
+
+/*
+ * Called when the KeyLargo GPIO line the real Apple ROM's cpu-probe? word
+ * pulses low is toggled (see gpio.c KL_GPIO_CPU_PROBE handling; the exact
+ * address is inferred from the ROM's own code, not from Apple/Linux
+ * documentation). Real hardware presumably has some way for a genuinely
+ * power-on-but-parked secondary CPU to answer this probe without racing
+ * the primary CPU's own concurrent, un-arbitrated cold-init ROM code --
+ * two independent races were found running that shared path on both CPUs
+ * at once (Keywest I2C, and a callback/vector-table setup routine).
+ *
+ * Two things were tried and rejected before this:
+ *
+ * 1) Jump straight to the trampoline the ROM has already copied to
+ *    physical 0x500 (see the cpu-probe? decompile:
+ *    "cpu-vector 500 h#10 move"), leaving SRR0 untouched. This avoids
+ *    both known races (verified live: the CPU parks in a clean, stable,
+ *    non-oscillating wait loop, not either race's address) and runs
+ *    genuinely correct ROM code -- but cpu-probe? still always saw a
+ *    false ack, because the trampoline's first action is
+ *    `mfspr r0, SRR0; stw r0, 0x10(cpu-info)`: SRR0 itself *is* the ack
+ *    value, and a raw NIP poke leaves it at its power-on value of zero.
+ *
+ * 2) Model this as a real HID0[NHR] soft-reset exception (see the
+ *    MPC7410 manual's system-reset chapter) into the ROM's own reset
+ *    vector, so SRR0 lands on the CPU's pre-reset NIP the way real
+ *    hardware's SRESET would. This reaches the real soft-reset dispatch
+ *    correctly (confirmed: HID0 reads back with NHR set, and the CPU
+ *    heads toward the trampoline via the ROM's own code) but the shared
+ *    prologue every reset runs through first (`bl 0xfff0060c`, common to
+ *    both hard- and soft-reset) checks UniNorth HWINIT_STATE and hangs
+ *    (`b .` at 0xfff03600) whenever it's already progressed past its own
+ *    early boot phase -- true by the time anything triggers this pulse
+ *    (confirmed live: HWINIT_STATE reads 0x2, its steady-state value,
+ *    well under a second after boot starts).
+ *
+ * This combines what worked from each: jump straight to the trampoline
+ * (skips the HWINIT_STATE-sensitive shared prologue entirely, same as
+ * attempt 1) but with SRR0 forced nonzero first (fixes attempt 1's
+ * always-false ack, without needing the real reset-vector plumbing
+ * attempt 2 went through to get there). Force the CPU back to halted
+ * shortly after either way -- nothing here can safely let it keep
+ * running the ROM's shared init state indefinitely.
+ */
+static void cpu_probe_wake(void *opaque, int n, int level)
+{
+    CpuProbeWakeState *pw = opaque;
+    PowerPCCPU *cpu = pw->cpu;
+    CPUState *cs = CPU(cpu);
+
+    if (level || !cs->halted) {
+        return;
+    }
+
+    cpu->env.spr[SPR_SRR0] = 0x500;
+    cpu->env.nip = 0x500;
+    cpu->env.msr = 0;
+    cs->halted = 0;
+    cs->exception_index = -1;
+    qemu_cpu_kick(cs);
+
+    /*
+     * The ack write (SRR0 -> cpu-info+0x10) happens within the trampoline's
+     * first ~10 instructions, so this only needs to outlast that, not the
+     * real ROM's full 64us probe window. 500us gives generous headroom
+     * over both without leaving the CPU free-running through the rest of
+     * the shared init state for long.
+     */
+    timer_mod(pw->rehalt_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 500000);
 }
 
 /* OpenBIOS is an ELF; a real Apple ROM is a flat binary image. */
@@ -762,6 +853,17 @@ static void ppc_core99_init(MachineState *machine)
     if (machine->smp.cpus > 3) {
         cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[3], 0);
         sysbus_connect_irq(s, 16, cpu_kick_irq);
+    }
+    if (machine->smp.cpus > 1) {
+        CpuProbeWakeState *pw = g_new0(CpuProbeWakeState, 1);
+        qemu_irq cpu_probe_irq;
+
+        pw->cpu = cpus[1];
+        pw->rehalt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        cpu_probe_wake_rehalt, CPU(cpus[1]));
+        cpu_probe_irq = qemu_allocate_irq(cpu_probe_wake, pw, 0);
+        sysbus_connect_irq(s, KL_GPIO_CPU_PROBE - KEYLARGO_GPIO_EXTINT_0,
+                           cpu_probe_irq);
     }
     g_free(cpus);
 

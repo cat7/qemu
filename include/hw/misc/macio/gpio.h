@@ -40,6 +40,24 @@
 #define KL_GPIO_RESET_CPU2             (KEYLARGO_GPIO_EXTINT_0 + 0x0f)
 #define KL_GPIO_RESET_CPU3             (KEYLARGO_GPIO_EXTINT_0 + 0x10)
 
+/*
+ * Total gpio_regs[] storage: 18 "extint" pins (0x58-0x69) plus 18 "regular"
+ * pins (KEYLARGO_GPIO_0=0x6A onward). Every index gets an IRQ line so any
+ * pin, not just the extint ones, can be wired to a listener the same way
+ * CPU1-3's reset lines are.
+ */
+#define MACIO_GPIO_NR_REGS             36
+
+/*
+ * KEYLARGO_GPIO_0+0x0A (macio offset 0x74, gpio_regs[28]) -- inferred, not
+ * from Apple/Linux documentation: this is the physical address the real
+ * Apple ROM's cpu-probe? word (see cpu_newworld.c cpu_probe_wake()) pulses
+ * low to ask a second CPU to run a trampoline. No independent hardware
+ * documentation confirms this is its real board-level function.
+ */
+#define KEYLARGO_GPIO_0                 0x6a
+#define KL_GPIO_CPU_PROBE               (KEYLARGO_GPIO_0 + 0x0a)
+
 #define TYPE_MACIO_GPIO "macio-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOGPIOState, MACIO_GPIO)
 
@@ -49,9 +67,9 @@ struct MacIOGPIOState {
     /*< public >*/
 
     MemoryRegion gpiomem;
-    qemu_irq gpio_extirqs[KEYLARGO_GPIO_EXTINT_CNT];
+    qemu_irq gpio_extirqs[MACIO_GPIO_NR_REGS];
     uint8_t gpio_levels[8];
-    uint8_t gpio_regs[36];
+    uint8_t gpio_regs[MACIO_GPIO_NR_REGS];
     uint32_t nb_cpus;
 };
 

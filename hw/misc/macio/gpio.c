@@ -57,11 +57,12 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
     }
 
     /*
-     * CPU reset lines (GPIO 3, 4, 15, 16) must always propagate, even if the
-     * register value doesn't change, so that repeated assert/deassert
-     * writes from the guest reliably kick the reset IRQ line.
+     * CPU reset lines (GPIO 3, 4, 15, 16) and the CPU-probe pulse line must
+     * always propagate, even if the register value doesn't change, so that
+     * repeated assert/deassert writes from the guest reliably fire the IRQ.
      */
     if (gpio != 3 && gpio != 4 && gpio != 15 && gpio != 16 &&
+        gpio != (KL_GPIO_CPU_PROBE - KEYLARGO_GPIO_EXTINT_0) &&
         new_reg == s->gpio_regs[gpio]) {
         return;
     }
@@ -86,6 +87,17 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
          * GPIO 3/4/15/16 are the KeyLargo CPU0-3 soft-reset lines used to
          * hold secondary CPUs in reset and release them for SMP.
          */
+        if (!state) {
+            trace_macio_gpio_irq_assert(gpio);
+            qemu_irq_raise(s->gpio_extirqs[gpio]);
+        } else {
+            trace_macio_gpio_irq_deassert(gpio);
+            qemu_irq_lower(s->gpio_extirqs[gpio]);
+        }
+        break;
+
+    case (KL_GPIO_CPU_PROBE - KEYLARGO_GPIO_EXTINT_0):
+        /* Pulse low: see mac_newworld.c cpu_probe_wake(). */
         if (!state) {
             trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
@@ -157,6 +169,12 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
         } else if (s->nb_cpus > 3 &&
                    addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
             macio_set_gpio(s, 16, !(value & OUT_ENABLE) || (ibit != 0));
+        } else if (s->nb_cpus > 1 &&
+                   addr == (KL_GPIO_CPU_PROBE - KEYLARGO_GPIO_EXTINT_0)) {
+            uint32_t gpio = KL_GPIO_CPU_PROBE - KEYLARGO_GPIO_EXTINT_0;
+
+            s->gpio_regs[addr] = value | ibit;
+            macio_set_gpio(s, gpio, !(value & OUT_ENABLE) || (ibit != 0));
         } else {
             s->gpio_regs[addr] = value | ibit;
         }
@@ -199,7 +217,7 @@ static void macio_gpio_init(Object *obj)
     MacIOGPIOState *s = MACIO_GPIO(obj);
     int i;
 
-    for (i = 0; i < KEYLARGO_GPIO_EXTINT_CNT; i++) {
+    for (i = 0; i < MACIO_GPIO_NR_REGS; i++) {
         sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
     }
 
