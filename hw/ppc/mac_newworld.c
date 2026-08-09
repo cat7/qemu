@@ -188,12 +188,20 @@ static void cpu_kick(void *opaque, int n, int level)
     }
 
     /*
-     * The reset vector spin loop the firmware places at 0x100 reads a
-     * mailbox to find its real entry point, matching real hardware's
-     * secondary-CPU boot protocol.
+     * Real hardware wires every CPU's reset vector the same way -- high
+     * ROM alias, matching ppc_core99_reset()'s PROM_BASE + 0x100 for the
+     * primary CPU. The ROM's own permanent secondary-CPU spin/mailbox
+     * routine lives there (verified against the real ROM image: CPU-id
+     * probing followed by a wait loop). Parking the woken CPU at plain
+     * low-RAM 0x100 instead used to work only by accident, while that
+     * address still held whatever the ROM last wrote there -- by the
+     * time the kernel does its own SMP bring-up, RAM at 0x100 has long
+     * since been reused for boot data, and the CPU executed garbage
+     * (observed: both CPUs converging on an identical illegal-instruction
+     * Program exception, stuck spinning at NIP 0x2020).
      */
-    cpu->env.excp_prefix = 0;
-    cpu->env.nip = 0x100;
+    cpu->env.excp_prefix = PROM_BASE;
+    cpu->env.nip = PROM_BASE + 0x100;
     cpu->env.msr = 0;
 
     cs->halted = 0;
