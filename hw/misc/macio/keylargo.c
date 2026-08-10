@@ -244,8 +244,8 @@ static void keylargo_i2s_out_complete(void *opaque)
  * begins draining, and how long to keep waiting for it once the guest
  * stops pushing (so a short final burst still plays out).
  */
-#define KL_I2S_PREBUF_NS        (30 * 1000 * 1000)
-#define KL_I2S_PREBUF_GIVEUP_NS (50 * 1000 * 1000)
+#define KL_I2S_PREBUF_NS        (60 * 1000 * 1000)
+#define KL_I2S_PREBUF_GIVEUP_NS (100 * 1000 * 1000)
 
 static void keylargo_i2s_audio_cb(void *opaque, int avail)
 {
