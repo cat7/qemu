@@ -422,8 +422,16 @@ static OSStatus out_device_ioproc(
     frame_size = core->device_frame_size;
     pending_frames = hw->pending_emul / hw->info.bytes_per_frame;
 
-    /* if there are not enough samples, set signal and return */
+    /*
+     * If there are not enough samples, fill the output with silence and
+     * return. Returning without touching the buffer replays whatever
+     * Core Audio still has in it from the previous cycle: once the
+     * guest stops streaming, the device (which keeps running) then
+     * loops the last fragment of audio indefinitely -- audible as "a
+     * piece of the last sound repeating forever" after every alert.
+     */
     if (pending_frames < frame_size) {
+        memset(out, 0, outOutputData->mBuffers[0].mDataByteSize);
         inInputTime = 0;
         coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(empty)");
         return 0;
