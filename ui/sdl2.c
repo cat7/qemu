@@ -91,8 +91,6 @@ void sdl2_window_create(struct sdl2_console *scon)
 
     if (gui_fullscreen) {
         flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
-    } else {
-        flags |= SDL_WINDOW_RESIZABLE;
     }
     if (scon->hidden) {
         flags |= SDL_WINDOW_HIDDEN;
