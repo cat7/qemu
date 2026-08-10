@@ -757,6 +757,22 @@ static void dbdma_control_write(DBDMA_channel *ch)
                         (value & PAUSE) ? "sett" : "clear");
     }
 
+    /* The general-purpose device status bits (s0-s7) are software
+     * writable through the same mask/value protocol as the control
+     * bits. Mac OS X's audio HAL depends on this: its I2S DBDMA
+     * program is a circular ring of OUTPUT_MORE commands carrying a
+     * branch-if-s0-set abort hook, and the driver stops playback by
+     * setting s0 so the ring branches to its stop/interrupt block.
+     * If the write is dropped the ring cycles (and the last buffer
+     * of audio repeats) forever after the guest has moved on.
+     */
+    if (mask & DEVSTAT) {
+        status = (status & ~(uint32_t)(mask & DEVSTAT)) |
+                 (value & mask & DEVSTAT);
+        DBDMA_DPRINTFCH(ch, " Setting DEVSTAT to 0x%x !\n",
+                        status & DEVSTAT);
+    }
+
     /* FLUSH is its own thing */
     if ((mask & FLUSH) && (value & FLUSH))  {
         DBDMA_DPRINTFCH(ch, " Setting FLUSH !\n");
