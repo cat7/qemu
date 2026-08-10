@@ -112,6 +112,13 @@ typedef struct KeyLargoI2SState {
      * schedule).
      */
     AudioBackend *audio_be;      /* borrowed from the owning device */
+    /*
+     * The TAS3001 codec sits between the I2S cell and the speakers on
+     * real hardware; when the driver ramps its volume register to zero
+     * (Mac OS X's idle path leaves the DMA free-running and silences
+     * the codec instead), the tap must go quiet too.
+     */
+    void *codec;                 /* I2CSlave*, cell 0 only */
     SWVoiceOut *voice;
     int voice_rate;
     uint8_t out_fifo[0x80000];
@@ -187,7 +194,8 @@ void keywest_i2c_init(KeyLargoI2CState *c, DeviceState *owner,
 #define KEYLARGO_I2S_DMA_OUT(cell)  ((cell) * 2)
 #define KEYLARGO_I2S_DMA_IN(cell)   ((cell) * 2 + 1)
 
-void keylargo_i2s_register_dma(KeyLargoState *s, void *dbdma);
+void keylargo_i2s_register_dma(KeyLargoState *s, void *dbdma,
+                               qemu_irq tx0_irq, qemu_irq rx0_irq);
 void keylargo_i2s_update_clocks(KeyLargoState *s);
 KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar);
 

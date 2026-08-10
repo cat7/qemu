@@ -83,6 +83,14 @@
 #define NEWWORLD_IDE2_DMA_CHAN 0xc
 /* i2c@18000: the real PowerMac3,4 tree says interrupts = <0x1a 1> */
 #define NEWWORLD_KEYWEST_IRQ   0x1a
+/*
+ * i2s-a ("i2s@10000"): the ROM's device tree gives the cell an
+ * interrupt-map based at 0x28 -- cell 0x28, tx-dma 0x29, rx-dma 0x2a
+ * (read back from a booted Mac OS X guest's IORegistry: the DBDMA
+ * audio engine's IOInterruptSpecifier resolves to 0x29).
+ */
+#define NEWWORLD_I2S0_TX_DMA_IRQ  0x29
+#define NEWWORLD_I2S0_RX_DMA_IRQ  0x2a
 #define NEWWORLD_EXTING_GPIO1  0x2f
 #define NEWWORLD_EXTING_GPIO9  0x37
 

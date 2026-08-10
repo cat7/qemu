@@ -247,9 +247,12 @@ static void keylargo_i2s_out_complete(void *opaque)
 #define KL_I2S_PREBUF_NS        (60 * 1000 * 1000)
 #define KL_I2S_PREBUF_GIVEUP_NS (100 * 1000 * 1000)
 
+static bool keylargo_i2s_codec_muted(KeyLargoI2SState *c);
+
 static void keylargo_i2s_audio_cb(void *opaque, int avail)
 {
     KeyLargoI2SState *c = opaque;
+    bool muted = keylargo_i2s_codec_muted(c);
 
     if (c->fifo_count == 0) {
         /* Stream drained (or never started): next data prebuffers. */
@@ -285,6 +288,9 @@ static void keylargo_i2s_audio_cb(void *opaque, int avail)
         }
         c->fifo_count -= chunk;
 
+        if (muted) {
+            memset(staging, 0, chunk);
+        }
         written = audio_be_write(c->audio_be, c->voice, staging, chunk);
         written -= written % KL_I2S_FRAME_BYTES;
         avail -= written;
@@ -372,15 +378,25 @@ static void keylargo_i2s_dma_flush(DBDMA_io *io)
 {
 }
 
-void keylargo_i2s_register_dma(KeyLargoState *s, void *dbdma)
+void keylargo_i2s_register_dma(KeyLargoState *s, void *dbdma,
+                               qemu_irq tx0_irq, qemu_irq rx0_irq)
 {
     int cell;
 
     for (cell = 0; cell < 2; cell++) {
-        DBDMA_register_channel(dbdma, KEYLARGO_I2S_DMA_OUT(cell), NULL,
+        /*
+         * The channel interrupt is not optional decoration: Mac OS X's
+         * audio engine takes its sample-clock timestamp from the ring's
+         * interrupt descriptor. With no interrupt delivered the engine
+         * clock never advances and every sound loops at its current
+         * position forever.
+         */
+        DBDMA_register_channel(dbdma, KEYLARGO_I2S_DMA_OUT(cell),
+                               cell == 0 ? tx0_irq : NULL,
                                keylargo_i2s_dma_rw, keylargo_i2s_dma_flush,
                                &s->i2s[cell]);
-        DBDMA_register_channel(dbdma, KEYLARGO_I2S_DMA_IN(cell), NULL,
+        DBDMA_register_channel(dbdma, KEYLARGO_I2S_DMA_IN(cell),
+                               cell == 0 ? rx0_irq : NULL,
                                keylargo_i2s_dma_rw, keylargo_i2s_dma_flush,
                                &s->i2s[cell]);
     }
@@ -765,6 +781,7 @@ struct TAS3001State {
     I2CSlave parent_obj;
     uint8_t subaddr;
     uint8_t pos;
+    bool vol_written;
     uint8_t regs[0x100][TAS3001_MAX_REG_LEN];
 };
 
@@ -786,6 +803,9 @@ static int tas3001_send(I2CSlave *i2c, uint8_t data)
         t->subaddr = data;
     } else if (t->pos - 1 < TAS3001_MAX_REG_LEN) {
         t->regs[t->subaddr][t->pos - 1] = data;
+        if (t->subaddr == 0x04) {
+            t->vol_written = true;
+        }
     }
     t->pos++;
     return 0;
@@ -814,6 +834,40 @@ static const TypeInfo tas3001_info = {
     .instance_size = sizeof(TAS3001State),
     .class_init = tas3001_class_init,
 };
+
+/*
+ * Mac OS X does not stop the I2S DMA when sound finishes: the HAL's ring
+ * keeps cycling and the driver instead silences the TAS3001 -- its idle
+ * path ramps the codec volume register (subaddress 4: three bytes each
+ * of left and right 4.16 fixed-point gain) down to zero. Honour that,
+ * or the last fragment of audio in the ring plays forever.
+ */
+static bool keylargo_i2s_codec_muted(KeyLargoI2SState *c)
+{
+    TAS3001State *t;
+    const uint8_t *vol;
+    int i;
+
+    if (!c->codec) {
+        return false;
+    }
+    t = TAS3001((I2CSlave *)c->codec);
+    if (!t->vol_written) {
+        /*
+         * Nothing has programmed the codec yet -- the boot chime plays
+         * before any OS driver touches it, and the reset-state registers
+         * read zero. Only a driver-written all-zero volume means mute.
+         */
+        return false;
+    }
+    vol = t->regs[0x04];
+    for (i = 0; i < 6; i++) {
+        if (vol[i]) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static void keylargo_register_types(void)
 {
@@ -853,7 +907,7 @@ KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar)
     memory_region_add_subregion(bar, KEYLARGO_I2C_BASE, &s->i2c.mem);
 
     /* The "deq" TAS3001 audio EQ, at 0x34 like the real machine's. */
-    i2c_slave_create_simple(s->i2c.bus, TYPE_TAS3001, 0x34);
+    s->i2s[0].codec = i2c_slave_create_simple(s->i2c.bus, TYPE_TAS3001, 0x34);
 
     return s;
 }

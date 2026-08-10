@@ -427,14 +427,19 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     }
     keylargo->i2s[0].audio_be = ns->audio_be;
     keylargo->i2s[1].audio_be = ns->audio_be;
-    keylargo_i2s_register_dma(keylargo, &s->dbdma);
-
     /* OpenPIC */
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
     sbd = SYS_BUS_DEVICE(&ns->pic);
     sysbus_realize_and_unref(sbd, &error_fatal);
     memory_region_add_subregion(&s->bar, 0x40000,
                                 sysbus_mmio_get_region(sbd, 0));
+
+    /* Needs the realized PIC for the DMA interrupt lines. */
+    keylargo_i2s_register_dma(keylargo, &s->dbdma,
+                              qdev_get_gpio_in(pic_dev,
+                                               NEWWORLD_I2S0_TX_DMA_IRQ),
+                              qdev_get_gpio_in(pic_dev,
+                                               NEWWORLD_I2S0_RX_DMA_IRQ));
 
     sbd = SYS_BUS_DEVICE(&s->escc);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCB_IRQ));
