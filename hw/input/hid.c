@@ -369,6 +369,21 @@ int hid_pointer_poll(HIDState *hs, uint8_t *buf, int len)
         dy = int_clamp(e->ydy, -127, 127);
         e->xdx -= dx;
         e->ydy -= dy;
+        /*
+         * Keep at most one further report's worth of overflow. An
+         * unbounded carry turns a single fast host-pointer flick into a
+         * backlog dribbled out 127 counts per report over many polls:
+         * the guest pointer keeps gliding after the hand has stopped,
+         * and the guest never sees a genuinely fast delta so its own
+         * acceleration curve never engages. A real mouse's counter is
+         * read-and-cleared -- it cannot bank motion it had no room to
+         * report -- but our deltas are host pixels already accelerated
+         * by the host, which overshoot +-127 more often than real
+         * hardware would, so keep one report of slack instead of
+         * discarding the excess outright.
+         */
+        e->xdx = int_clamp(e->xdx, -127, 127);
+        e->ydy = int_clamp(e->ydy, -127, 127);
     } else {
         dx = e->xdx;
         dy = e->ydy;
