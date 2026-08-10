@@ -20,6 +20,7 @@ contrib_plugins = [
 'pcwatch.c',
 'regpc.c',
 'sprwatch.c',
+'sxwatch.c',
 'excburst.c',
 'stoptrigger.c',
 'traps.c',
