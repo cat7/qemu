@@ -55,5 +55,8 @@ keylargo_fcr_write(uint64_t addr, uint32_t val) "FCR addr=0x%"PRIx64" val=0x%08x
 keylargo_i2s_read(int cell, uint64_t addr, uint32_t val) "I2S%d addr=0x%"PRIx64" val=0x%08x"
 keylargo_i2s_write(int cell, uint64_t addr, uint32_t val) "I2S%d addr=0x%"PRIx64" val=0x%08x"
 keylargo_i2s_dma(int cell, uint64_t addr, int len, int rate) "I2S%d dma addr=0x%"PRIx64" len=%d rate=%d"
+keylargo_i2s_fifo_overflow(int cell, int dropped) "I2S%d out fifo full, dropped %d bytes"
+tas3001_reg_write(uint8_t subaddr, int pos, uint8_t val) "deq reg=0x%02x byte %d = 0x%02x"
+keylargo_i2s_cb(int cell, int avail, uint32_t fifo, bool prebuf) "I2S%d cb avail=%d fifo=%u prebuf=%d"
 keylargo_i2c_read(const char *n, uint64_t addr, uint32_t val) "%s R reg=0x%02"PRIx64" val=0x%02x"
 keylargo_i2c_write(const char *n, uint64_t addr, uint32_t val) "%s W reg=0x%02"PRIx64" val=0x%02x"

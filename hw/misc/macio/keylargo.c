@@ -114,15 +114,46 @@ static bool keylargo_i2s_clocks_running(KeyLargoState *s, int cell)
     return (fcr1 & enable) && (fcr1 & clk) && !(fcr1 & reset);
 }
 
+static uint32_t keylargo_i2s_frame_count_now(KeyLargoI2SState *c);
+
 void keylargo_i2s_update_clocks(KeyLargoState *s)
 {
     int cell;
 
     for (cell = 0; cell < 2; cell++) {
-        if (!keylargo_i2s_clocks_running(s, cell)) {
-            s->i2s[cell].intr_ctl |= I2S_INT_CLOCKS_STOPPED_PENDING;
+        KeyLargoI2SState *c = &s->i2s[cell];
+        bool running = keylargo_i2s_clocks_running(s, cell);
+
+        if (!running) {
+            c->intr_ctl |= I2S_INT_CLOCKS_STOPPED_PENDING;
         }
     }
+}
+
+static int keylargo_i2s_rate(KeyLargoI2SState *c);
+
+/*
+ * How far the reported FRAME_COUNT trails real time. The guest's whole
+ * position model hangs off this counter: IOAudioEngine's eraser zeroes
+ * the ring up to it, and the mixer writes a couple of blocks ahead of
+ * it. Our DMA walk jitters within [now - MAX_DEBT, now] around the
+ * main loop, so the counter has to sit far enough in the past that the
+ * eraser (behind the counter) can never overtake the walk -- reading
+ * freshly erased frames was audible as constant 5-20ms dropouts. Keep
+ * COUNT_LAG > MAX_DEBT with margin.
+ */
+#define KL_I2S_COUNT_LAG_NS     (20 * 1000 * 1000)
+
+
+static uint32_t keylargo_i2s_frame_count_now(KeyLargoI2SState *c)
+{
+    int64_t rate = keylargo_i2s_rate(c);
+    uint64_t lag_frames = rate > 0 ?
+        (uint64_t)rate * KL_I2S_COUNT_LAG_NS / NANOSECONDS_PER_SECOND : 0;
+    uint64_t counted = c->walk_frames > lag_frames ?
+        c->walk_frames - lag_frames : 0;
+
+    return (uint32_t)counted + c->frame_count_bias;
 }
 
 static uint64_t keylargo_i2s_read(void *opaque, hwaddr addr, unsigned size)
@@ -141,7 +172,7 @@ static uint64_t keylargo_i2s_read(void *opaque, hwaddr addr, unsigned size)
         val = c->data_word_sizes;
         break;
     case I2S_REG_FRAME_COUNT:
-        val = c->frame_count;
+        val = keylargo_i2s_frame_count_now(c);
         break;
     default:
         val = 0;
@@ -173,7 +204,13 @@ static void keylargo_i2s_write(void *opaque, hwaddr addr, uint64_t value,
         c->data_word_sizes = value;
         break;
     case I2S_REG_FRAME_COUNT:
-        c->frame_count = value;
+        /*
+         * Bias against the raw walk count, not the lagged readback:
+         * biasing against the lagged value would cancel the lag, and
+         * the eraser (which chases this register) would race the DMA
+         * walk again.
+         */
+        c->frame_count_bias = value - (uint32_t)c->walk_frames;
         break;
     default:
         break;
@@ -247,16 +284,55 @@ static void keylargo_i2s_out_complete(void *opaque)
 #define KL_I2S_PREBUF_NS        (60 * 1000 * 1000)
 #define KL_I2S_PREBUF_GIVEUP_NS (100 * 1000 * 1000)
 
+/*
+ * How far completion pacing may fall behind before descriptors stop
+ * retiring back-to-back; also bounds the burst (and the dma_end
+ * recursion depth, ~28 of Mac OS X's 128-byte ring pieces) after a
+ * stall.
+ */
+#define KL_I2S_MAX_DEBT_NS      (10 * 1000 * 1000)
+
+
 static bool keylargo_i2s_codec_muted(KeyLargoI2SState *c);
+
+/*
+ * The i2s cell keeps clocking zeros whenever the guest has nothing
+ * queued, and the emulated voice must do the same: the mixing engine
+ * only advances a shared hw voice by the minimum progress across all
+ * active sw voices, so an active voice that writes nothing pins that
+ * minimum at zero and starves every other frontend on the same
+ * audiodev (usb-audio being the audible victim).
+ */
+static void keylargo_i2s_write_silence(KeyLargoI2SState *c, int avail)
+{
+    static const uint8_t zeros[4096];
+
+    avail -= avail % KL_I2S_FRAME_BYTES;
+    while (avail >= KL_I2S_FRAME_BYTES) {
+        size_t chunk = MIN(avail, (int)sizeof(zeros));
+        size_t written;
+
+        written = audio_be_write(c->audio_be, c->voice,
+                                 (void *)zeros, chunk);
+        written -= written % KL_I2S_FRAME_BYTES;
+        avail -= written;
+        if (written < chunk) {
+            break;
+        }
+    }
+}
 
 static void keylargo_i2s_audio_cb(void *opaque, int avail)
 {
     KeyLargoI2SState *c = opaque;
     bool muted = keylargo_i2s_codec_muted(c);
 
+    trace_keylargo_i2s_cb(c->cell, avail, c->fifo_count, c->prebuffering);
+
     if (c->fifo_count == 0) {
         /* Stream drained (or never started): next data prebuffers. */
         c->prebuffering = true;
+        keylargo_i2s_write_silence(c, avail);
         return;
     }
     if (c->prebuffering) {
@@ -267,6 +343,7 @@ static void keylargo_i2s_audio_cb(void *opaque, int avail)
 
         if (c->fifo_count < want &&
             now - c->last_push_ns < KL_I2S_PREBUF_GIVEUP_NS) {
+            keylargo_i2s_write_silence(c, avail);
             return;
         }
         c->prebuffering = false;
@@ -341,10 +418,16 @@ static void keylargo_i2s_tap_out(KeyLargoI2SState *c, DBDMA_io *io, int rate)
 
         dma_memory_read(&address_space_memory, addr, buf, len,
                         MEMTXATTRS_UNSPECIFIED);
+        if (c->dump_fp) {
+            fwrite(buf, 1, len, c->dump_fp);
+        }
         for (i = 0; i < len && c->fifo_count < sizeof(c->out_fifo); i++) {
             c->out_fifo[c->fifo_wptr] = buf[i];
             c->fifo_wptr = (c->fifo_wptr + 1) % sizeof(c->out_fifo);
             c->fifo_count++;
+        }
+        if (i < len) {
+            trace_keylargo_i2s_fifo_overflow(c->cell, len - i);
         }
         addr += len;
         remaining -= len;
@@ -361,14 +444,35 @@ static void keylargo_i2s_dma_rw(DBDMA_io *io)
 
     trace_keylargo_i2s_dma(c->cell, io->addr, io->len, rate);
 
-    if (io->is_dma_out && keylargo_i2s_frame_bytes(c) == KL_I2S_FRAME_BYTES) {
-        keylargo_i2s_tap_out(c, io, rate);
+    if (io->is_dma_out) {
+        c->walk_frames += frames;
+        if (keylargo_i2s_frame_bytes(c) == KL_I2S_FRAME_BYTES) {
+            keylargo_i2s_tap_out(c, io, rate);
+        }
     }
 
-    if (c->play_deadline_ns < now) {
-        c->play_deadline_ns = now;       /* the stream had drained */
+    /*
+     * Cap the pacing debt so a stalled stream doesn't burst unboundedly
+     * when it resumes, then charge this descriptor.
+     */
+    if (c->play_deadline_ns < now - KL_I2S_MAX_DEBT_NS) {
+        c->play_deadline_ns = now - KL_I2S_MAX_DEBT_NS;
     }
     c->play_deadline_ns += dur_ns;
+
+    if (c->play_deadline_ns <= now) {
+        /*
+         * Behind schedule: retire immediately. Waiting out a timer costs
+         * a main-loop round trip per descriptor, and Mac OS X's engine
+         * runs the ring in 128-byte pieces (725us each) -- paying ~0.5ms
+         * of turnaround on every one capped the stream at half the
+         * sample rate, so the FIFO underran continuously (heard as
+         * chopped, repeating audio). The debt cap above bounds how many
+         * descriptors can retire back-to-back this way.
+         */
+        io->dma_end(io);
+        return;
+    }
 
     c->pending_out_io = io;
     timer_mod(c->out_complete_timer, c->play_deadline_ns);
@@ -376,6 +480,30 @@ static void keylargo_i2s_dma_rw(DBDMA_io *io)
 
 static void keylargo_i2s_dma_flush(DBDMA_io *io)
 {
+    KeyLargoI2SState *c = io->opaque;
+
+    /*
+     * DBDMA calls this on FLUSH and whenever the channel stops; the
+     * contract (see mac_dbdma.c) is that the outstanding command must
+     * complete before ACTIVE drops. Left pending, our completion timer
+     * fired dma_end() into whatever the guest had reprogrammed the
+     * channel to by then: Mac OS X's audio engine stop/start sequence
+     * (IODBDMAStop + IODBDMAReset, then IODBDMAStart at the ring base
+     * with a zeroed FRAME_COUNT) got its fresh ring skipped ahead by a
+     * stale continuation on every restart, sliding the DMA walk out of
+     * phase with the driver's ring-position model -- each output-device
+     * switch degraded playback further until only slivers of each sound
+     * survived the eraser.
+     */
+    if (c->pending_out_io) {
+        DBDMA_io *pending = c->pending_out_io;
+
+        c->pending_out_io = NULL;
+        timer_del(c->out_complete_timer);
+        pending->dma_end(pending);
+    }
+    /* No pacing debt survives into a restarted stream. */
+    c->play_deadline_ns = 0;
 }
 
 void keylargo_i2s_register_dma(KeyLargoState *s, void *dbdma,
@@ -806,6 +934,7 @@ static int tas3001_send(I2CSlave *i2c, uint8_t data)
         if (t->subaddr == 0x04) {
             t->vol_written = true;
         }
+        trace_tas3001_reg_write(t->subaddr, t->pos - 1, data);
     }
     t->pos++;
     return 0;

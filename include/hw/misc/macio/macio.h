@@ -180,6 +180,7 @@ struct NewWorldMacIOState {
     bool has_adb;
     bool real_ata;
     AudioBackend *audio_be;
+    char *i2s_dump_path;
     OpenPICState pic;
     MACIOIDEState ide[3];
     MacIOGPIOState gpio;

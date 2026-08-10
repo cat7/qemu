@@ -92,7 +92,24 @@ typedef struct KeyLargoI2SState {
     uint32_t intr_ctl;
     uint32_t serial_format;
     uint32_t data_word_sizes;
-    uint32_t frame_count;
+    /*
+     * FRAME_COUNT counts every frame the cell clocks out, and the Apple
+     * drivers use it as the playback position: AppleI2SAudio's
+     * getCurrentSampleFrame() is this register, and IOAudioEngine's
+     * eraser zeroes the ring "behind" it (left static, the eraser never
+     * ran and a sound's last ring lap repeated forever). It is derived
+     * from the DMA walk, not from time: a wall-clock counter kept
+     * running while an engine stop parked the walk, so after any
+     * output-device switch the guest's ring-position model diverged
+     * from where the walk actually was, and each subsequent sound
+     * mixed into parts of the ring the walk never visited (heard as
+     * progressively shorter fragments). Walk-derived, the counter is
+     * structurally in lockstep with the ring position across stop/
+     * restart, and the eraser (which trails the counter) can never
+     * overtake the walk.
+     */
+    uint64_t walk_frames;        /* frames the DMA walk has consumed */
+    uint32_t frame_count_bias;   /* guest-written FRAME_COUNT offset */
 
     /*
      * Sound DMA has to be paced to real playback time. Completing a
@@ -135,6 +152,9 @@ typedef struct KeyLargoI2SState {
      */
     bool prebuffering;
     int64_t last_push_ns;
+    /* optional debug capture of every byte the DMA walk reads */
+    char *dump_path;
+    FILE *dump_fp;
 } KeyLargoI2SState;
 
 typedef struct KeyLargoI2CState {

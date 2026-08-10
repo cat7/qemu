@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "hw/misc/macio/cuda.h"
 #include "hw/pci/pci.h"
@@ -427,6 +428,15 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     }
     keylargo->i2s[0].audio_be = ns->audio_be;
     keylargo->i2s[1].audio_be = ns->audio_be;
+    if (ns->i2s_dump_path && *ns->i2s_dump_path) {
+        keylargo->i2s[0].dump_fp = fopen(ns->i2s_dump_path, "wb");
+        if (!keylargo->i2s[0].dump_fp) {
+            warn_report("macio: cannot open i2s dumpfile %s",
+                        ns->i2s_dump_path);
+        } else {
+            setvbuf(keylargo->i2s[0].dump_fp, NULL, _IOFBF, 1 << 16);
+        }
+    }
     /* OpenPIC */
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
     sbd = SYS_BUS_DEVICE(&ns->pic);
@@ -632,6 +642,7 @@ static const VMStateDescription vmstate_macio_newworld = {
 static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_AUDIO_PROPERTIES(NewWorldMacIOState, audio_be),
+    DEFINE_PROP_STRING("i2s-dumpfile", NewWorldMacIOState, i2s_dump_path),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
     /* Real KeyLargo ATA layout (Apple ROM) vs the one OpenBIOS describes */
     DEFINE_PROP_BOOL("real-ata", NewWorldMacIOState, real_ata, true),
