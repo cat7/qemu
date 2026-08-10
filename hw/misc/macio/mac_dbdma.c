@@ -134,6 +134,7 @@ static void conditional_interrupt(DBDMA_channel *ch)
     case INTR_NEVER:  /* don't interrupt */
         return;
     case INTR_ALWAYS: /* always interrupt */
+        trace_dbdma_interrupt(ch->channel);
         qemu_irq_raise(ch->irq);
         DBDMA_DPRINTFCH(ch, "%s: raise\n", __func__);
         return;
@@ -149,12 +150,14 @@ static void conditional_interrupt(DBDMA_channel *ch)
     switch(intr) {
     case INTR_IFSET:  /* intr if condition bit is 1 */
         if (cond) {
+            trace_dbdma_interrupt(ch->channel);
             qemu_irq_raise(ch->irq);
             DBDMA_DPRINTFCH(ch, "%s: raise\n", __func__);
         }
         return;
     case INTR_IFCLR:  /* intr if condition bit is 0 */
         if (!cond) {
+            trace_dbdma_interrupt(ch->channel);
             qemu_irq_raise(ch->irq);
             DBDMA_DPRINTFCH(ch, "%s: raise\n", __func__);
         }
@@ -678,6 +681,23 @@ void DBDMA_kick(DBDMAState *dbdma)
     qemu_bh_schedule(dbdma->bh);
 }
 
+/*
+ * Retire an in-progress command from a device's flush callback: write
+ * the descriptor status back with ACTIVE cleared, the way a flush that
+ * aborts a parked transfer leaves the channel quiesced. Mac OS 9's
+ * serial driver drains its RX ring by setting FLUSH and polling the
+ * armed INPUT descriptor's xfer_status until ACTIVE goes away; a
+ * write-back that still carries ACTIVE reads as "still draining" and
+ * the driver retries forever.
+ */
+void DBDMA_flush_retire(DBDMA_io *io)
+{
+    DBDMA_channel *ch = io->channel;
+
+    ch->regs[DBDMA_STATUS] &= ~ACTIVE;
+    io->dma_end(io);
+}
+
 void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
                             DBDMA_rw rw, DBDMA_flush flush,
                             void *opaque)
@@ -821,7 +841,8 @@ static void dbdma_control_write(DBDMA_channel *ch)
 
     /* Finally update the status register image */
     ch->regs[DBDMA_STATUS] = status;
-    trace_dbdma_control_write_done(ch->channel, status);
+    trace_dbdma_control_write_done(ch->channel, status,
+                                   ch->regs[DBDMA_CMDPTR_LO]);
 
     /* If active, make sure the BH gets to run */
     if (status & ACTIVE) {

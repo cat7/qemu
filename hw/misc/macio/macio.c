@@ -409,6 +409,26 @@ static const MemoryRegionOps timer_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static void macio_escc_idle_dma_rw(DBDMA_io *io)
+{
+    if (io->is_dma_out) {
+        /* Idle sink: transmitted bytes vanish, completion is instant. */
+        io->dma_end(io);
+    }
+    /*
+     * Input: no serial data ever arrives, so the command stays parked
+     * exactly like real hardware's -- ACTIVE, resident, waiting. The
+     * guest ends it with a channel FLUSH (below) or channel teardown.
+     */
+}
+
+static void macio_escc_idle_dma_flush(DBDMA_io *io)
+{
+    if (io->processing) {
+        DBDMA_flush_retire(io);
+    }
+}
+
 static void macio_newworld_realize(PCIDevice *d, Error **errp)
 {
     MacIOState *s = MACIO(d);
@@ -445,6 +465,32 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
                                 sysbus_mmio_get_region(sbd, 0));
 
     /* Needs the realized PIC for the DMA interrupt lines. */
+    /*
+     * ESCC serial DMA channels (SCC-A tx/rx = 4/5, SCC-B tx/rx = 6/7),
+     * with real idle-line semantics. Mac OS 9.2's serial driver arms an
+     * RX ring ([STOP][INPUT_MORE][STORE_QUAD][NOP/branch] gates) during
+     * boot and then drains it: set FLUSH, then poll the armed INPUT
+     * descriptor's xfer_status for ACTIVE -- the write-back a real
+     * channel performs when a flush lands on a command that is parked
+     * waiting for serial data. The unassigned-channel fallback instead
+     * completed the INPUT instantly (an idle line never does), the ring
+     * sailed on to the next STOP gate, and the poll spun forever:
+     * Mac OS 9.2 froze at "Starting Up..." while its serial/AppleTalk
+     * stack initialized. Park inputs; complete them from the flush.
+     */
+    for (int escc_ch = 4; escc_ch <= 7; escc_ch++) {
+        /*
+         * DMA interrupt sources from the real PowerMac3,4 device tree:
+         * ch-a (tx/rx = channels 4/5) raises 0x05/0x06, ch-b (6/7)
+         * raises 0x07/0x08 -- i.e. channel + 1. The serial driver's
+         * post-drain state machine only advances from these interrupts.
+         */
+        DBDMA_register_channel(&s->dbdma, escc_ch,
+                               qdev_get_gpio_in(pic_dev, escc_ch + 1),
+                               macio_escc_idle_dma_rw,
+                               macio_escc_idle_dma_flush, NULL);
+    }
+
     keylargo_i2s_register_dma(keylargo, &s->dbdma,
                               qdev_get_gpio_in(pic_dev,
                                                NEWWORLD_I2S0_TX_DMA_IRQ),

@@ -46,8 +46,9 @@ pmu_debug_protocol_cmd_resp_complete(int ier) "Response send complete. IER=0x%02
 # mac_dbdma.c
 dbdma_write(int channel, int reg, uint64_t value) "channel=0x%x reg=0x%x value=0x%"PRIx64
 dbdma_read(int channel, int reg, uint64_t value) "channel=0x%x reg=0x%x value=0x%"PRIx64
-dbdma_control_write_done(int channel, uint32_t status) "channel=0x%x new_status=0x%08x"
+dbdma_control_write_done(int channel, uint32_t status, uint32_t cmdptr) "channel=0x%x new_status=0x%08x cmdptr=0x%08x"
 dbdma_channel_run(int channel, uint16_t command) "channel=0x%x command=0x%04x"
+dbdma_interrupt(int channel) "channel=0x%x"
 
 # keylargo.c
 keylargo_fcr_read(uint64_t addr, uint32_t val) "FCR addr=0x%"PRIx64" val=0x%08x"
