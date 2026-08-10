@@ -944,6 +944,7 @@ mask_active_if_processing:
     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
                     (uint32_t)addr >> DBDMA_CHANNEL_SHIFT, reg);
 
+    trace_dbdma_read(channel, reg, value);
     return value;
 }
 
