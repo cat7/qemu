@@ -95,8 +95,8 @@ static void awacs_fifo_push(AWACSState *s, const uint8_t *data, int len)
 /* Playout cushion (see the field comment in awacs.h): target depth the
  * FIFO must reach before a freshly (re)started stream begins draining,
  * and how long to keep waiting for it once the guest stops pushing. */
-#define AWACS_PREBUF_NS         (30 * 1000 * 1000)
-#define AWACS_PREBUF_GIVEUP_NS  (50 * 1000 * 1000)
+#define AWACS_PREBUF_NS         (60 * 1000 * 1000)
+#define AWACS_PREBUF_GIVEUP_NS  (100 * 1000 * 1000)
 
 static void awacs_audio_callback(void *opaque, int avail)
 {
