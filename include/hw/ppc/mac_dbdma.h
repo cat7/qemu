@@ -234,7 +234,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(DBDMAState, MAC_DBDMA)
 
 /* Externally callable functions */
 
-void DBDMA_flush_retire(DBDMA_io *io);
+void DBDMA_park_writeback(DBDMA_io *io);
 void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
                             DBDMA_rw rw, DBDMA_flush flush,
                             void *opaque);

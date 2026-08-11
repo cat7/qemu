@@ -409,24 +409,24 @@ static const MemoryRegionOps timer_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/*
+ * The SCC's DMA request line is never asserted by our async-only escc
+ * model, so every ESCC DBDMA command stays uncompleted: status written
+ * back once, no completion, no interrupt, flush a no-op. Mac OS 9.2's
+ * SerialDMA boot-time init is proven to fail past exactly these
+ * semantics within seconds (measured on upstream QEMU with the same
+ * disk image; see DBDMA_park_writeback()). Deliberately NOT modeled as
+ * "helpful" completions: retiring the drain commands lets the driver
+ * into a deeper init stage it then polls forever, freezing the boot.
+ */
 static void macio_escc_idle_dma_rw(DBDMA_io *io)
 {
-    if (io->is_dma_out) {
-        /* Idle sink: transmitted bytes vanish, completion is instant. */
-        io->dma_end(io);
-    }
-    /*
-     * Input: no serial data ever arrives, so the command stays parked
-     * exactly like real hardware's -- ACTIVE, resident, waiting. The
-     * guest ends it with a channel FLUSH (below) or channel teardown.
-     */
+    DBDMA_park_writeback(io);
 }
 
 static void macio_escc_idle_dma_flush(DBDMA_io *io)
 {
-    if (io->processing) {
-        DBDMA_flush_retire(io);
-    }
+    /* No transfer is ever in progress, so there is nothing to flush. */
 }
 
 static void macio_newworld_realize(PCIDevice *d, Error **errp)
@@ -466,17 +466,14 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
 
     /* Needs the realized PIC for the DMA interrupt lines. */
     /*
-     * ESCC serial DMA channels (SCC-A tx/rx = 4/5, SCC-B tx/rx = 6/7),
-     * with real idle-line semantics. Mac OS 9.2's serial driver arms an
-     * RX ring ([STOP][INPUT_MORE][STORE_QUAD][NOP/branch] gates) during
-     * boot and then drains it: set FLUSH, then poll the armed INPUT
-     * descriptor's xfer_status for ACTIVE -- the write-back a real
-     * channel performs when a flush lands on a command that is parked
-     * waiting for serial data. The unassigned-channel fallback instead
-     * completed the INPUT instantly (an idle line never does), the ring
-     * sailed on to the next STOP gate, and the poll spun forever:
-     * Mac OS 9.2 froze at "Starting Up..." while its serial/AppleTalk
-     * stack initialized. Park inputs; complete them from the flush.
+     * ESCC serial DMA channels (SCC-A tx/rx = 4/5, SCC-B tx/rx = 6/7).
+     * Registered so they don't inherit the generic unassigned-channel
+     * fallback, whose auto-completion misleads Mac OS 9.2's SerialDMA
+     * boot-time init (a drained RX ring that "succeeds" walks the
+     * driver into a deeper init stage it polls forever, freezing the
+     * boot at "Starting Up..."). See macio_escc_idle_dma_rw() for the
+     * request-line-never-asserted semantics these channels present
+     * instead.
      */
     for (int escc_ch = 4; escc_ch <= 7; escc_ch++) {
         /*

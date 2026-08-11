@@ -682,20 +682,35 @@ void DBDMA_kick(DBDMAState *dbdma)
 }
 
 /*
- * Retire an in-progress command from a device's flush callback: write
- * the descriptor status back with ACTIVE cleared, the way a flush that
- * aborts a parked transfer leaves the channel quiesced. Mac OS 9's
- * serial driver drains its RX ring by setting FLUSH and polling the
- * armed INPUT descriptor's xfer_status until ACTIVE goes away; a
- * write-back that still carries ACTIVE reads as "still draining" and
- * the driver retries forever.
+ * Write the current I/O command's status back to its descriptor
+ * (xfer_status with the channel still RUN|ACTIVE, res_count = nothing
+ * transferred) and leave the command uncompleted: no interrupt, no
+ * branch, no command-pointer advance. This is what a real DBDMA
+ * channel presents to the guest while its device never asserts the
+ * request line, and it is the behavior Mac OS's SerialDMA driver is
+ * demonstrably able to fail past: the same OS 9.2 image booted on
+ * upstream QEMU (whose ESCC DMA channels are unregistered and behave
+ * exactly like this) runs its whole SCC-B drain/init sequence -- 6
+ * transfer attempts, 58 flushes -- inside 15 seconds, errors out, and
+ * boots on to the desktop. Semantics that instead *complete* the
+ * drain (retiring the command with ACTIVE cleared) let the driver
+ * into a deeper init stage that polls forever on ring state our
+ * emulation cannot produce, freezing the boot at "Starting Up...".
  */
-void DBDMA_flush_retire(DBDMA_io *io)
+void DBDMA_park_writeback(DBDMA_io *io)
 {
     DBDMA_channel *ch = io->channel;
+    dbdma_cmd *current = &ch->current;
+    uint16_t cmd = le16_to_cpu(current->command) & COMMAND_MASK;
 
-    ch->regs[DBDMA_STATUS] &= ~ACTIVE;
-    io->dma_end(io);
+    io->processing = false;
+
+    if (cmd == OUTPUT_MORE || cmd == OUTPUT_LAST ||
+        cmd == INPUT_MORE || cmd == INPUT_LAST) {
+        current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+        current->res_count = cpu_to_le16(io->len);
+        dbdma_cmdptr_save(ch);
+    }
 }
 
 void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
