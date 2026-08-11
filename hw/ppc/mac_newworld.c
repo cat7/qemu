@@ -74,6 +74,7 @@
 #include "hw/core/fw-path-provider.h"
 #include "elf.h"
 #include "qemu/error-report.h"
+#include <zlib.h>                /* adler32() for the CHRP nvram outer checksum */
 #include "system/kvm.h"
 #include "system/reset.h"
 #include "kvm_ppc.h"
@@ -461,6 +462,139 @@ static int core99_macio_devfn(Core99Model model)
 static int core99_usb_devfn(Core99Model model)
 {
     return model == CORE99_MODEL_PM36 ? pm36_usb_devfn() : pm34_usb_devfn();
+}
+
+/* CHRP nvram partition-header checksum (see include/hw/nvram/chrp_nvram.h). */
+static uint8_t core99_chrp_cksum(const uint8_t *hdr)
+{
+    unsigned int sum = hdr[0];
+    int i;
+
+    for (i = 0; i < 14; i++) {
+        sum += hdr[2 + i];
+        sum = (sum + ((sum & 0xff00) >> 8)) & 0xff;
+    }
+    return sum & 0xff;
+}
+
+/*
+ * Make the built-in gmac usable under Mac OS by publishing its MAC on the
+ * Open Firmware ethernet node.
+ *
+ * Mac OS (classic AppleTalk/OT and OS X's AppleGMACEthernet) reads the
+ * Ethernet MAC solely from the OF "local-mac-address" property and will not
+ * create en0 without it; a "built-in" property additionally makes it show as
+ * "Built-in Ethernet" rather than a PCI slot. The real Apple ROM's own gmac
+ * driver never publishes these -- its (open) aborts on an internal ALLOC-MEM
+ * cap before it gets there -- so we inject them ourselves via the OF
+ * "boot-command" variable, honouring whatever MAC the gmac was given on the
+ * command line (or QEMU's default when none was specified).
+ *
+ * boot-command (not nvramrc) is used deliberately: nvramrc runs before
+ * probe-all, when /pci@f4000000/ethernet@f does not yet exist; boot-command
+ * runs at the end of start-up, after the PCI ethernet node has been probed.
+ *
+ * The nvram is Apple/CHRP format: an 8KB image mirrored inside the 16KB
+ * flash, OF variables stored as name=value NUL strings in the "common"
+ * partition. Every edit must fix both the per-partition header checksum and
+ * the outer Adler32 (at copy+0x10, over [copy+0x14 : copy+0x2000]); without
+ * the latter the ROM rejects the image ("NVRAM corrupted") and wipes it.
+ */
+static void core99_nvram_set_gmac_bootcmd(uint8_t *data, uint32_t size,
+                                          const uint8_t mac[6])
+{
+    const uint32_t COPY = 0x2000;
+    g_autofree char *bootcmd = g_strdup_printf(
+        "boot-command=dev /pci@f4000000/ethernet@f "
+        "here h# %02x over c! 1+ h# %02x over c! 1+ h# %02x over c! 1+ "
+        "h# %02x over c! 1+ h# %02x over c! 1+ h# %02x swap c! "
+        "here 6 encode-bytes \" local-mac-address\" property "
+        "0 0 encode-bytes \" built-in\" property device-end mac-boot",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    uint32_t base;
+
+    for (base = 0; base + COPY <= size; base += COPY) {
+        uint32_t off;
+
+        /* Replace boot-command in this copy's "common" partition. */
+        for (off = base; off + 16 <= base + COPY; ) {
+            uint32_t plen = (((data[off + 2] << 8) | data[off + 3]) * 16);
+
+            if (plen == 0) {
+                break;
+            }
+            if (data[off] == 0x70 &&
+                memcmp(&data[off + 4], "common", 6) == 0) {
+                uint32_t dstart = off + 16, dlen = plen - 16, i;
+                GString *vars = g_string_new(NULL);
+                bool seen = false;
+
+                for (i = dstart; i < dstart + dlen && data[i]; ) {
+                    const char *v = (const char *)&data[i];
+                    size_t vl = strnlen(v, dstart + dlen - i);
+
+                    if (!strncmp(v, "boot-command=", 13)) {
+                        g_string_append(vars, bootcmd);
+                        seen = true;
+                    } else {
+                        g_string_append_len(vars, v, vl);
+                    }
+                    g_string_append_c(vars, '\0');
+                    i += vl + 1;
+                }
+                if (!seen) {
+                    g_string_append(vars, bootcmd);
+                    g_string_append_c(vars, '\0');
+                }
+                g_string_append_c(vars, '\0');   /* end-of-list marker */
+
+                if (vars->len <= dlen) {
+                    memset(&data[dstart], 0, dlen);
+                    memcpy(&data[dstart], vars->str, vars->len);
+                    data[off + 1] = core99_chrp_cksum(&data[off]);
+                } else {
+                    warn_report("gmac: nvram vars too large, "
+                                "local-mac-address not injected");
+                }
+                g_string_free(vars, TRUE);
+                break;
+            }
+            off += plen;
+        }
+
+        /* Fix the outer Adler32 in this copy's "nvram" (0x5a) header. */
+        if (data[base] == 0x5a &&
+            !memcmp(&data[base + 4], "nvram", 5)) {
+            /* Standard Adler-32 (initial value 1), as the real Apple ROM uses. */
+            uint32_t a = adler32(1, &data[base + 0x14], COPY - 0x14);
+            stl_be_p(&data[base + 0x10], a);
+        }
+    }
+}
+
+/*
+ * Read the built-in gmac's effective MAC (command-line or QEMU default) and
+ * inject it into the OF nvram so Mac OS brings up the interface. No-op if no
+ * sungem device is present.
+ */
+static void core99_inject_gmac_mac(MacIONVRAMState *nvr)
+{
+    Object *o = object_resolve_path_type("", "sungem", NULL);
+    g_autofree char *macstr = NULL;
+    uint8_t mac[6];
+
+    if (!o || !nvr->data) {
+        return;
+    }
+    macstr = object_property_get_str(o, "mac", NULL);
+    if (!macstr) {
+        return;
+    }
+    if (sscanf(macstr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6) {
+        return;
+    }
+    core99_nvram_set_gmac_bootcmd(nvr->data, nvr->size, mac);
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -1022,6 +1156,15 @@ static void ppc_core99_init(MachineState *machine)
      */
     if (!rom_is_flash && macio_nvram_is_blank(nvr, MACIO_NVRAM_SIZE)) {
         pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    }
+    /*
+     * Real Apple ROM: inject the built-in gmac's MAC into the OF device tree
+     * via boot-command so Mac OS recognises and brings up Built-in Ethernet
+     * (the ROM's own gmac driver never publishes local-mac-address). Patches
+     * the in-RAM nvram image only; the backing file is left untouched.
+     */
+    if (rom_is_flash) {
+        core99_inject_gmac_mac(nvr);
     }
     /* No PCI init: the BIOS will do it */
 
