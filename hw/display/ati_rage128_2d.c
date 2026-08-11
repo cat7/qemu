@@ -98,43 +98,6 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
     default:
         break;
     }
-
-}
-
-/*
- * Engine writes go straight through the RAM pointer, bypassing the
- * MemoryRegion accessors that would otherwise set the dirty bits, so the
- * operations mark their destination by hand. Without this, everything the
- * 2D engine draws is invisible to dirty tracking: the display refresh has
- * no reason to repaint those scanlines, and -- because this device reuses
- * DIRTY_MEMORY_VGA to find the live framebuffer -- an accelerated desktop
- * looks like a completely idle region of VRAM (observed live on Mac OS X
- * 10.3: a valid, actively-drawn 800x600 desktop scored as dead and was
- * overridden by a garbled auto-detect guess).
- *
- * Marking happens ONCE PER OPERATION over the touched row span, not per
- * pixel: memory_region_set_dirty() is a global-state call, and issuing it
- * for every pixel of every blit made the whole guest visibly slower. The
- * span may over-mark the row edges; over-marking is harmless.
- */
-static void ati_rage128_2d_mark_rows_dirty(ATIRage128State *s,
-                                           uint32_t offset, uint32_t stride,
-                                           int y0, int y1)
-{
-    hwaddr start, len;
-
-    if (y1 < y0 || !stride) {
-        return;
-    }
-    start = offset + (hwaddr)y0 * stride;
-    len = (hwaddr)(y1 - y0 + 1) * stride;
-    if (start >= ATI_RAGE128_VRAM_SIZE) {
-        return;
-    }
-    if (start + len > ATI_RAGE128_VRAM_SIZE) {
-        len = ATI_RAGE128_VRAM_SIZE - start;
-    }
-    memory_region_set_dirty(&s->vram, start, len);
 }
 
 static uint32_t ati_rage128_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,
@@ -187,12 +150,99 @@ static uint32_t ati_rage128_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,
     return result;
 }
 
+
+/*
+ * Pattern ("brush") lookup for one destination pixel.
+ *
+ * Returns false when the pixel must be left untouched -- that is what
+ * the transparent "_LA" (leave alone) brush types mean, and it is what
+ * turns a rectangle stamped with a 50% dither into a dotted outline
+ * rather than a solid block.
+ *
+ * The mono pattern lives in BRUSH_DATA0.. as a bitmap, one row per
+ * byte for the 8-wide forms and one row per dword for the 32-wide ones,
+ * MSB first within a byte (the same order the mono host-data expander
+ * uses). BRUSH_Y_X gives the pattern origin.
+ */
+static bool ati_rage128_2d_brush(ATIRage128State *s, int x, int y, int bpp,
+                                 uint32_t *pat)
+{
+    unsigned type = (s->dp_datatype & R128_DP_BRUSH_DATATYPE) >>
+                    R128_DP_BRUSH_DATATYPE_SHIFT;
+    uint32_t yx = s->regs[R128_BRUSH_Y_X >> 2];
+    int bx = x - (int)(yx & 0xffff);
+    int by = y - (int)((yx >> 16) & 0xffff);
+    const uint32_t *data = &s->regs[R128_BRUSH_DATA0 >> 2];
+    bool transparent = false;
+    int pw, ph, bit;
+
+    switch (type) {
+    case R128_BRUSH_SOLID_COLOR:
+    case R128_BRUSH_NONE:
+    default:
+        *pat = s->dp_brush_frgd_clr;
+        return true;
+
+    case R128_BRUSH_8X8_COLOR:
+        *pat = data[((by & 7) * 8 + (bx & 7)) & 63];
+        return true;
+    case R128_BRUSH_1X8_COLOR:
+        *pat = data[by & 7];
+        return true;
+
+    case R128_BRUSH_8X8_MONO_FG_LA:
+        transparent = true;
+        /* fall through */
+    case R128_BRUSH_8X8_MONO_FG_BG:
+        pw = 8; ph = 8;
+        break;
+    case R128_BRUSH_1X8_MONO_FG_LA:
+        transparent = true;
+        /* fall through */
+    case R128_BRUSH_1X8_MONO_FG_BG:
+        pw = 1; ph = 8;
+        break;
+    case R128_BRUSH_32X1_MONO_FG_LA:
+        transparent = true;
+        /* fall through */
+    case R128_BRUSH_32X1_MONO_FG_BG:
+        pw = 32; ph = 1;
+        break;
+    case R128_BRUSH_32X32_MONO_FG_LA:
+        transparent = true;
+        /* fall through */
+    case R128_BRUSH_32X32_MONO_FG_BG:
+        pw = 32; ph = 32;
+        break;
+    }
+
+    bx &= pw - 1;
+    by &= ph - 1;
+    if (pw == 32) {
+        bit = (data[by] >> (31 - bx)) & 1;
+    } else {
+        /* eight rows of eight bits: four rows to a dword, low byte first */
+        bit = (data[by >> 2] >> ((by & 3) * 8 + (7 - bx))) & 1;
+    }
+
+    if (bit) {
+        *pat = s->dp_brush_frgd_clr;
+        return true;
+    }
+    if (transparent) {
+        return false;
+    }
+    *pat = s->dp_brush_bkgd_clr;
+    return true;
+}
+
 static void ati_rage128_2d_do_blt(ATIRage128State *s)
 {
     int bpp = ati_rage128_bpp_from_dp_datatype(s);
     uint8_t rop = (s->dp_mix >> 16) & 0xff;
     bool left_to_right = s->dp_cntl & R128_DST_X_LEFT_TO_RIGHT;
     bool top_to_bottom = s->dp_cntl & R128_DST_Y_TOP_TO_BOTTOM;
+    bool overlaps;
     int width = s->dst_width;
     int height = s->dst_height;
     uint32_t dst_stride, src_stride;
@@ -228,77 +278,25 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     }
 
     /*
-     * Row-wise fast paths for the four ops that carry essentially all of
-     * an accelerated desktop's traffic (full-surface copies and fills,
-     * issued every frame): straight copy, solid fill, clear to 0/1. The
-     * general per-pixel read-modify-write loop below costs several calls
-     * per pixel, which at 800x600x32bpp per frame is the difference
-     * between a fluid desktop and a sluggish one. Semantics mirror the
-     * general loop exactly (same scissor clip, no write-mask/color-
-     * compare handling there either); vertical direction is honored so
-     * overlapping scrolls stay correct, horizontal overlap is memmove's
-     * problem. 24bpp stays on the general path.
+     * Pick a non-destructive direction when a copy overlaps itself.
+     *
+     * Mac OS never varies the direction bits -- DP_CNTL reads 0x0107,
+     * left-to-right and top-to-bottom, for every blit, including the six
+     * overlapping down-and-right copies a single diagonal window drag
+     * produces. Real hardware clearly does not corrupt those, so the
+     * engine must order the copy itself rather than trusting the driver.
+     * Walking forward regardless re-read rows that had already been
+     * overwritten, smearing repeated fragments across a window whenever
+     * it was dragged anything other than exactly horizontally.
      */
-    if ((rop == 0xcc || rop == 0xf0 || rop == 0x00 || rop == 0xff) &&
-        bpp != 24) {
-        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-        int bypp = bpp / 8;
-        int x0 = MAX((int)s->dst_x, sc_left);
-        int x1 = MIN((int)s->dst_x + width - 1, sc_right);
-        int y0 = MAX((int)s->dst_y, sc_top);
-        int y1 = MIN((int)s->dst_y + height - 1, sc_bottom);
-        int n = x1 - x0 + 1;
-
-        if (n <= 0 || y1 < y0) {
-            return;
-        }
-        for (y = 0; y < y1 - y0 + 1; y++) {
-            int dy = top_to_bottom ? y0 + y : y1 - y;
-            uint64_t daddr = (uint64_t)s->dst_offset +
-                             (uint64_t)dy * dst_stride +
-                             (uint64_t)x0 * bypp;
-
-            if (daddr + (uint64_t)n * bypp > ATI_RAGE128_VRAM_SIZE) {
-                continue;
-            }
-            if (rop == 0xcc) {
-                int sy = (int)s->src_y + (dy - (int)s->dst_y);
-                int sx = (int)s->src_x + (x0 - (int)s->dst_x);
-                uint64_t saddr = (uint64_t)s->src_offset +
-                                 (uint64_t)sy * src_stride +
-                                 (uint64_t)sx * bypp;
-
-                if (sy < 0 || sx < 0 ||
-                    saddr + (uint64_t)n * bypp > ATI_RAGE128_VRAM_SIZE) {
-                    continue;
-                }
-                memmove(vram + daddr, vram + saddr, (size_t)n * bypp);
-            } else if (rop == 0x00) {
-                memset(vram + daddr, 0, (size_t)n * bypp);
-            } else if (rop == 0xff) {
-                memset(vram + daddr, 0xff, (size_t)n * bypp);
-            } else {
-                uint32_t color = s->dp_brush_frgd_clr;
-
-                if (bypp == 4) {
-                    uint32_t *p = (uint32_t *)(vram + daddr);
-
-                    for (x = 0; x < n; x++) {
-                        stl_le_p(p + x, color);
-                    }
-                } else if (bypp == 2) {
-                    uint16_t *p = (uint16_t *)(vram + daddr);
-
-                    for (x = 0; x < n; x++) {
-                        stw_le_p(p + x, color);
-                    }
-                } else {
-                    memset(vram + daddr, color, (size_t)n);
-                }
-            }
-        }
-        ati_rage128_2d_mark_rows_dirty(s, s->dst_offset, dst_stride, y0, y1);
-        return;
+    overlaps = s->src_offset == s->dst_offset &&
+               (int)s->dst_x < (int)s->src_x + width &&
+               (int)s->src_x < (int)s->dst_x + width &&
+               (int)s->dst_y < (int)s->src_y + height &&
+               (int)s->src_y < (int)s->dst_y + height;
+    if (overlaps) {
+        left_to_right = s->dst_x <= s->src_x;
+        top_to_bottom = s->dst_y <= s->src_y;
     }
 
     for (y = 0; y < height; y++) {
@@ -317,10 +315,13 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
                                    : (int)s->src_x + width - 1 - x;
             uint32_t src_pixel = 0;
             uint32_t dst_pixel;
-            uint32_t pat_pixel = s->dp_brush_frgd_clr;
+            uint32_t pat_pixel;
             uint32_t result;
 
             if (dx < sc_left || dx > sc_right) {
+                continue;
+            }
+            if (!ati_rage128_2d_brush(s, dx, dy, bpp, &pat_pixel)) {
                 continue;
             }
             if (rop != 0xf0) {
@@ -336,23 +337,178 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
                                        bpp, result);
         }
     }
+}
 
-    ati_rage128_2d_mark_rows_dirty(s, s->dst_offset, dst_stride,
-                                   MAX((int)s->dst_y, sc_top),
-                                   MIN((int)s->dst_y + height - 1,
-                                       sc_bottom));
+
+static uint32_t ati_rage128_scale_texel(const uint8_t *row, int sx,
+                                        unsigned dt)
+{
+    int y, u, v, r, g, b;
+
+    switch (dt) {
+    case R128_SCALE_DT_YUYV422:
+    case R128_SCALE_DT_UYVY422:
+    {
+        const uint8_t *p = row + (sx & ~1) * 2;
+
+        if (dt == R128_SCALE_DT_YUYV422) {      /* Y0 U Y1 V */
+            y = p[(sx & 1) ? 2 : 0];
+            u = p[1];
+            v = p[3];
+        } else {                                /* U Y0 V Y1 ('2vuy') */
+            y = p[(sx & 1) ? 3 : 1];
+            u = p[0];
+            v = p[2];
+        }
+        break;
+    }
+    case R128_SCALE_DT_AYUV444:
+        y = row[sx * 4 + 1];
+        u = row[sx * 4 + 2];
+        v = row[sx * 4 + 3];
+        break;
+    case R128_SCALE_DT_Y8:
+        y = row[sx];
+        u = v = 128;
+        break;
+    case R128_SCALE_DT_ARGB8888:
+        return ldl_be_p(row + sx * 4) & 0xffffff;
+    case R128_SCALE_DT_RGB565:
+    {
+        uint16_t px = lduw_be_p(row + sx * 2);
+
+        return (((px >> 11) & 0x1f) << 19) | (((px >> 5) & 0x3f) << 10) |
+               ((px & 0x1f) << 3);
+    }
+    case R128_SCALE_DT_ARGB1555:
+    {
+        uint16_t px = lduw_be_p(row + sx * 2);
+
+        return (((px >> 10) & 0x1f) << 19) | (((px >> 5) & 0x1f) << 11) |
+               ((px & 0x1f) << 3);
+    }
+    default:
+        return 0;
+    }
+
+    y = (y - 16) * 298;
+    u -= 128;
+    v -= 128;
+    r = (y + 409 * v + 128) >> 8;
+    g = (y - 100 * u - 208 * v + 128) >> 8;
+    b = (y + 516 * u + 128) >> 8;
+    r = MIN(MAX(r, 0), 255);
+    g = MIN(MAX(g, 0), 255);
+    b = MIN(MAX(b, 0), 255);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+/*
+ * CNTL_SCALING: a scaled, optionally YUV-converting copy from a source
+ * image in VRAM into the destination rectangle. This is how Mac OS plays
+ * video on this card -- the counterpart of the mach64's scaler pipe, and
+ * it carries the same parameters for the same movie.
+ *
+ * Nearest-neighbour: the increments are DDA accumulator steps with 12
+ * fractional bits, sitting at bits 19:4 exactly as the mach64's do.
+ * Reading them unshifted gives a sixteen-fold downscale, which cannot be
+ * right when the source and destination are the same size.
+ */
+void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t dst_xy = pkt[R128_SCALE_PKT_DST_X_Y];
+    uint32_t dst_hw = pkt[R128_SCALE_PKT_DST_H_W];
+    uint32_t sc_tl = pkt[R128_SCALE_PKT_SC_TL];
+    uint32_t sc_br = pkt[R128_SCALE_PKT_SC_BR];
+    unsigned dt = pkt[R128_SCALE_PKT_DATATYPE] & 0xf;
+    uint32_t src_off = pkt[R128_SCALE_PKT_OFFSET] & ~7u;
+    uint32_t src_pitch = (pkt[R128_SCALE_PKT_PITCH] & 0x3fff) * 8;
+    uint32_t x_inc = pkt[R128_SCALE_PKT_X_INC] >> 4;
+    uint32_t y_inc = pkt[R128_SCALE_PKT_Y_INC] >> 4;
+    int dst_x = (dst_xy >> 16) & 0x3fff, dst_y = dst_xy & 0x3fff;
+    int w = dst_hw & 0x3fff, h = (dst_hw >> 16) & 0x3fff;
+    int sc_left = sc_tl & 0x3fff, sc_top = (sc_tl >> 16) & 0x3fff;
+    int sc_right = sc_br & 0x3fff, sc_bottom = (sc_br >> 16) & 0x3fff;
+    int bpp = ati_rage128_bpp_from_dp_datatype(s);
+    /*
+     * The packet carries its own pitch/offset for both source and
+     * destination -- its context dword sets both PITCH_OFFSET_CNTL bits,
+     * which is precisely what those bits mean. Using the engine's
+     * left-over state instead sent every scaled frame to wherever the
+     * previous operation happened to be pointing.
+     */
+    uint32_t dpo = pkt[R128_SCALE_PKT_DST_PITCH_OFF];
+    uint32_t dst_off = (dpo & R128_PITCH_OFFSET_OFF_MASK) <<
+                       R128_PITCH_OFFSET_OFF_SHIFT;
+    uint32_t dst_stride = (dpo >> R128_PITCH_OFFSET_PITCH_SHIFT) * bpp;
+    int src_bpp, x, y;
+
+    trace_ati_rage128_scale(dst_x, dst_y, w, h, src_off, src_pitch,
+                            x_inc, y_inc, dt);
+    if (!bpp || !dst_stride || !x_inc || !y_inc || !src_pitch ||
+        w <= 0 || h <= 0) {
+        return;
+    }
+
+    switch (dt) {
+    case R128_SCALE_DT_Y8:
+        src_bpp = 1;
+        break;
+    case R128_SCALE_DT_ARGB1555:
+    case R128_SCALE_DT_RGB565:
+    case R128_SCALE_DT_YUYV422:
+    case R128_SCALE_DT_UYVY422:
+        src_bpp = 2;
+        break;
+    case R128_SCALE_DT_ARGB8888:
+    case R128_SCALE_DT_AYUV444:
+        src_bpp = 4;
+        break;
+    default:
+        trace_ati_rage128_scale_unimp(dt);
+        return;
+    }
+
+    for (y = 0; y < h; y++) {
+        int dy = dst_y + y;
+        uint32_t sy = ((uint32_t)y * y_inc) >> 12;
+        const uint8_t *row;
+
+        if (dy < sc_top || dy > sc_bottom) {
+            continue;
+        }
+        row = vram + src_off + sy * src_pitch * (uint32_t)src_bpp;
+        if (src_off + (sy + 1) * src_pitch * (uint32_t)src_bpp >
+            ATI_RAGE128_VRAM_SIZE) {
+            break;
+        }
+        for (x = 0; x < w; x++) {
+            int dx = dst_x + x;
+            uint32_t sx = ((uint32_t)x * x_inc) >> 12;
+
+            if (dx < sc_left || dx > sc_right) {
+                continue;
+            }
+            if ((sx + 1) * (uint32_t)src_bpp > src_pitch * (uint32_t)src_bpp) {
+                break;
+            }
+            ati_rage128_2d_write_pixel(s, dst_off, dst_stride, dx, dy, bpp,
+                                       ati_rage128_scale_texel(row, sx, dt));
+        }
+    }
 }
 
 void ati_rage128_2d_blt(ATIRage128State *s)
 {
     uint32_t src_source = s->dp_mix & R128_DP_SRC_SOURCE;
 
-    trace_ati_rage128_2d_blt(s->src_offset, (s->src_x << 16) | s->src_y,
-                             s->dst_offset, (s->dst_x << 16) | s->dst_y,
+    trace_ati_rage128_2d_blt((s->src_x << 16) | s->src_y,
+                             (s->dst_x << 16) | s->dst_y,
                              s->dst_width, s->dst_height,
-                             (s->src_pitch << 16) | s->dst_pitch,
                              (s->dp_mix >> 16) & 0xff, s->dp_datatype,
-                             src_source >> 8);
+                             src_source >> 8, s->src_offset, s->dst_offset,
+                             (s->src_pitch << 16) | s->dst_pitch);
 
     if (s->host_data_active) {
         /* A new blt implicitly ends any still-in-progress HOST_DATA
@@ -385,7 +541,28 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
     int bpp = ati_rage128_bpp_from_dp_datatype(s);
     uint32_t src_datatype = s->dp_datatype & R128_DP_SRC_DATATYPE;
     uint32_t dst_stride;
-    uint8_t pix_buf[16]; /* 128 bits */
+    /*
+     * One accumulator holds 128 bits. As COLOUR data that is at most 16
+     * pixels (8bpp); expanded from MONOCHROME it is 128 pixels of up to
+     * four bytes each. Sizing this for the colour case only -- as it was
+     * -- let the mono expander below run 128 pixels into a 16-byte
+     * buffer, smashing the stack: a guest-triggered abort, seen live
+     * (SIGABRT via __stack_chk_fail) the first time Mac OS issued a mono
+     * host-data blit on this card.
+     */
+    uint8_t pix_buf[128 * 4];
+    /*
+     * Which expanded pixels must not be written at all. Source datatype
+     * MONO_FRGD ("foreground / leave alone") paints only the set bits and
+     * leaves the destination untouched everywhere else -- the same
+     * transparency the "_LA" brush types have. Painting the clear bits
+     * with the background colour instead turned every submenu arrow into
+     * a solid black square, the glyph's cell filled in rather than
+     * masked.
+     */
+    bool pix_skip[128];
+    uint32_t acc[4];
+    int sc_left, sc_top, sc_right, sc_bottom;
     unsigned bypp, pix_count, idx, row, col;
 
     if (!s->host_data_active) {
@@ -403,9 +580,46 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
         return false;
     }
 
+    /*
+     * HOST_BIG_ENDIAN_EN: the payload was written by a big-endian host
+     * and has to be converted, by PIXEL size -- a full dword swap for
+     * 32bpp, a swap within each halfword for 16bpp, nothing for 8bpp
+     * (where byte order inside a dword is already the pixel order).
+     * The Mac driver relies on this: it byte-swaps its COMMAND dwords in
+     * software so the little-endian command fetch reads them correctly,
+     * then ships bitmap payload verbatim and leaves the conversion to
+     * the chip. Without it every host-supplied pixel lands reversed.
+     */
+    if ((s->dp_datatype & R128_HOST_BIG_ENDIAN_EN) &&
+        src_datatype == R128_SRC_COLOR) {
+        unsigned w;
+
+        /*
+         * Colour payload only. A monochrome source is a bitmask, not
+         * pixels -- there is no pixel size to swap by, and its bit order
+         * is already spelled out by BYTE_PIX_ORDER below, so leave it
+         * alone rather than guess.
+         */
+        for (w = 0; w < ARRAY_SIZE(acc); w++) {
+            uint32_t v = s->host_data_acc[w];
+
+            if (bpp == 32) {
+                acc[w] = bswap32(v);
+            } else if (bpp == 16) {
+                acc[w] = ((v & 0x00ff00ffu) << 8) | ((v & 0xff00ff00u) >> 8);
+            } else {
+                acc[w] = v;
+            }
+        }
+    } else {
+        memcpy(acc, s->host_data_acc, sizeof(acc));
+    }
+
+    memset(pix_skip, 0, sizeof(pix_skip));
+
     if (src_datatype == R128_SRC_COLOR) {
-        pix_count = sizeof(pix_buf) / bypp;
-        memcpy(pix_buf, s->host_data_acc, sizeof(s->host_data_acc));
+        pix_count = sizeof(acc) / bypp;
+        memcpy(pix_buf, acc, sizeof(acc));
     } else {
         uint32_t byte_pix_order = s->dp_datatype & R128_DP_BYTE_PIX_ORDER;
         uint32_t fg = s->dp_src_frgd_clr;
@@ -414,14 +628,18 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
 
         /* Expand the 128 accumulated monochrome bits to bypp-sized
          * foreground/background pixels. */
+        bool transparent = src_datatype == R128_SRC_MONO_FRGD;
+
         for (word = 0; word < 4; word++) {
             for (byte = 0; byte < 4; byte++) {
-                uint8_t byte_val = s->host_data_acc[word] >> (byte * 8);
+                uint8_t byte_val = acc[word] >> (byte * 8);
 
                 for (bit = 0; bit < 8; bit++) {
                     bool is_fg = byte_val &
                                  (1u << (byte_pix_order ? bit : 7 - bit));
                     uint32_t color = is_fg ? fg : bg;
+
+                    pix_skip[pidx / bypp] = !is_fg && transparent;
 
                     switch (bypp) {
                     case 1:
@@ -438,7 +656,33 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
                 }
             }
         }
-        pix_count = sizeof(pix_buf) / bypp;
+        /*
+         * 128 bits in, one pixel out per bit. This used to be recomputed
+         * as sizeof(pix_buf) / bypp, i.e. the COLOUR pixel count, so all
+         * but the first few expanded pixels of every chunk were silently
+         * dropped -- monochrome text and icons came out mangled.
+         */
+        pix_count = 128;
+    }
+
+    /*
+     * The destination scissors apply here just as they do to an ordinary
+     * blit. That matters more than it sounds: the Mac driver pads every
+     * host-data blit's WIDTH up to a multiple of four pixels -- one
+     * 128-bit accumulator chunk -- and relies on the scissors to throw
+     * the padding away. Captured live, 1061 of 1613 host-data blits
+     * overhang their clip rectangle, including a 1028-pixel-wide blit on
+     * a 1024-pixel screen. The padding dwords are junk, so drawing them
+     * put one to four columns of speckled garbage down the right-hand
+     * edge of every icon, button, glyph run and menu.
+     */
+    sc_left = s->sc_left;
+    sc_top = s->sc_top;
+    sc_right = s->sc_right;
+    sc_bottom = s->sc_bottom;
+    if (sc_right == 0 && sc_bottom == 0) {
+        sc_right = 0x3fff;
+        sc_bottom = 0x3fff;
     }
 
     row = s->host_data_row;
@@ -449,8 +693,17 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
         unsigned i;
 
         for (i = 0; i < n; i++) {
+            int dx = (int)(s->dst_x + col + i);
+            int dy = (int)(s->dst_y + row);
             uint32_t color;
 
+            if (dx < sc_left || dx > sc_right ||
+                dy < sc_top || dy > sc_bottom) {
+                continue;
+            }
+            if (pix_skip[idx + i]) {
+                continue;       /* mask bit clear: leave the destination */
+            }
             switch (bypp) {
             case 1:
                 color = pix_buf[(idx + i) * bypp];
@@ -476,10 +729,6 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
             row++;
         }
     }
-    ati_rage128_2d_mark_rows_dirty(s, s->dst_offset, dst_stride,
-                                   (int)s->dst_y + (int)s->host_data_row,
-                                   (int)s->dst_y + (int)row);
-
     s->host_data_row = row;
     s->host_data_col = col;
     if (s->host_data_row >= s->dst_height) {

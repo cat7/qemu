@@ -37,6 +37,16 @@
 #define R128_GPIO_MONID              0x0068
 #define R128_SEPROM_CNTL             0x006c
 /*
+ * The retail card's FCode drives 0x6C as a second GPIO port ("GPIO
+ * MONID B": A [3:0], Y [11:8] read-only, EN [19:16], MASK [27:24] --
+ * same lane layout as GPIO_MONID) for its DDC/EDID path: its word
+ * 0x918 sets MASK=0xf, toggles CRTC_OFFSET bit 23 and expects pad 3
+ * (Y bit 3) to follow -- a cable/DDC presence handshake -- before the
+ * bulk EDID read. The RRG names 0x6C SEPROM_CNTL; both uses share the
+ * pads on real silicon.
+ */
+#define R128_GPIO_MONIDB             0x006c
+/*
  * The hardware I2C engine (0x0090/0x0094/0x0098) is NOT documented in
  * RRG-G04500-C at all, but the OEM Mac FCode ROM's constant table
  * includes all three offsets and XFree86's r128_reg.h names them
@@ -90,9 +100,6 @@
 #define R128_SOFT_RESET_GUI          (1u << 0)
 #define R128_PC_NGUI_MODE            0x0180
 #define R128_PC_NGUI_CTLSTAT         0x0184
-/* GUI-engine pixel cache twin of the pair above (SourceFiles ati_regs.h) */
-#define R128_PC_GUI_MODE             0x1744
-#define R128_PC_GUI_CTLSTAT          0x1748
 #define R128_PC_MISC_CTL             0x0188
 #define R128_CRTC_H_TOTAL_DISP       0x0200
 #define R128_CRTC_H_SYNC_STRT_WID    0x0204
@@ -112,6 +119,21 @@
 #define R128_CUR_HORZ_VERT_OFF       0x0268
 #define R128_CUR_CLR0                0x026c
 #define R128_CUR_CLR1                0x0270
+
+/* Hardware cursor field layout (RRG-G04500-C 3.13) */
+#define R128_CUR_OFFSET_MASK         0x01fffff0 /* [24:0], [3:0] hardwired 0 */
+#define R128_CUR_LOCK                (1u << 31) /* atomic shape/move update */
+#define R128_CUR_VERT_POSN_MASK      0x7ff      /* [10:0] */
+#define R128_CUR_HORZ_POSN_SHIFT     16         /* [26:16] */
+#define R128_CUR_HORZ_POSN_MASK      0x7ff
+#define R128_CUR_VERT_OFF_MASK       0x3f       /* [5:0] */
+#define R128_CUR_HORZ_OFF_SHIFT      16         /* [21:16] */
+#define R128_CUR_HORZ_OFF_MASK       0x3f
+/* 64x64 pixels, 16 bytes per row: 8 of AND mask then 8 of XOR mask */
+#define R128_CUR_WIDTH               64
+#define R128_CUR_HEIGHT              64
+#define R128_CUR_ROW_BYTES           16
+#define R128_CUR_IMAGE_BYTES         (R128_CUR_HEIGHT * R128_CUR_ROW_BYTES)
 #define R128_DAC_EXT_CNTL            0x0280
 #define R128_DDA_CONFIG              0x02e0
 #define R128_DDA_ON_OFF              0x02e4
@@ -218,10 +240,52 @@
  * generation's PM4 parser).
  */
 #define R128_PM4_OPCODE_PAINT         0x91
-#define R128_PM4_OPCODE_BITBLT        0x92
-#define R128_PM4_OPCODE_HOSTDATA_BLT  0x94
+/*
+ * PAINT_MULTI: the same solid-fill operation as PAINT, but carrying
+ * several rectangles in one packet -- the payload is consecutive
+ * (DST_Y_X, DST_HEIGHT_WIDTH) pairs, with the drawing context set up
+ * beforehand through ordinary register writes (the Mac driver programs
+ * it via the GUI context "_C" aliases). Classic Mac OS paints every
+ * window panel, button and dialog background with these, so dropping
+ * them leaves only text and lines on screen -- the long-standing
+ * "ghost window" rendering on this card.
+ */
 #define R128_PM4_OPCODE_PAINT_MULTI   0x9a
+#define R128_PM4_OPCODE_BITBLT        0x92
+/*
+ * CNTL_BITBLT_MULTI: BITBLT carrying its own destination pitch/offset, so
+ * a run of copies can share one context dword. Mac OS X issues exactly one
+ * of these per frame of a window drag -- while it went unimplemented the
+ * copy simply never happened, and every later blit out of the driver's
+ * offscreen surface propagated whatever stale content was left there.
+ * That was the garbled window contents on this card.
+ *
+ * Two header dwords and then a RUN of rectangles, three dwords each -- the
+ * MULTI is not decoration:
+ *   [0]      GMC (DP_GUI_MASTER_CNTL)
+ *   [1]      SRC_PITCH_OFFSET (observed 0x10000400 = offset 0x8000, pitch
+ *            128 -- the screen; see the ring parser for why this is the
+ *            source and not the destination)
+ *   [2+3k]   SRC_X_Y
+ *   [3+3k]   DST_X_Y
+ *   [4+3k]   DST_WIDTH_HEIGHT
+ * X/WIDTH live in the HIGH half and Y/HEIGHT in the low half, the same way
+ * round as PAINT_MULTI and plain BITBLT on this driver.
+ *
+ * Captured live, iTunes sends 29 dwords = 2 + NINE rectangles, and they
+ * tile one window exactly: 590x1, 594x1, 596x1, 598x2, then 600x390, then
+ * 598x2, 596x1, 594x1, 590x1, with the destination Y running 10, 11, 12,
+ * 13, 15, 405, 407, 408, 409 -- contiguous, narrow at top and bottom and
+ * wide in between. That is a rounded-corner window, the same shape the
+ * BITBLT and PAINT_MULTI comments describe. Handling only the first
+ * rectangle copied a single 1-pixel-high strip and threw away the 600x390
+ * body, which is why window CHROME came out right while the CONTENTS were
+ * garbage.
+ */
 #define R128_PM4_OPCODE_BITBLT_MULTI  0x9b
+/* header dwords plus at least one 3-dword rectangle */
+#define R128_BITBLT_MULTI_MIN_DWORDS  5
+#define R128_PM4_OPCODE_HOSTDATA_BLT  0x94
 
 /*
  * PIO alternative submission path for the same PM4 stream: undocumented
@@ -268,6 +332,15 @@
 #define R128_DST_Y_X                 0x1438
 #define R128_DST_HEIGHT_WIDTH        0x143c
 #define R128_DP_GUI_MASTER_CNTL      0x146c
+/*
+ * GUI_MASTER_CNTL bit 31: the packet carries the brush pattern and
+ * origin inline, rather than the driver having pre-loaded the
+ * BRUSH_DATA registers. Mac OS sets it on every patterned PAINT.
+ */
+#define R128_GMC_LD_BRUSH_Y_X        0x80000000
+#define R128_BRUSH_Y_X               0x1474
+#define R128_BRUSH_DATA0             0x1480   /* .. BRUSH_DATA63 at 0x157c */
+#define R128_BRUSH_DATA63            0x157c
 #define R128_DP_BRUSH_BKGD_CLR       0x1478
 #define R128_DP_BRUSH_FRGD_CLR       0x147c
 #define R128_DST_WIDTH_X             0x1588
@@ -277,6 +350,21 @@
 #define R128_DST_HEIGHT_Y            0x15a0
 #define R128_SRC_OFFSET              0x15ac
 #define R128_SRC_PITCH               0x15b0
+/*
+ * Colour compare: a per-pixel test that suppresses the write. Mac OS
+ * uses it to repaint a text field's background without disturbing the
+ * glyphs already in it, so leaving it unimplemented erased the text.
+ */
+#define R128_CLR_CMP_CNTL            0x15c0
+#define R128_CLR_CMP_CLR_SRC         0x15c4
+#define R128_CLR_CMP_CLR_DST         0x15c8
+#define R128_CLR_CMP_MASK            0x15cc
+#define R128_CLR_CMP_FN_MASK         0x00000007
+#define R128_CLR_CMP_FN_FALSE        0
+#define R128_CLR_CMP_FN_TRUE         1
+#define R128_CLR_CMP_FN_NOT_EQUAL    4
+#define R128_CLR_CMP_FN_EQUAL        5
+#define R128_CLR_CMP_SRC_SOURCE      0x01000000
 #define R128_DP_SRC_FRGD_CLR         0x15d8
 #define R128_DP_SRC_BKGD_CLR         0x15dc
 #define R128_SC_LEFT                 0x1640
@@ -322,12 +410,53 @@
 
 #define R128_DP_DST_DATATYPE         0x0000000f
 #define R128_DP_BRUSH_DATATYPE       0x00000f00
+#define R128_DP_BRUSH_DATATYPE_SHIFT 8
+/*
+ * Brush (pattern) types, DP_DATATYPE bits 11:8 -- the same codes
+ * GUI_MASTER_CNTL carries in bits 7:4. The "_LA" ("leave alone")
+ * variants are transparent: where the pattern bit is 0 the destination
+ * is not touched at all. Mac OS draws its drag-selection marquee as one
+ * big DSTINVERT rectangle stamped through an 8x8 MONO_FG_LA brush, so
+ * treating every brush as solid inverted the WHOLE rectangle instead of
+ * a dotted outline -- leaving olive-green (inverted desktop purple)
+ * blocks behind on screen.
+ */
+#define R128_BRUSH_8X8_MONO_FG_BG    0
+#define R128_BRUSH_8X8_MONO_FG_LA    1
+#define R128_BRUSH_1X8_MONO_FG_BG    4
+#define R128_BRUSH_1X8_MONO_FG_LA    5
+#define R128_BRUSH_32X1_MONO_FG_BG   6
+#define R128_BRUSH_32X1_MONO_FG_LA   7
+#define R128_BRUSH_32X32_MONO_FG_BG  8
+#define R128_BRUSH_32X32_MONO_FG_LA  9
+#define R128_BRUSH_8X8_COLOR         10
+#define R128_BRUSH_1X8_COLOR         12
+#define R128_BRUSH_SOLID_COLOR       13
+#define R128_BRUSH_NONE              15
 #define R128_DP_SRC_DATATYPE         0x00030000
 #define R128_DP_ROP3                 0x00ff0000
 #define R128_DP_SRC_SOURCE           0x00000700
 #define R128_DP_SRC_HOST             0x00000300
 #define R128_DP_SRC_HOST_BYTEALIGN   0x00000400
 #define R128_DP_BYTE_PIX_ORDER       0x40000000
+/*
+ * "Host data is big endian" -- the chip byte-swaps every pixel the host
+ * feeds it through the HOST_DATA registers or a HOSTDATA_BLT payload,
+ * by pixel size. A big-endian driver that byte-swaps its COMMAND dwords
+ * in software (so the little-endian command fetch reads them right) can
+ * then ship bitmap payload verbatim and let the chip convert it.
+ * Confirmed against xf86-video-r128's r128_reg.h.
+ */
+#define R128_HOST_BIG_ENDIAN_EN      0x20000000
+/*
+ * The fields DP_GUI_MASTER_CNTL aliases into DP_DATATYPE. Everything
+ * outside this mask -- HOST_BIG_ENDIAN_EN above, in particular -- has no
+ * counterpart in GUI_MASTER_CNTL and must survive a write to it.
+ */
+#define R128_DP_DATATYPE_GMC_ALIAS   (R128_DP_DST_DATATYPE | \
+                                      R128_DP_BRUSH_DATATYPE | \
+                                      R128_DP_SRC_DATATYPE | \
+                                      R128_DP_BYTE_PIX_ORDER)
 #define R128_SRC_MONO_FRGD_BKGD      0x00000000
 #define R128_SRC_MONO_FRGD           0x00010000
 #define R128_SRC_COLOR                0x00030000
@@ -337,8 +466,6 @@
 #define R128_GMC_DST_PITCH_OFFSET_CNTL 0x00000002
 #define R128_GMC_SRC_CLIPPING        0x00000004
 #define R128_GMC_DST_CLIPPING        0x00000008
-#define R128_GMC_BRUSH_DATATYPE_MASK 0x000000f0
-#define R128_GMC_BRUSH_SOLID_COLOR   0x000000d0
 #define R128_GMC_ROP3_MASK           0x00ff0000
 #define R128_ROP3_BLACKNESS          0x00000000
 #define R128_ROP3_SRCCOPY            0x00cc0000
@@ -359,9 +486,6 @@
  * it via this register, then reads back GUI_SCRATCH_REG0/1 expecting
  * the sentinel to have landed there -- see ati_rage128_bm_gui_run().
  */
-#define R128_BM_QUEUE_STATUS         0x0a10
-#define R128_BM_QUEUE_FREE_STATUS    0x0a14
-#define R128_BM_CHUNK_0_VAL          0x0a18
 #define R128_BM_GUI_TABLE            0x0a50
 #define R128_BM_CHUNK_0_VAL          0x0a18
 
@@ -440,13 +564,6 @@
 #define R128_CRTC_V_DISP_MASK        0x7ff
 #define R128_CRTC_OFFSET_MASK        0x01fffff8 /* [24:0], bits 2:0 wired 0 */
 #define R128_CRTC_OFFSET_LOCK        (1u << 31)
-/*
- * Bit 31 of CUR_OFFSET, CUR_HORZ_VERT_POSN and CUR_HORZ_VERT_OFF alike:
- * held set across the several register writes needed to move the cursor
- * past the top/left edges or to change its shape, so the update lands
- * atomically (RRG-G04500-C 3.13).
- */
-#define R128_CUR_LOCK                (1u << 31)
 #define R128_CRTC_PITCH_MASK         0x3ff      /* [9:0], pixels * 8 */
 
 /* CLOCK_CNTL_INDEX */
@@ -517,5 +634,73 @@
 #define R128_I2C_SEL                 (1 << 16)
 #define R128_I2C_EN                  (1 << 17)
 #define R128_I2C_TIME_LIMIT_SHIFT    24
+
+
+/*
+ * CNTL_SCALING (packet-3 opcode 0x96): the scaled blit Mac OS uses for
+ * video on this card, the counterpart of the mach64's scaler pipe. A
+ * 16-dword packet; the layout below was established from a live capture
+ * of QuickTime playback and cross-checked against the mach64, which
+ * drives the same movie through its own scaler with identical
+ * parameters (the X/Y DDA increments are literally the same values).
+ *
+ *   [0]  GUI_MASTER_CNTL         [3]  SC_TOP_LEFT
+ *   [4]  SC_BOTTOM_RIGHT         [8]  source datatype
+ *   [9]  source offset (bytes)   [10] source pitch, in 8-pixel units
+ *   [12] X increment             [13] Y increment
+ *   [14] DST_X_Y   (X high)      [15] DST_HEIGHT_WIDTH (height high)
+ *
+ * Self-consistency check that pins four of those at once: the scissors
+ * in [3]/[4] exactly bound the rectangle that [14] and [15] describe.
+ */
+#define R128_PM4_OPCODE_SCALING       0x96
+#define R128_SCALE_PKT_DWORDS         16
+#define R128_SCALE_PKT_GMC            0
+#define R128_SCALE_PKT_SRC_PITCH_OFF  1
+#define R128_SCALE_PKT_DST_PITCH_OFF  2
+#define R128_SCALE_PKT_SC_TL          3
+#define R128_SCALE_PKT_SC_BR          4
+#define R128_SCALE_PKT_DATATYPE       8
+#define R128_SCALE_PKT_OFFSET         9
+#define R128_SCALE_PKT_PITCH          10
+#define R128_SCALE_PKT_X_INC          12
+#define R128_SCALE_PKT_Y_INC          13
+#define R128_SCALE_PKT_DST_X_Y        14
+#define R128_SCALE_PKT_DST_H_W        15
+
+/*
+ * Scaler source datatypes. The two 4:2:2 codes are named inconsistently
+ * between the tables in xf86-video-r128's own header, so trust the
+ * behaviour instead: the mach64 uses code 12 for this same movie and
+ * renders correctly as UYVY ('2vuy', the classic Mac 4:2:2 layout).
+ */
+/*
+ * PITCH_OFFSET packing, as Linux's r128 driver builds it:
+ * (pitch << 21) | (offset >> 5), pitch counting 8-pixel units. Verified
+ * against the captured packet, where the source form decodes to pitch
+ * 192 and offset 0x1fda000 -- the same offset the packet also carries
+ * separately, and the same pitch.
+ */
+#define R128_PITCH_OFFSET_PITCH_SHIFT 21
+#define R128_PITCH_OFFSET_OFF_MASK    0x001fffff
+#define R128_PITCH_OFFSET_OFF_SHIFT   5
+
+/*
+ * Blit directions also have a second, differently packed home. Leaving
+ * it undecoded left the direction stale, so an overlapping copy with a
+ * vertical component duplicated rows -- visible as repeated fragments
+ * when a window is dragged anything other than exactly horizontally.
+ */
+#define R128_DP_CNTL_XDIR_YDIR_YMAJOR 0x16d0
+#define R128_DST_Y_DIR_TOP_TO_BOTTOM  0x00008000
+#define R128_DST_X_DIR_LEFT_TO_RIGHT  0x80000000
+
+#define R128_SCALE_DT_ARGB1555        3
+#define R128_SCALE_DT_RGB565          4
+#define R128_SCALE_DT_ARGB8888        6
+#define R128_SCALE_DT_Y8              8
+#define R128_SCALE_DT_YUYV422         11
+#define R128_SCALE_DT_UYVY422         12
+#define R128_SCALE_DT_AYUV444         14
 
 #endif /* ATI_RAGE128_REGS_H */
