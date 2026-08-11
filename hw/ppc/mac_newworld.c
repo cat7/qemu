@@ -479,7 +479,8 @@ static uint8_t core99_chrp_cksum(const uint8_t *hdr)
 
 /*
  * Make the built-in gmac usable under Mac OS by publishing its MAC on the
- * Open Firmware ethernet node.
+ * Open Firmware ethernet node, and graft the missing L2-cache device-tree
+ * data our ROM never produces so Mac OS stops reporting a cache fault.
  *
  * Mac OS (classic AppleTalk/OT and OS X's AppleGMACEthernet) reads the
  * Ethernet MAC solely from the OF "local-mac-address" property and will not
@@ -490,9 +491,23 @@ static uint8_t core99_chrp_cksum(const uint8_t *hdr)
  * "boot-command" variable, honouring whatever MAC the gmac was given on the
  * command line (or QEMU's default when none was specified).
  *
+ * A real PowerMac3,4 publishes /cpus/PowerPC,G4@0/l2cr = 0xb9000000 and a
+ * child "l2-cache" node (1MB unified, 64-byte lines, 0x2000 sets, 233MHz --
+ * verbatim from a real lsprop dump). Our 7450-family L2CR write path was
+ * already fixed (commit 33231ae62a), but the ROM's own L2 bring-up/POST
+ * still never runs on QEMU's transparent memory model, so the device tree
+ * ends up with neither property and /diagnostics/post-results (the POST
+ * failure bitmask a real healthy Mac reads back as 0x00000000) is left
+ * non-zero -- which is what Mac OS surfaces as "a problem with cache
+ * memory". Graft both: the l2cr/l2-cache data a real machine has, and a
+ * zeroed post-results, so Mac OS sees exactly what a passing POST would
+ * have produced.
+ *
  * boot-command (not nvramrc) is used deliberately: nvramrc runs before
  * probe-all, when /pci@f4000000/ethernet@f does not yet exist; boot-command
- * runs at the end of start-up, after the PCI ethernet node has been probed.
+ * runs at the end of start-up, after the PCI ethernet node has been probed
+ * and after /diagnostics/post-results has already been written by the ROM's
+ * own (failing) POST, so it is the right point to overwrite both.
  *
  * The nvram is Apple/CHRP format: an 8KB image mirrored inside the 16KB
  * flash, OF variables stored as name=value NUL strings in the "common"
@@ -509,7 +524,21 @@ static void core99_nvram_set_gmac_bootcmd(uint8_t *data, uint32_t size,
         "here h# %02x over c! 1+ h# %02x over c! 1+ h# %02x over c! 1+ "
         "h# %02x over c! 1+ h# %02x over c! 1+ h# %02x swap c! "
         "here 6 encode-bytes \" local-mac-address\" property "
-        "0 0 encode-bytes \" built-in\" property device-end mac-boot",
+        "0 0 encode-bytes \" built-in\" property device-end "
+        "dev /cpus/PowerPC,G4@0 "
+        "h# b9000000 encode-int \" l2cr\" property "
+        "new-device \" l2-cache\" device-name \" cache\" device-type "
+        "h# de86254 encode-int \" clock-frequency\" property "
+        "0 0 encode-bytes \" cache-unified\" property "
+        "h# 40 encode-int \" d-cache-line-size\" property "
+        "h# 40 encode-int \" i-cache-line-size\" property "
+        "h# 2000 encode-int \" d-cache-sets\" property "
+        "h# 2000 encode-int \" i-cache-sets\" property "
+        "h# 100000 encode-int \" d-cache-size\" property "
+        "h# 100000 encode-int \" i-cache-size\" property "
+        "finish-device device-end "
+        "dev /diagnostics 0 encode-int \" post-results\" property "
+        "device-end mac-boot",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     uint32_t base;
 
