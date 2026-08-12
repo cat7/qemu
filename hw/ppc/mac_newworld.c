@@ -132,6 +132,7 @@ struct Core99MachineState {
 
     Core99ViaConfig via_config;
     Core99Model model;
+    bool cd_boot_fix;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -515,16 +516,30 @@ static uint8_t core99_chrp_cksum(const uint8_t *hdr)
  * the outer Adler32 (at copy+0x10, over [copy+0x14 : copy+0x2000]); without
  * the latter the ROM rejects the image ("NVRAM corrupted") and wipes it.
  */
-static void core99_nvram_set_gmac_bootcmd(uint8_t *data, uint32_t size,
-                                          const uint8_t mac[6])
+static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
+                                     const uint8_t *mac)
 {
     const uint32_t COPY = 0x2000;
-    g_autofree char *bootcmd = g_strdup_printf(
-        "boot-command=dev /pci@f4000000/ethernet@f "
+    /*
+     * gmac graft (only when a MAC is supplied): publishes local-mac-address +
+     * "built-in" so Mac OS creates en0. Skipped for classic-Mac-OS CD boots
+     * (the cd-boot-fix property) because OS 9's en0 bring-up off "built-in" hangs
+     * the boot.
+     */
+    g_autofree char *gmac = mac ? g_strdup_printf(
+        "dev /pci@f4000000/ethernet@f "
         "here h# %02x over c! 1+ h# %02x over c! 1+ h# %02x over c! 1+ "
         "h# %02x over c! 1+ h# %02x over c! 1+ h# %02x swap c! "
         "here 6 encode-bytes \" local-mac-address\" property "
-        "0 0 encode-bytes \" built-in\" property device-end "
+        "0 0 encode-bytes \" built-in\" property device-end ",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]) : g_strdup("");
+    /*
+     * cache-POST graft (always): the l2cr/l2-cache device-tree data a real
+     * PowerMac3,4 publishes plus a zeroed /diagnostics/post-results, so Mac OS
+     * never shows the "problem with cache memory" alert. Independent of the
+     * gmac graft above.
+     */
+    g_autofree char *bootcmd = g_strconcat("boot-command=", gmac,
         "dev /cpus/PowerPC,G4@0 "
         "h# b9000000 encode-int \" l2cr\" property "
         "new-device \" l2-cache\" device-name \" cache\" device-type "
@@ -538,8 +553,7 @@ static void core99_nvram_set_gmac_bootcmd(uint8_t *data, uint32_t size,
         "h# 100000 encode-int \" i-cache-size\" property "
         "finish-device device-end "
         "dev /diagnostics 0 encode-int \" post-results\" property "
-        "device-end mac-boot",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        "device-end mac-boot", NULL);
     uint32_t base;
 
     for (base = 0; base + COPY <= size; base += COPY) {
@@ -582,8 +596,8 @@ static void core99_nvram_set_gmac_bootcmd(uint8_t *data, uint32_t size,
                     memcpy(&data[dstart], vars->str, vars->len);
                     data[off + 1] = core99_chrp_cksum(&data[off]);
                 } else {
-                    warn_report("gmac: nvram vars too large, "
-                                "local-mac-address not injected");
+                    warn_report("nvram: vars too large, "
+                                "boot-command graft not applied");
                 }
                 g_string_free(vars, TRUE);
                 break;
@@ -602,28 +616,32 @@ static void core99_nvram_set_gmac_bootcmd(uint8_t *data, uint32_t size,
 }
 
 /*
- * Read the built-in gmac's effective MAC (command-line or QEMU default) and
- * inject it into the OF nvram so Mac OS brings up the interface. No-op if no
- * sungem device is present.
+ * Graft the OF boot-command: always the cache-POST data (so no "cache memory"
+ * alert), and -- unless booting classic Mac OS from CD (cd-boot-fix) -- the
+ * built-in gmac's MAC so Mac OS brings up en0. The gmac graft is gated because
+ * OS 9's en0 bring-up off "built-in" hangs the boot; it is skipped for CD boots
+ * and whenever no sungem is present, but the cache graft applies regardless.
  */
-static void core99_inject_gmac_mac(MacIONVRAMState *nvr)
+static void core99_nvram_graft(MacIONVRAMState *nvr, bool inject_gmac)
 {
-    Object *o = object_resolve_path_type("", "sungem", NULL);
-    g_autofree char *macstr = NULL;
     uint8_t mac[6];
+    bool have_mac = false;
 
-    if (!o || !nvr->data) {
+    if (!nvr->data) {
         return;
     }
-    macstr = object_property_get_str(o, "mac", NULL);
-    if (!macstr) {
-        return;
+    if (inject_gmac) {
+        Object *o = object_resolve_path_type("", "sungem", NULL);
+        g_autofree char *macstr = o ? object_property_get_str(o, "mac", NULL)
+                                    : NULL;
+
+        if (macstr && sscanf(macstr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                             &mac[0], &mac[1], &mac[2], &mac[3], &mac[4],
+                             &mac[5]) == 6) {
+            have_mac = true;
+        }
     }
-    if (sscanf(macstr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6) {
-        return;
-    }
-    core99_nvram_set_gmac_bootcmd(nvr->data, nvr->size, mac);
+    core99_nvram_set_bootcmd(nvr->data, nvr->size, have_mac ? mac : NULL);
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -1187,13 +1205,13 @@ static void ppc_core99_init(MachineState *machine)
         pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
     }
     /*
-     * Real Apple ROM: inject the built-in gmac's MAC into the OF device tree
-     * via boot-command so Mac OS recognises and brings up Built-in Ethernet
-     * (the ROM's own gmac driver never publishes local-mac-address). Patches
+     * Real Apple ROM: graft the OF boot-command -- the cache-POST data always,
+     * and the built-in gmac's MAC unless booting classic Mac OS from CD (the
+     * gmac graft hangs OS 9's en0 bring-up; see the cd-boot-fix property). Patches
      * the in-RAM nvram image only; the backing file is left untouched.
      */
     if (rom_is_flash) {
-        core99_inject_gmac_mac(nvr);
+        core99_nvram_graft(nvr, !core99_machine->cd_boot_fix);
     }
     /* No PCI init: the BIOS will do it */
 
@@ -1414,6 +1432,16 @@ static void core99_set_model(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool core99_get_cd_boot_fix(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->cd_boot_fix;
+}
+
+static void core99_set_cd_boot_fix(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->cd_boot_fix = value;
+}
+
 static void core99_instance_init(Object *obj)
 {
     Core99MachineState *cms = CORE99_MACHINE(obj);
@@ -1435,6 +1463,17 @@ static void core99_instance_init(Object *obj)
                                     "(pm34 = PowerMac3,4 Digital Audio, "
                                     "pm36 = PowerMac3,6 Mirrored Drive "
                                     "Doors). Valid values are pm34 and pm36");
+
+    /* Default off: normal (HD) boots keep the built-in-ethernet graft. */
+    cms->cd_boot_fix = false;
+    object_property_add_bool(obj, "cd-boot-fix", core99_get_cd_boot_fix,
+                             core99_set_cd_boot_fix);
+    object_property_set_description(obj, "cd-boot-fix",
+                                    "Booting classic Mac OS (9) from CD: skip "
+                                    "the built-in-ethernet OF graft, whose en0 "
+                                    "bring-up hangs Mac OS 9. Off by default; "
+                                    "irrelevant to Mac OS X. Does not affect "
+                                    "the cache-POST graft.");
 }
 
 static const TypeInfo core99_machine_info = {
