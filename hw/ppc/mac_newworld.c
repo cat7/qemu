@@ -892,6 +892,15 @@ static void ppc_core99_init(MachineState *machine)
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf0800000);
         sysbus_mmio_map(s, 1, 0xf0c00000);
+        /*
+         * AGP bus I/O space, 8 MB at 0xf0000000, matching the real
+         * PowerMac3,4 /pci@f0000000 "ranges". Low overlap priority so the
+         * fw_cfg registers mapped inside it (at 0xf0000510) keep winning
+         * their bytes. Without this window, guest accesses to AGP I/O
+         * ports hit unmapped memory instead of the empty-bus 0xff.
+         */
+        memory_region_add_subregion_overlap(get_system_memory(), 0xf0000000,
+                                             sysbus_mmio_get_region(s, 2), -1);
 
         /* Uninorth internal bus */
         uninorth_internal_dev = qdev_new(

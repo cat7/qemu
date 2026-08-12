@@ -308,8 +308,25 @@ static void pci_unin_agp_init(Object *obj)
     memory_region_init_io(&h->data_mem, OBJECT(h), &unin_data_ops,
                           obj, "unin-agp-conf-data", 0x1000);
 
+    /*
+     * The AGP bus has its own MMIO and I/O address spaces. A real
+     * PowerMac3,4 /pci@f0000000 carries an 8 MB I/O window at 0xf0000000
+     * (see its "ranges"); without it, 68K display/AGP drivers loaded from
+     * the Mac OS 9 CD touch AGP I/O ports that hit unmapped memory,
+     * spinning the boot in an unhandled-DSI storm at "Starting Up...".
+     * Mirror the main bus so those accesses resolve (empty => reads -1).
+     * pci_mmio also backs the bus's memory space handed to
+     * pci_register_root_bus() below, which was previously left
+     * uninitialised.
+     */
+    memory_region_init(&s->pci_mmio, OBJECT(s), "unin-agp-mmio",
+                       0x100000000ULL);
+    memory_region_init_io(&s->pci_io, OBJECT(s), &unassigned_io_ops, obj,
+                          "unin-agp-isa-mmio", 0x00800000);
+
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
+    sysbus_init_mmio(sbd, &s->pci_io);
 
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
 }
