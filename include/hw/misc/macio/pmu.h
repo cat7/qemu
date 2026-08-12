@@ -253,6 +253,9 @@ struct PMUState {
     uint8_t pram[20];
     uint8_t xpram[256];
 
+    /* Optional backing file so PRAM persists across runs (see "drive"). */
+    BlockBackend *pram_blk;
+
     /* GPIO */
     MacIOGPIOState *gpio;
 };

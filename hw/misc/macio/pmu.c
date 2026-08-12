@@ -30,13 +30,17 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
 #include "hw/core/irq.h"
 #include "hw/misc/macio/pmu.h"
 #include "qemu/timer.h"
+#include "system/block-backend.h"
 #include "system/runstate.h"
 #include "system/rtc.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
+#include "qobject/qdict.h"
 #include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -433,6 +437,62 @@ static void pmu_cmd_power_events(PMUState *s,
  * them during early boot and write-verifies whatever it initializes, so
  * the storage must round-trip.
  */
+/*
+ * The PMU's battery-backed PRAM (the 256-byte extended block plus the 20-byte
+ * legacy clock block) holds per-user settings the guest expects to survive a
+ * power cycle: the startup disk, sound volume, mouse/keyboard timings,
+ * AppleTalk port, time zone, etc. Persist it to a file, mirroring cuda.c's
+ * cuda_default_pram_blk()/cuda_pram_update(). The image layout is xpram[256]
+ * followed by pram[20].
+ */
+#define PMU_PRAM_FILE_SIZE (sizeof(((PMUState *)0)->xpram) + \
+                            sizeof(((PMUState *)0)->pram))
+
+static BlockBackend *pmu_default_pram_blk(void)
+{
+    static const char filename[] = "pram.img";
+    struct stat st;
+    BlockBackend *blk;
+    Error *local_err = NULL;
+    QDict *options;
+    int fd;
+
+    fd = qemu_open_old(filename, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        warn_report("could not open/create default PRAM image '%s': %s",
+                    filename, strerror(errno));
+        return NULL;
+    }
+    if (fstat(fd, &st) == 0 && st.st_size < (int64_t)PMU_PRAM_FILE_SIZE) {
+        if (ftruncate(fd, PMU_PRAM_FILE_SIZE) != 0) {
+            warn_report("could not size default PRAM image '%s': %s",
+                        filename, strerror(errno));
+        }
+    }
+    close(fd);
+
+    options = qdict_new();
+    qdict_put_str(options, "driver", "raw");
+    blk = blk_new_open(filename, NULL, options, BDRV_O_RDWR, &local_err);
+    if (!blk) {
+        warn_report_err(local_err);
+        return NULL;
+    }
+    return blk;
+}
+
+static void pmu_pram_update(PMUState *s)
+{
+    if (!s->pram_blk) {
+        return;
+    }
+    if (blk_pwrite(s->pram_blk, 0, sizeof(s->xpram), s->xpram, 0) < 0 ||
+        blk_pwrite(s->pram_blk, sizeof(s->xpram), sizeof(s->pram),
+                   s->pram, 0) < 0) {
+        qemu_log("pmu_pram_update: cannot write PRAM backing file\n");
+    }
+}
+
 static void pmu_cmd_pram_write(PMUState *s,
                                const uint8_t *in_data, uint8_t in_len,
                                uint8_t *out_data, uint8_t *out_len)
@@ -444,6 +504,7 @@ static void pmu_cmd_pram_write(PMUState *s,
         return;
     }
     memcpy(s->pram, in_data, sizeof(s->pram));
+    pmu_pram_update(s);
 }
 
 static void pmu_cmd_pram_read(PMUState *s,
@@ -475,6 +536,7 @@ static void pmu_cmd_xpram_write(PMUState *s,
         return;
     }
     memcpy(&s->xpram[addr], &in_data[2], count);
+    pmu_pram_update(s);
 }
 
 static void pmu_cmd_xpram_read(PMUState *s,
@@ -891,6 +953,33 @@ static void pmu_realize(DeviceState *dev, Error **errp)
         qbus_init(adb_bus, sizeof(*adb_bus), TYPE_ADB_BUS, dev, "adb.0");
         adb_register_autopoll_callback(adb_bus, pmu_adb_poll, s);
     }
+
+    /* Persistent PRAM: attach a default backing file if none was given. */
+    if (!s->pram_blk) {
+        s->pram_blk = pmu_default_pram_blk();
+    }
+    if (s->pram_blk) {
+        int64_t len = blk_getlength(s->pram_blk);
+
+        if (len < 0) {
+            error_setg_errno(errp, -len,
+                             "could not get length of PRAM backing image");
+            return;
+        }
+        if (blk_set_perm(s->pram_blk,
+                         BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                         BLK_PERM_ALL, errp) < 0) {
+            return;
+        }
+        if (len >= (int64_t)PMU_PRAM_FILE_SIZE) {
+            if (blk_pread(s->pram_blk, 0, sizeof(s->xpram), s->xpram, 0) < 0 ||
+                blk_pread(s->pram_blk, sizeof(s->xpram), sizeof(s->pram),
+                          s->pram, 0) < 0) {
+                error_setg(errp, "could not read PRAM backing image");
+                return;
+            }
+        }
+    }
 }
 
 static void pmu_init(Object *obj)
@@ -913,6 +1002,7 @@ static void pmu_init(Object *obj)
 
 static const Property pmu_properties[] = {
     DEFINE_PROP_BOOL("has-adb", PMUState, has_adb, true),
+    DEFINE_PROP_DRIVE("drive", PMUState, pram_blk),
 };
 
 static void pmu_class_init(ObjectClass *oc, const void *data)
