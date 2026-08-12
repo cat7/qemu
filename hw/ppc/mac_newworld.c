@@ -616,6 +616,68 @@ static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
 }
 
 /*
+ * Return a NUL-terminated copy of an OF variable's value from the nvram
+ * "common" (0x70) partition, or NULL if not present. Caller frees.
+ *
+ * The 16 KB flash is two mirrored 8 KB copies and the active data can live in
+ * either one (the other is left erased, 0xff, as the next write target), so
+ * both copies are scanned.
+ */
+static char *core99_nvram_get_var(const uint8_t *data, uint32_t size,
+                                  const char *name)
+{
+    const uint32_t COPY = 0x2000;
+    size_t nlen = strlen(name);
+    uint32_t base;
+
+    for (base = 0; base + COPY <= size; base += COPY) {
+        uint32_t off;
+
+        for (off = base; off + 16 <= base + COPY; ) {
+            uint32_t plen = (((data[off + 2] << 8) | data[off + 3]) * 16);
+            uint32_t dstart, dend, i;
+
+            if (plen == 0) {
+                break;
+            }
+            if (data[off] != 0x70 || memcmp(&data[off + 4], "common", 6) != 0) {
+                off += plen;
+                continue;
+            }
+            dstart = off + 16;
+            dend = (plen > 16 && off + plen <= base + COPY) ? off + plen
+                                                            : base + COPY;
+            for (i = dstart; i < dend && data[i]; ) {
+                const char *v = (const char *)&data[i];
+                size_t vl = strnlen(v, dend - i);
+
+                if (vl > nlen && v[nlen] == '=' && !memcmp(v, name, nlen)) {
+                    return g_strndup(v + nlen + 1, vl - nlen - 1);
+                }
+                i += vl + 1;
+            }
+            break;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Report which device the machine is configured to boot from -- the OF
+ * "boot-device" nvram variable (a one-line stderr note plus a trace event).
+ * This is what the guest is *set* to boot from; the Apple ROM may still fall
+ * back to scanning other devices if it is absent.
+ */
+static void core99_report_boot_device(MacIONVRAMState *nvr)
+{
+    g_autofree char *dev = nvr->data ?
+        core99_nvram_get_var(nvr->data, nvr->size, "boot-device") : NULL;
+
+    trace_mac99_boot_device(dev ? dev : "(unset)");
+    info_report("boot device=%s", dev ? dev : "(unset)");
+}
+
+/*
  * Graft the OF boot-command: always the cache-POST data (so no "cache memory"
  * alert), and -- unless booting classic Mac OS from CD (cd-boot-fix) -- the
  * built-in gmac's MAC so Mac OS brings up en0. The gmac graft is gated because
@@ -1222,6 +1284,7 @@ static void ppc_core99_init(MachineState *machine)
     if (rom_is_flash) {
         core99_nvram_graft(nvr, !core99_machine->cd_boot_fix);
     }
+    core99_report_boot_device(nvr);
     /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
