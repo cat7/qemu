@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
@@ -121,6 +122,27 @@ static const char *ati_rage128_reg_name(uint32_t base)
     case R128_GUI_DEBUG0:            return "GUI_DEBUG0";
     case R128_WAIT_UNTIL:            return "WAIT_UNTIL";
     case R128_GUI_STAT:              return "GUI_STAT";
+    case R128_GUI_SCRATCH_REG0:      return "GUI_SCRATCH_REG0";
+    case R128_GUI_SCRATCH_REG1:      return "GUI_SCRATCH_REG1";
+    case R128_BM_GUI_TABLE:          return "BM_GUI_TABLE";
+    case R128_BM_CHUNK_0_VAL:        return "BM_CHUNK_0_VAL";
+    case R128_PM4_BUFFER_OFFSET:     return "PM4_BUFFER_OFFSET";
+    case R128_PM4_BUFFER_CNTL:       return "PM4_BUFFER_CNTL";
+    case R128_PM4_BUFFER_WM_CNTL:    return "PM4_BUFFER_WM_CNTL";
+    case R128_PM4_BUFFER_DL_RPTR_ADDR: return "PM4_BUFFER_DL_RPTR_ADDR";
+    case R128_PM4_BUFFER_DL_RPTR:    return "PM4_BUFFER_DL_RPTR";
+    case R128_PM4_BUFFER_DL_WPTR:    return "PM4_BUFFER_DL_WPTR";
+    case R128_PM4_STAT:              return "PM4_STAT";
+    case R128_PM4_IW_INDOFF:         return "PM4_IW_INDOFF";
+    case R128_PM4_IW_INDSIZE:        return "PM4_IW_INDSIZE";
+    case R128_PM4_MICROCODE_ADDR:    return "PM4_MICROCODE_ADDR";
+    case R128_PM4_MICROCODE_RADDR:   return "PM4_MICROCODE_RADDR";
+    case R128_PM4_MICROCODE_DATAH:   return "PM4_MICROCODE_DATAH";
+    case R128_PM4_MICROCODE_DATAL:   return "PM4_MICROCODE_DATAL";
+    case R128_PM4_BUFFER_ADDR:       return "PM4_BUFFER_ADDR";
+    case R128_PM4_MICRO_CNTL:        return "PM4_MICRO_CNTL";
+    case R128_PM4_FIFO_DATA_EVEN:    return "PM4_FIFO_DATA_EVEN";
+    case R128_PM4_FIFO_DATA_ODD:     return "PM4_FIFO_DATA_ODD";
     default:                         return "?";
     }
 }
@@ -168,6 +190,7 @@ static void ati_rage128_get_mode(ATIRage128State *s, ATIRage128Mode *mode)
     mode->pitch = ((s->regs[R128_CRTC_PITCH >> 2] & R128_CRTC_PITCH_MASK) * 8) *
                   (mode->bpp ? mode->bpp : 1);
     mode->fb_offset = s->regs[R128_CRTC_OFFSET >> 2] & R128_CRTC_OFFSET_MASK;
+    mode->pix_width = pix_width;
 }
 
 static bool ati_rage128_mode_valid(ATIRage128State *s,
@@ -198,16 +221,39 @@ static bool ati_rage128_mode_valid(ATIRage128State *s,
 }
 
 /*
- * All drawing converts through an allocated 32bpp surface: 8bpp is
- * palettized, and the direct-color modes hold big-endian pixels (Mac
- * guest; same reasoning as ati_mach64.c's draw helpers, which these
- * follow). Rage 128 adds the per-aperture byte-swap configured in
- * CONFIG_CNTL -- APER_0_ENDIAN swaps CPU *accesses* on their way to
- * VRAM, so a Mac driver using a swapped aperture still produces
- * little-endian bytes in VRAM. The swap mode therefore selects how we
- * decode VRAM bytes here. Until a guest is seen actually enabling the
- * swappers (trace ati_rage128_aper_endian), VRAM bytes are decoded
- * big-endian like every other classic Mac framebuffer.
+ * Snapshot the mode the instant a CRTC1 register write makes it valid,
+ * rather than waiting for the next periodic gfx_update poll. Open
+ * Firmware's own boot-time mode-set (e.g. picking a bigger console for
+ * BootX) can assert a real, valid mode only fleetingly -- set it,
+ * possibly draw through it once via some other internal path, then
+ * move on -- entirely between two of QEMU's display-refresh ticks.
+ * Without this, ati_rage128_update_display()'s own poll-based check
+ * can miss that window completely and never learn the real
+ * offset/pitch/dimensions the guest is actually using, even though
+ * real content keeps landing there.
+ */
+static void ati_rage128_maybe_capture_mode(ATIRage128State *s)
+{
+    ATIRage128Mode mode;
+
+    ati_rage128_get_mode(s, &mode);
+    if (ati_rage128_mode_valid(s, &mode)) {
+        s->mode = mode;
+        s->have_valid_mode = true;
+        s->mode_dirty = true;
+    }
+}
+
+/*
+ * All drawing converts through an allocated 32bpp surface. VRAM bytes
+ * are decoded CHIP-NATIVE LITTLE-ENDIAN: with the aperture-1 byte
+ * swapper actually modeled (see ati_rage128_aper1_ops), a big-endian
+ * Mac guest's pixels land in VRAM in the chip's own layout, exactly
+ * as on real hardware (verified live against Mac OS 9's lavender
+ * desktop: bytes 9c 63 63 00 = LE B,G,R,X -- decoding them big-endian
+ * was what tinted the desktop olive-green once the swapper existed;
+ * the earlier BE decode had only ever looked right because the
+ * missing swapper and the wrong decode cancelled out).
  */
 static void ati_rage128_draw_8bpp(ATIRage128State *s, DisplaySurface *ds,
                                   const ATIRage128Mode *mode)
@@ -243,7 +289,7 @@ static void ati_rage128_draw_16bpp(ATIRage128State *s, DisplaySurface *ds,
         dst = (uint32_t *)((uint8_t *)surface_data(ds) +
                            y * surface_stride(ds));
         for (x = 0; x < mode->width; x++) {
-            uint16_t pixel = ((uint16_t)src[2 * x] << 8) | src[2 * x + 1];
+            uint16_t pixel = ((uint16_t)src[2 * x + 1] << 8) | src[2 * x];
             uint8_t r, g, b;
 
             if (rgb565) {
@@ -278,9 +324,9 @@ static void ati_rage128_draw_32bpp(ATIRage128State *s, DisplaySurface *ds,
         dst = (uint32_t *)((uint8_t *)surface_data(ds) +
                            y * surface_stride(ds));
         for (x = 0; x < mode->width; x++) {
-            /* big-endian X,R,G,B in VRAM */
-            dst[x] = 0xff000000u | ((uint32_t)src[4 * x + 1] << 16) |
-                     ((uint32_t)src[4 * x + 2] << 8) | src[4 * x + 3];
+            /* chip-native little-endian: B,G,R,X in VRAM */
+            dst[x] = 0xff000000u | ((uint32_t)src[4 * x + 2] << 16) |
+                     ((uint32_t)src[4 * x + 1] << 8) | src[4 * x];
         }
         src += mode->pitch;
     }
@@ -298,11 +344,243 @@ static void ati_rage128_draw_24bpp(ATIRage128State *s, DisplaySurface *ds,
         dst = (uint32_t *)((uint8_t *)surface_data(ds) +
                            y * surface_stride(ds));
         for (x = 0; x < mode->width; x++) {
-            dst[x] = 0xff000000u | ((uint32_t)src[3 * x] << 16) |
-                     ((uint32_t)src[3 * x + 1] << 8) | src[3 * x + 2];
+            /* chip-native little-endian: B,G,R in VRAM */
+            dst[x] = 0xff000000u | ((uint32_t)src[3 * x + 2] << 16) |
+                     ((uint32_t)src[3 * x + 1] << 8) | src[3 * x];
         }
         src += mode->pitch;
     }
+}
+
+/*
+ * Auto-detect the real, currently-live framebuffer via VRAM write
+ * activity rather than any register. Live testing (2026-08-02, both
+ * Mac OS X 10.2 and Mac OS 9.2) found CRTC1's "Extended" mode-set
+ * registers are never programmed by either guest OS at all -- not
+ * through direct MMIO, not through MM_INDEX/MM_DATA, not through PM4
+ * -- so ati_rage128_maybe_capture_mode() only ever captures whatever
+ * mode Open Firmware's own boot console happened to establish once at
+ * power-on. That's sufficient as long as the guest keeps using that
+ * exact mode (confirmed live: OS X mirroring at 256 colors/8bpp
+ * renders cleanly, matching that original boot mode) -- but switching
+ * to a higher color depth makes the guest draw its real desktop
+ * somewhere else in VRAM instead, through a mechanism that still
+ * isn't understood, and the last-known-good CRTC1 mode has no way to
+ * find it.
+ *
+ * What IS observable is that switching to a real live framebuffer
+ * writes a large, contiguous block of VRAM at least once -- so scan
+ * VRAM periodically (via QEMU's own per-MemoryRegion dirty-bitmap
+ * tracking, the same DIRTY_MEMORY_VGA mechanism every other display
+ * device uses to skip redrawing unchanged scanlines -- reused here
+ * for discovery instead) for the largest contiguous span that was
+ * written at all recently, and treat it as the real framebuffer once
+ * it's been confirmed against a plausible resolution. A single write
+ * is trusted immediately (a mostly-static desktop -- no cursor blink,
+ * no clock tick landing in the scanned region -- may only ever paint
+ * a freshly-switched mode once and then sit idle, so waiting for
+ * *repeated* activity would miss it entirely); the size-vs-known-
+ * resolution match already filters out noise from small, unrelated
+ * writes, so a low per-block bar is safe here. The decay counter
+ * still ages a region out over several idle scans once superseded,
+ * so switching back to an earlier mode is eventually noticed too.
+ */
+/*
+ * ACTIVITY_HIT is the per-block credit granted on a hit (decaying 1
+ * per scan), i.e. how many scans a write stays "recent". It must
+ * comfortably exceed the duration of a slow, multi-scan-straddling
+ * canvas paint: the completed region only becomes visible as ONE run
+ * once the last slice lands, and it must then survive un-shrunk for
+ * at least the 2 scans the stability gate needs -- with credit N, a
+ * paint spread over up to N-2 scans still adopts correctly (verified
+ * in the qtest harness with a 6-scan paint).
+ */
+#define ATI_RAGE128_FB_SCAN_PERIOD      30
+#define ATI_RAGE128_FB_ACTIVITY_HIT     12
+#define ATI_RAGE128_FB_ACTIVITY_THRESH  1
+
+/*
+ * Real Mac resolutions this hardware/driver combination has actually
+ * been observed offering or using (see the mach64 Monitors panel's
+ * own Resolution list, live-tested this session) -- dirty tracking
+ * alone can find a byte span but can't recover its 2D geometry, so a
+ * detected span gets matched against whichever of these implies the
+ * closest total size.
+ */
+static const struct { uint32_t width, height; } ati_rage128_known_modes[] = {
+    { 640, 480 }, { 800, 600 }, { 832, 624 }, { 1024, 768 },
+    { 1152, 870 }, { 1280, 960 }, { 1280, 1024 },
+};
+
+static uint32_t ati_rage128_pix_width_from_bpp(uint32_t bpp)
+{
+    switch (bpp) {
+    case 1:
+        return R128_PIX_WIDTH_8BPP;
+    case 2:
+        /*
+         * 2 bytes/pixel is ambiguous by size alone -- RGB555 (15bpp)
+         * and RGB565 (16bpp) are byte-identical in length, differing
+         * only in bit packing. Classic Mac OS/Mac OS X's "Thousands
+         * of colors" is conventionally 15bpp (unlike Windows, which
+         * defaults to 16bpp), so guess that -- guessing 16bpp here
+         * produces a real, visible, structured color-channel
+         * corruption from the mismatched bit layout (reported live as
+         * looking "endianness-troubled" -- it isn't a byte-order bug,
+         * this device's 32bpp path was already confirmed correct
+         * byte-for-byte against real content earlier this session,
+         * but a 15-vs-16bpp mismatch looks similar enough to read
+         * that way).
+         */
+        return R128_PIX_WIDTH_15BPP;
+    case 4:
+        return R128_PIX_WIDTH_32BPP;
+    default:
+        return 0;
+    }
+}
+
+static void ati_rage128_pick_auto_fb(ATIRage128State *s, int nblocks)
+{
+    int i, run_start = -1, best_start = -1, best_len = 0, cur_len = 0;
+    uint32_t best_size, best_score = UINT32_MAX;
+    static const uint32_t bpp_candidates[] = { 1, 2, 4 };
+    unsigned bi, mi;
+    ATIRage128Mode candidate;
+    bool found = false;
+
+    for (i = 0; i <= nblocks; i++) {
+        bool active = i < nblocks &&
+                     s->fb_scan_activity[i] >= ATI_RAGE128_FB_ACTIVITY_THRESH;
+
+        if (active) {
+            if (run_start < 0) {
+                run_start = i;
+            }
+            cur_len++;
+        } else {
+            if (cur_len > best_len) {
+                best_len = cur_len;
+                best_start = run_start;
+            }
+            run_start = -1;
+            cur_len = 0;
+        }
+    }
+
+    if (best_len == 0) {
+        trace_ati_rage128_auto_fb(0, 0, 0, 0, false, 0);
+        s->auto_fb_valid = false;
+        s->auto_fb_pending_valid = false;
+        return;
+    }
+    best_size = (uint32_t)best_len * ATI_RAGE128_FB_SCAN_BLOCK;
+
+    memset(&candidate, 0, sizeof(candidate));
+    for (mi = 0; mi < ARRAY_SIZE(ati_rage128_known_modes); mi++) {
+        for (bi = 0; bi < ARRAY_SIZE(bpp_candidates); bi++) {
+            uint32_t w = ati_rage128_known_modes[mi].width;
+            uint32_t h = ati_rage128_known_modes[mi].height;
+            uint32_t bpp = bpp_candidates[bi];
+            uint32_t size = w * bpp * h;
+            uint32_t diff = size > best_size ? size - best_size
+                                             : best_size - size;
+
+            if (diff < best_score) {
+                best_score = diff;
+                candidate.width = w;
+                candidate.height = h;
+                candidate.bpp = bpp;
+                candidate.pitch = w * bpp;
+                found = true;
+            }
+        }
+    }
+
+    /*
+     * No plausible resolution matches within 10% of the detected
+     * span -- don't guess.
+     */
+    if (!found || best_score > best_size / 10) {
+        trace_ati_rage128_auto_fb((uint32_t)best_start *
+                                  ATI_RAGE128_FB_SCAN_BLOCK,
+                                  0, 0, best_size, false, best_score);
+        s->auto_fb_valid = false;
+        s->auto_fb_pending_valid = false;
+        return;
+    }
+
+    candidate.fb_offset = (uint32_t)best_start * ATI_RAGE128_FB_SCAN_BLOCK;
+    candidate.pix_width = ati_rage128_pix_width_from_bpp(candidate.bpp);
+    if ((uint64_t)candidate.fb_offset +
+        (uint64_t)candidate.pitch * candidate.height > ATI_RAGE128_VRAM_SIZE) {
+        trace_ati_rage128_auto_fb(candidate.fb_offset, candidate.width,
+                                  candidate.height, candidate.bpp, false,
+                                  best_score);
+        s->auto_fb_valid = false;
+        s->auto_fb_pending_valid = false;
+        return;
+    }
+
+    /*
+     * Stability gate: only expose a candidate for adoption once the
+     * same one has come out of two consecutive scans -- see the field
+     * comment on auto_fb_pending in ati_rage128.h for the two churn
+     * states this suppresses.
+     */
+    if (s->auto_fb_pending_valid &&
+        memcmp(&candidate, &s->auto_fb_pending, sizeof(candidate)) == 0) {
+        s->auto_fb_mode = candidate;
+        s->auto_fb_valid = true;
+    } else {
+        s->auto_fb_valid = false;
+    }
+    s->auto_fb_pending = candidate;
+    s->auto_fb_pending_valid = true;
+    trace_ati_rage128_auto_fb(candidate.fb_offset, candidate.width,
+                              candidate.height, candidate.bpp,
+                              s->auto_fb_valid, best_score);
+}
+
+static void ati_rage128_scan_vram_activity(ATIRage128State *s)
+{
+    int nblocks = ATI_RAGE128_VRAM_SIZE / ATI_RAGE128_FB_SCAN_BLOCK;
+    DirtyBitmapSnapshot *snap;
+    int i;
+
+    if (++s->fb_scan_counter < ATI_RAGE128_FB_SCAN_PERIOD) {
+        return;
+    }
+    s->fb_scan_counter = 0;
+
+    snap = memory_region_snapshot_and_clear_dirty(&s->vram, 0,
+                                                   ATI_RAGE128_VRAM_SIZE,
+                                                   DIRTY_MEMORY_VGA);
+    for (i = 0; i < nblocks; i++) {
+        bool dirty = memory_region_snapshot_get_dirty(
+            &s->vram, snap, (hwaddr)i * ATI_RAGE128_FB_SCAN_BLOCK,
+            ATI_RAGE128_FB_SCAN_BLOCK);
+
+        if (dirty) {
+            /*
+             * Jump most of the way to the cap on a single hit rather
+             * than incrementing by 1: a large canvas-filling write
+             * can straddle a scan-period boundary, landing in two
+             * separate snapshots. With a slow +1/-1 pace the earlier
+             * half decays back to 0 right as the later half turns on,
+             * so the two halves are never seen as one contiguous
+             * region -- jumping to near-cap on any hit gives a hit
+             * several scans (~seconds) of "recent" credit, long
+             * enough for a split write's other half to show up too.
+             */
+            s->fb_scan_activity[i] = ATI_RAGE128_FB_ACTIVITY_HIT;
+        } else if (s->fb_scan_activity[i] > 0) {
+            s->fb_scan_activity[i]--;
+        }
+    }
+    g_free(snap);
+
+    ati_rage128_pick_auto_fb(s, nblocks);
 }
 
 static bool ati_rage128_update_display(void *opaque)
@@ -310,17 +588,78 @@ static bool ati_rage128_update_display(void *opaque)
     ATIRage128State *s = opaque;
     ATIRage128Mode mode;
     DisplaySurface *ds;
-    uint32_t pix_width;
+    bool valid;
 
     ati_rage128_get_mode(s, &mode);
-    trace_ati_rage128_update(mode.width, mode.height, mode.bpp,
-                             ati_rage128_mode_valid(s, &mode),
+    valid = ati_rage128_mode_valid(s, &mode);
+    trace_ati_rage128_update(mode.width, mode.height, mode.bpp, valid,
                              mode.fb_offset);
-    if (!ati_rage128_mode_valid(s, &mode)) {
-        return true;
+    if (!valid) {
+        if (!s->have_valid_mode) {
+            return true;
+        }
+        /*
+         * CRTC_EN/CRTC_EXT_DISP_EN going away doesn't necessarily mean
+         * the guest stopped drawing. Real Old World boot flow has
+         * Open Firmware itself switch to a bigger console mode via
+         * these same registers (e.g. BootX asking for a nicer startup
+         * resolution); once classic Mac OS/Mac OS X's own generic
+         * framebuffer driver takes over, it can go on drawing into
+         * that same framebuffer indefinitely without ever restoring
+         * these bits (observed live: real desktop content keeps
+         * landing at a fixed offset/pitch while CRTC_EN reads 0 the
+         * entire time). Once a real mode has been seen, keep
+         * rendering it instead of going blank on a bit that's
+         * advisory in practice -- actual blanking is DISPLAY_DIS in
+         * CRTC_EXT_CNTL, already checked above.
+         */
+        mode = s->mode;
+    } else {
+        s->have_valid_mode = true;
     }
-    pix_width = (s->regs[R128_CRTC_GEN_CNTL >> 2] >>
-                 R128_CRTC_PIX_WIDTH_SHIFT) & R128_CRTC_PIX_WIDTH_MASK;
+
+    ati_rage128_scan_vram_activity(s);
+    if (s->auto_fb_valid &&
+        (s->auto_fb_mode.fb_offset != mode.fb_offset ||
+         s->auto_fb_mode.width != mode.width ||
+         s->auto_fb_mode.height != mode.height ||
+         s->auto_fb_mode.bpp != mode.bpp)) {
+        /*
+         * FALLBACK, activity-gated: the auto-detected region only
+         * overrides the CRTC-derived mode when the CRTC's own
+         * framebuffer region shows no recent write activity at all --
+         * i.e. the CRTC registers describe a stale mode (typically
+         * the boot console) while the guest is really painting
+         * somewhere else, which is exactly the pre-CCE-support wedge
+         * signature. A CRTC region that IS being written wins
+         * unconditionally: with the CCE/GART path implemented the
+         * real driver programs CRTC1 with fully valid modes
+         * (confirmed live 2026-08-02: GEN_CNTL=0x03090600, an
+         * 800x600@32bpp mode at offset 0x8000 -- earlier "CRTC is
+         * never programmed" conclusions were an artifact of
+         * byte-order-confused pmemsave analysis on my side, not of
+         * guest behavior).
+         */
+        uint64_t crtc_len = (uint64_t)mode.pitch * mode.height;
+        int first = mode.fb_offset / ATI_RAGE128_FB_SCAN_BLOCK;
+        int last = (mode.fb_offset + crtc_len - 1) / ATI_RAGE128_FB_SCAN_BLOCK;
+        bool crtc_region_live = false;
+        int i;
+
+        if (valid) {
+            for (i = first; i <= last &&
+                 i < (int)(ATI_RAGE128_VRAM_SIZE /
+                           ATI_RAGE128_FB_SCAN_BLOCK); i++) {
+                if (s->fb_scan_activity[i] >= ATI_RAGE128_FB_ACTIVITY_THRESH) {
+                    crtc_region_live = true;
+                    break;
+                }
+            }
+        }
+        if (!crtc_region_live) {
+            mode = s->auto_fb_mode;
+        }
+    }
 
     if (memcmp(&s->mode, &mode, sizeof(mode)) != 0 || s->mode_dirty) {
         s->mode = mode;
@@ -329,7 +668,7 @@ static bool ati_rage128_update_display(void *opaque)
         qemu_console_set_surface(s->con, ds);
     }
     ds = qemu_console_surface(s->con);
-    switch (pix_width) {
+    switch (mode.pix_width) {
     case R128_PIX_WIDTH_8BPP:
         ati_rage128_draw_8bpp(s, ds, &mode);
         break;
@@ -520,6 +859,62 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
          */
         val |= R128_DAC_CMP_OUTPUT;
         break;
+    case R128_GPIO_MONID:
+        /*
+         * MONID_Y (read-only pad-level readback, bits 11:8) was
+         * previously left as whatever raw value happened to be stored,
+         * so the FCode's monitor-sense bit-bang (drive one pad low via
+         * MONID_A/MONID_EN, then poll MONID_Y for the other pads) never
+         * saw the "released pad floats high" response and spun -- live
+         * trace showed 265k+ back-to-back reads of this exact byte
+         * stuck at 0. Real open-drain GPIO pads with an internal weak
+         * pull-up read back their own driven value while in output
+         * mode, and read high while floating in input mode with
+         * nothing externally pulling them low (no monitor attached in
+         * this model) -- there is no dedicated DDC engine wired to
+         * these 4 pads (unlike the hardware I2C_CNTL_0/1/DATA engine
+         * above, which already serves EDID), so this is the physically
+         * correct default response absent one.
+         */
+    {
+        uint32_t en = (val >> 16) & 0xf;
+        uint32_t a = val & 0xf;
+        uint32_t y = (a & en) | (~en & 0xf);
+
+        /*
+         * Apple Monitor Sense (Technical Note HW30) on MONID0-2, same
+         * connected display the onboard mach64 presents (a MultiScan
+         * Band-3: standard code 6, extended code 0x23 -- the exact
+         * monitor whose codes are already proven against this ROM and
+         * OS on the mach64 side). Without a sense response the classic
+         * Mac OS driver labels the port a generic "VGA Display" and
+         * offers era-absurd refresh lists (observed live: 120Hz).
+         * Probe patterns: all three lines floating = standard code on
+         * Y[2:0]; exactly one line driven low = the extended code's
+         * two-bit answer on the other two lines.
+         */
+        if (s->monitor_connected) {
+            uint32_t drv = en & 7 & ~a;   /* lines driven low */
+
+            if ((en & 7) == 0) {
+                /* standard sense: code 6 = 0b110 on Y2..Y0 */
+                y = (y & ~7u) | 6;
+            } else if (drv == 4 && (en & 7) == 4) {
+                /* sense2 low: ext[5:4] -> (Y1,Y0) = 1,0 */
+                y = (y & ~3u) | 2;
+            } else if (drv == 2 && (en & 7) == 2) {
+                /* sense1 low: ext[3:2] -> (Y2,Y0) = 0,0 */
+                y &= ~5u;
+            } else if (drv == 1 && (en & 7) == 1) {
+                /* sense0 low: ext[1:0] -> (Y2,Y1) = 1,1 */
+                y |= 6;
+            }
+        }
+
+        val = (val & ~(0xfu << 8)) | (y << 8);
+        trace_ati_rage128_monid(s->regs[base >> 2], y);
+        break;
+    }
     case R128_PALETTE_INDEX:
         val = s->dac_wr_index | ((uint32_t)s->dac_rd_index << 16);
         break;
@@ -534,6 +929,48 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         if (s->i2c_data_pos < s->i2c_data_len) {
             val = s->i2c_data_fifo[s->i2c_data_pos++];
         }
+        break;
+    case R128_AMCGPIO_Y_MIR:
+        /*
+         * Same floating-pin pull-up default as GPIO_MONID above; the
+         * FCode drives this mirror's byte lane [23:16] alongside
+         * GPIO_MONID during the same probe.
+         */
+        val = (s->regs[R128_AMCGPIO_A_MIR >> 2] &
+               s->regs[R128_AMCGPIO_EN_MIR >> 2]) |
+              ~s->regs[R128_AMCGPIO_EN_MIR >> 2];
+        break;
+    case R128_PM4_STAT:
+        /*
+         * Engine idle: all FIFO entries free (192 covers every
+         * partitioning mode's fifo size), BUSY/GUI_ACTIVE clear --
+         * matches the Linux driver's r128_do_cce_idle() check.
+         */
+        val = 192;
+        break;
+    case R128_PM4_BUFFER_OFFSET:
+        val = s->pm4_buffer_addr;
+        break;
+    case R128_PM4_BUFFER_CNTL:
+        val = s->pm4_buffer_cntl;
+        break;
+    case R128_PM4_BUFFER_DL_RPTR:
+        val = s->pm4_rptr;
+        break;
+    case R128_PM4_BUFFER_DL_WPTR:
+        val = s->pm4_wptr;
+        break;
+    case R128_PM4_MICROCODE_DATAH:
+        val = s->pm4_microcode[s->pm4_ucode_raddr][0];
+        break;
+    case R128_PM4_MICROCODE_DATAL:
+        val = s->pm4_microcode[s->pm4_ucode_raddr][1];
+        s->pm4_ucode_raddr = (s->pm4_ucode_raddr + 1) &
+                             (R128_PM4_MICROCODE_WORDS - 1);
+        break;
+    case R128_PM4_BUFFER_ADDR:
+        /* read as a fence by init code ("as per the sample code") */
+        val = 0;
         break;
     case R128_CONFIG_MEMSIZE:
         val = ATI_RAGE128_VRAM_SIZE;
@@ -579,6 +1016,96 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         /* engine idle, all 64 command FIFO entries free */
         val = 0x40;
         break;
+    case R128_DST_OFFSET:
+        val = s->dst_offset;
+        break;
+    case R128_DST_PITCH:
+        val = s->dst_pitch | (s->dst_tile << 16);
+        break;
+    case R128_DST_WIDTH:
+        val = s->dst_width;
+        break;
+    case R128_DST_HEIGHT:
+        val = s->dst_height;
+        break;
+    case R128_SRC_X:
+        val = s->src_x;
+        break;
+    case R128_SRC_Y:
+        val = s->src_y;
+        break;
+    case R128_DST_X:
+        val = s->dst_x;
+        break;
+    case R128_DST_Y:
+        val = s->dst_y;
+        break;
+    case R128_DP_GUI_MASTER_CNTL:
+        /* aliases fields from DP_MIX and DP_DATATYPE -- see the write case */
+        val = s->dp_gui_master_cntl |
+              ((s->dp_datatype & R128_DP_BRUSH_DATATYPE) >> 4) |
+              ((s->dp_datatype & R128_DP_DST_DATATYPE) << 8) |
+              ((s->dp_datatype & R128_DP_SRC_DATATYPE) >> 4) |
+              (s->dp_mix & R128_DP_ROP3) |
+              ((s->dp_mix & R128_DP_SRC_SOURCE) << 16);
+        break;
+    case R128_SRC_OFFSET:
+        val = s->src_offset;
+        break;
+    case R128_SRC_PITCH:
+        val = s->src_pitch | (s->src_tile << 16);
+        break;
+    case R128_DP_BRUSH_BKGD_CLR:
+        val = s->dp_brush_bkgd_clr;
+        break;
+    case R128_DP_BRUSH_FRGD_CLR:
+        val = s->dp_brush_frgd_clr;
+        break;
+    case R128_DP_SRC_FRGD_CLR:
+        val = s->dp_src_frgd_clr;
+        break;
+    case R128_DP_SRC_BKGD_CLR:
+        val = s->dp_src_bkgd_clr;
+        break;
+    case R128_DP_CNTL:
+        val = s->dp_cntl;
+        break;
+    case R128_DP_DATATYPE:
+        val = s->dp_datatype;
+        break;
+    case R128_DP_MIX:
+        val = s->dp_mix;
+        break;
+    case R128_DP_WRITE_MASK:
+        val = s->dp_write_mask;
+        break;
+    case R128_DEFAULT_OFFSET:
+        val = s->default_offset;
+        break;
+    case R128_DEFAULT_PITCH:
+        val = s->default_pitch;
+        break;
+    case R128_DEFAULT_SC_BOTTOM_RIGHT:
+        val = s->default_sc_right | (s->default_sc_bottom << 16);
+        break;
+    case R128_SC_TOP:
+        val = s->sc_top;
+        break;
+    case R128_SC_LEFT:
+        val = s->sc_left;
+        break;
+    case R128_SC_BOTTOM:
+        val = s->sc_bottom;
+        break;
+    case R128_SC_RIGHT:
+        val = s->sc_right;
+        break;
+    case R128_SRC_SC_BOTTOM:
+        val = s->src_sc_bottom;
+        break;
+    case R128_SRC_SC_RIGHT:
+        val = s->src_sc_right;
+        break;
     case R128_CFG_MIRROR_BASE ... R128_CFG_MIRROR_END:
         val = pci_default_read_config(dev, base - R128_CFG_MIRROR_BASE, 4);
         break;
@@ -587,6 +1114,14 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
     }
     return val;
 }
+
+static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table);
+static void ati_rage128_pm4_run(ATIRage128State *s);
+static void ati_rage128_pm4_fifo_push(ATIRage128State *s, uint32_t val);
+static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
+                                     uint32_t dwords);
+static void ati_rage128_2d_blt(ATIRage128State *s);
+static bool ati_rage128_host_data_flush(ATIRage128State *s);
 
 static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                                     uint32_t val)
@@ -633,11 +1168,13 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->regs[base >> 2] = val;
         s->mode_dirty = true;
         trace_ati_rage128_mode_reg(ati_rage128_reg_name(base), val);
+        ati_rage128_maybe_capture_mode(s);
         break;
     case R128_CRTC_OFFSET:
         s->regs[base >> 2] = val & (R128_CRTC_OFFSET_MASK |
                                     R128_CRTC_OFFSET_LOCK);
         s->mode_dirty = true;
+        ati_rage128_maybe_capture_mode(s);
         break;
     case R128_CRTC_STATUS:
         /* write 1 to bit 1 clears CRTC_VBLANK_SAVE */
@@ -678,8 +1215,271 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
             !!(val & R128_APER_REG_ENDIAN));
         break;
     case R128_GEN_RESET_CNTL:
-        /* engine soft reset: accept and report done by storing 0 */
         s->regs[base >> 2] = val;
+        if (val & R128_SOFT_RESET_GUI) {
+            /* engine soft reset also aborts any half-parsed command
+             * stream state (matches the driver's reset-then-restart
+             * expectation) */
+            s->pm4_fifo.remaining = 0;
+            s->pm4_rptr = 0;
+            s->pm4_wptr = 0;
+        }
+        break;
+    case R128_BM_GUI_TABLE:
+        s->regs[base >> 2] = val;
+        ati_rage128_bm_gui_run(s, val);
+        break;
+    case R128_PM4_BUFFER_OFFSET:
+        s->pm4_buffer_addr = val;
+        s->regs[base >> 2] = val;
+        break;
+    case R128_PM4_BUFFER_CNTL:
+    {
+        uint32_t l2qw = R128_PM4_BUFFER_SIZE_L2QW(val);
+        uint32_t mode = val & R128_PM4_MODE_MASK;
+
+        s->pm4_buffer_cntl = val;
+        s->regs[base >> 2] = val;
+        /*
+         * Only the even "BM" modes give the primary command stream a
+         * bus-master ring; the PIO modes (incl. mode 7, which Mac OS
+         * X uses) deliver the primary stream through the FIFO
+         * registers, handled separately below.
+         */
+        if ((mode == R128_PM4_192BM || mode == R128_PM4_128BM_64INDBM ||
+             mode == R128_PM4_64BM_128INDBM ||
+             mode == R128_PM4_64BM_64VCBM_64INDBM) && l2qw > 0) {
+            s->pm4_ring_dwords = 2u << l2qw;
+        } else {
+            s->pm4_ring_dwords = 0;
+        }
+        break;
+    }
+    case R128_PM4_BUFFER_DL_RPTR:
+        s->pm4_rptr = val & ~R128_PM4_BUFFER_DL_DONE;
+        break;
+    case R128_PM4_BUFFER_DL_WPTR:
+        s->pm4_wptr = val & ~R128_PM4_BUFFER_DL_DONE;
+        /* bit31 (DL_DONE) is a flush marker -- either way, consume */
+        ati_rage128_pm4_run(s);
+        break;
+    case R128_PM4_IW_INDOFF:
+        s->regs[base >> 2] = val;
+        break;
+    case R128_PM4_IW_INDSIZE:
+        s->regs[base >> 2] = val;
+        ati_rage128_pm4_indirect(s, s->regs[R128_PM4_IW_INDOFF >> 2], val);
+        break;
+    case R128_PM4_MICROCODE_ADDR:
+        s->pm4_ucode_waddr = val & (R128_PM4_MICROCODE_WORDS - 1);
+        break;
+    case R128_PM4_MICROCODE_RADDR:
+        s->pm4_ucode_raddr = val & (R128_PM4_MICROCODE_WORDS - 1);
+        break;
+    case R128_PM4_MICROCODE_DATAH:
+        s->pm4_microcode[s->pm4_ucode_waddr][0] = val;
+        break;
+    case R128_PM4_MICROCODE_DATAL:
+        s->pm4_microcode[s->pm4_ucode_waddr][1] = val;
+        s->pm4_ucode_waddr = (s->pm4_ucode_waddr + 1) &
+                             (R128_PM4_MICROCODE_WORDS - 1);
+        break;
+    case R128_PM4_MICRO_CNTL:
+    case R128_PM4_BUFFER_WM_CNTL:
+    case R128_PM4_BUFFER_DL_RPTR_ADDR:
+        s->regs[base >> 2] = val;
+        break;
+    case R128_PM4_FIFO_DATA_EVEN:
+    case R128_PM4_FIFO_DATA_ODD:
+        ati_rage128_pm4_fifo_push(s, val);
+        break;
+    case R128_DST_OFFSET:
+        s->dst_offset = val & 0xfffffff0;
+        break;
+    case R128_DST_PITCH:
+        s->dst_pitch = val & 0x3fff;
+        s->dst_tile = (val >> 16) & 1;
+        break;
+    case R128_DST_WIDTH:
+        s->dst_width = val & 0x3fff;
+        ati_rage128_2d_blt(s);
+        break;
+    case R128_DST_HEIGHT:
+        s->dst_height = val & 0x3fff;
+        break;
+    case R128_SRC_X:
+        s->src_x = val & 0x3fff;
+        break;
+    case R128_SRC_Y:
+        s->src_y = val & 0x3fff;
+        break;
+    case R128_DST_X:
+        s->dst_x = val & 0x3fff;
+        break;
+    case R128_DST_Y:
+        s->dst_y = val & 0x3fff;
+        break;
+    case R128_SRC_PITCH_OFFSET:
+        s->src_offset = (val & 0x1fffff) << 5;
+        s->src_pitch = (val & 0x7fe00000) >> 21;
+        s->src_tile = val >> 31;
+        break;
+    case R128_DST_PITCH_OFFSET:
+        s->dst_offset = (val & 0x1fffff) << 5;
+        s->dst_pitch = (val & 0x7fe00000) >> 21;
+        s->dst_tile = val >> 31;
+        break;
+    case R128_SRC_Y_X:
+        s->src_x = val & 0x3fff;
+        s->src_y = (val >> 16) & 0x3fff;
+        break;
+    case R128_DST_Y_X:
+        s->dst_x = val & 0x3fff;
+        s->dst_y = (val >> 16) & 0x3fff;
+        break;
+    case R128_DST_HEIGHT_WIDTH:
+        s->dst_width = val & 0x3fff;
+        s->dst_height = (val >> 16) & 0x3fff;
+        ati_rage128_2d_blt(s);
+        break;
+    case R128_DP_GUI_MASTER_CNTL:
+        s->dp_gui_master_cntl = val & 0xf800000f;
+        s->dp_datatype = (val & 0x0f00) >> 8 | (val & 0x30f0) << 4 |
+                         (val & 0x4000) << 16;
+        s->dp_mix = (val & R128_GMC_ROP3_MASK) | (val & 0x7000000) >> 16;
+        if (!(val & R128_GMC_SRC_PITCH_OFFSET_CNTL)) {
+            s->src_offset = s->default_offset;
+            s->src_pitch = s->default_pitch;
+        }
+        if (!(val & R128_GMC_DST_PITCH_OFFSET_CNTL)) {
+            s->dst_offset = s->default_offset;
+            s->dst_pitch = s->default_pitch;
+        }
+        if (!(val & R128_GMC_SRC_CLIPPING)) {
+            s->src_sc_right = s->default_sc_right;
+            s->src_sc_bottom = s->default_sc_bottom;
+        }
+        if (!(val & R128_GMC_DST_CLIPPING)) {
+            s->sc_top = 0;
+            s->sc_left = 0;
+            s->sc_right = s->default_sc_right;
+            s->sc_bottom = s->default_sc_bottom;
+        }
+        break;
+    case R128_DST_WIDTH_X:
+        s->dst_x = val & 0x3fff;
+        s->dst_width = (val >> 16) & 0x3fff;
+        ati_rage128_2d_blt(s);
+        break;
+    case R128_SRC_X_Y:
+        s->src_y = val & 0x3fff;
+        s->src_x = (val >> 16) & 0x3fff;
+        break;
+    case R128_DST_X_Y:
+        s->dst_y = val & 0x3fff;
+        s->dst_x = (val >> 16) & 0x3fff;
+        break;
+    case R128_DST_WIDTH_HEIGHT:
+        s->dst_height = val & 0x3fff;
+        s->dst_width = (val >> 16) & 0x3fff;
+        ati_rage128_2d_blt(s);
+        break;
+    case R128_DST_HEIGHT_Y:
+        s->dst_y = val & 0x3fff;
+        s->dst_height = (val >> 16) & 0x3fff;
+        break;
+    case R128_SRC_OFFSET:
+        s->src_offset = val & 0xfffffff0;
+        break;
+    case R128_SRC_PITCH:
+        s->src_pitch = val & 0x3fff;
+        s->src_tile = (val >> 16) & 1;
+        break;
+    case R128_DP_BRUSH_BKGD_CLR:
+        s->dp_brush_bkgd_clr = val;
+        break;
+    case R128_DP_BRUSH_FRGD_CLR:
+        s->dp_brush_frgd_clr = val;
+        break;
+    case R128_DP_CNTL:
+        s->dp_cntl = val;
+        break;
+    case R128_DP_SRC_FRGD_CLR:
+        s->dp_src_frgd_clr = val;
+        break;
+    case R128_DP_SRC_BKGD_CLR:
+        s->dp_src_bkgd_clr = val;
+        break;
+    case R128_DP_DATATYPE:
+        s->dp_datatype = val & 0xe0070f0f;
+        break;
+    case R128_DP_MIX:
+        s->dp_mix = val & 0x00ff0700;
+        break;
+    case R128_DP_WRITE_MASK:
+        s->dp_write_mask = val;
+        break;
+    case R128_DEFAULT_OFFSET:
+        s->default_offset = val & 0xfffffff0;
+        break;
+    case R128_DEFAULT_PITCH:
+        s->default_pitch = val & 0x3fff;
+        break;
+    case R128_DEFAULT_SC_BOTTOM_RIGHT:
+        s->default_sc_right = val & 0x3fff;
+        s->default_sc_bottom = (val >> 16) & 0x3fff;
+        break;
+    case R128_SC_TOP_LEFT:
+        s->sc_left = val & 0x3fff;
+        s->sc_top = (val >> 16) & 0x3fff;
+        break;
+    case R128_SC_LEFT:
+        s->sc_left = val & 0x3fff;
+        break;
+    case R128_SC_TOP:
+        s->sc_top = val & 0x3fff;
+        break;
+    case R128_SC_BOTTOM_RIGHT:
+        s->sc_right = val & 0x3fff;
+        s->sc_bottom = (val >> 16) & 0x3fff;
+        break;
+    case R128_SC_RIGHT:
+        s->sc_right = val & 0x3fff;
+        break;
+    case R128_SC_BOTTOM:
+        s->sc_bottom = val & 0x3fff;
+        break;
+    case R128_SRC_SC_BOTTOM_RIGHT:
+        s->src_sc_right = val & 0x3fff;
+        s->src_sc_bottom = (val >> 16) & 0x3fff;
+        break;
+    case R128_SRC_SC_RIGHT:
+        s->src_sc_right = val & 0x3fff;
+        break;
+    case R128_SRC_SC_BOTTOM:
+        s->src_sc_bottom = val & 0x3fff;
+        break;
+    case R128_HOST_DATA0:
+    case R128_HOST_DATA1:
+    case R128_HOST_DATA2:
+    case R128_HOST_DATA3:
+    case R128_HOST_DATA4:
+    case R128_HOST_DATA5:
+    case R128_HOST_DATA6:
+    case R128_HOST_DATA7:
+    case R128_HOST_DATA_LAST:
+        if (!s->host_data_active) {
+            break;
+        }
+        s->host_data_acc[s->host_data_next++] = val;
+        if (base == R128_HOST_DATA_LAST) {
+            ati_rage128_host_data_flush(s);
+            s->host_data_active = false;
+            s->host_data_next = 0;
+        } else if (s->host_data_next >= 4) {
+            ati_rage128_host_data_flush(s);
+            s->host_data_next = 0;
+        }
         break;
     case R128_CFG_MIRROR_BASE ... R128_CFG_MIRROR_END:
         /* read-only mirror of PCI config space */
@@ -688,6 +1488,759 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->regs[base >> 2] = val;
         break;
     }
+}
+
+/*
+ * GUI bus master: walk the descriptor table at the given guest-physical
+ * address. Each 12-byte, little-endian entry is {dest register offset,
+ * source system-memory address, control}; control's low 16 bits are a
+ * byte count and bit 31 is END_OF_LIST (both inferred from the smoke
+ * test -- see the comment on R128_BM_GUI_TABLE in ati_rage128_regs.h).
+ * The transfer completes synchronously, one dword at a time through the
+ * normal register-write path so a descriptor can target any register
+ * exactly as if the driver had written it directly via MM_INDEX/DATA.
+ */
+static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
+{
+    PCIDevice *pci = PCI_DEVICE(s);
+    dma_addr_t desc = table;
+    int entry;
+
+    for (entry = 0; entry < 4096; entry++) {
+        uint32_t d[3];
+        uint32_t reg_off, sysaddr, ctrl, count;
+
+        if (pci_dma_read(pci, desc, d, sizeof(d)) != MEMTX_OK) {
+            break;
+        }
+        reg_off = le32_to_cpu(d[0]);
+        sysaddr = le32_to_cpu(d[1]);
+        ctrl = le32_to_cpu(d[2]);
+        count = ctrl & 0xffff;
+        trace_ati_rage128_bm_desc(reg_off, sysaddr, ctrl);
+
+        while (count >= 4) {
+            uint32_t word;
+
+            if (pci_dma_read(pci, sysaddr, &word, 4) != MEMTX_OK) {
+                break;
+            }
+            ati_rage128_reg_write32(s, reg_off & 0x3ffc, le32_to_cpu(word));
+            sysaddr += 4;
+            reg_off += 4;
+            count -= 4;
+        }
+
+        if (ctrl & (1u << 31)) {
+            break;
+        }
+        desc += 12;
+    }
+
+    s->regs[R128_GEN_INT_STATUS >> 2] |= R128_BUSMASTER_EOL_INT;
+    ati_rage128_update_irq(s);
+}
+
+/*
+ * Read one dword from the PM4 ring at the current read pointer and
+ * advance it, wrapping at the ring size. The ring lives in VRAM (see
+ * the comment on R128_PM4_BUFFER_OFFSET) so this is a direct pointer
+ * read, not a DMA -- consistent with every other VRAM access in this
+ * file.
+ */
+/*
+ * Read one little-endian dword from card address space: local VRAM
+ * below ATI_RAGE128_VRAM_SIZE, otherwise the 32MB GART-translated
+ * "VM" window (see the R128_PCIGART_TABLE_ENTRIES comment in
+ * ati_rage128_regs.h). Command streams are little-endian regardless
+ * of guest CPU endianness -- big-endian Mac drivers byte-swap their
+ * command buffers on the way out, exactly like the Linux driver's
+ * cpu_to_le32() (verified live: PIO-FIFO dwords, which arrive
+ * pre-swapped through the LE register aperture, decode with the
+ * identical packet layout).
+ *
+ * The GART window's card-space base isn't modeled explicitly: the
+ * window is exactly 32MB and its base is 32MB-aligned, so masking the
+ * page index into the 8192-entry table is base-agnostic.
+ */
+static uint32_t ati_rage128_card_read32(ATIRage128State *s, uint32_t addr,
+                                        bool gart)
+{
+    if (!gart && addr + 4 <= ATI_RAGE128_VRAM_SIZE) {
+        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+        return ldl_le_p(vram + addr);
+    } else {
+        uint32_t gart_base = s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu;
+        uint32_t idx = (addr >> 12) & (R128_PCIGART_TABLE_ENTRIES - 1);
+        uint32_t entry, page, val;
+
+        if (!gart_base) {
+            return 0;
+        }
+        pci_dma_read(PCI_DEVICE(s), gart_base + idx * 4, &entry,
+                     sizeof(entry));
+        page = le32_to_cpu(entry) & ~0xfffu;
+        if (!page) {
+            return 0;
+        }
+        pci_dma_read(PCI_DEVICE(s), page | (addr & 0xfff), &val,
+                     sizeof(val));
+        return le32_to_cpu(val);
+    }
+}
+
+static uint32_t ati_rage128_pm4_read_ring(ATIRage128State *s)
+{
+    bool gart = s->pm4_buffer_addr & R128_AGP_OFFSET_FLAG;
+    uint32_t base = s->pm4_buffer_addr & ~R128_AGP_OFFSET_FLAG;
+    uint32_t val;
+
+    val = ati_rage128_card_read32(s, base + s->pm4_rptr * 4, gart);
+    s->pm4_rptr = (s->pm4_rptr + 1) & (s->pm4_ring_dwords - 1);
+    return val;
+}
+
+/*
+ * Consume PM4 ring entries from the read pointer up to the write
+ * pointer, synchronously (matching the BM engine's own synchronous
+ * model). Packet format: see the comment on R128_PM4_BUFFER_OFFSET in
+ * ati_rage128_regs.h.
+ */
+static void ati_rage128_pm4_run(ATIRage128State *s)
+{
+    int guard;
+
+    if (!s->pm4_ring_dwords) {
+        return;
+    }
+
+    for (guard = 0; guard < 100000 && s->pm4_rptr != s->pm4_wptr; guard++) {
+        uint32_t header = ati_rage128_pm4_read_ring(s);
+        uint32_t type = R128_PM4_PACKET_TYPE(header);
+        uint32_t count = R128_PM4_PACKET_COUNT(header);
+        uint32_t i;
+
+        switch (type) {
+        case 0:
+        {
+            uint32_t reg = R128_PM4_PACKET0_REG(header);
+            bool one_reg = R128_PM4_PACKET0_ONE_REG(header);
+
+            for (i = 0; i < count; i++) {
+                uint32_t data = ati_rage128_pm4_read_ring(s);
+
+                ati_rage128_reg_write32(s, reg & 0x3ffc, data);
+                if (!one_reg) {
+                    reg += 4;
+                }
+            }
+            break;
+        }
+        case 1:
+        {
+            uint32_t reg1 = R128_PM4_PACKET1_REG1(header);
+            uint32_t reg2 = R128_PM4_PACKET1_REG2(header);
+            uint32_t data1 = ati_rage128_pm4_read_ring(s);
+            uint32_t data2 = ati_rage128_pm4_read_ring(s);
+
+            ati_rage128_reg_write32(s, reg1 & 0x3ffc, data1);
+            ati_rage128_reg_write32(s, reg2 & 0x3ffc, data2);
+            break;
+        }
+        case 2:
+            /* NOP/padding, no data words */
+            break;
+        case 3:
+        {
+            uint32_t opcode = R128_PM4_PACKET3_OPCODE(header);
+
+            switch (opcode) {
+            case R128_PM4_OPCODE_PAINT:
+                if (count >= 2) {
+                    uint32_t dst_y_x = ati_rage128_pm4_read_ring(s);
+                    uint32_t dst_h_w = ati_rage128_pm4_read_ring(s);
+
+                    s->dst_x = dst_y_x & 0x3fff;
+                    s->dst_y = (dst_y_x >> 16) & 0x3fff;
+                    s->dst_width = dst_h_w & 0x3fff;
+                    s->dst_height = (dst_h_w >> 16) & 0x3fff;
+                    for (i = 2; i < count; i++) {
+                        ati_rage128_pm4_read_ring(s);
+                    }
+                    ati_rage128_2d_blt(s);
+                } else {
+                    for (i = 0; i < count; i++) {
+                        ati_rage128_pm4_read_ring(s);
+                    }
+                }
+                break;
+            case R128_PM4_OPCODE_BITBLT:
+                if (count >= 3) {
+                    uint32_t src_y_x = ati_rage128_pm4_read_ring(s);
+                    uint32_t dst_y_x = ati_rage128_pm4_read_ring(s);
+                    uint32_t dst_h_w = ati_rage128_pm4_read_ring(s);
+
+                    s->src_x = src_y_x & 0x3fff;
+                    s->src_y = (src_y_x >> 16) & 0x3fff;
+                    s->dst_x = dst_y_x & 0x3fff;
+                    s->dst_y = (dst_y_x >> 16) & 0x3fff;
+                    s->dst_width = dst_h_w & 0x3fff;
+                    s->dst_height = (dst_h_w >> 16) & 0x3fff;
+                    for (i = 3; i < count; i++) {
+                        ati_rage128_pm4_read_ring(s);
+                    }
+                    ati_rage128_2d_blt(s);
+                } else {
+                    for (i = 0; i < count; i++) {
+                        ati_rage128_pm4_read_ring(s);
+                    }
+                }
+                break;
+            case R128_PM4_OPCODE_HOSTDATA_BLT:
+                if (count >= 2) {
+                    uint32_t dst_y_x = ati_rage128_pm4_read_ring(s);
+                    uint32_t dst_h_w = ati_rage128_pm4_read_ring(s);
+
+                    s->dst_x = dst_y_x & 0x3fff;
+                    s->dst_y = (dst_y_x >> 16) & 0x3fff;
+                    s->dst_width = dst_h_w & 0x3fff;
+                    s->dst_height = (dst_h_w >> 16) & 0x3fff;
+                    ati_rage128_2d_blt(s); /* enters host-data mode */
+                    for (i = 2; i < count; i++) {
+                        uint32_t hdata = ati_rage128_pm4_read_ring(s);
+
+                        if (s->host_data_active) {
+                            s->host_data_acc[s->host_data_next++] = hdata;
+                            if (s->host_data_next >= 4) {
+                                ati_rage128_host_data_flush(s);
+                                s->host_data_next = 0;
+                            }
+                        }
+                    }
+                    if (s->host_data_active) {
+                        ati_rage128_host_data_flush(s);
+                        s->host_data_active = false;
+                        s->host_data_next = 0;
+                    }
+                } else {
+                    for (i = 0; i < count; i++) {
+                        ati_rage128_pm4_read_ring(s);
+                    }
+                }
+                break;
+            default:
+                trace_ati_rage128_pm4_unimp(opcode, count);
+                for (i = 0; i < count; i++) {
+                    ati_rage128_pm4_read_ring(s);
+                }
+                break;
+            }
+            break;
+        }
+        }
+    }
+}
+
+/*
+ * PIO alternative to the ring above: the real driver actually pushes
+ * its command stream straight through PM4_FIFO_DATA_EVEN/ODD (see the
+ * comment on those in ati_rage128_regs.h), one dword per write. Same
+ * packet format as the ring, just delivered by MMIO write instead of
+ * being pulled from VRAM, so the state (in-flight packet type/count/
+ * running register) has to live across calls instead of a loop index.
+ */
+static void ati_rage128_pm4_parse(ATIRage128State *s,
+                                  ATIRage128PM4Parser *p, uint32_t val)
+{
+    if (p->remaining == 0) {
+        /* val is a new packet header */
+        p->type = R128_PM4_PACKET_TYPE(val);
+
+        switch (p->type) {
+        case 0:
+            p->reg = R128_PM4_PACKET0_REG(val);
+            p->one_reg = R128_PM4_PACKET0_ONE_REG(val);
+            p->remaining = R128_PM4_PACKET_COUNT(val);
+            break;
+        case 1:
+            p->p1_reg1 = R128_PM4_PACKET1_REG1(val);
+            p->p1_reg2 = R128_PM4_PACKET1_REG2(val);
+            p->remaining = 2;
+            break;
+        case 2:
+            /* NOP/padding, no data words */
+            break;
+        case 3:
+            p->remaining = R128_PM4_PACKET_COUNT(val);
+            p->p3_opcode = R128_PM4_PACKET3_OPCODE(val);
+            p->p3_param_idx = 0;
+            if (p->p3_opcode != R128_PM4_OPCODE_PAINT &&
+                p->p3_opcode != R128_PM4_OPCODE_BITBLT &&
+                p->p3_opcode != R128_PM4_OPCODE_HOSTDATA_BLT) {
+                trace_ati_rage128_pm4_unimp(p->p3_opcode, p->remaining);
+            }
+            break;
+        }
+        return;
+    }
+
+    /* val is a data dword for the packet currently in flight */
+    switch (p->type) {
+    case 0:
+        ati_rage128_reg_write32(s, p->reg & 0x3ffc, val);
+        if (!p->one_reg) {
+            p->reg += 4;
+        }
+        break;
+    case 1:
+        if (p->remaining == 2) {
+            ati_rage128_reg_write32(s, p->p1_reg1 & 0x3ffc, val);
+        } else {
+            ati_rage128_reg_write32(s, p->p1_reg2 & 0x3ffc, val);
+        }
+        break;
+    case 3:
+        switch (p->p3_opcode) {
+        case R128_PM4_OPCODE_PAINT:
+            if (p->p3_param_idx < 2) {
+                p->p3_params[p->p3_param_idx++] = val;
+                if (p->p3_param_idx == 2) {
+                    s->dst_x = p->p3_params[0] & 0x3fff;
+                    s->dst_y = (p->p3_params[0] >> 16) & 0x3fff;
+                    s->dst_width = p->p3_params[1] & 0x3fff;
+                    s->dst_height = (p->p3_params[1] >> 16) & 0x3fff;
+                    ati_rage128_2d_blt(s);
+                }
+            }
+            break;
+        case R128_PM4_OPCODE_BITBLT:
+            if (p->p3_param_idx < 3) {
+                p->p3_params[p->p3_param_idx++] = val;
+                if (p->p3_param_idx == 3) {
+                    s->src_x = p->p3_params[0] & 0x3fff;
+                    s->src_y = (p->p3_params[0] >> 16) & 0x3fff;
+                    s->dst_x = p->p3_params[1] & 0x3fff;
+                    s->dst_y = (p->p3_params[1] >> 16) & 0x3fff;
+                    s->dst_width = p->p3_params[2] & 0x3fff;
+                    s->dst_height = (p->p3_params[2] >> 16) & 0x3fff;
+                    ati_rage128_2d_blt(s);
+                }
+            }
+            break;
+        case R128_PM4_OPCODE_HOSTDATA_BLT:
+            if (p->p3_param_idx < 2) {
+                p->p3_params[p->p3_param_idx++] = val;
+                if (p->p3_param_idx == 2) {
+                    s->dst_x = p->p3_params[0] & 0x3fff;
+                    s->dst_y = (p->p3_params[0] >> 16) & 0x3fff;
+                    s->dst_width = p->p3_params[1] & 0x3fff;
+                    s->dst_height = (p->p3_params[1] >> 16) & 0x3fff;
+                    ati_rage128_2d_blt(s); /* enters host-data mode */
+                }
+            } else if (s->host_data_active) {
+                s->host_data_acc[s->host_data_next++] = val;
+                if (s->host_data_next >= 4) {
+                    ati_rage128_host_data_flush(s);
+                    s->host_data_next = 0;
+                }
+            }
+            break;
+        default:
+            /* draw opcode payload / NOP overrun: discarded, not modeled */
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    p->remaining--;
+    if (p->remaining == 0 && p->type == 3 &&
+        p->p3_opcode == R128_PM4_OPCODE_HOSTDATA_BLT &&
+        s->host_data_active) {
+        ati_rage128_host_data_flush(s);
+        s->host_data_active = false;
+        s->host_data_next = 0;
+    }
+}
+
+static void ati_rage128_pm4_fifo_push(ATIRage128State *s, uint32_t val)
+{
+    ati_rage128_pm4_parse(s, &s->pm4_fifo, val);
+}
+
+/*
+ * Indirect-buffer dispatch (PM4_IW_INDOFF/INDSIZE): the engine
+ * fetches `dwords` command dwords from card address `offset` --
+ * bus-master command submission from GART-translated system memory
+ * (or VRAM). This is how Mac OS X's driver, running the CCE in mode
+ * 7 (64PIO_64VCBM_64INDBM), submits its actual drawing/mode-set
+ * command buffers; the Linux driver does the same via
+ * r128_cce_dispatch_indirect(). Each fetched dword goes through the
+ * same packet state machine as the PIO FIFO, so every packet type the
+ * FIFO path understands works identically here.
+ */
+static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
+                                     uint32_t dwords)
+{
+    /*
+     * The IND queue is a bus-master fetcher by definition (the CNTL
+     * mode names literally call it INDBM): with a GART configured,
+     * IW_INDOFF addresses are offsets into the GART-translated VM
+     * space (guest system memory), even small ones -- confirmed live:
+     * treating small offsets as VRAM read all-zero/stale bytes, while
+     * the guest's real command buffers sit in the GART pages.
+     */
+    bool gart = (s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu) != 0;
+    ATIRage128PM4Parser parser = { 0 };
+    uint32_t i;
+
+    trace_ati_rage128_pm4_indirect(offset, dwords,
+        dwords ? ati_rage128_card_read32(s, offset, gart) : 0);
+    if (dwords > 0x10000) {
+        /* bogus size -- a real IB is at most a few KB */
+        return;
+    }
+    for (i = 0; i < dwords; i++) {
+        ati_rage128_pm4_parse(s, &parser,
+            ati_rage128_card_read32(s, offset + i * 4, gart));
+    }
+}
+
+/*
+ * 2D GUI (destination datapath) engine. Ported from the real, shipped
+ * upstream `ati-vga` device (hw/display/ati.c/ati_2d.c) rather than
+ * written from scratch or from the abandoned SourceFiles/ATI/qemu
+ * clone -- see the comment on the register block in
+ * ati_rage128_regs.h for why. Adapted for this device's standalone
+ * VRAM MemoryRegion (no VGACommonState/vbe here) and for a bigger ROP3
+ * repertoire: upstream only implements SRCCOPY/PATCOPY/BLACKNESS/
+ * WHITENESS and no-ops everything else; this adds a general bit-level
+ * ROP3 fallback (all 16 codes) so a ROP this driver actually uses
+ * doesn't silently vanish.
+ */
+static int ati_rage128_bpp_from_dp_datatype(ATIRage128State *s)
+{
+    switch (s->dp_datatype & 0xf) {
+    case 2:
+        return 8;
+    case 3:
+    case 4:
+        return 16;
+    case 5:
+        return 24;
+    case 6:
+        return 32;
+    default:
+        return 0;
+    }
+}
+
+static uint32_t ati_rage128_2d_read_pixel(ATIRage128State *s, uint32_t offset,
+                                          uint32_t stride, int x, int y,
+                                          int bpp)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
+
+    if (x < 0 || y < 0 || addr + bpp / 8 > ATI_RAGE128_VRAM_SIZE) {
+        return 0;
+    }
+    switch (bpp) {
+    case 8:
+        return vram[addr];
+    case 16:
+        return lduw_le_p(vram + addr);
+    case 24:
+        return ((uint32_t)vram[addr + 2] << 16) |
+               ((uint32_t)vram[addr + 1] << 8) | vram[addr];
+    case 32:
+        return ldl_le_p(vram + addr);
+    default:
+        return 0;
+    }
+}
+
+static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
+                                       uint32_t stride, int x, int y, int bpp,
+                                       uint32_t color)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
+
+    if (x < 0 || y < 0 || addr + bpp / 8 > ATI_RAGE128_VRAM_SIZE) {
+        return;
+    }
+    switch (bpp) {
+    case 8:
+        vram[addr] = color;
+        break;
+    case 16:
+        stw_le_p(vram + addr, color);
+        break;
+    case 24:
+        vram[addr] = color & 0xff;
+        vram[addr + 1] = (color >> 8) & 0xff;
+        vram[addr + 2] = (color >> 16) & 0xff;
+        break;
+    case 32:
+        stl_le_p(vram + addr, color);
+        break;
+    default:
+        break;
+    }
+}
+
+static uint32_t ati_rage128_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,
+                                       uint32_t pat)
+{
+    uint32_t result = 0;
+    int bit;
+
+    /* Fast paths for the common cases */
+    switch (rop) {
+    case 0x00:
+        return 0;
+    case 0xff:
+        return 0xffffffffu;
+    case 0xcc: /* SRCCOPY */
+        return src;
+    case 0xf0: /* PATCOPY */
+        return pat;
+    case 0x55: /* DSTINVERT */
+        return ~dst;
+    case 0x66: /* SRCINVERT (XOR) */
+        return src ^ dst;
+    case 0x88: /* SRCAND */
+        return src & dst;
+    case 0xee: /* SRCPAINT (OR) */
+        return src | dst;
+    case 0x33: /* NOTSRCCOPY */
+        return ~src;
+    case 0x5a: /* PATINVERT */
+        return pat ^ dst;
+    case 0xc0: /* MERGECOPY */
+        return pat & src;
+    default:
+        break;
+    }
+
+    /* General bit-level ROP3: each of the 8 bits of `rop` selects the
+     * output for one of the 8 (S,D,P) input combinations. */
+    for (bit = 0; bit < 32; bit++) {
+        uint32_t mask = 1u << bit;
+        int sb = (src & mask) ? 1 : 0;
+        int db = (dst & mask) ? 1 : 0;
+        int pb = (pat & mask) ? 1 : 0;
+        int idx = (sb << 2) | (db << 1) | pb;
+
+        if (rop & (1 << idx)) {
+            result |= mask;
+        }
+    }
+    return result;
+}
+
+static void ati_rage128_2d_do_blt(ATIRage128State *s)
+{
+    int bpp = ati_rage128_bpp_from_dp_datatype(s);
+    uint8_t rop = (s->dp_mix >> 16) & 0xff;
+    bool left_to_right = s->dp_cntl & R128_DST_X_LEFT_TO_RIGHT;
+    bool top_to_bottom = s->dp_cntl & R128_DST_Y_TOP_TO_BOTTOM;
+    int width = s->dst_width;
+    int height = s->dst_height;
+    uint32_t dst_stride, src_stride;
+    int sc_left, sc_top, sc_right, sc_bottom;
+    int x, y;
+
+    if (!bpp || width == 0 || height == 0) {
+        return;
+    }
+
+    dst_stride = s->dst_pitch * (bpp / 8);
+    src_stride = s->src_pitch * (bpp / 8);
+    if (!dst_stride) {
+        return;
+    }
+
+    sc_left = s->sc_left;
+    sc_top = s->sc_top;
+    sc_right = s->sc_right;
+    sc_bottom = s->sc_bottom;
+    if (sc_right == 0 && sc_bottom == 0) {
+        sc_right = 0x3fff;
+        sc_bottom = 0x3fff;
+    }
+
+    for (y = 0; y < height; y++) {
+        int dy = top_to_bottom ? (int)s->dst_y + y
+                               : (int)s->dst_y + height - 1 - y;
+        int sy = top_to_bottom ? (int)s->src_y + y
+                               : (int)s->src_y + height - 1 - y;
+
+        if (dy < sc_top || dy > sc_bottom) {
+            continue;
+        }
+        for (x = 0; x < width; x++) {
+            int dx = left_to_right ? (int)s->dst_x + x
+                                   : (int)s->dst_x + width - 1 - x;
+            int sx = left_to_right ? (int)s->src_x + x
+                                   : (int)s->src_x + width - 1 - x;
+            uint32_t src_pixel = 0;
+            uint32_t dst_pixel;
+            uint32_t pat_pixel = s->dp_brush_frgd_clr;
+            uint32_t result;
+
+            if (dx < sc_left || dx > sc_right) {
+                continue;
+            }
+            if (rop != 0xf0) {
+                src_pixel = ati_rage128_2d_read_pixel(s, s->src_offset,
+                                                      src_stride, sx, sy,
+                                                      bpp);
+            }
+            dst_pixel = ati_rage128_2d_read_pixel(s, s->dst_offset,
+                                                  dst_stride, dx, dy, bpp);
+            result = ati_rage128_apply_rop3(rop, src_pixel, dst_pixel,
+                                            pat_pixel);
+            ati_rage128_2d_write_pixel(s, s->dst_offset, dst_stride, dx, dy,
+                                       bpp, result);
+        }
+    }
+}
+
+static void ati_rage128_2d_blt(ATIRage128State *s)
+{
+    uint32_t src_source = s->dp_mix & R128_DP_SRC_SOURCE;
+
+    if (s->host_data_active) {
+        /* A new blt implicitly ends any still-in-progress HOST_DATA
+         * transfer, matching upstream's ati_host_data_finish(). */
+        ati_rage128_host_data_flush(s);
+        s->host_data_active = false;
+    }
+
+    if (src_source == R128_DP_SRC_HOST ||
+        src_source == R128_DP_SRC_HOST_BYTEALIGN) {
+        s->host_data_active = true;
+        s->host_data_next = 0;
+        s->host_data_col = 0;
+        s->host_data_row = 0;
+        return;
+    }
+    ati_rage128_2d_do_blt(s);
+}
+
+/*
+ * Flush one HOST_DATA_ACC_BITS (128-bit / 4-dword) accumulator's worth
+ * of pixels, pushed via the HOST_DATA0-7/LAST registers (direct MMIO
+ * path) or the equivalent PM4 HOSTDATA_BLT payload dwords, into VRAM
+ * at the current scanline/column position -- continuing a
+ * possibly-multi-flush transfer across (s->dst_width, s->dst_height).
+ * Same chunked-flush protocol as upstream's ati_host_data_flush().
+ */
+static bool ati_rage128_host_data_flush(ATIRage128State *s)
+{
+    int bpp = ati_rage128_bpp_from_dp_datatype(s);
+    uint32_t src_datatype = s->dp_datatype & R128_DP_SRC_DATATYPE;
+    uint32_t dst_stride;
+    uint8_t pix_buf[16]; /* 128 bits */
+    unsigned bypp, pix_count, idx, row, col;
+
+    if (!s->host_data_active) {
+        return false;
+    }
+    if (!bpp || bpp == 24) {
+        s->host_data_active = false;
+        return false;
+    }
+
+    bypp = bpp / 8;
+    dst_stride = s->dst_pitch * bypp;
+    if (!dst_stride) {
+        s->host_data_active = false;
+        return false;
+    }
+
+    if (src_datatype == R128_SRC_COLOR) {
+        pix_count = sizeof(pix_buf) / bypp;
+        memcpy(pix_buf, s->host_data_acc, sizeof(s->host_data_acc));
+    } else {
+        uint32_t byte_pix_order = s->dp_datatype & R128_DP_BYTE_PIX_ORDER;
+        uint32_t fg = s->dp_src_frgd_clr;
+        uint32_t bg = s->dp_src_bkgd_clr;
+        unsigned word, byte, bit, pidx = 0;
+
+        /* Expand the 128 accumulated monochrome bits to bypp-sized
+         * foreground/background pixels. */
+        for (word = 0; word < 4; word++) {
+            for (byte = 0; byte < 4; byte++) {
+                uint8_t byte_val = s->host_data_acc[word] >> (byte * 8);
+
+                for (bit = 0; bit < 8; bit++) {
+                    bool is_fg = byte_val &
+                                 (1u << (byte_pix_order ? bit : 7 - bit));
+                    uint32_t color = is_fg ? fg : bg;
+
+                    switch (bypp) {
+                    case 1:
+                        pix_buf[pidx] = color;
+                        break;
+                    case 2:
+                        stw_le_p(pix_buf + pidx, color);
+                        break;
+                    case 4:
+                        stl_le_p(pix_buf + pidx, color);
+                        break;
+                    }
+                    pidx += bypp;
+                }
+            }
+        }
+        pix_count = sizeof(pix_buf) / bypp;
+    }
+
+    row = s->host_data_row;
+    col = s->host_data_col;
+    idx = 0;
+    while (idx < pix_count && row < s->dst_height) {
+        unsigned n = MIN(pix_count - idx, s->dst_width - col);
+        unsigned i;
+
+        for (i = 0; i < n; i++) {
+            uint32_t color;
+
+            switch (bypp) {
+            case 1:
+                color = pix_buf[(idx + i) * bypp];
+                break;
+            case 2:
+                color = lduw_le_p(pix_buf + (idx + i) * bypp);
+                break;
+            case 4:
+                color = ldl_le_p(pix_buf + (idx + i) * bypp);
+                break;
+            default:
+                color = 0;
+                break;
+            }
+            ati_rage128_2d_write_pixel(s, s->dst_offset, dst_stride,
+                                       s->dst_x + col + i, s->dst_y + row,
+                                       bpp, color);
+        }
+        idx += n;
+        col += n;
+        if (col >= s->dst_width) {
+            col = 0;
+            row++;
+        }
+    }
+    s->host_data_row = row;
+    s->host_data_col = col;
+    if (s->host_data_row >= s->dst_height) {
+        s->host_data_active = false;
+    }
+    return s->host_data_active;
 }
 
 /*
@@ -771,6 +2324,82 @@ static const MemoryRegionOps ati_rage128_mmio_ops = {
     },
 };
 
+/*
+ * Aperture 1: the second 32MB framebuffer image, with the CONFIG_CNTL
+ * APER_1_ENDIAN byte swapper actually applied (RRG-G04500-C: "For the
+ * PowerMac environment, this allows each [aperture] to be
+ * independently marked as big-endian or little-endian"). Mac OS X's
+ * driver programs mode 2 (32-bit swap) and stages its CCE indirect
+ * buffers through this half; the swap is what turns its native
+ * big-endian stores into the little-endian bytes the command
+ * processor expects to fetch.
+ *
+ * The swap is modeled as byte-lane XOR addressing (how the real
+ * silicon implements it): mode 1 (16-bit swap) = XOR 1, mode 2
+ * (32-bit swap) = XOR 3, mode 3 (half-dword swap) = XOR 2. With the
+ * region declared guest-native big-endian, an unswapped mapping would
+ * put an access's most-significant byte at the lowest address, so
+ * lane i of an N-byte access carries byte N-1-i of the value.
+ */
+static uint64_t ati_rage128_aper1_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    ATIRage128State *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    static const uint32_t xor_map[4] = { 0, 1, 3, 2 };
+    uint32_t mode = (s->regs[R128_CONFIG_CNTL >> 2] >>
+                     R128_APER_1_ENDIAN_SHIFT) & R128_APER_0_ENDIAN_MASK;
+    uint32_t lane_xor = xor_map[mode];
+    uint64_t val = 0;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        uint64_t off = (addr + i) ^ lane_xor;
+
+        if (off < ATI_RAGE128_VRAM_SIZE) {
+            val |= (uint64_t)vram[off] << (8 * (size - 1 - i));
+        }
+    }
+    return val;
+}
+
+static void ati_rage128_aper1_write(void *opaque, hwaddr addr, uint64_t data,
+                                    unsigned size)
+{
+    ATIRage128State *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    static const uint32_t xor_map[4] = { 0, 1, 3, 2 };
+    uint32_t mode = (s->regs[R128_CONFIG_CNTL >> 2] >>
+                     R128_APER_1_ENDIAN_SHIFT) & R128_APER_0_ENDIAN_MASK;
+    uint32_t lane_xor = xor_map[mode];
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        uint64_t off = (addr + i) ^ lane_xor;
+
+        if (off < ATI_RAGE128_VRAM_SIZE) {
+            vram[off] = (data >> (8 * (size - 1 - i))) & 0xff;
+        }
+    }
+    /* keep the dirty-bitmap framebuffer scanner seeing these writes */
+    memory_region_set_dirty(&s->vram, addr & ~7ull, 8);
+}
+
+static const MemoryRegionOps ati_rage128_aper1_ops = {
+    .read = ati_rage128_aper1_read,
+    .write = ati_rage128_aper1_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
 /* ---------------------------------------------------------------- */
 
 static void ati_rage128_reset_hold(Object *obj, ResetType type)
@@ -810,17 +2439,31 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
     /*
      * BAR0: the 64MB linear aperture, holding two 32MB "images" of the
      * frame buffer (CONFIG_APER_0_BASE / CONFIG_APER_1_BASE). Each
-     * image can be given its own endian-swap mode via CONFIG_CNTL;
-     * the swappers themselves are not modeled yet (traced instead) so
-     * both halves currently alias the same raw VRAM bytes.
+     * image can be given its own endian-swap mode via CONFIG_CNTL.
+     * Aperture 0 stays a plain RAM mapping (fast path; a guest
+     * enabling a swap mode on it is only traced) -- aperture 1 is a
+     * real swapping IO view, which is the half Mac drivers configure
+     * as their byte-swapped window (observed live: Mac OS X sets
+     * CONFIG_CNTL=0x8 = 32-bit swap on aperture 1 and stages its CCE
+     * indirect buffers through it; without the swap those buffers
+     * land byte-reversed and every command mis-parses).
      */
     memory_region_init(&s->aper, obj, "ati-rage128-aper",
                        ATI_RAGE128_APER_SIZE);
     memory_region_init_ram(&s->vram, obj, "ati-rage128-vram",
                            ATI_RAGE128_VRAM_SIZE, &error_fatal);
+    /*
+     * Needed by ati_rage128_scan_vram_activity() to auto-detect the
+     * real live framebuffer when CRTC1 never describes it (see that
+     * function's comment) -- reuses the same DIRTY_MEMORY_VGA client
+     * every other display device's dirty-scanline tracking already
+     * uses, since this device has no dirty-tracking use of its own to
+     * conflict with.
+     */
+    memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
     memory_region_add_subregion(&s->aper, 0, &s->vram);
-    memory_region_init_alias(&s->vram_aper1, obj, "ati-rage128-aper1",
-                             &s->vram, 0, ATI_RAGE128_VRAM_SIZE);
+    memory_region_init_io(&s->vram_aper1, obj, &ati_rage128_aper1_ops, s,
+                          "ati-rage128-aper1", ATI_RAGE128_VRAM_SIZE);
     memory_region_add_subregion(&s->aper, ATI_RAGE128_APER_SIZE / 2,
                                 &s->vram_aper1);
 
@@ -857,7 +2500,35 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
     timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               ATI_RAGE128_VBLANK_PERIOD_NS);
 
-    qemu_edid_generate(s->edid, sizeof(s->edid), &s->edid_info);
+    /*
+     * Period-correct EDID: an Apple-style 17" multiscan CRT limited to
+     * the classic Mac timing set (640x480@60/67 through 1280x1024@75,
+     * preferred 1152x870@75, vertical range capped at 75Hz). QEMU's
+     * generated default EDID advertises modern high-refresh modes,
+     * which a guest driver that builds its mode list from DDC turns
+     * into era-absurd offerings (observed live under Mac OS 9: 120Hz
+     * refresh choices on a "VGA Display").
+     */
+    static const uint8_t rage128_default_edid[128] = {
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+        0x06, 0x10, 0x75, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x0c, 0x09, 0x01, 0x01, 0x08, 0x20, 0x18, 0x78,
+        0x0a, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26,
+        0x0f, 0x50, 0x54, 0x31, 0x6b, 0x80, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10, 0x27,
+        0x80, 0x30, 0x41, 0x66, 0x2d, 0x30, 0x40, 0x80,
+        0x13, 0x00, 0x40, 0xf0, 0x10, 0x00, 0x00, 0x1e,
+        0x00, 0x00, 0x00, 0xfd, 0x00, 0x32, 0x4b, 0x1e,
+        0x46, 0x0a, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x4d,
+        0x75, 0x6c, 0x74, 0x69, 0x70, 0x6c, 0x65, 0x20,
+        0x53, 0x63, 0x61, 0x6e, 0x00, 0x00, 0x00, 0x10,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76,
+    };
+
+    memcpy(s->edid, rage128_default_edid, sizeof(s->edid));
 }
 
 static void ati_rage128_exit(PCIDevice *dev)
@@ -889,6 +2560,8 @@ static const VMStateDescription vmstate_ati_rage128 = {
 };
 
 static const Property ati_rage128_properties[] = {
+    DEFINE_PROP_BOOL("monitor-connected", ATIRage128State,
+                     monitor_connected, true),
     DEFINE_EDID_PROPERTIES(ATIRage128State, edid_info),
 };
 

@@ -160,6 +160,11 @@ ati_rage128_update(int w, int h, int bpp, int valid, uint32_t fb_off) "update %d
 ati_rage128_mode_reg(const char *name, uint32_t val) "%s <- 0x%08x"
 ati_rage128_i2c(uint8_t addr, uint8_t count, int receive, int nack, uint8_t edid_off) "addr=0x%02x count=%u receive=%d nack=%d edid_off=%u"
 ati_rage128_aper_endian(uint32_t aper0, uint32_t aper1, int reg_swap) "APER_0_ENDIAN=%u APER_1_ENDIAN=%u REG_ENDIAN=%d"
+ati_rage128_bm_desc(uint32_t reg_off, uint32_t sysaddr, uint32_t ctrl) "reg_off=0x%x sysaddr=0x%x ctrl=0x%08x"
+ati_rage128_pm4_unimp(uint32_t opcode, uint32_t count) "PM4 packet3 opcode=0x%02x count=%u (unimplemented, skipped)"
+ati_rage128_auto_fb(uint32_t off, uint32_t w, uint32_t h, uint32_t bpp_or_size, int valid, uint32_t score) "off=0x%x %ux%u bpp/size=%u valid=%d score=%u"
+ati_rage128_pm4_indirect(uint32_t offset, uint32_t dwords, uint32_t first) "IB dispatch: card-addr=0x%x dwords=%u first=0x%08x"
+ati_rage128_monid(uint32_t raw, uint32_t y) "GPIO_MONID probe raw=0x%08x -> Y=0x%x"
 
 # artist.c
 artist_reg_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 "%s -> 0x%08"PRIx64
