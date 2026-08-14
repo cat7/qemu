@@ -59,7 +59,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIRage128State, ATI_RAGE128)
  *   Expansion ROM: 128KB
  */
 #define ATI_RAGE128_APER_SIZE   (64 * 1024 * 1024)
-#define ATI_RAGE128_VRAM_SIZE   (16 * 1024 * 1024)
+/*
+ * 32MB, which is what the retail Rage 128 Pro this device models carries
+ * and what the rest of the code already assumes: the 64MB aperture is
+ * described, and mapped, as two 32MB images of the frame buffer.
+ *
+ * With only 16MB the upper half of the guest's frame-buffer memory did
+ * not exist. Mac OS allocates its offscreen surfaces from the top, so
+ * everything it staged there was silently lost -- captured live, the
+ * video scaler's source sat at 0x1fda000 (31.85MB) and the blits around
+ * it addressed 0x1fd9500 and 0x1ff3f00, all beyond the end of VRAM.
+ */
+#define ATI_RAGE128_VRAM_SIZE   (32 * 1024 * 1024)
 #define ATI_RAGE128_MMIO_SIZE   (16 * 1024)
 #define ATI_RAGE128_IO_SIZE     256
 #define ATI_RAGE128_NUM_REGS    (ATI_RAGE128_MMIO_SIZE / 4)
@@ -74,13 +85,10 @@ typedef struct ATIRage128PM4Parser {
     uint32_t p1_reg1;        /* packet1's two register offsets */
     uint32_t p1_reg2;
     uint32_t p3_opcode;      /* packet3 2D-draw sub-state */
-    uint32_t p3_params[3];
+    uint32_t p3_params[8];
+    uint32_t p3_scale[16];      /* R128_SCALE_PKT_DWORDS */
     uint32_t p3_param_idx;
-    /* *_MULTI packet prefix/rect-cycle sub-state */
-    bool p3_need_src_po;
-    bool p3_need_dst_po;
-    bool p3_need_color;
-    uint32_t p3_rect_phase;
+    uint32_t p3_total;       /* payload dwords the packet3 declared */
 } ATIRage128PM4Parser;
 
 typedef struct ATIRage128Mode {
@@ -112,20 +120,6 @@ struct ATIRage128State {
 
     ATIRage128Mode mode;
     bool mode_dirty;
-    /*
-     * Cursor updates are coalesced to one per displayed frame. Moving the
-     * pointer past the top edge takes two writes that must agree --
-     * CUR_OFFSET advances 16 bytes per hidden line while CUR_VERT_OFF
-     * counts the same lines -- and Mac OS X does NOT bracket them with
-     * CUR_LOCK (confirmed live: lock read 0 in every sample). Rebuilding
-     * the sprite on each individual write therefore renders the
-     * intermediate state, where the offset has moved but the line count
-     * has not, and the tail of the 64-row read runs off the end of the
-     * 1KB image into unrelated VRAM -- drawn as a large opaque block.
-     * Real hardware has the same window but only latches the cursor once
-     * a frame, so it is never visible; do the same.
-     */
-    bool cursor_dirty;
     bool have_valid_mode; /* has `mode` ever held a real, valid mode? */
 
     /*
@@ -189,18 +183,22 @@ struct ATIRage128State {
     uint8_t i2c_offset;      /* current EDID read offset */
     uint8_t i2c_data_fifo[16];
     int i2c_data_len;
+    int i2c_data_pos;
 
     /*
-     * Second DDC path: Mac OS X's ATI ndrv bit-bangs I2C on the
-     * GPIO_MONID pads (SDA = pad 0, SCL = pad 1), marking them with
-     * MASK nibble 0xf -- distinct from the Apple-sense probes (MASK
-     * 0x7) and the FCode's EN-only convention (MASK 0). Serves the
-     * same 128-byte EDID as the hardware engine above.
+     * Second DDC path: the ATI Mac drivers (Mac OS X's ndrv on mac99,
+     * and -- observed live on g3beige -- the classic Mac OS 9 driver
+     * and the card FCode too) bit-bang I2C on the GPIO_MONID pads
+     * (SDA = pad 0, SCL = pad 1), marking them with MASK nibble 0xf --
+     * distinct from the Apple-sense probes (MASK 0x7) and the FCode's
+     * EN-only convention (MASK 0). Serves the same 128-byte EDID as
+     * the hardware engine above.
      */
+    bool host_cursor_published;   /* synthetic arrow handed to the UI */
     bitbang_i2c_interface monid_i2c;
     int monid_sda;           /* live SDA level fed back into MONID_Y */
-    uint32_t ddc1_pos;       /* VSYNC-clocked DDC1 EDID bitstream position */
-    int i2c_data_pos;
+    uint32_t ddc1_pos;       /* DDC1 EDID bitstream position (in bits) */
+    uint32_t ddc1_half;      /* half-bit phase: 2 manual VSYNC pulses/bit */
 
     /*
      * PM4/CCE GUI command-FIFO ring buffer -- the mechanism the real
@@ -267,31 +265,83 @@ struct ATIRage128State {
     uint32_t dp_gui_master_cntl;
     uint32_t dp_brush_bkgd_clr, dp_brush_frgd_clr;
     uint32_t dp_src_frgd_clr, dp_src_bkgd_clr;
-    uint32_t sc_top, sc_left, sc_bottom, sc_right;
-    uint32_t src_sc_bottom, src_sc_right;
+    /*
+     * Scissors are SIGNED 14-bit fields -- the register guide gives the
+     * range as -8192..8191 ("Destination left scissor", RAGE 128 VR/GL
+     * Register Reference Manual 7.6). Holding them unsigned turned a
+     * legitimately negative left/top edge -- what the driver programs
+     * for a window hanging off the left or top of the screen -- into a
+     * huge positive one, which clips the whole drawing away.
+     */
+    int32_t sc_top, sc_left, sc_bottom, sc_right;
+    int32_t src_sc_bottom, src_sc_right;
     uint32_t dp_cntl, dp_datatype, dp_mix, dp_write_mask;
     uint32_t default_offset, default_pitch;
-    uint32_t default_sc_bottom, default_sc_right;
+    int32_t default_sc_bottom, default_sc_right;
 
     /*
-     * The pitch/offset and scissor fields above are the EFFECTIVE values the
-     * drawing code uses; these are the register values they derive from.
-     * DP_GUI_MASTER_CNTL's SRC/DST_PITCH_OFFSET_CNTL and SRC/DST_CLIPPING
-     * bits SELECT, per operation, whether the effective value comes from the
-     * source/destination registers or from DEFAULT_* -- a selection, not a
-     * transfer. Folding it straight into the effective field on every GMC
-     * write destroys the register behind it, so the result then depends on
-     * the order the driver happens to write things in. Mac OS X hits exactly
-     * that: it programs the separate SRC_PITCH/SRC_OFFSET registers rather
-     * than the packed SRC_PITCH_OFFSET, and every PAINT/BITBLT packet
-     * carries its own GMC dword, so a blit could run with a pitch left over
-     * from an earlier, differently sized surface. One 8-pixel pitch unit of
-     * staleness shears the copy by 8 pixels per row.
+     * The pitch/offset and scissor fields above are the EFFECTIVE values
+     * the drawing code uses; these are the register values they are
+     * derived from. DP_GUI_MASTER_CNTL's SRC/DST_PITCH_OFFSET_CNTL and
+     * SRC/DST_CLIPPING bits select, per operation, whether the effective
+     * value comes from the source/destination registers or from the
+     * DEFAULT_* ones -- a selection, not a transfer. Folding it straight
+     * into the effective field on every GMC write (which is what this
+     * used to do) destroys the register behind it, so the result depends
+     * on the order the driver happens to write things in. Mac OS X hits
+     * exactly that: it programs the separate SRC_PITCH/SRC_OFFSET
+     * registers rather than the packed SRC_PITCH_OFFSET, and every
+     * PAINT/BITBLT packet carries its own GMC dword, so a blit could run
+     * with a pitch left over from an earlier, differently sized surface.
+     * One 8-pixel pitch unit of staleness shears the copy by 8 pixels per
+     * row -- the diagonally streaked window contents on the Rage.
      */
     uint32_t src_offset_reg, src_pitch_reg, src_tile_reg;
     uint32_t dst_offset_reg, dst_pitch_reg, dst_tile_reg;
-    uint32_t sc_top_reg, sc_left_reg, sc_bottom_reg, sc_right_reg;
-    uint32_t src_sc_bottom_reg, src_sc_right_reg;
+    int32_t sc_top_reg, sc_left_reg, sc_bottom_reg, sc_right_reg;
+    int32_t src_sc_bottom_reg, src_sc_right_reg;
+
+    /*
+     * Diagnostic: CPU stores into the frame buffer go through aperture 0,
+     * which is a plain RAM alias, so nothing in this device can see them
+     * -- and that is exactly the path that fills the driver's offscreen
+     * staging surface. Setting the "fillwatch"/"fillwatch-size" properties
+     * lays an instrumented IO window over that range of aperture 0 so the
+     * fills become visible. Writes are coalesced into contiguous runs and
+     * traced one line per run, so a full surface fill costs a line per row
+     * rather than one per store.
+     */
+    MemoryRegion vram_watch;
+    uint32_t fillwatch_off, fillwatch_size;
+    uint32_t fw_run_start, fw_run_end;
+    bool fw_active;
+
+    /*
+     * Hardware cursor (CUR_* registers). hw_cursor_on tracks whether the
+     * guest's own cursor is live, so the host-driven fallback pointer
+     * stands aside rather than fighting it for the console cursor.
+     * hw_cursor_sum is a checksum of the published image, so a shape
+     * change made by writing VRAM alone is still picked up without
+     * re-uploading an unchanged cursor on every frame.
+     */
+    bool hw_cursor_on;
+    uint32_t hw_cursor_sum;
+    /*
+     * When the mach64's host-side pointer tracking is driving this display
+     * (its host-cursor-tracking property, which the Mac OS 9 launcher turns
+     * on), it owns the console cursor for good and the guest's own hardware
+     * cursor must stand aside -- under Mac OS 9 the guest barely updates the
+     * CUR_* registers on this card, so publishing them leaves a pointer
+     * frozen at a stale position. Under Mac OS X, where tracking is off and
+     * the guest drives the registers properly, the hardware cursor wins.
+     *
+     * Ownership is a latch, NOT a timeout. Expiring it after a second of no
+     * host updates meant that whenever the pointer sat still on the other
+     * display the hardware cursor took the console back and redisplayed its
+     * stale position -- a ghost pointer left behind on this screen, plus an
+     * artefact as the handover happened on the way across.
+     */
+    bool host_cursor_active;
 
     /* HOST_DATA0-7/LAST accumulator, same protocol as upstream */
     bool host_data_active;
@@ -305,6 +355,16 @@ const char *ati_rage128_reg_name(uint32_t base);
 
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
+void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt);
 bool ati_rage128_host_data_flush(ATIRage128State *s);
+
+/*
+ * Show/position a host-driven pointer on this card's console. Used by
+ * the mach64's host-cursor-tracking workaround once the pointer crosses
+ * onto this display: this device has no hardware-cursor emulation and
+ * the guest never drives one here, so without it the pointer would
+ * simply vanish on the second screen.
+ */
+void ati_rage128_host_cursor(int x, int y, bool on);
 
 #endif /* ATI_RAGE128_INT_H */
