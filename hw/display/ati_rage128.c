@@ -623,6 +623,19 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
         }
         qemu_console_set_cursor(s->con, c);
         cursor_unref(c);
+    } else {
+        /*
+         * Cursor disabled: unpublish the sprite. Leaving the last one
+         * composited paints a stale arrow over whatever the guest does
+         * next -- Mac OS X turns CRTC_CUR_EN off when it falls back to
+         * software cursor drawing, and the leftover hardware sprite
+         * then shadows the real, guest-drawn pointer.
+         */
+        QEMUCursor *empty = cursor_alloc(1, 1);
+
+        empty->data[0] = 0;
+        qemu_console_set_cursor(s->con, empty);
+        cursor_unref(empty);
     }
     ati_rage128_cursor_set_pos(s);
 }
@@ -1209,6 +1222,22 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
     case R128_GUI_STAT:
         /* engine idle, all 64 command FIFO entries free */
         val = 0x40;
+        break;
+    case R128_BM_QUEUE_STATUS:
+        /* bus-master engine idle, nothing queued */
+        val = 0;
+        break;
+    case R128_BM_QUEUE_FREE_STATUS:
+        /*
+         * Every queue slot free. Descriptor tables run synchronously in
+         * ati_rage128_bm_gui_run(), so the queue can never be observed
+         * non-empty. Mac OS X 10.4's driver programs BM_CHUNK_0_VAL and
+         * then checks here before submitting its presentation blits; a
+         * raw-zero answer read as "queue full forever" and it never
+         * submitted anything -- the desktop stayed composed in the back
+         * buffer while the screen kept the loginwindow backdrop.
+         */
+        val = 0x10101010;
         break;
     case R128_DST_OFFSET:
         val = s->dst_offset;

@@ -348,6 +348,9 @@
  * it via this register, then reads back GUI_SCRATCH_REG0/1 expecting
  * the sentinel to have landed there -- see ati_rage128_bm_gui_run().
  */
+#define R128_BM_QUEUE_STATUS         0x0a10
+#define R128_BM_QUEUE_FREE_STATUS    0x0a14
+#define R128_BM_CHUNK_0_VAL          0x0a18
 #define R128_BM_GUI_TABLE            0x0a50
 #define R128_BM_CHUNK_0_VAL          0x0a18
 
