@@ -52,6 +52,7 @@ struct UNINHostState {
 
     uint32_t ofw_addr;
     bool real_irq_map;
+    bool no_self_func;
     qemu_irq irqs[8];
     MemoryRegion pci_mmio;
     MemoryRegion pci_hole;

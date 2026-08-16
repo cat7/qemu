@@ -219,3 +219,9 @@ int pm34_usb_devfn(void)
 {
     return PCI_DEVFN(0x18, 0);
 }
+
+/* Real PM34 device tree: /pci@f4000000/firewire@e, device 14 function 0. */
+int pm34_firewire_devfn(void)
+{
+    return PCI_DEVFN(0x0e, 0);
+}

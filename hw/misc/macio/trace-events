@@ -61,3 +61,7 @@ tas3001_reg_write(uint8_t subaddr, int pos, uint8_t val) "deq reg=0x%02x byte %d
 keylargo_i2s_cb(int cell, int avail, uint32_t fifo, bool prebuf) "I2S%d cb avail=%d fifo=%u prebuf=%d"
 keylargo_i2c_read(const char *n, uint64_t addr, uint32_t val) "%s R reg=0x%02"PRIx64" val=0x%02x"
 keylargo_i2c_write(const char *n, uint64_t addr, uint32_t val) "%s W reg=0x%02"PRIx64" val=0x%02x"
+
+# mac99_firewire_stub.c
+mac99_firewire_stub_read(uint64_t addr, unsigned size, uint64_t val) "R addr=0x%03"PRIx64" size=%u val=0x%08"PRIx64
+mac99_firewire_stub_write(uint64_t addr, unsigned size, uint64_t val) "W addr=0x%03"PRIx64" size=%u val=0x%08"PRIx64

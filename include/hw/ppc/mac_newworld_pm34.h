@@ -52,5 +52,6 @@ void pm34_pci_irq_map(DeviceState *uninorth_pci_dev, DeviceState *pic_dev);
 
 int pm34_macio_devfn(void);
 int pm34_usb_devfn(void);
+int pm34_firewire_devfn(void);
 
 #endif

@@ -141,23 +141,25 @@ static uint64_t unin_data_read(void *opaque, hwaddr addr,
 
     /*
      * Real PowerMac PCI bridges legitimately have some genuinely
-     * unpopulated device numbers -- e.g. this project's own real-hardware
-     * device-tree dump confirms the internal bus's own bridge
-     * self-function sits at device 14, leaving device 11 truly empty
-     * there, the same device number AppleMacRiscPCI::configure() checks
-     * on every bridge (main/internal/AGP alike) for an AGP capability.
-     * Its capability-chain walker, findPCICapability(), has no defense
-     * against a genuine "no device" response: an all-1s PCI_STATUS
-     * falsely looks like "capability list present" (its bit 0x10), and
-     * the chain it then tries to walk never finds the byte-0 terminator
-     * its only loop-exit test looks for, spinning forever. This is
-     * presumably a dormant kernel bug real hardware never exercises for
-     * reasons specific to that silicon this emulation doesn't replicate
-     * -- confirmed via live kernel-symbol tracing during a genuine OS X
-     * 10.0.3/10.1.3 boot hang, see the mac99 project notes. Report a
-     * clean, capability-free response instead of the generic empty-slot
-     * sentinel whenever nothing is actually at the target devfn, letting
-     * the capability walker's own early-exit path do the right thing.
+     * unpopulated device numbers -- e.g. device 11 is empty on both the
+     * main and internal buses of a real PowerMac3,4 (confirmed against
+     * this project's own real-hardware device-tree dump: pci@f4000000's
+     * only two children are ethernet@f and firewire@e, nothing at
+     * device 11), the same device number AppleMacRiscPCI::configure()
+     * checks on every bridge (main/internal/AGP alike) for an AGP
+     * capability. Its capability-chain walker, findPCICapability(), has
+     * no defense against a genuine "no device" response: an all-1s
+     * PCI_STATUS falsely looks like "capability list present" (its bit
+     * 0x10), and the chain it then tries to walk never finds the byte-0
+     * terminator its only loop-exit test looks for, spinning forever.
+     * This is presumably a dormant kernel bug real hardware never
+     * exercises for reasons specific to that silicon this emulation
+     * doesn't replicate -- confirmed via live kernel-symbol tracing
+     * during a genuine OS X 10.0.3/10.1.3 boot hang, see the mac99
+     * project notes. Report a clean, capability-free response instead of
+     * the generic empty-slot sentinel whenever nothing is actually at
+     * the target devfn, letting the capability walker's own early-exit
+     * path do the right thing.
      */
     if (!pci_find_device(phb->bus, (config_addr >> 16) & 0xff,
                          (config_addr >> 8) & 0xff)) {
@@ -347,7 +349,17 @@ static void pci_unin_internal_realize(DeviceState *dev, Error **errp)
                                    PCI_DEVFN(14, 0),
                                    s->real_irq_map ? 8 : 4, TYPE_PCI_BUS);
 
-    pci_create_simple(h->bus, PCI_DEVFN(14, 0), "uni-north-internal-pci");
+    /*
+     * On a real PowerMac3,4, device 14 function 0 of this bus is not a
+     * generic bridge self-function -- it's the onboard Lucent/Agere
+     * FireWire OHCI controller (/pci@f4000000/firewire@e, vendor:device
+     * 11c1:5811, confirmed against a real machine's device-tree dump).
+     * Leave that slot free for it there instead of shadowing it with this
+     * placeholder.
+     */
+    if (!s->no_self_func) {
+        pci_create_simple(h->bus, PCI_DEVFN(14, 0), "uni-north-internal-pci");
+    }
 }
 
 static void pci_unin_internal_init(Object *obj)
@@ -618,6 +630,8 @@ static const TypeInfo pci_unin_agp_info = {
 static const Property pci_unin_internal_props[] = {
     /* Route slots per the real PowerMac3,4 interrupt-map (Apple ROM mode) */
     DEFINE_PROP_BOOL("real-irq-map", UNINHostState, real_irq_map, false),
+    /* Leave device 14 function 0 free for a real onboard device */
+    DEFINE_PROP_BOOL("no-self-func", UNINHostState, no_self_func, false),
 };
 
 static void pci_unin_internal_class_init(ObjectClass *klass, const void *data)

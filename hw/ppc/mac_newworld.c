@@ -517,7 +517,7 @@ static uint8_t core99_chrp_cksum(const uint8_t *hdr)
  * the latter the ROM rejects the image ("NVRAM corrupted") and wipes it.
  */
 static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
-                                     const uint8_t *mac)
+                                     const uint8_t *mac, const uint8_t *guid)
 {
     const uint32_t COPY = 0x2000;
     /*
@@ -534,12 +534,34 @@ static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
         "0 0 encode-bytes \" built-in\" property device-end ",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]) : g_strdup("");
     /*
+     * FireWire GUID graft (only when a GUID is supplied, PM34 only):
+     * publishes an 8-byte GUID property on the built-in firewire@e node.
+     * The real ROM's own vendor-specific bring-up for the real 11c1:5811
+     * identity crashes (a CPU/MMU translation gap in the ROM's own code,
+     * unfixable device-side) before it ever reaches a config-ROM/GUID
+     * readback, and no separate GUID/serial EEPROM exists on the real
+     * board to model a read protocol against in the first place --
+     * confirmed against the real PowerMac3,4 schematic, which shows the
+     * FireWire link integrated into UniNorth 1.5 with only a PHY (no GUID
+     * EEPROM) as a separate part. So this is grafted directly, the same
+     * way local-mac-address is above; see mac99 gmac/firewire
+     * investigation memory.
+     */
+    g_autofree char *fwguid = guid ? g_strdup_printf(
+        "dev /pci@f4000000/firewire@e "
+        "here h# %02x over c! 1+ h# %02x over c! 1+ h# %02x over c! 1+ "
+        "h# %02x over c! 1+ h# %02x over c! 1+ h# %02x over c! 1+ "
+        "h# %02x over c! 1+ h# %02x swap c! "
+        "here 8 encode-bytes \" GUID\" property device-end ",
+        guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6],
+        guid[7]) : g_strdup("");
+    /*
      * cache-POST graft (always): the l2cr/l2-cache device-tree data a real
      * PowerMac3,4 publishes plus a zeroed /diagnostics/post-results, so Mac OS
      * never shows the "problem with cache memory" alert. Independent of the
-     * gmac graft above.
+     * gmac/fwguid grafts above.
      */
-    g_autofree char *bootcmd = g_strconcat("boot-command=", gmac,
+    g_autofree char *bootcmd = g_strconcat("boot-command=", gmac, fwguid,
         "dev /cpus/PowerPC,G4@0 "
         "h# b9000000 encode-int \" l2cr\" property "
         "new-device \" l2-cache\" device-name \" cache\" device-type "
@@ -683,27 +705,40 @@ static void core99_report_boot_device(MacIONVRAMState *nvr)
  * built-in gmac's MAC so Mac OS brings up en0. The gmac graft is gated because
  * OS 9's en0 bring-up off "built-in" hangs the boot; it is skipped for CD boots
  * and whenever no sungem is present, but the cache graft applies regardless.
+ * On PM34, also grafts a synthesized FireWire GUID (see
+ * core99_nvram_set_bootcmd's fwguid comment for why this can't be read from
+ * real hardware); its serial portion borrows the gmac's last 3 bytes when
+ * available, purely to keep the two synthesized identities consistent with
+ * each other, not because real hardware ties them together.
  */
-static void core99_nvram_graft(MacIONVRAMState *nvr, bool inject_gmac)
+static void core99_nvram_graft(MacIONVRAMState *nvr, bool inject_gmac,
+                               bool is_pm34)
 {
+    Object *o = object_resolve_path_type("", "sungem", NULL);
+    g_autofree char *macstr = o ? object_property_get_str(o, "mac", NULL)
+                                : NULL;
     uint8_t mac[6];
+    uint8_t guid[8];
     bool have_mac = false;
 
     if (!nvr->data) {
         return;
     }
-    if (inject_gmac) {
-        Object *o = object_resolve_path_type("", "sungem", NULL);
-        g_autofree char *macstr = o ? object_property_get_str(o, "mac", NULL)
-                                    : NULL;
-
-        if (macstr && sscanf(macstr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                             &mac[0], &mac[1], &mac[2], &mac[3], &mac[4],
-                             &mac[5]) == 6) {
-            have_mac = true;
-        }
+    if (macstr && sscanf(macstr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                         &mac[0], &mac[1], &mac[2], &mac[3], &mac[4],
+                         &mac[5]) == 6) {
+        have_mac = true;
     }
-    core99_nvram_set_bootcmd(nvr->data, nvr->size, have_mac ? mac : NULL);
+    if (is_pm34) {
+        guid[0] = 0x00; guid[1] = 0x30; guid[2] = 0x65; /* Apple OUI */
+        guid[3] = 0xff; guid[4] = 0xfe;                 /* EUI-64 padding */
+        guid[5] = have_mac ? mac[3] : 0x00;
+        guid[6] = have_mac ? mac[4] : 0x00;
+        guid[7] = have_mac ? mac[5] : 0x01;
+    }
+    core99_nvram_set_bootcmd(nvr->data, nvr->size,
+                             (inject_gmac && have_mac) ? mac : NULL,
+                             is_pm34 ? guid : NULL);
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -969,6 +1004,8 @@ static void ppc_core99_init(MachineState *machine)
                                 TYPE_UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE);
         qdev_prop_set_bit(uninorth_internal_dev, "real-irq-map",
                           rom_is_flash);
+        qdev_prop_set_bit(uninorth_internal_dev, "no-self-func",
+                          core99_machine->model == CORE99_MODEL_PM34);
         s = SYS_BUS_DEVICE(uninorth_internal_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf4800000);
@@ -1217,6 +1254,13 @@ static void ppc_core99_init(MachineState *machine)
 
         core99_place_gmac(core99_machine->model, internal_bus,
                          mc->default_nic);
+
+        /* Real PM34 device tree: /pci@f4000000/firewire@e, same internal
+         * bus as ethernet@f -- not the external pci@f2000000 bus. */
+        if (core99_machine->model == CORE99_MODEL_PM34) {
+            pci_create_simple(internal_bus, pm34_firewire_devfn(),
+                              "mac99-firewire-stub");
+        }
     } else {
         pci_init_nic_devices(pci_bus, mc->default_nic);
     }
@@ -1282,7 +1326,8 @@ static void ppc_core99_init(MachineState *machine)
      * the in-RAM nvram image only; the backing file is left untouched.
      */
     if (rom_is_flash) {
-        core99_nvram_graft(nvr, !core99_machine->cd_boot_fix);
+        core99_nvram_graft(nvr, !core99_machine->cd_boot_fix,
+                          core99_machine->model == CORE99_MODEL_PM34);
     }
     core99_report_boot_device(nvr);
     /* No PCI init: the BIOS will do it */
