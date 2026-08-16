@@ -3205,6 +3205,16 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
     pci_config_set_interrupt_pin(dev->config, 1);
 
     /*
+     * Report the AGP identity when asked (see the "agp" property /
+     * PCI_DEVICE_ID_ATI_RAGE128PRO_AGP's comment) -- an AGP ROM's FCode
+     * will not bind to a device whose PCIR-visible device ID doesn't
+     * match its own header exactly.
+     */
+    if (s->agp_ident) {
+        pci_config_set_device_id(dev->config, PCI_DEVICE_ID_ATI_RAGE128PRO_AGP);
+    }
+
+    /*
      * AGP capability block. The Rage 128 Pro OEM AGP ROMs (FCode part
      * numbers 113-630xx / 113-720xx) walk the PCI capability chain for a
      * PCI_CAP_ID_AGP block during their init probe; when it is absent they
@@ -3321,6 +3331,7 @@ static const Property ati_rage128_properties[] = {
     DEFINE_PROP_UINT32("fillwatch-size", ATIRage128State, fillwatch_size, 0),
     DEFINE_PROP_BOOL("monitor-connected", ATIRage128State,
                      monitor_connected, true),
+    DEFINE_PROP_BOOL("agp", ATIRage128State, agp_ident, false),
     DEFINE_EDID_PROPERTIES(ATIRage128State, edid_info),
 };
 

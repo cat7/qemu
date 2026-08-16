@@ -556,12 +556,55 @@ static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
         guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6],
         guid[7]) : g_strdup("");
     /*
+     * AGP-slot enable graft (PM34 only): PowerMac3,4 always shipped with an
+     * AGP graphics card, but this ROM's native PCI config-space access code
+     * is hardcoded to the main bus only -- a Ghidra disassembly of the whole
+     * 1MB image found literal references to the main bus's config-space
+     * MMIO addresses at 4 sites, and zero anywhere to the AGP or internal
+     * bus's -- so nothing ever flips PCI_COMMAND's memory-space-enable bit
+     * for a card sitting on the AGP bus. The generic BAR-sizing walk still
+     * runs and assigns real addresses (device-identity-independent,
+     * confirmed with an unrelated rtl8139 in the same slot), it just never
+     * gets turned on. See mac99 AGP investigation memory for the full trail.
+     *
+     * Set the bit ourselves, operating purely from the AGP host bridge's own
+     * node (always present, unconditionally created for every PM34 machine)
+     * via its generic config-b@/config-b! methods with an explicit config
+     * address -- device 0x10 (16) is the real AGP slot's device number on
+     * this bus (confirmed via the disassembly-derived `unin_get_config_reg`
+     * geographic-addressing scheme), offset 4 is PCI_COMMAND.
+     *
+     * Deliberately does NOT navigate to the card's own auto-generated child
+     * node by path (`dev /pci@.../pci1af4,1100@10`, needed for e.g.
+     * `my-space`-relative access) -- `my-space` is an INSTANCE word that
+     * plain `dev` doesn't open (confirmed live: throws "no current
+     * instance"), and wrapping a `dev <path>` in a colon-definition +
+     * `catch` to make a possibly-absent child safe to reference doesn't
+     * work either: `dev` is a PARSING word that reads its path from the
+     * current input stream at *run* time, and by the time a deferred
+     * colon-word executes via `' ... catch`, the input pointer has already
+     * moved past that text during the original top-level scan (confirmed
+     * live as a garbled "path, unknown word" error). Operating on the
+     * parent bridge with an explicit config address sidesteps all of this:
+     * poking a devfn with nothing present is a harmless no-op on real
+     * hardware (and on this emulation, per `unin_data_read`/`write`'s own
+     * not-found handling in hw/pci-host/uninorth.c), so it needs no
+     * presence check or `catch` at all, and safely does nothing when no AGP
+     * card is attached -- confirmed live, no regression on the normal
+     * main-bus-only config.
+     */
+    const char *agp_enable = guid ?
+        "dev /pci@f0000000 h# 8004 config-b@ 2 or h# 8004 config-b! "
+        "device-end "
+        : "";
+    /*
      * cache-POST graft (always): the l2cr/l2-cache device-tree data a real
      * PowerMac3,4 publishes plus a zeroed /diagnostics/post-results, so Mac OS
      * never shows the "problem with cache memory" alert. Independent of the
      * gmac/fwguid grafts above.
      */
     g_autofree char *bootcmd = g_strconcat("boot-command=", gmac, fwguid,
+        agp_enable,
         "dev /cpus/PowerPC,G4@0 "
         "h# b9000000 encode-int \" l2cr\" property "
         "new-device \" l2-cache\" device-name \" cache\" device-type "

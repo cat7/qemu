@@ -46,6 +46,20 @@
  * only Rage 128 Pro ROM dump available at the time.
  */
 #define PCI_DEVICE_ID_ATI_RAGE128PRO   0x5245
+/*
+ * 0x5046 "PF" = Rage 128 Pro, AGP 4x TMDS variant -- the real identity of
+ * the OEM AGP ROMs (ati_oem_rage128pro_110/136_agp_full.rom, PCIR-confirmed:
+ * both declare device 0x5046). Open Firmware's FCode-binding step requires
+ * an exact vendor:device match against the ROM's own PCIR header, so an AGP
+ * ROM paired with a card reporting 0x5245 (the PCI identity above) is
+ * refused binding outright -- confirmed live on mac99/PM34: the generic PCI
+ * bus-walk still sizes and reserves the card's BARs (identity-agnostic
+ * housekeeping), but memory-space-enable is never set and the FCode never
+ * runs. Selected via the "agp" property, not the default -- g3beige never
+ * had an AGP slot (see PCI_DEVICE_ID_ATI_RAGE128PRO's own comment) so this
+ * only matters for mac99 placements on the AGP bus.
+ */
+#define PCI_DEVICE_ID_ATI_RAGE128PRO_AGP 0x5046
 
 #define TYPE_ATI_RAGE128 "ati-rage128-pro"
 OBJECT_DECLARE_SIMPLE_TYPE(ATIRage128State, ATI_RAGE128)
@@ -160,6 +174,11 @@ struct ATIRage128State {
      * (all sense lines float high).
      */
     bool monitor_connected;
+    /*
+     * Report the AGP identity (0x5046) instead of the default PCI one
+     * (0x5245) -- see PCI_DEVICE_ID_ATI_RAGE128PRO_AGP's comment.
+     */
+    bool agp_ident;
     ATIRage128Mode auto_fb_pending;
 
     /*
