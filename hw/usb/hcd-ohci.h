@@ -63,6 +63,18 @@ struct OHCIState {
      */
     QEMUTimer *resume_timer;
 
+    /*
+     * QEMU_CLOCK_REALTIME timestamp of port 0's last reset, or 0 if it
+     * has never been reset. Deliberately wall-clock, not virtual time:
+     * this only ever gates a real g_usleep() stagger, so it needs to
+     * track actual elapsed time regardless of how much (or how little)
+     * guest virtual time advances between the two resets. Used by
+     * ohci_port_set_status() and ohci_roothub_reset() to detect when a
+     * later port's reset lands right on top of port 0's -- see the
+     * comments there for why that specific collision matters.
+     */
+    int64_t port0_reset_time;
+
     /* OHCI state */
     /* Control partition */
     uint32_t ctl, status;

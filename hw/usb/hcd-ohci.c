@@ -331,7 +331,27 @@ static void ohci_roothub_reset(OHCIState *ohci)
         port = &ohci->rhport[i];
         port->ctrl = 0;
         if (port->port.dev && port->port.dev->attached) {
+            /*
+             * A whole-hub reset (HCFS=Reset, e.g. guest-initiated bus
+             * recovery -- this isn't just an initial-boot path) resets
+             * every attached port back-to-back in this loop, with no
+             * real time between them. That is the same classic-Mac-OS
+             * shim collision ohci_port_set_status() staggers for
+             * guest-driven individual port resets (see the comment
+             * there): whichever device isn't on port 0 loses the race
+             * and never gets its HID reports delivered, even though it
+             * finishes USB-level enumeration just fine. This loop is a
+             * separate code path (ohci_roothub_reset() calls
+             * usb_port_reset() directly, bypassing ohci_port_set_status()
+             * entirely) so it needs its own copy of the same stagger.
+             */
+            if (i > 0) {
+                g_usleep(50000);
+            }
             usb_port_reset(&port->port);
+            if (i == 0) {
+                ohci->port0_reset_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            }
         }
     }
     ohci_stop_endpoints(ohci);
@@ -1592,6 +1612,37 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
             ohci_set_ctl(ohci, (ohci->ctl & ~OHCI_CTL_HCFS) | OHCI_USB_OPERATIONAL);
         }
         usb_device_reset(port->port.dev);
+        if (portnum == 0) {
+            ohci->port0_reset_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        } else if (ohci->port0_reset_time != 0 &&
+                   qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - ohci->port0_reset_time <
+                   200 * SCALE_MS) {
+            /*
+             * Classic Mac OS's USB-to-ADB compatibility shim (baked into
+             * the Mac OS ROM) is timing-sensitive during enumeration: when
+             * two devices reset back-to-back with no gap, only the device
+             * on port 0 ends up usable - a second keyboard/mouse
+             * enumerates fine at the USB level (address, descriptors,
+             * configuration all succeed) but the shim never delivers its
+             * HID reports to the Cursor Device Manager, leaving it dead
+             * (confirmed via hid_pointer_poll tracing: real, correct
+             * dx/dy data reaches the guest's USB report buffer, so the
+             * guest itself is at fault, not the emulation up to that
+             * point).
+             *
+             * This isn't unique to initial boot enumeration -- the guest
+             * can decide to reset both ports again later in the session
+             * (observed live: a second dual-port reset landing well after
+             * boot, with port 0's SET_ADDRESS immediately followed by
+             * port 1's in the same handful of requests), and the same
+             * collision kills port 1's device again when it happens. So
+             * gate the stagger on actual proximity to port 0's last
+             * reset, not on "first reset ever": only delay when port 0
+             * was reset within the last 200ms, which is what the shim
+             * actually seems to be sensitive to.
+             */
+            g_usleep(50000);
+        }
         port->ctrl &= ~OHCI_PORT_PRS;
         /* ??? Should this also set OHCI_PORT_PESC. */
         port->ctrl |= OHCI_PORT_PES | OHCI_PORT_PRSC;
