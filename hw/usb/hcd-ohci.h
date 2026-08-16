@@ -56,14 +56,6 @@ struct OHCIState {
     int64_t sof_time;
 
     /*
-     * Real OHCI hardware auto-completes a Resume back to Operational
-     * after the required resume-signaling time, without waiting for
-     * software to write HCFS=Operational itself -- see ohci_resume()
-     * in hcd-ohci.c for why this matters.
-     */
-    QEMUTimer *resume_timer;
-
-    /*
      * QEMU_CLOCK_REALTIME timestamp of port 0's last reset, or 0 if it
      * has never been reset. Deliberately wall-clock, not virtual time:
      * this only ever gates a real g_usleep() stagger, so it needs to

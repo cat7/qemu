@@ -106,28 +106,7 @@ void usb_wakeup(USBEndpoint *ep, unsigned int stream)
          */
         return;
     }
-    /*
-     * Standards-strict gating on dev->remote_wakeup (only true after the
-     * guest explicitly does SET_FEATURE(DEVICE_REMOTE_WAKEUP)) used to be
-     * here. Traced live against Mac OS X 10.0: its USB stack suspends the
-     * OHCI controller as routine power management but never sends that
-     * SET_FEATURE to either our emulated keyboard or mouse, even though
-     * both correctly advertise remote-wakeup capability in their config
-     * descriptor (USB_CFG_ATT_WAKEUP). Once suspended, real HID data
-     * arriving (a real keypress, confirmed reaching hid_keyboard_event())
-     * had no way to resume the bus, so it just sat in the queue forever --
-     * the whole controller stayed suspended for the rest of the session.
-     * Real USB keyboards/mice have remote wakeup as an always-on hardware
-     * capability, not something a driver opts into (that's how "press a
-     * key to wake the Mac" works) -- so unconditionally offering the
-     * port/controller-level wakeup here, whenever the device itself has
-     * new data, matches real hardware better than requiring an explicit
-     * enable an early driver may simply never bother sending. The
-     * downstream wakeup ops (see ohci_wakeup) already no-op when nothing
-     * is actually suspended, so this is harmless for devices that were
-     * never asleep to begin with.
-     */
-    if (dev->port && dev->port->ops->wakeup) {
+    if (dev->remote_wakeup && dev->port && dev->port->ops->wakeup) {
         dev->port->ops->wakeup(dev->port);
     }
     if (bus->ops->wakeup_endpoint) {
