@@ -29,6 +29,14 @@
 /* Number of Downstream Ports on the root hub: */
 #define OHCI_MAX_PORTS 15
 
+/*
+ * Number of simultaneous in-flight async USB packets this controller can
+ * track. Real OHCI hardware allows one active transfer per endpoint; we
+ * approximate that with a small fixed pool of slots shared across all
+ * endpoints/devices on the controller, instead of a single shared slot.
+ */
+#define OHCI_MAX_ASYNC 8
+
 typedef struct OHCIPort {
     USBPort port;
     uint32_t ctrl;
@@ -87,10 +95,10 @@ struct OHCIState {
 
     /* Active packets.  */
     uint32_t old_ctl;
-    USBPacket usb_packet;
-    uint8_t usb_buf[8192];
-    uint32_t async_td;
-    bool async_complete;
+    USBPacket usb_packet[OHCI_MAX_ASYNC];
+    uint8_t usb_buf[OHCI_MAX_ASYNC][8192];
+    uint32_t async_td[OHCI_MAX_ASYNC];
+    bool async_complete[OHCI_MAX_ASYNC];
 
     void (*ohci_die)(OHCIState *ohci);
 };
