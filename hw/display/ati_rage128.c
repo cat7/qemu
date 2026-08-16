@@ -615,6 +615,19 @@ static bool ati_rage128_update_display(void *opaque)
     }
     s->mode = mode;
     s->mode_dirty = false;
+    if (trace_event_get_state_backends(TRACE_ATI_RAGE128_VRAM_PEEK)) {
+        uint8_t *vp = (uint8_t *)memory_region_get_ram_ptr(&s->vram);
+        uint32_t o5 = mode.fb_offset + 5 * mode.pitch;
+        uint32_t o30 = mode.fb_offset + 30 * mode.pitch;
+        trace_ati_rage128_vram_peek(5, o5, ldl_le_p(vp + o5),
+                                    ldl_le_p(vp + o5 + 4),
+                                    ldl_le_p(vp + o5 + 8),
+                                    ldl_le_p(vp + o5 + 12));
+        trace_ati_rage128_vram_peek(30, o30, ldl_le_p(vp + o30),
+                                    ldl_le_p(vp + o30 + 4),
+                                    ldl_le_p(vp + o30 + 8),
+                                    ldl_le_p(vp + o30 + 12));
+    }
     ds = qemu_console_surface(s->con);
     switch (mode.pix_width) {
     case R128_PIX_WIDTH_8BPP:
@@ -1643,6 +1656,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_DP_BRUSH_FRGD_CLR:
     case R128_CONSTANT_COLOR_C:
         s->dp_brush_frgd_clr = val;
+        trace_ati_rage128_brush_clr(base, val);
         break;
     case R128_DP_CNTL:
         s->dp_cntl = val;

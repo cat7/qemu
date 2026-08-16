@@ -80,6 +80,9 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
     if (x < 0 || y < 0 || addr + bpp / 8 > ATI_RAGE128_VRAM_SIZE) {
         return;
     }
+    if (addr >= 0xd000 && addr < 0xe000) {
+        trace_ati_rage128_pixwatch(addr, color, bpp);
+    }
     switch (bpp) {
     case 8:
         vram[addr] = color;
@@ -286,6 +289,13 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
         sc_right = 0x3fff;
         sc_bottom = 0x3fff;
     }
+
+    trace_ati_rage128_blt_clip(s->dst_x, s->dst_y, width, height,
+                               s->dst_offset, dst_stride,
+                               s->mode.fb_offset, s->mode.pitch,
+                               s->mode.bpp, bpp);
+    trace_ati_rage128_blt_scissor(s->dst_x, s->dst_y, width, height,
+                                  sc_left, sc_top, sc_right, sc_bottom);
 
     /*
      * Pick a non-destructive direction when a copy overlaps itself.
@@ -519,6 +529,9 @@ void ati_rage128_2d_blt(ATIRage128State *s)
                              (s->dp_mix >> 16) & 0xff, s->dp_datatype,
                              src_source >> 8, s->src_offset, s->dst_offset,
                              (s->src_pitch << 16) | s->dst_pitch);
+    trace_ati_rage128_blt_fill(s->dp_brush_frgd_clr, s->dp_brush_bkgd_clr,
+                               s->dp_src_frgd_clr, (s->dp_mix >> 16) & 0xff,
+                               s->dp_datatype);
 
     if (s->host_data_active) {
         /* A new blt implicitly ends any still-in-progress HOST_DATA
