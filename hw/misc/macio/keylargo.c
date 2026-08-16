@@ -708,15 +708,20 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
                 c->status &= ~KW_I2C_STAT_LAST_RW;
             }
             /*
-             * A read transfer starts clocking the first byte in as soon as
-             * the device has acknowledged its address, so the data interrupt
-             * is already pending by the time the driver looks.
+             * Defer the data byte fetch and IRQ_DATA to when the driver
+             * acks IRQ_ADDR (in the ISR case below) instead of raising both
+             * synchronously here -- see read_pending's doc comment. Real
+             * Apple Hardware Test's Core99 I2C TCM hangs forever against
+             * the old synchronous-bundle behavior: its real-hardware-
+             * correct "isr |= ADDR" ack read the DATA bit as already set
+             * too, and its write-back (write-1-to-clear) cleared DATA
+             * before the driver read it, so our old auto-stop-on-DATA-ack
+             * logic completed the transfer early and the driver's own
+             * DATA-wait loop then spun forever (see mac99 CD-boot
+             * investigation memory for the full trace-level derivation).
              */
-            if (ack && (c->addr & 1)) {
-                c->data = i2c_recv(c->bus);
-            }
-            keywest_i2c_set_irq(c, KW_I2C_IRQ_ADDR |
-                                   (ack ? KW_I2C_IRQ_DATA : 0));
+            c->read_pending = ack && (c->addr & 1);
+            keywest_i2c_set_irq(c, KW_I2C_IRQ_ADDR);
 
             /*
              * On a NAK the controller aborts the transfer by itself and
@@ -764,6 +769,20 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         /* Write-1-to-clear. */
         c->isr &= ~(val & KW_I2C_IRQ_MASK);
         keywest_i2c_update_irq(c);
+
+        /*
+         * The driver acking IRQ_ADDR is what lets the deferred data byte
+         * land (see read_pending's doc comment) -- fetch it and raise
+         * IRQ_DATA as a genuinely new event now, not before, so the driver
+         * never observes ADDR and DATA set simultaneously on its very
+         * first poll.
+         */
+        if ((val & KW_I2C_IRQ_ADDR) && c->xfer_active && c->read_pending) {
+            c->read_pending = false;
+            c->data = i2c_recv(c->bus);
+            c->status |= KW_I2C_STAT_LAST_AAK;
+            keywest_i2c_set_irq(c, KW_I2C_IRQ_DATA);
+        }
 
         /*
          * Acknowledging the data interrupt is what lets the byte engine run

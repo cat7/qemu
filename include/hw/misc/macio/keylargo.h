@@ -188,6 +188,20 @@ typedef struct KeyLargoI2CState {
      * distinguishes those two acks; see keywest_i2c_write()'s ISR case.
      */
     bool manual_byte_delivered;
+    /*
+     * XADDR-triggered reads (COMBINED/STANDARD/STANDARDSUB): true from the
+     * address ack until the driver acks IRQ_ADDR, at which point the data
+     * byte is fetched and IRQ_DATA raised. See keywest_i2c_write()'s
+     * CONTROL and ISR cases -- this is the same "defer the byte fetch to
+     * the driver's next ack" contract DUMB mode already uses via
+     * manual_byte_delivered above, applied to the XADDR path so ADDR and
+     * DATA are never visible to the driver as a single simultaneous event
+     * (real hardware clocks the byte in only after the address phase is
+     * acked; a driver's real-hardware-correct "isr |= ADDR" read-modify-
+     * write would otherwise read DATA as already set too, and its write-
+     * back would clear DATA before the driver ever reads it).
+     */
+    bool read_pending;
     uint8_t mode;
     uint8_t control;
     uint8_t status;
