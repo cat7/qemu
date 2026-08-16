@@ -1487,6 +1487,15 @@ static void ohci_set_hub_status(OHCIState *ohci, uint32_t val)
     }
 }
 
+static void ohci_resume_timer(void *opaque)
+{
+    OHCIState *ohci = opaque;
+
+    if ((ohci->ctl & OHCI_CTL_HCFS) == OHCI_USB_RESUME) {
+        ohci_set_ctl(ohci, (ohci->ctl & ~OHCI_CTL_HCFS) | OHCI_USB_OPERATIONAL);
+    }
+}
+
 /* This is the one state transition the controller can do by itself */
 static bool ohci_resume(OHCIState *s)
 {
@@ -1494,6 +1503,17 @@ static bool ohci_resume(OHCIState *s)
         trace_usb_ohci_remote_wakeup(s->name);
         s->ctl &= ~OHCI_CTL_HCFS;
         s->ctl |= OHCI_USB_RESUME;
+        /*
+         * Real OHCI hardware auto-completes Resume -> Operational after
+         * the required ~20ms resume-signaling time, without waiting for
+         * software to write HCFS=Operational itself. Mac OS X 10.0's USB
+         * stack never does that write on its own here -- confirmed live,
+         * the controller sat at Resume (ctl masked to 0x40) forever after
+         * a real keypress triggered this path, since nothing else ever
+         * advanced it. Model the real auto-completion with a timer.
+         */
+        timer_mod(s->resume_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 20 * SCALE_MS);
         return true;
     }
     return false;
@@ -1556,6 +1576,21 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
 
     if (ohci_port_set_if_connected(ohci, portnum, val & OHCI_PORT_PRS)) {
         trace_usb_ohci_port_reset(portnum);
+        if ((ohci->ctl & OHCI_CTL_HCFS) == OHCI_USB_SUSPEND) {
+            /*
+             * The guest can legitimately ask the root hub to reset a port
+             * while the whole controller is suspended (e.g. as part of its
+             * own bring-up sequence for a second device, before the first
+             * device has started polling and would otherwise trigger our
+             * usb_wakeup()-driven resume). ohci_bus_stop() tore down the
+             * eof_timer on entry to Suspend, so with nothing else to wake
+             * it, frame/list processing -- and this very reset -- would
+             * never actually be serviced. A real root hub initiating a
+             * port reset implies it is not asleep, so treat it as an
+             * implicit resume.
+             */
+            ohci_set_ctl(ohci, (ohci->ctl & ~OHCI_CTL_HCFS) | OHCI_USB_OPERATIONAL);
+        }
         usb_device_reset(port->port.dev);
         port->ctrl &= ~OHCI_PORT_PRS;
         /* ??? Should this also set OHCI_PORT_PESC. */
@@ -2026,6 +2061,8 @@ void usb_ohci_init(OHCIState *ohci, DeviceState *dev, uint32_t num_ports,
 
     ohci->eof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    ohci_frame_boundary, ohci);
+    ohci->resume_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      ohci_resume_timer, ohci);
 }
 
 /*

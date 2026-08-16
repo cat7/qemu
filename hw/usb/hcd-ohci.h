@@ -55,6 +55,14 @@ struct OHCIState {
     QEMUTimer *eof_timer;
     int64_t sof_time;
 
+    /*
+     * Real OHCI hardware auto-completes a Resume back to Operational
+     * after the required resume-signaling time, without waiting for
+     * software to write HCFS=Operational itself -- see ohci_resume()
+     * in hcd-ohci.c for why this matters.
+     */
+    QEMUTimer *resume_timer;
+
     /* OHCI state */
     /* Control partition */
     uint32_t ctl, status;
