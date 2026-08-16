@@ -225,20 +225,62 @@ static void macio_oldworld_init(Object *obj)
     }
 }
 
-static void timer_write(void *opaque, hwaddr addr, uint64_t value,
-                       unsigned size)
+/* Free-running 18.432MHz KeyLargo counter, in its own ticks. */
+static uint64_t macio_kltime(void)
 {
-    trace_macio_timer_write(addr, size, value);
-}
-
-static uint64_t timer_read(void *opaque, hwaddr addr, unsigned size)
-{
-    uint32_t value = 0;
     uint64_t systime = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t kltime;
 
     kltime = muldiv64(systime, 4194300, NANOSECONDS_PER_SECOND * 4);
     kltime = muldiv64(kltime, 18432000, 1048575);
+
+    return kltime;
+}
+
+/*
+ * The counter is settable, and both the Mac OS ROM and Mac OS X's
+ * AppleKeyLargo depend on it: their bus-speed calibration
+ * (KeyLargo::AdjustBusSpeeds / TimeSystemBusKeyLargo in the OS X kext)
+ * zeroes this register, spins for a fixed decrementer interval and reads
+ * back how far the counter advanced -- so what it wants is a delta, not
+ * an absolute. Discarding writes (as this did) hands it the whole count
+ * since the machine powered on: BusClockRateHz comes out as
+ * CONST/elapsed instead of the real value, and the decrementer clock as
+ * a quarter of that. On the OpenBIOS mac99 (whose PowerMac3,1 model
+ * selects AppleCore99PE, which does not mark via-pmu BusSpeedCorrect
+ * either) Mac OS X 10.1 ended up with gPEClockFrequencyInfo.dec = 200kHz
+ * instead of 25MHz: guest time ran ~125x fast, screen saver in seconds,
+ * frantic UI. The bogus value depends on how long the boot took to reach
+ * the calibration, so it also looked nondeterministic.
+ */
+static void timer_write(void *opaque, hwaddr addr, uint64_t value,
+                        unsigned size)
+{
+    NewWorldMacIOState *ns = opaque;
+
+    trace_macio_timer_write(addr, size, value);
+
+    switch (addr) {
+    case 0x38:
+        ns->timer_base = (ns->timer_base & ~0xffffffffULL) | (uint32_t)value;
+        break;
+    case 0x3c:
+        ns->timer_base = (ns->timer_base & 0xffffffffULL) |
+                         ((uint64_t)(uint32_t)value << 32);
+        break;
+    default:
+        return;
+    }
+    ns->timer_base_kltime = macio_kltime();
+}
+
+static uint64_t timer_read(void *opaque, hwaddr addr, unsigned size)
+{
+    NewWorldMacIOState *ns = opaque;
+    uint32_t value = 0;
+    uint64_t kltime;
+
+    kltime = ns->timer_base + (macio_kltime() - ns->timer_base_kltime);
 
     switch (addr) {
     case 0x38:
@@ -299,7 +341,7 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
 
     /* Timer */
     timer_memory = g_new(MemoryRegion, 1);
-    memory_region_init_io(timer_memory, OBJECT(s), &timer_ops, NULL, "timer",
+    memory_region_init_io(timer_memory, OBJECT(s), &timer_ops, ns, "timer",
                           0x1000);
     memory_region_add_subregion(&s->bar, 0x15000, timer_memory);
 

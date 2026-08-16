@@ -142,6 +142,10 @@ struct NewWorldMacIOState {
     OpenPICState pic;
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
+
+    /* settable KeyLargo timer counter: value written, and when */
+    uint64_t timer_base;
+    uint64_t timer_base_kltime;
 };
 
 #endif /* MACIO_H */
