@@ -3190,6 +3190,31 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
      */
     pci_config_set_interrupt_pin(dev->config, 1);
 
+    /*
+     * AGP capability block. The Rage 128 Pro OEM AGP ROMs (FCode part
+     * numbers 113-630xx / 113-720xx) walk the PCI capability chain for a
+     * PCI_CAP_ID_AGP block during their init probe; when it is absent they
+     * abort before ever programming the CRTC, so the card never lights up
+     * (observed: the v1.10/v1.36 AGP ROMs leave the CRTC at 8x1 bpp=0).
+     * Model a minimal AGP 2.0 capability -- advertise 1x/2x rates,
+     * sideband addressing and a full request queue in the read-only
+     * status word, and leave the command register guest-writable so the
+     * driver's AGP-enable handshake completes harmlessly. (The PCI-side
+     * Rage 128 retail ROM ignores this block, so it is safe on either
+     * bus.)
+     */
+    {
+        int cap = pci_add_capability(dev, PCI_CAP_ID_AGP, 0, 0x0c, errp);
+        if (cap < 0) {
+            return;
+        }
+        dev->config[cap + PCI_AGP_VERSION] = 0x20; /* AGP 2.0 */
+        pci_set_long(dev->config + cap + PCI_AGP_STATUS,
+                     PCI_AGP_STATUS_RQ_MASK | PCI_AGP_STATUS_SBA |
+                     PCI_AGP_STATUS_RATE2 | PCI_AGP_STATUS_RATE1);
+        pci_set_long(dev->wmask + cap + PCI_AGP_COMMAND, 0xffffffffu);
+    }
+
     memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
 
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
