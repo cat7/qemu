@@ -174,6 +174,8 @@ ati_rage128_scale(int dx, int dy, int w, int h, uint32_t off, uint32_t pitch, ui
 ati_rage128_scale_unimp(unsigned dt) "scale: unhandled source datatype %u"
 ati_rage128_2d_blt(uint32_t sxy, uint32_t dxy, uint32_t w, uint32_t h, uint32_t rop, uint32_t datatype, uint32_t src, uint32_t soff, uint32_t doff, uint32_t pitches) "blt src xy=0x%08x -> dst xy=0x%08x wh=%ux%u rop=0x%02x dt=0x%x srcsel=%u srcoff=0x%x dstoff=0x%x pitches=0x%08x"
 ati_rage128_auto_fb(uint32_t off, uint32_t w, uint32_t h, uint32_t bpp_or_size, int valid, uint32_t score) "off=0x%x %ux%u bpp/size=%u valid=%d score=%u"
+ati_rage128_pm4_ib_dword(uint32_t idx, uint32_t val) "IB[%u] = 0x%08x"
+ati_rage128_pm4_p3_hdr(uint32_t opcode, uint32_t count) "packet3 opcode=0x%02x count=%u"
 ati_rage128_pm4_indirect(uint32_t offset, uint32_t dwords, uint32_t first) "IB dispatch: card-addr=0x%x dwords=%u first=0x%08x"
 ati_rage128_fillwatch(uint32_t start, uint32_t len, uint32_t delta) "CPU fill run: start=0x%08x len=%u next_run_delta=%u"
 ati_rage128_ctx_write(const char *name, uint32_t reg, uint32_t val) "2D context: %s (0x%03x) <- 0x%08x"
