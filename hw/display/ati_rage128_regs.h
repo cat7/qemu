@@ -476,6 +476,8 @@
 #define R128_GMC_SRC_CLIPPING        0x00000004
 #define R128_GMC_DST_CLIPPING        0x00000008
 #define R128_GMC_ROP3_MASK           0x00ff0000
+#define R128_GMC_CLR_CMP_CNTL_DIS    (1u << 28)
+#define R128_GMC_WR_MSK_DIS          (1u << 30)
 #define R128_ROP3_BLACKNESS          0x00000000
 #define R128_ROP3_SRCCOPY            0x00cc0000
 #define R128_ROP3_PATCOPY            0x00f00000

@@ -247,10 +247,36 @@ static bool ati_rage128_2d_brush(ATIRage128State *s, int x, int y, int bpp,
     return true;
 }
 
+/*
+ * Colour compare (CLR_CMP_CNTL functions 0/1/4/5/7, RRG 3-178): does a
+ * pixel that compares as `eq` against the reference get drawn?
+ */
+static inline bool ati_rage128_clr_cmp_draw(unsigned fn, bool eq)
+{
+    switch (fn) {
+    case 1:
+        return false;               /* CMP_TRUE: never draw */
+    case 4:
+    case 7:
+        return eq;                  /* draw when equal (7: flip on eq) */
+    case 5:
+        return !eq;                 /* draw when not equal */
+    default:
+        return true;                /* CMP_FALSE: always draw */
+    }
+}
+
 static void ati_rage128_2d_do_blt(ATIRage128State *s)
 {
     int bpp = ati_rage128_bpp_from_dp_datatype(s);
     uint8_t rop = (s->dp_mix >> 16) & 0xff;
+    uint32_t pixmask;
+    uint32_t cmp_cntl = s->regs[R128_CLR_CMP_CNTL >> 2];
+    unsigned cmp_fn_src = cmp_cntl & 7;
+    unsigned cmp_fn_dst = (cmp_cntl >> 8) & 7;
+    unsigned cmp_sel = (cmp_cntl >> 24) & 3;
+    uint32_t cmp_mask, cmp_src, cmp_dst, wmask;
+    bool cmp_on_dst, cmp_on_src;
     bool left_to_right = s->dp_cntl & R128_DST_X_LEFT_TO_RIGHT;
     bool top_to_bottom = s->dp_cntl & R128_DST_Y_TOP_TO_BOTTOM;
     bool overlaps;
@@ -278,6 +304,28 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     if (!dst_stride) {
         return;
     }
+
+    /*
+     * Colour compare and write mask. CLR_CMP_SRC selects which side is
+     * keyed (0 = destination, 1 = source, 2 = both; 3 "HILITE" treated
+     * as destination), CLR_CMP_MSK picks the compared bits, DP_WRITE_MSK
+     * the written ones. Mac OS's QuickDraw hilite is a four-fill dance
+     * on exactly these: clear the aRGB1555 alpha bits, white -> hilite
+     * colour + alpha flag, unflagged hilite (the previous selection) ->
+     * white, flagged -> hilite. Ignoring them made every pass a plain
+     * solid fill: the highlighted list row lost its text and the old
+     * highlight was never removed.
+     */
+    pixmask = bpp >= 32 ? 0xffffffffu : (1u << bpp) - 1;   /* bpp in bits */
+    cmp_mask = s->regs[R128_CLR_CMP_MASK >> 2] & pixmask;
+    cmp_src = s->regs[R128_CLR_CMP_CLR_SRC >> 2] & cmp_mask;
+    cmp_dst = s->regs[R128_CLR_CMP_CLR_DST >> 2] & cmp_mask;
+    cmp_on_dst = (cmp_sel != 1) && cmp_fn_dst != 0;
+    cmp_on_src = (cmp_sel == 1 || cmp_sel == 2) && cmp_fn_src != 0 &&
+                 rop != 0xf0;
+    wmask = s->dp_write_mask & pixmask;
+    trace_ati_rage128_2d_cmp(cmp_cntl, cmp_mask, cmp_src, cmp_dst, wmask,
+                             s->dp_brush_frgd_clr);
 
     sc_left = s->sc_left;
     sc_top = s->sc_top;
@@ -342,8 +390,21 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
             }
             dst_pixel = ati_rage128_2d_read_pixel(s, s->dst_offset,
                                                   dst_stride, dx, dy, bpp);
+            if (cmp_on_dst &&
+                !ati_rage128_clr_cmp_draw(cmp_fn_dst,
+                                          (dst_pixel & cmp_mask) == cmp_dst)) {
+                continue;
+            }
+            if (cmp_on_src &&
+                !ati_rage128_clr_cmp_draw(cmp_fn_src,
+                                          (src_pixel & cmp_mask) == cmp_src)) {
+                continue;
+            }
             result = ati_rage128_apply_rop3(rop, src_pixel, dst_pixel,
                                             pat_pixel);
+            if (wmask != pixmask) {
+                result = (result & wmask) | (dst_pixel & ~wmask);
+            }
             ati_rage128_2d_write_pixel(s, s->dst_offset, dst_stride, dx, dy,
                                        bpp, result);
         }

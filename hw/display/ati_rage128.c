@@ -1644,6 +1644,23 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                          (val & 0x0f00) >> 8 | (val & 0x30f0) << 4 |
                          (val & 0x4000) << 16;
         s->dp_mix = (val & R128_GMC_ROP3_MASK) | (val & 0x7000000) >> 16;
+        /*
+         * GMC bits 28 and 30 are actions, not state (RRG 3-174): a
+         * write with CLR_CMP_CNTL_DIS clears both colour-compare
+         * functions, one with WR_MSK_DIS resets DP_WRITE_MSK and
+         * CLR_CMP_MSK to all-ones. Mac OS's driver relies on exactly
+         * this: its QuickDraw hilite (white<->highlight swap) is four
+         * fills that each start from a GMC write and then set only the
+         * compare/mask registers they need, so a mask left over from
+         * the previous fill would be applied to the wrong pass.
+         */
+        if (val & R128_GMC_CLR_CMP_CNTL_DIS) {
+            s->regs[R128_CLR_CMP_CNTL >> 2] &= ~0x707u;
+        }
+        if (val & R128_GMC_WR_MSK_DIS) {
+            s->dp_write_mask = 0xffffffff;
+            s->regs[R128_CLR_CMP_MASK >> 2] = 0xffffffff;
+        }
         ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_WIDTH_X:
@@ -2440,6 +2457,8 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
     /* val is a data dword for the packet currently in flight */
     switch (p->type) {
     case 0:
+        trace_ati_rage128_pm4_reg(p->reg & 0x3ffc,
+                                  ati_rage128_reg_name(p->reg & 0x3ffc), val);
         ati_rage128_reg_write32(s, p->reg & 0x3ffc, val);
         if (!p->one_reg) {
             p->reg += 4;
@@ -2447,8 +2466,12 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
         break;
     case 1:
         if (p->remaining == 2) {
+            trace_ati_rage128_pm4_reg(p->p1_reg1 & 0x3ffc,
+                ati_rage128_reg_name(p->p1_reg1 & 0x3ffc), val);
             ati_rage128_reg_write32(s, p->p1_reg1 & 0x3ffc, val);
         } else {
+            trace_ati_rage128_pm4_reg(p->p1_reg2 & 0x3ffc,
+                ati_rage128_reg_name(p->p1_reg2 & 0x3ffc), val);
             ati_rage128_reg_write32(s, p->p1_reg2 & 0x3ffc, val);
         }
         break;
@@ -2988,6 +3011,10 @@ static void ati_rage128_reset_hold(Object *obj, ResetType type)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
     memset(s->palette, 0, sizeof(s->palette));
+    /* every driver's engine init writes all-ones here; a zero mask
+     * would silently draw nothing until it does */
+    s->dp_write_mask = 0xffffffff;
+    s->regs[R128_CLR_CMP_MASK >> 2] = 0xffffffff;
     s->dac_wr_index = 0;
     s->dac_rd_index = 0;
     s->i2c_offset = 0;
