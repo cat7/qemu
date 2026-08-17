@@ -967,6 +967,44 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
              *   left classic Mac OS naming the display a generic
              *   "VGA Display".
              */
+            if (s->monid_pads12 && s->monitor_connected) {
+                /*
+                 * The AGP ROM's FCode also reads the Apple monitor sense
+                 * lines inside its DDC session (mask nibble still 0xf)
+                 * and through the same logical<->physical swap of pads
+                 * 1 and 2 (word 0x946): its probe n drives logical pin
+                 * (2,1,0) low -- physical pad (1,2,0) -- and reads the
+                 * other two, again swapped. Present the same MultiScan
+                 * 17" (6/0x23) as the plain-mask table below, expressed
+                 * in its layout: n=1 (pad 1 low) -> logical (Y1,Y0) =
+                 * physical (Y2,Y0) = 1,0; n=2 (pad 2 low) -> logical
+                 * (Y2,Y0) = physical (Y1,Y0) = 0,0; n=3 (pad 0 low) ->
+                 * logical (Y2,Y1) = physical (Y1,Y2) = 1,1. Standard
+                 * code 6 on Y2..Y0 with everything floating (SDA on pad
+                 * 1 idles high anyway; the slave's ACK below still wins
+                 * on that pad). Without this the ROM's table lookup gave
+                 * 0x73f = "no monitor" -> display-type "NONE", which
+                 * Mac OS X 10.3+'s BootX takes as "don't use this
+                 * display": no boot splash, no -v text.
+                 */
+                /*
+                 * Telling a sense probe from a DDC step on the same
+                 * pads: the probes (word 0x990) write A=0 for every pad,
+                 * while every DDC step keeps a released pad's A bit at 1
+                 * (0x0f040002 = SCL low in DDC vs 0x0f040000 = probe 2).
+                 * The DDC-presence check drives SCL low and expects SDA
+                 * still high, so probe 2's answer must not fire there.
+                 */
+                if ((en & 7) == 0) {
+                    y = (y & ~7u) | 6;
+                } else if ((a & 7) == 0 && en == 2) {
+                    y = (y & ~5u) | 4;          /* Y2=1, Y0=0 */
+                } else if ((a & 7) == 0 && en == 4) {
+                    y &= ~3u;                   /* Y1=0, Y0=0 */
+                } else if ((a & 7) == 0 && en == 1) {
+                    y |= 6;                     /* Y2=1, Y1=1 */
+                }
+            }
             {
                 /* SDA pad: 0 for the OS drivers, 1 for the AGP ROM's
                  * FCode (SCL on pad 2) -- see the write handler. */
@@ -976,7 +1014,11 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
                     if (!s->monid_sda) {
                         y &= ~sda_bit; /* DDC2 slave holding SDA low */
                     } else if (s->monid_ddc2) {
-                        y |= sda_bit;  /* DDC2 mode: released SDA idles high */
+                        /* DDC2 mode: released SDA idles high, unless an
+                         * Apple-sense answer above pulled that pad */
+                        if (!s->monid_pads12) {
+                            y |= sda_bit;
+                        }
                     } else {
                         uint32_t frame = s->ddc1_pos / 9;
                         uint32_t bit = s->ddc1_pos % 9;
@@ -988,8 +1030,20 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
                 }
             }
             if (!(en & 8) && s->monitor_connected) {
+                /*
+                 * VSYNC loopback on pad 3 follows V_SYNC_POL only while
+                 * the CRTC runs; with CRTC_EN clear there is no sync and
+                 * the pad reads low. The FCode relies on that: it turns
+                 * the CRTC off (CRTC_GEN_CNTL byte 3 <- 5) right before
+                 * its Apple-sense probes and indexes its decode table
+                 * with the whole Y nibble, so a stuck-high pad 3 landed
+                 * every lookup one row too far (-> 0x73f, "no monitor").
+                 */
+                bool crtc_on = s->regs[R128_CRTC_GEN_CNTL >> 2] & R128_CRTC_EN;
+
                 y = (y & ~8u) |
-                    (((s->regs[R128_CRTC_V_SYNC_STRT_WID >> 2] >> 23) & 1)
+                    ((crtc_on &&
+                      ((s->regs[R128_CRTC_V_SYNC_STRT_WID >> 2] >> 23) & 1))
                      << 3);
             }
         } else if (s->monitor_connected) {
