@@ -591,6 +591,9 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         object_property_set_link(OBJECT(&s->pmu), "gpio", OBJECT(sbd),
                                  &error_abort);
         qdev_prop_set_bit(DEVICE(&s->pmu), "has-adb", ns->has_adb);
+        if (ns->pram_file) {
+            qdev_prop_set_string(DEVICE(&s->pmu), "pram-file", ns->pram_file);
+        }
         if (!qdev_realize(DEVICE(&s->pmu), BUS(&s->macio_bus), errp)) {
             return;
         }
@@ -684,6 +687,8 @@ static const VMStateDescription vmstate_macio_newworld = {
 
 static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
+    /* default PRAM backing file handed to the PMU (NULL = its own default) */
+    DEFINE_PROP_STRING("pram-file", NewWorldMacIOState, pram_file),
     DEFINE_AUDIO_PROPERTIES(NewWorldMacIOState, audio_be),
     DEFINE_PROP_STRING("i2s-dumpfile", NewWorldMacIOState, i2s_dump_path),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),

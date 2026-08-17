@@ -177,6 +177,7 @@ struct NewWorldMacIOState {
     /*< public >*/
 
     bool has_pmu;
+    char *pram_file;
     bool has_adb;
     bool real_ata;
     AudioBackend *audio_be;

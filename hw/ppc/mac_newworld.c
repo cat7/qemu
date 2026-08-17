@@ -1322,6 +1322,16 @@ static void ppc_core99_init(MachineState *machine)
      * device tree; OpenBIOS hardcodes the legacy channels/interrupts.
      */
     qdev_prop_set_bit(dev, "real-ata", rom_is_flash);
+    if (has_pmu && rom_is_flash) {
+        /*
+         * Per-model PRAM file, like nvram-flash-34/36.img: PRAM contents
+         * are model specific too, so models run from one directory must
+         * not share a file.
+         */
+        qdev_prop_set_string(dev, "pram-file",
+                             core99_machine->model == CORE99_MODEL_PM36 ?
+                             "pram-36.img" : "pram-34.img");
+    }
 
     dev = DEVICE(object_resolve_path_component(macio, "escc"));
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));

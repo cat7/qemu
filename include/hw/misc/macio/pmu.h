@@ -255,6 +255,7 @@ struct PMUState {
 
     /* Optional backing file so PRAM persists across runs (see "drive"). */
     BlockBackend *pram_blk;
+    char *pram_file;
 
     /* GPIO */
     MacIOGPIOState *gpio;

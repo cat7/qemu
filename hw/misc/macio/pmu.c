@@ -448,9 +448,8 @@ static void pmu_cmd_power_events(PMUState *s,
 #define PMU_PRAM_FILE_SIZE (sizeof(((PMUState *)0)->xpram) + \
                             sizeof(((PMUState *)0)->pram))
 
-static BlockBackend *pmu_default_pram_blk(void)
+static BlockBackend *pmu_default_pram_blk(const char *filename)
 {
-    static const char filename[] = "pram.img";
     struct stat st;
     BlockBackend *blk;
     Error *local_err = NULL;
@@ -956,7 +955,8 @@ static void pmu_realize(DeviceState *dev, Error **errp)
 
     /* Persistent PRAM: attach a default backing file if none was given. */
     if (!s->pram_blk) {
-        s->pram_blk = pmu_default_pram_blk();
+        s->pram_blk = pmu_default_pram_blk(s->pram_file ? s->pram_file
+                                                        : "pram.img");
     }
     if (s->pram_blk) {
         int64_t len = blk_getlength(s->pram_blk);
@@ -1003,6 +1003,8 @@ static void pmu_init(Object *obj)
 static const Property pmu_properties[] = {
     DEFINE_PROP_BOOL("has-adb", PMUState, has_adb, true),
     DEFINE_PROP_DRIVE("drive", PMUState, pram_blk),
+    /* default backing file for the PRAM when no drive is given */
+    DEFINE_PROP_STRING("pram-file", PMUState, pram_file),
 };
 
 static void pmu_class_init(ObjectClass *oc, const void *data)
