@@ -2058,10 +2058,25 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
                     break;
                 }
                 gmc = ati_rage128_pm4_read_ring(s);
-                color = ati_rage128_pm4_read_ring(s);
                 ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, gmc);
+                i = 1;
+                /*
+                 * A context with DST_PITCH_OFFSET_CNTL set carries the
+                 * destination pitch/offset dword before the colour
+                 * (Linux's r128 DRM clear packet); Mac OS 9's context
+                 * (0x72f036d0) has the bit clear and goes straight to
+                 * the colour.
+                 */
+                if ((gmc & R128_GMC_DST_PITCH_OFFSET_CNTL) &&
+                    i + 1 < (int)count) {
+                    ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET,
+                                            ati_rage128_pm4_read_ring(s));
+                    i++;
+                }
+                color = ati_rage128_pm4_read_ring(s);
                 ati_rage128_reg_write32(s, R128_DP_BRUSH_FRGD_CLR, color);
-                for (i = 2; i + 1 < (int)count; i += 2) {
+                i++;
+                for (; i + 1 < (int)count; i += 2) {
                     uint32_t dst_x_y = ati_rage128_pm4_read_ring(s);
                     uint32_t dst_w_h = ati_rage128_pm4_read_ring(s);
 
@@ -2084,32 +2099,48 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
             }
             case R128_PM4_OPCODE_BITBLT_MULTI:
                 /*
-                 * The save-under half of a window drag: two header dwords
-                 * and then a RUN of three-dword rectangles -- the MULTI is
-                 * not decoration. See ati_rage128_regs.h for the layout.
-                 * iTunes sends nine rectangles in one 29-dword packet,
-                 * tiling a rounded-corner window, so stopping after the
-                 * first copied a 1-pixel strip and dropped the 600x390
-                 * body: chrome came out right, contents did not.
+                 * The save-under half of a window drag: a context
+                 * dword, the pitch/offset dwords the context itself
+                 * announces, and then a RUN of three-dword rectangles
+                 * -- the MULTI is not decoration. See
+                 * ati_rage128_regs.h for the layout. iTunes sends nine
+                 * rectangles in one 29-dword packet, tiling a
+                 * rounded-corner window, so stopping after the first
+                 * copied a 1-pixel strip and dropped the 600x390 body:
+                 * chrome came out right, contents did not.
                  *
-                 * The pitch/offset dword is the SOURCE, not the
-                 * destination, and the packet's own GMC settles that: it
-                 * carries SRC_PITCH_OFFSET_CNTL set with
-                 * DST_PITCH_OFFSET_CNTL CLEAR, i.e. "source from
-                 * SRC_PITCH_OFFSET, destination from DEFAULT_*". Feeding it
-                 * to DST_PITCH_OFFSET wrote a register the engine had been
-                 * told to ignore. Live, the dword is 0x10000400 (offset
-                 * 0x8000, pitch 128 -- the screen) while DEFAULT_* points
-                 * at the offscreen surface: screen to offscreen, which is
-                 * what saving under a window is.
+                 * How many pitch/offset dwords follow the context is
+                 * decided by that context's own SRC/DST_PITCH_OFFSET_CNTL
+                 * bits, in SRC-then-DST order (Linux's r128 DRM builds
+                 * its swap packet exactly so). Mac OS 9 sets only the
+                 * SRC bit: one dword, the screen, with DEFAULT_* as the
+                 * offscreen destination. Mac OS X 10.4 sets BOTH for
+                 * its 16x16 pointer save/restore: source, destination,
+                 * then the rectangle. Reading that as one dword plus a
+                 * rectangle turned the restore into a copy of
+                 * (pointer x) by (pointer y) pixels from a 64-pixel-wide
+                 * sprite buffer to the screen's top-left corner -- the
+                 * "corruption growing from the top-left towards the
+                 * mouse" on OS X 10.2/10.4.
                  */
                 if (count >= R128_BITBLT_MULTI_MIN_DWORDS) {
                     uint32_t gmc = ati_rage128_pm4_read_ring(s);
-                    uint32_t spo = ati_rage128_pm4_read_ring(s);
 
                     ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, gmc);
-                    ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET, spo);
-                    for (i = 2; i + 3 <= (int)count; i += 3) {
+                    i = 1;
+                    if ((gmc & R128_GMC_SRC_PITCH_OFFSET_CNTL) &&
+                        i < (int)count) {
+                        ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET,
+                                                ati_rage128_pm4_read_ring(s));
+                        i++;
+                    }
+                    if ((gmc & R128_GMC_DST_PITCH_OFFSET_CNTL) &&
+                        i < (int)count) {
+                        ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET,
+                                                ati_rage128_pm4_read_ring(s));
+                        i++;
+                    }
+                    for (; i + 3 <= (int)count; i += 3) {
                         uint32_t src_x_y = ati_rage128_pm4_read_ring(s);
                         uint32_t dst_x_y = ati_rage128_pm4_read_ring(s);
                         uint32_t dst_w_h = ati_rage128_pm4_read_ring(s);
@@ -2350,6 +2381,7 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
             p->p3_opcode = R128_PM4_PACKET3_OPCODE(val);
             p->p3_param_idx = 0;
             p->p3_total = p->remaining;
+            trace_ati_rage128_pm4_p3_hdr(p->p3_opcode, p->remaining);
             if (p->p3_opcode != R128_PM4_OPCODE_PAINT &&
                 p->p3_opcode != R128_PM4_OPCODE_PAINT_MULTI &&
                 p->p3_opcode != R128_PM4_OPCODE_BITBLT &&
@@ -2457,14 +2489,22 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
              * pairs -- see the ring parser's copy of this case for the
              * live capture that established the field order.
              */
-            if (p->p3_param_idx < 2) {
-                p->p3_params[p->p3_param_idx++] = val;
-                if (p->p3_param_idx == 2) {
-                    ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL,
-                                            p->p3_params[0]);
-                    ati_rage128_reg_write32(s, R128_DP_BRUSH_FRGD_CLR,
-                                            p->p3_params[1]);
-                }
+            if (p->p3_param_idx == 0) {
+                /*
+                 * see the ring parser: a context with
+                 * DST_PITCH_OFFSET_CNTL set is followed by the
+                 * destination pitch/offset dword, then the colour
+                 */
+                ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, val);
+                p->p3_params[3] = (val & R128_GMC_DST_PITCH_OFFSET_CNTL) ?
+                                  1 : 0;
+                p->p3_param_idx = 1;
+            } else if (p->p3_param_idx == 1 && p->p3_params[3]) {
+                ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET, val);
+                p->p3_params[3] = 0;
+            } else if (p->p3_param_idx == 1) {
+                ati_rage128_reg_write32(s, R128_DP_BRUSH_FRGD_CLR, val);
+                p->p3_param_idx = 2;
             } else if (p->p3_param_idx == 2) {
                 p->p3_params[2] = val;
                 p->p3_param_idx = 3;
@@ -2490,13 +2530,31 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
              * layout. The rectangle run is longer than p3_params, so each
              * three-dword rectangle is gathered in place and issued as
              * soon as it completes rather than buffering the packet.
+             * p3_params[3] counts the pitch/offset dwords the context
+             * announced, so the rectangle run is known to start at
+             * index 1 + that count.
              */
             if (p->p3_param_idx == 0) {
                 ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, val);
-            } else if (p->p3_param_idx == 1) {
-                ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET, val);
+                p->p3_params[3] = 0;
+                if (val & R128_GMC_SRC_PITCH_OFFSET_CNTL) {
+                    p->p3_params[3]++;
+                }
+                if (val & R128_GMC_DST_PITCH_OFFSET_CNTL) {
+                    p->p3_params[3]++;
+                }
+                p->p3_params[4] = val;
+            } else if (p->p3_param_idx <= p->p3_params[3]) {
+                bool src_first = p->p3_params[4] &
+                                 R128_GMC_SRC_PITCH_OFFSET_CNTL;
+
+                if (p->p3_param_idx == 1 && src_first) {
+                    ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET, val);
+                } else {
+                    ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET, val);
+                }
             } else {
-                unsigned slot = (p->p3_param_idx - 2) % 3;
+                unsigned slot = (p->p3_param_idx - 1 - p->p3_params[3]) % 3;
 
                 p->p3_params[slot] = val;
                 if (slot == 2) {
@@ -2650,8 +2708,10 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
         return;
     }
     for (i = 0; i < dwords; i++) {
-        ati_rage128_pm4_parse(s, &parser,
-            ati_rage128_card_read32(s, offset + i * 4, gart));
+        uint32_t val = ati_rage128_card_read32(s, offset + i * 4, gart);
+
+        trace_ati_rage128_pm4_ib_dword(i, val);
+        ati_rage128_pm4_parse(s, &parser, val);
     }
 }
 
