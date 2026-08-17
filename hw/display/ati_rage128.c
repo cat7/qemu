@@ -3067,13 +3067,25 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
         (int)horz_off;
     y = (int)(posn & R128_CUR_VERT_POSN_MASK);
 
+    /*
+     * Order-sensitive hash of the image plus everything that shapes it.
+     * The previous rotate-left-1/xor was blind to a 64-byte shift of the
+     * data (two full 32-bit rotations): OS X 10.2 first shows its arrow
+     * with CUR_OFFSET=0 (4 zero rows -- opaque white -- above the image
+     * at 0x40) and then moves CUR_OFFSET to 0x40; both views hashed the
+     * same (verified: 0x90627cdc for either offset), so the white-topped,
+     * 4-rows-late image was kept for good -- a 64x4 white bar above the
+     * arrow tip. Mix the offset in as well.
+     */
+    sum = 0x811c9dc5u ^ vram_off;
     for (row = 0; row < R128_CUR_IMAGE_BYTES; row++) {
-        sum = (sum << 1 | sum >> 31) ^ src[row];
+        sum = (sum ^ src[row]) * 0x01000193u;
     }
     sum ^= clr0 ^ clr1 ^ (uint32_t)horz_off ^ ((uint32_t)vert_off << 8);
 
     if (s->hw_cursor_on && sum == s->hw_cursor_sum) {
         /* Same image: a move only, so don't re-upload it. */
+        trace_ati_rage128_cursor_move(vram_off, x, y, sum);
         qemu_console_set_mouse(s->con, x, y, true);
         return;
     }
@@ -3097,6 +3109,9 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
             c->data[row * R128_CUR_WIDTH + px] = val;
         }
     }
+    trace_ati_rage128_cursor_upload(vram_off, horz_off, vert_off, x, y,
+                                    c->data[0], c->data[64 * 4],
+                                    c->data[64 * 4 + 4]);
     qemu_console_set_cursor(s->con, c);
     cursor_unref(c);
     s->hw_cursor_on = true;
