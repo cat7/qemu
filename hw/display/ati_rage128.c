@@ -967,16 +967,24 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
              *   left classic Mac OS naming the display a generic
              *   "VGA Display".
              */
-            if (!(en & 1)) {
-                if (!s->monid_sda) {
-                    y &= ~1u; /* DDC2 slave holding SDA low */
-                } else {
-                    uint32_t frame = s->ddc1_pos / 9;
-                    uint32_t bit = s->ddc1_pos % 9;
-                    int sda = (bit == 8) ? 1 :
-                        (s->edid[frame % sizeof(s->edid)] >> (7 - bit)) & 1;
+            {
+                /* SDA pad: 0 for the OS drivers, 1 for the AGP ROM's
+                 * FCode (SCL on pad 2) -- see the write handler. */
+                uint32_t sda_bit = s->monid_pads12 ? 2u : 1u;
 
-                    y = (y & ~1u) | sda;
+                if (!(en & sda_bit)) {
+                    if (!s->monid_sda) {
+                        y &= ~sda_bit; /* DDC2 slave holding SDA low */
+                    } else if (s->monid_ddc2) {
+                        y |= sda_bit;  /* DDC2 mode: released SDA idles high */
+                    } else {
+                        uint32_t frame = s->ddc1_pos / 9;
+                        uint32_t bit = s->ddc1_pos % 9;
+                        int sda = (bit == 8) ? 1 :
+                            (s->edid[frame % sizeof(s->edid)] >> (7 - bit)) & 1;
+
+                        y = (y & ~sda_bit) | (sda ? sda_bit : 0);
+                    }
                 }
             }
             if (!(en & 8) && s->monitor_connected) {
@@ -1777,12 +1785,24 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_GPIO_MONID: {
         /*
-         * The FCode's DDC session (MASK nibble 0xf, distinct from the
-         * Apple-sense probes' 0x7): SDA on pad 0, SCL on pad 1, open
-         * drain -- a pad drives its A-bit level while its EN bit is
-         * set, floats high otherwise. Every edge feeds the DDC2
-         * bit-bang core, whose resulting SDA level the read handler
-         * feeds back on a floating pad 0.
+         * A DDC session (MASK nibble 0xf, distinct from the Apple-sense
+         * probes' 0x7): open drain -- a pad drives its A-bit level while
+         * its EN bit is set, floats high otherwise. Every edge feeds the
+         * DDC2 bit-bang core, whose resulting SDA level the read handler
+         * feeds back on the floating SDA pad.
+         *
+         * Two pad layouts exist on the same card. The Mac OS drivers
+         * (classic ndrv and OS X, observed live) use SDA on pad 0 and
+         * SCL on pad 1. The AGP ROM's own FCode (109-72700 rev 136,
+         * word 0x946 swaps logical bits 1<->2 before every GPIO write)
+         * uses SDA on pad 1 and SCL on pad 2 -- its START is pad 2 low,
+         * both low, pad 1 low with pad 2 released; under OpenBIOS the
+         * probe never got an ACK with the fixed pad-0/1 decode, spun 33k
+         * reads in ddc2-send-byte's ack wait and gave up, leaving
+         * display-type "NONE" and every mode but 640x480@60 disabled.
+         * Pad 2 is never driven by the pad-0/1 masters, so the first
+         * write of a session that drives pad 2 selects the FCode
+         * layout; session exit (mask leaving 0xf) resets it.
          */
         uint32_t oldmask = (s->regs[base >> 2] >> 24) & 0xf;
 
@@ -1790,13 +1810,35 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         if (((val >> 24) & 0xf) == 0xf) {
             uint32_t en = (val >> 16) & 0xf;
             uint32_t a = val & 0xf;
-            int scl = (en & 2) ? !!(a & 2) : 1;
-            int sda = (en & 1) ? !!(a & 1) : 1;
+            int scl, sda;
 
             if (oldmask != 0xf) {
                 /* session entry rewinds the DDC1 stream to byte 0 */
                 s->ddc1_pos = 0;
                 s->ddc1_half = 0;
+                s->monid_pads12 = false;
+                s->monid_ddc2 = false;
+            }
+            if (en & 4) {
+                s->monid_pads12 = true;
+            }
+            if (s->monid_pads12) {
+                scl = (en & 4) ? !!(a & 4) : 1;
+                sda = (en & 2) ? !!(a & 2) : 1;
+            } else {
+                scl = (en & 2) ? !!(a & 2) : 1;
+                sda = (en & 1) ? !!(a & 1) : 1;
+            }
+            if (!scl) {
+                /*
+                 * VESA DDC: a monitor that sees the host clock SCL
+                 * switches from DDC1 to DDC2 and stops shifting the
+                 * EDID bitstream out on SDA. Without this the FCode's
+                 * DDC2 STOP/idle check ("SDA released and high?") kept
+                 * reading EDID byte 0's zero bits and looped forever.
+                 * The stream resumes at the next session (mask re-entry).
+                 */
+                s->monid_ddc2 = true;
             }
             bitbang_i2c_set(&s->monid_i2c, BITBANG_I2C_SCL, scl);
             s->monid_sda = bitbang_i2c_set(&s->monid_i2c,

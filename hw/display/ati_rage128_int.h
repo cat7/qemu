@@ -207,6 +207,8 @@ struct ATIRage128State {
     bool host_cursor_published;   /* synthetic arrow handed to the UI */
     bitbang_i2c_interface monid_i2c;
     int monid_sda;           /* live SDA level fed back into MONID_Y */
+    bool monid_pads12;       /* DDC session uses SDA=pad1/SCL=pad2 (FCode) */
+    bool monid_ddc2;         /* host clocked SCL: DDC1 stream silenced */
     uint32_t ddc1_pos;       /* DDC1 EDID bitstream position (in bits) */
     uint32_t ddc1_half;      /* half-bit phase: 2 manual VSYNC pulses/bit */
 
