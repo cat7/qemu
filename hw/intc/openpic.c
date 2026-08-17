@@ -398,6 +398,7 @@ static void openpic_set_irq(void *opaque, int n_IRQ, int level)
     src = &opp->src[n_IRQ];
     DPRINTF("openpic: set irq %d = %d ivpr=0x%08x",
             n_IRQ, level, src->ivpr);
+    src->line = !!level;
     if (src->level) {
         /* level-sensitive irq */
         src->pending = level;
@@ -503,6 +504,7 @@ static inline void write_IRQreg_ilr(OpenPICState *opp, int n_IRQ, uint32_t val)
 static inline void write_IRQreg_ivpr(OpenPICState *opp, int n_IRQ, uint32_t val)
 {
     uint32_t mask;
+    bool was_level;
 
     /*
      * NOTE when implementing newer FSL MPIC models: starting with v4.0,
@@ -522,7 +524,26 @@ static inline void write_IRQreg_ivpr(OpenPICState *opp, int n_IRQ, uint32_t val)
      */
     switch (opp->src[n_IRQ].type) {
     case IRQ_TYPE_NORMAL:
+        was_level = opp->src[n_IRQ].level;
         opp->src[n_IRQ].level = !!(opp->src[n_IRQ].ivpr & IVPR_SENSE_MASK);
+        /*
+         * A change of sense re-samples the source. Level-sensitive:
+         * pending mirrors the input line; the line's state was tracked
+         * all along, including while the source was edge-triggered or
+         * masked. Edge-triggered: nothing has been latched yet.
+         *
+         * Without this, an edge latched while the source was masked
+         * (or before a reset that kept the pending flag) survived a
+         * switch to level-sensitive with the line low, and no line
+         * transition would ever clear it: an interrupt storm on the
+         * vector, IACK returning it after every EOI. Seen on mac99
+         * with the KeyLargo I2C source (0x1a) after a warm restart
+         * from Mac OS X 10.4 into its install DVD.
+         */
+        if (opp->src[n_IRQ].level != was_level) {
+            opp->src[n_IRQ].pending = opp->src[n_IRQ].level ?
+                                      opp->src[n_IRQ].line : 0;
+        }
         break;
 
     case IRQ_TYPE_FSLINT:
@@ -1271,6 +1292,12 @@ static void openpic_reset(DeviceState *d)
         switch (opp->src[i].type) {
         case IRQ_TYPE_NORMAL:
             opp->src[i].level = !!(opp->ivpr_reset & IVPR_SENSE_MASK);
+            /*
+             * Reset drops any latched edge; a level-sensitive source
+             * comes up reflecting its input line, which a device that
+             * is not itself reset may well still be driving.
+             */
+            opp->src[i].pending = opp->src[i].level ? opp->src[i].line : 0;
             break;
 
         case IRQ_TYPE_FSLINT:
