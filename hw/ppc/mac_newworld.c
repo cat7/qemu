@@ -92,6 +92,26 @@
 
 #define PROM_FILENAME "openbios-ppc"
 #define PROM_BASE 0xfff00000
+
+static uint64_t core99_rom_read(void *opaque, hwaddr addr, unsigned size)
+{
+    /* never called: reads are served from the ROM device's RAM backing */
+    return 0;
+}
+
+static void core99_rom_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    trace_mac99_rom_write(addr, size, val);
+}
+
+static const MemoryRegionOps core99_rom_ops = {
+    .read = core99_rom_read,
+    .write = core99_rom_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+};
 /* KeyLargo/MacIO base decoded by real hardware (and by real Apple ROMs) */
 #define MACIO_BASE 0xf3000000
 #define MACIO_WIN_SIZE 0x01000000
@@ -104,8 +124,8 @@
  */
 #define NVRAM_FLASH_SIZE 0x4000
 /* The ROM socket's full decode window; only the top PROM_SIZE is populated */
-#define ROM_WINDOW_BASE 0xff800000
-#define ROM_WINDOW_SIZE (8 * MiB)
+#define ROM_WINDOW_BASE 0xff000000
+#define ROM_WINDOW_SIZE (16 * MiB)
 
 #define KERNEL_LOAD_ADDR 0x01000000
 #define KERNEL_GAP       0x00100000
@@ -853,9 +873,28 @@ static char *core99_nvram_get_var(const uint8_t *data, uint32_t size,
 {
     const uint32_t COPY = 0x2000;
     size_t nlen = strlen(name);
-    uint32_t base;
+    uint32_t base, best = 0, best_gen = 0;
+    bool have_best = false;
 
+    /*
+     * Two 8KB banks; the ROM (and Mac OS's nvram,flash driver) use the one
+     * with the higher generation count (core99 header: CHRP header, adler32
+     * at +0x10, generation at +0x14). Report from that one, not the first.
+     */
     for (base = 0; base + COPY <= size; base += COPY) {
+        uint32_t gen;
+
+        if (data[base] != 0x5a || memcmp(&data[base + 4], "nvram", 5) != 0) {
+            continue;
+        }
+        gen = ldl_be_p(&data[base + 0x14]);
+        if (!have_best || gen > best_gen) {
+            best = base;
+            best_gen = gen;
+            have_best = true;
+        }
+    }
+    for (base = have_best ? best : 0; base + COPY <= size; base += COPY) {
         uint32_t off;
 
         for (off = base; off + 16 <= base + COPY; ) {
@@ -958,6 +997,7 @@ static void ppc_core99_init(MachineState *machine)
     int i, j, k, ppc_boot_device, machine_arch, bios_size = -1;
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
     MemoryRegion *bios = g_new(MemoryRegion, 1);
+    MemoryRegion *rom_chip = g_new(MemoryRegion, 1);
     bool rom_is_flash;
     hwaddr kernel_base = 0, initrd_base = 0, cmdline_base = 0;
     long kernel_size = 0, initrd_size = 0;
@@ -1020,23 +1060,46 @@ static void ppc_core99_init(MachineState *machine)
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     rom_is_flash = filename && !firmware_is_elf(filename);
 
-    memory_region_init_rom(bios, NULL, "ppc_core99.bios", PROM_SIZE,
-                           &error_fatal);
-    memory_region_add_subregion(get_system_memory(), PROM_BASE, bios);
+    /*
+     * A ROM *device* rather than plain ROM so that guest stores into the
+     * boot-flash range are visible (traced) instead of silently dropped:
+     * the real part is one flash chip, and a guest flash driver may issue
+     * its command/ID cycles anywhere in it, not only inside the 16KB
+     * NVRAM window that mac_nvram.c models. Reads still come straight
+     * from the RAM backing.
+     */
+    memory_region_init_rom_device(bios, NULL, &core99_rom_ops, NULL,
+                                  "ppc_core99.bios", PROM_SIZE,
+                                  &error_fatal);
+    /*
+     * "rom_chip" is the whole 1MB flash part: the ROM image with, on the
+     * Apple ROM machines, the 16KB NVRAM window overlaid at 0x4000 (added
+     * below once the nvram device exists). Everything that decodes the
+     * part -- the primary slot at PROM_BASE and every alias -- goes
+     * through this container, so the NVRAM shows up in every alias too.
+     */
+    memory_region_init(rom_chip, NULL, "ppc_core99.rom-chip", PROM_SIZE);
+    memory_region_add_subregion(rom_chip, 0, bios);
+    memory_region_add_subregion(get_system_memory(), PROM_BASE, rom_chip);
 
     /*
-     * The ROM socket decodes 8MB at ROM_WINDOW_BASE (the real machine's
-     * /rom@ff800000 node has ranges ff800000 00800000), but only the top 1MB
-     * is populated, so the part aliases through the rest of the window. A
-     * real Apple ROM makes use of that: after its low-level init it jumps to
-     * code via a window-relative address such as 0xff80b644, which on
-     * hardware is simply offset 0xb644 of the same flash part.
+     * The ROM socket decodes ROM_WINDOW_SIZE at ROM_WINDOW_BASE, but only
+     * the top 1MB is populated, so the part aliases through the rest of the
+     * window. The real Apple ROM makes use of that: after its low-level init
+     * it jumps to code via a window-relative address such as 0xff80b644,
+     * which on hardware is simply offset 0xb644 of the same flash part --
+     * and Mac OS 9's "nvram,flash" native driver (Mac OS ROM 8.x parcel
+     * nvram,flash-1.0d1) reads and programs the two NVRAM banks at
+     * 0xff004000/0xff006000: the same 0x4000/0x6000 offsets of the part,
+     * decoded 16MB below the top. With only 8MB mirrored it read zeros
+     * there, found no 0x5a bank signature, and silently never wrote --
+     * Startup Disk / PRAM changes were lost on every restart.
      */
     for (i = 0; i < ROM_WINDOW_SIZE / PROM_SIZE - 1; i++) {
         MemoryRegion *mirror = g_new(MemoryRegion, 1);
         g_autofree char *name = g_strdup_printf("ppc_core99.bios.mirror%d", i);
 
-        memory_region_init_alias(mirror, NULL, name, bios, 0, PROM_SIZE);
+        memory_region_init_alias(mirror, NULL, name, rom_chip, 0, PROM_SIZE);
         memory_region_add_subregion(get_system_memory(),
                                     ROM_WINDOW_BASE + (hwaddr)i * PROM_SIZE,
                                     mirror);
@@ -1508,7 +1571,14 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
+    if (rom_is_flash && nvram_addr == 0xFFF04000) {
+        /* Part of the flash chip: overlay it inside every ROM alias. */
+        memory_region_add_subregion_overlap(rom_chip, nvram_addr - PROM_BASE,
+                                            sysbus_mmio_get_region(
+                                                SYS_BUS_DEVICE(dev), 0), 1);
+    } else {
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
+    }
     nvr = MACIO_NVRAM(dev);
     /*
      * Only seed the default partitions into a genuinely fresh image --

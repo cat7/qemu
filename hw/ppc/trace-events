@@ -179,3 +179,6 @@ ppc4xx_sdram_init(uint64_t base, uint64_t size, uint32_t bcr) "Init RAM area 0x%
 
 # mac_newworld.c
 mac99_boot_device(const char *dev) "boot device=%s"
+
+# mac_newworld.c
+mac99_rom_write(uint64_t addr, unsigned size, uint64_t val) "guest store into boot flash range: off=0x%06" PRIx64 " size=%u val=0x%" PRIx64
