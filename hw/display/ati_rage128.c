@@ -1528,8 +1528,15 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_PM4_BUFFER_DL_RPTR_ADDR:
         s->regs[base >> 2] = val;
         break;
-    case R128_PM4_FIFO_DATA_EVEN:
-    case R128_PM4_FIFO_DATA_ODD:
+    case R128_PM4_FIFO_DATA_EVEN ... R128_PM4_FIFO_APER_END:
+        /*
+         * Any dword in the CCE FIFO aperture is a push. Mac OS's driver
+         * writes packets as bursts across 0x1000..0x101c; taking only
+         * EVEN/ODD lost the tail of every burst -- typically the
+         * DST_Y_X/DST_HEIGHT_WIDTH pair that arms a host-data blit, so
+         * the HOST_DATA stream that followed (menu bar restore, window
+         * icons, drag save-behind) was thrown away.
+         */
         ati_rage128_pm4_fifo_push(s, val);
         break;
     case R128_DST_OFFSET:
