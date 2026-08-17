@@ -317,6 +317,8 @@ void ohci_stop_endpoints(OHCIState *ohci)
     }
 }
 
+static void ohci_port_reset_rearm(OHCIState *ohci);
+
 static void ohci_roothub_reset(OHCIState *ohci)
 {
     OHCIPort *port;
@@ -330,6 +332,7 @@ static void ohci_roothub_reset(OHCIState *ohci)
     for (i = 0; i < ohci->num_ports; i++) {
         port = &ohci->rhport[i];
         port->ctrl = 0;
+        ohci->port_reset_end[i] = 0;
         if (port->port.dev && port->port.dev->attached) {
             /*
              * A whole-hub reset (HCFS=Reset, e.g. guest-initiated bus
@@ -354,6 +357,7 @@ static void ohci_roothub_reset(OHCIState *ohci)
             }
         }
     }
+    ohci_port_reset_rearm(ohci);
     ohci_stop_endpoints(ohci);
 }
 
@@ -1553,6 +1557,52 @@ static int ohci_port_set_if_connected(OHCIState *ohci, int i, uint32_t val)
 }
 
 /* Set root hub port status */
+static void ohci_port_reset_rearm(OHCIState *ohci)
+{
+    int64_t next = 0;
+    int i;
+
+    for (i = 0; i < ohci->num_ports; i++) {
+        if (ohci->port_reset_end[i] &&
+            (!next || ohci->port_reset_end[i] < next)) {
+            next = ohci->port_reset_end[i];
+        }
+    }
+    if (next) {
+        timer_mod(ohci->port_reset_timer, next);
+    } else {
+        timer_del(ohci->port_reset_timer);
+    }
+}
+
+/* Reset signalling on a root-hub port has run its course. */
+static void ohci_port_reset_done(void *opaque)
+{
+    OHCIState *ohci = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int i;
+
+    for (i = 0; i < ohci->num_ports; i++) {
+        OHCIPort *port = &ohci->rhport[i];
+
+        if (!ohci->port_reset_end[i] || ohci->port_reset_end[i] > now) {
+            continue;
+        }
+        ohci->port_reset_end[i] = 0;
+        if (!(port->ctrl & OHCI_PORT_PRS)) {
+            continue;       /* port went away meanwhile */
+        }
+        if (port->port.dev && port->port.dev->attached) {
+            usb_device_reset(port->port.dev);
+        }
+        port->ctrl &= ~OHCI_PORT_PRS;
+        /* ??? Should this also set OHCI_PORT_PESC. */
+        port->ctrl |= OHCI_PORT_PES | OHCI_PORT_PRSC;
+        ohci_set_interrupt(ohci, OHCI_INTR_RHSC);
+    }
+    ohci_port_reset_rearm(ohci);
+}
+
 static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
 {
     uint32_t old_state;
@@ -1575,42 +1625,49 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
     }
 
     if (ohci_port_set_if_connected(ohci, portnum, val & OHCI_PORT_PRS)) {
+        /*
+         * port-reset-us > 0 models what a real HC does: reset signalling
+         * on the port for a while (nominally 10ms, OHCI 7.4.4 / USB 2.0
+         * 7.1.7.5) with PRS reading 1, then device reset, PES, PRSC and
+         * RHSC. Opt-in only: it did not cure the Mac OS 9.0.4 ROM
+         * root-hub driver, which mis-tracks which port it just addressed
+         * whenever a third root-hub device is present (3-port hub, or 2
+         * ports with a usb-hub) -- it "resets the other port" but hits
+         * its own freshly addressed device, re-enumerates a few times and
+         * stops with no interrupt endpoints scheduled -- and with the
+         * completion coming from a timer while the guest polls PRS/PRSC,
+         * results became host-timing dependent. Kept for guests that
+         * want a spec-shaped reset.
+         */
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
         trace_usb_ohci_port_reset(portnum);
-        usb_device_reset(port->port.dev);
-        if (portnum == 0) {
-            ohci->port0_reset_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        } else if (ohci->port0_reset_time != 0 &&
-                   qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - ohci->port0_reset_time <
-                   200 * SCALE_MS) {
+        if (ohci->port_reset_us == 0) {
             /*
-             * Classic Mac OS's USB-to-ADB compatibility shim (baked into
-             * the Mac OS ROM) is timing-sensitive during enumeration: when
-             * two devices reset back-to-back with no gap, only the device
-             * on port 0 ends up usable - a second keyboard/mouse
-             * enumerates fine at the USB level (address, descriptors,
-             * configuration all succeed) but the shim never delivers its
-             * HID reports to the Cursor Device Manager, leaving it dead
-             * (confirmed via hid_pointer_poll tracing: real, correct
-             * dx/dy data reaches the guest's USB report buffer, so the
-             * guest itself is at fault, not the emulation up to that
-             * point).
-             *
-             * This isn't unique to initial boot enumeration -- the guest
-             * can decide to reset both ports again later in the session
-             * (observed live: a second dual-port reset landing well after
-             * boot, with port 0's SET_ADDRESS immediately followed by
-             * port 1's in the same handful of requests), and the same
-             * collision kills port 1's device again when it happens. So
-             * gate the stagger on actual proximity to port 0's last
-             * reset, not on "first reset ever": only delay when port 0
-             * was reset within the last 200ms, which is what the shim
-             * actually seems to be sensitive to.
+             * Default: complete inside the register write, as upstream
+             * does. Classic Mac OS's USB-to-ADB shim is timing-sensitive
+             * during enumeration: when two ports are reset back-to-back
+             * only the device on port 0 ends up usable (the second
+             * enumerates fine at the USB level but its HID reports are
+             * never delivered), so stagger a non-port-0 reset landing
+             * within 200ms wall-clock of port 0's by 50ms.
              */
-            g_usleep(50000);
+            usb_device_reset(port->port.dev);
+            if (portnum == 0) {
+                ohci->port0_reset_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            } else if (ohci->port0_reset_time != 0 &&
+                       qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+                       ohci->port0_reset_time < 200 * SCALE_MS) {
+                g_usleep(50000);
+            }
+            port->ctrl &= ~OHCI_PORT_PRS;
+            /* ??? Should this also set OHCI_PORT_PESC. */
+            port->ctrl |= OHCI_PORT_PES | OHCI_PORT_PRSC;
+        } else {
+            ohci->port_reset_end[portnum] = now +
+                (int64_t)ohci->port_reset_us * SCALE_US;
+            ohci_port_reset_rearm(ohci);
         }
-        port->ctrl &= ~OHCI_PORT_PRS;
-        /* ??? Should this also set OHCI_PORT_PESC. */
-        port->ctrl |= OHCI_PORT_PES | OHCI_PORT_PRSC;
     }
 
     /* Invert order here to ensure in ambiguous case, device is powered up. */
@@ -2077,6 +2134,8 @@ void usb_ohci_init(OHCIState *ohci, DeviceState *dev, uint32_t num_ports,
 
     ohci->eof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    ohci_frame_boundary, ohci);
+    ohci->port_reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                          ohci_port_reset_done, ohci);
 }
 
 /*

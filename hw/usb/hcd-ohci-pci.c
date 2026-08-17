@@ -41,6 +41,7 @@ struct OHCIPCIState {
     OHCIState state;
     char *masterbus;
     uint32_t num_ports;
+    uint32_t port_reset_us;
     uint32_t firstport;
 };
 
@@ -73,6 +74,7 @@ static void usb_ohci_realize_pci(PCIDevice *dev, Error **errp)
         error_propagate(errp, err);
         return;
     }
+    ohci->state.port_reset_us = ohci->port_reset_us;
 
     ohci->state.irq = pci_allocate_irq(dev);
     pci_register_bar(dev, 0, 0, &ohci->state.mem);
@@ -108,6 +110,9 @@ static void usb_ohci_reset_pci(DeviceState *d)
 static const Property ohci_pci_properties[] = {
     DEFINE_PROP_STRING("masterbus", OHCIPCIState, masterbus),
     DEFINE_PROP_UINT32("num-ports", OHCIPCIState, num_ports, 3),
+    /* root-hub port reset signalling duration; 0 = complete inside the
+     * PRS write (upstream behaviour, see ohci_port_set_status()) */
+    DEFINE_PROP_UINT32("port-reset-us", OHCIPCIState, port_reset_us, 0),
     DEFINE_PROP_UINT32("firstport", OHCIPCIState, firstport, 0),
 };
 

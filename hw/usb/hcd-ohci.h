@@ -67,6 +67,17 @@ struct OHCIState {
      */
     int64_t port0_reset_time;
 
+    /*
+     * Root-hub port reset in progress: PRS reads 1 and the port stays
+     * disabled until port_reset_end[i] (QEMU_CLOCK_VIRTUAL), when the
+     * device is reset, PES/PRSC are set and RHSC raised -- the ~10ms
+     * reset signalling a real HC does (OHCI 7.4.4, USB 7.1.7.5). Zero
+     * means no reset pending on that port.
+     */
+    QEMUTimer *port_reset_timer;
+    int64_t port_reset_end[OHCI_MAX_PORTS];
+    uint32_t port_reset_us;     /* reset signalling duration */
+
     /* OHCI state */
     /* Control partition */
     uint32_t ctl, status;
