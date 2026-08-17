@@ -39,6 +39,22 @@
 
 #define ATI_RAGE128_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
 #define ATI_RAGE128_VBLANK_LEN_NS    (ATI_RAGE128_VBLANK_PERIOD_NS / 8)
+/*
+ * How long the PCI IRQ line stays asserted after a VBLANK/VSYNC raise
+ * if the guest never acknowledges GEN_INT_STATUS. Acks deassert the
+ * line early (see ati_rage128_update_irq()). Real silicon holds the
+ * line until software acks; this cap only exists so a bring-up phase
+ * that enables the interrupt without servicing it cannot storm -- the
+ * line always drops before the next blank start so every frame still
+ * yields exactly one fresh edge. Measured live (OS 9.1, OpenBIOS
+ * mac99, OpenPIC level source): with the old 1/8-frame pulse the guest
+ * missed ~23% of VBLs (its ISR/other interrupt work often exceeded
+ * 2 ms, and a level source that goes low before it is taken is simply
+ * lost), which was the direct cause of jerky mouse motion -- Mac OS
+ * moves the hardware cursor from its VBL task.
+ */
+#define ATI_RAGE128_VBLANK_IRQ_LEN_NS (ATI_RAGE128_VBLANK_PERIOD_NS - \
+                                       ATI_RAGE128_VBLANK_LEN_NS)
 
 /* ---------------------------------------------------------------- */
 /* Display                                                          */
@@ -659,7 +675,12 @@ static const GraphicHwOps ati_rage128_gfx_ops = {
 };
 
 /* ---------------------------------------------------------------- */
-/* VBLANK interrupt: gated pulse, as validated on the mach64 device */
+/*
+ * VBLANK interrupt: level held until acked (GEN_INT_STATUS is
+ * write-1-to-clear and the line follows STATUS & CNTL), with a
+ * per-frame fallback cap so a never-acking guest cannot storm -- see
+ * ATI_RAGE128_VBLANK_IRQ_LEN_NS.
+ */
 
 static void ati_rage128_update_irq(ATIRage128State *s)
 {
@@ -674,6 +695,8 @@ static void ati_rage128_vblank_end_tick(void *opaque)
 {
     ATIRage128State *s = opaque;
 
+    /* Fallback only: the guest normally lowered the line long ago by
+     * acking GEN_INT_STATUS (ati_rage128_update_irq()). */
     pci_set_irq(PCI_DEVICE(s), 0);
 }
 
@@ -693,7 +716,8 @@ static void ati_rage128_vblank_timer_tick(void *opaque)
             trace_ati_rage128_vblank_irq(1,
                 s->regs[R128_GEN_INT_CNTL >> 2]);
             pci_set_irq(PCI_DEVICE(s), 1);
-            timer_mod(s->vblank_end_timer, now + ATI_RAGE128_VBLANK_LEN_NS);
+            timer_mod(s->vblank_end_timer,
+                      now + ATI_RAGE128_VBLANK_IRQ_LEN_NS);
         }
     }
 
