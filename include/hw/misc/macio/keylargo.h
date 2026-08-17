@@ -224,6 +224,7 @@ typedef struct KeyLargoState {
 
 void keywest_i2c_init(KeyLargoI2CState *c, DeviceState *owner,
                       const char *name, uint64_t size);
+void keywest_i2c_reset(KeyLargoI2CState *c);
 /* i2s-a owns DBDMA channels 0 (out) and 1 (in); i2s-b owns 2 and 3. */
 #define KEYLARGO_I2S_DMA_OUT(cell)  ((cell) * 2)
 #define KEYLARGO_I2S_DMA_IN(cell)   ((cell) * 2 + 1)

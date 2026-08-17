@@ -749,6 +749,8 @@ static void unin_reset_hold(Object *obj, ResetType type)
      * previously had no reset() handler at all, so it never did here.
      */
     memset(s->regs, 0, sizeof(s->regs));
+    /* the Keywest cell too: idle, nothing pending (it has no IRQ line) */
+    keywest_i2c_reset(&s->i2c);
 }
 
 static void unin_class_init(ObjectClass *klass, const void *data)

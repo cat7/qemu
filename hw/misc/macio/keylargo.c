@@ -34,6 +34,7 @@
 #include "hw/ppc/mac_dbdma.h"
 #include "qemu/timer.h"
 #include "system/dma.h"
+#include "system/reset.h"
 #include "trace.h"
 
 /* ---------------------------------------------------------------------- */
@@ -556,6 +557,41 @@ static void keywest_i2c_update_irq(KeyLargoI2CState *c)
     }
 }
 
+/*
+ * System reset: the Keywest cell comes up idle with no interrupt pending
+ * or enabled, and its interrupt line low.
+ *
+ * Without this the cell's ISR/IER survived a warm restart. Mac OS X's
+ * driver leaves IER on and can leave an ISR bit set at shutdown, so the
+ * line was still asserted when the OpenPIC reset put source 0x1a back to
+ * edge-sensitive; the next system's driver programmed IER with nothing
+ * pending (a "level 0" the edge-mode source ignores) and only then made
+ * the source level-sensitive -- and inherited a pending bit no line
+ * transition would ever clear: an interrupt storm on 0x1a with ISR
+ * reading 0, seen as "restart after Startup Disk hangs on the grey
+ * Apple" (10.4 -> 10.4.6 install DVD). Lowering the line here happens
+ * before the OpenPIC's own reset (legacy reset handlers registered
+ * during machine init precede the sysbus tree in the reset container),
+ * while the source is still level-sensitive, so its pending state
+ * follows the line down.
+ */
+void keywest_i2c_reset(KeyLargoI2CState *c)
+{
+    c->xfer_active = false;
+    c->manual_addr_pending = false;
+    c->manual_byte_delivered = false;
+    c->read_pending = false;
+    c->mode = 0;
+    c->control = 0;
+    c->status = 0;
+    c->isr = 0;
+    c->ier = 0;
+    c->addr = 0;
+    c->subaddr = 0;
+    c->data = 0;
+    keywest_i2c_update_irq(c);
+}
+
 static void keywest_i2c_set_irq(KeyLargoI2CState *c, uint8_t bits)
 {
     c->isr |= bits;
@@ -1024,6 +1060,16 @@ static void keylargo_register_types(void)
 
 type_init(keylargo_register_types)
 
+static void keylargo_reset(void *opaque)
+{
+    KeyLargoState *s = opaque;
+
+    /* FCRs back to their cold-boot state: cells disabled, clocks stopped */
+    memset(s->fcr, 0, sizeof(s->fcr));
+    keylargo_i2s_update_clocks(s);
+    keywest_i2c_reset(&s->i2c);
+}
+
 KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar)
 {
     KeyLargoState *s = g_new0(KeyLargoState, 1);
@@ -1056,6 +1102,8 @@ KeyLargoState *keylargo_cells_init(DeviceState *owner, MemoryRegion *bar)
 
     /* The "deq" TAS3001 audio EQ, at 0x34 like the real machine's. */
     s->i2s[0].codec = i2c_slave_create_simple(s->i2c.bus, TYPE_TAS3001, 0x34);
+
+    qemu_register_reset(keylargo_reset, s);
 
     return s;
 }
