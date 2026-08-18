@@ -326,6 +326,13 @@ struct ATIRage128State {
      */
     bool hw_cursor_on;
     uint32_t hw_cursor_sum;
+    /*
+     * CUR_LOCK is a single bit that merely appears in bit 31 of all three
+     * of CUR_OFFSET / CUR_HORZ_VERT_POSN / CUR_HORZ_VERT_OFF (RRG 3-80):
+     * the most recent write to any of them sets or clears it. Kept here
+     * rather than in the regs[] copies, which are stored without it.
+     */
+    bool cur_lock;
     /* last position published to the console, so an unchanged cursor is
      * not re-published (and re-traced) on every refresh tick */
     int hw_cursor_x, hw_cursor_y;

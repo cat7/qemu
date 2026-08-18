@@ -168,6 +168,7 @@ ati_rage128_pm4_reg(uint32_t reg, const char *name, uint32_t val) "packet0/1 reg
 ati_rage128_cursor_move(uint32_t off, int x, int y, uint32_t sum) "cursor move only @0x%x to (%d,%d) sum=0x%08x"
 ati_rage128_cursor_upload(uint32_t off, unsigned hoff, unsigned voff, int x, int y, uint32_t p00, uint32_t p40, uint32_t p44) "cursor image @0x%x hoff=%u voff=%u at (%d,%d) px[0,0]=0x%08x px[0,4]=0x%08x px[4,4]=0x%08x"
 ati_rage128_cursor_off(int x, int y) "cursor disabled (CRTC_CUR_EN clear), was at (%d,%d)"
+ati_rage128_cur_reg(const char *name, uint32_t val, bool locked) "%s <- 0x%08x lock=%d"
 ati_rage128_surface_realloc(int old_w, int old_h, unsigned w, unsigned h, unsigned bpp, uint32_t fb_offset, unsigned pitch) "DisplaySurface %dx%d -> %ux%u bpp=%u fb_offset=0x%x pitch=%u"
 ati_rage128_mode_override(bool on, unsigned w, unsigned h, unsigned bpp, uint32_t fb_offset, unsigned pitch) "auto-detected framebuffer overriding CRTC mode: %d -> now drawing %ux%u bpp=%u fb_offset=0x%x pitch=%u"
 ati_rage128_datatype(uint32_t val, int big_endian) "DP_DATATYPE <- 0x%08x host_big_endian=%d"
