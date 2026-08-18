@@ -469,7 +469,6 @@ static void ati_rage128_pick_auto_fb(ATIRage128State *s, int nblocks)
 static void ati_rage128_scan_vram_activity(ATIRage128State *s)
 {
     int nblocks = ATI_RAGE128_VRAM_SIZE / ATI_RAGE128_FB_SCAN_BLOCK;
-    DirtyBitmapSnapshot *snap;
     int i;
 
     if (++s->fb_scan_counter < ATI_RAGE128_FB_SCAN_PERIOD) {
@@ -477,14 +476,10 @@ static void ati_rage128_scan_vram_activity(ATIRage128State *s)
     }
     s->fb_scan_counter = 0;
 
-    snap = memory_region_snapshot_and_clear_dirty(&s->vram, 0,
-                                                   ATI_RAGE128_VRAM_SIZE,
-                                                   DIRTY_MEMORY_VGA);
     for (i = 0; i < nblocks; i++) {
-        bool dirty = memory_region_snapshot_get_dirty(
-            &s->vram, snap, (hwaddr)i * ATI_RAGE128_FB_SCAN_BLOCK,
-            ATI_RAGE128_FB_SCAN_BLOCK);
+        bool dirty = s->fb_block_pending[i];
 
+        s->fb_block_pending[i] = false;
         if (dirty) {
             /*
              * Jump most of the way to the cap on a single hit rather
@@ -502,9 +497,33 @@ static void ati_rage128_scan_vram_activity(ATIRage128State *s)
             s->fb_scan_activity[i]--;
         }
     }
-    g_free(snap);
 
     ati_rage128_pick_auto_fb(s, nblocks);
+}
+
+/*
+ * Consume the VRAM dirty bitmap once per refresh: note which scan blocks
+ * were written (for the activity heuristic above) and return the snapshot
+ * so the caller can ask whether the range it is about to display changed.
+ */
+static DirtyBitmapSnapshot *ati_rage128_take_dirty(ATIRage128State *s)
+{
+    int nblocks = ATI_RAGE128_VRAM_SIZE / ATI_RAGE128_FB_SCAN_BLOCK;
+    DirtyBitmapSnapshot *snap;
+    int i;
+
+    snap = memory_region_snapshot_and_clear_dirty(&s->vram, 0,
+                                                   ATI_RAGE128_VRAM_SIZE,
+                                                   DIRTY_MEMORY_VGA);
+    for (i = 0; i < nblocks; i++) {
+        if (!s->fb_block_pending[i] &&
+            memory_region_snapshot_get_dirty(&s->vram, snap,
+                                             (hwaddr)i * ATI_RAGE128_FB_SCAN_BLOCK,
+                                             ATI_RAGE128_FB_SCAN_BLOCK)) {
+            s->fb_block_pending[i] = true;
+        }
+    }
+    return snap;
 }
 
 static void ati_rage128_cursor_update(ATIRage128State *s);
@@ -515,8 +534,11 @@ static bool ati_rage128_update_display(void *opaque)
     ATIRage128State *s = opaque;
     ATIRage128Mode mode;
     DisplaySurface *ds;
-    bool valid, blanked;
+    DirtyBitmapSnapshot *snap;
+    bool valid, blanked, redraw;
+    uint64_t fb_len;
 
+    snap = ati_rage128_take_dirty(s);
     ati_rage128_get_mode(s, &mode);
     valid = ati_rage128_mode_valid(s, &mode);
     /*
@@ -535,6 +557,7 @@ static bool ati_rage128_update_display(void *opaque)
                              mode.fb_offset);
     if (!valid) {
         if (!s->have_valid_mode) {
+            g_free(snap);
             return true;
         }
         /*
@@ -650,6 +673,7 @@ static bool ati_rage128_update_display(void *opaque)
      * bookkeeping is not.
      */
     ds = qemu_console_surface(s->con);
+    redraw = s->force_redraw;
     if (!ds || surface_width(ds) != (int)mode.width ||
         surface_height(ds) != (int)mode.height) {
         trace_ati_rage128_surface_realloc(ds ? surface_width(ds) : 0,
@@ -658,9 +682,35 @@ static bool ati_rage128_update_display(void *opaque)
                                           mode.fb_offset, mode.pitch);
         ds = qemu_create_displaysurface(mode.width, mode.height);
         qemu_console_set_surface(s->con, ds);
+        redraw = true;
     }
+    /*
+     * Only redraw -- and only hand the UI a new frame -- when something
+     * that shapes the picture changed: the mode/framebuffer geometry, the
+     * palette (force_redraw), or the displayed VRAM range itself (CPU
+     * stores through either aperture, engine-drawn pixels and DMA all
+     * land in the dirty bitmap). Re-pushing an identical 1024x768 frame
+     * on every refresh tick was pure host load, and on macOS the stream
+     * of redundant full-window redraws is what the intermittent darker
+     * frames ("screen flicker") were made of.
+     */
+    if (memcmp(&s->mode, &mode, sizeof(mode)) != 0) {
+        redraw = true;
+    }
+    fb_len = (uint64_t)mode.pitch * mode.height;
+    if (fb_len && (uint64_t)mode.fb_offset + fb_len <= ATI_RAGE128_VRAM_SIZE &&
+        memory_region_snapshot_get_dirty(&s->vram, snap, mode.fb_offset,
+                                         fb_len)) {
+        redraw = true;
+    }
+    g_free(snap);
     s->mode = mode;
     s->mode_dirty = false;
+    if (!redraw) {
+        ati_rage128_cursor_update(s);
+        return true;
+    }
+    s->force_redraw = false;
     ds = qemu_console_surface(s->con);
     switch (mode.pix_width) {
     case R128_PIX_WIDTH_8BPP:
@@ -1571,6 +1621,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->palette[s->dac_wr_index][0] = (val >> 16) & 0xff;  /* R */
         s->palette[s->dac_wr_index][1] = (val >> 8) & 0xff;   /* G */
         s->palette[s->dac_wr_index][2] = val & 0xff;          /* B */
+        s->force_redraw = true;
         s->dac_wr_index++;
         break;
     case R128_I2C_CNTL_0:

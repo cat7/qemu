@@ -154,6 +154,15 @@ struct ATIRage128State {
      */
     uint8_t fb_scan_activity[ATI_RAGE128_VRAM_SIZE / ATI_RAGE128_FB_SCAN_BLOCK];
     uint32_t fb_scan_counter;
+    /*
+     * Dirty VRAM blocks seen by the per-refresh dirty snapshot since the
+     * activity scan last consumed them (the snapshot clears the bitmap, so
+     * there is exactly one consumer of it -- ati_rage128_update_display --
+     * and the slower activity scan reads this instead).
+     */
+    bool fb_block_pending[ATI_RAGE128_VRAM_SIZE / ATI_RAGE128_FB_SCAN_BLOCK];
+    /* redraw the whole surface next pass regardless of dirty state */
+    bool force_redraw;
     bool auto_fb_valid;
     ATIRage128Mode auto_fb_mode;
     /*
