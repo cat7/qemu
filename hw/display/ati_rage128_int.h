@@ -345,6 +345,12 @@ struct ATIRage128State {
      */
     bool hw_cursor_on;
     uint32_t hw_cursor_sum;
+    /* last position published to the console, so an unchanged cursor is
+     * not re-published (and re-traced) on every refresh tick */
+    int hw_cursor_x, hw_cursor_y;
+    /* the auto-detected framebuffer is currently overriding the CRTC mode
+     * (tracked so the transition can be traced, not every frame) */
+    bool auto_fb_overriding;
     /*
      * When the mach64's host-side pointer tracking is driving this display
      * (its host-cursor-tracking property, which the Mac OS 9 launcher turns

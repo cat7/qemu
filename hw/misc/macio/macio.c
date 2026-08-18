@@ -621,7 +621,6 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
 
 static void macio_newworld_init(Object *obj)
 {
-    MacIOState *s = MACIO(obj);
     NewWorldMacIOState *ns = NEWWORLD_MACIO(obj);
     int i;
 
