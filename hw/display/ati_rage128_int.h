@@ -118,9 +118,18 @@ struct ATIRage128State {
     uint8_t dac_rd_index;
     uint8_t palette[256][3];
 
-    ATIRage128Mode mode;
+    ATIRage128Mode mode;      /* what the last refresh actually drew */
+    /*
+     * The last mode CRTC1 itself described while valid. Kept apart from
+     * `mode`: when the auto-detected framebuffer overrides the CRTC, `mode`
+     * holds the guess, and using it as the "remembered CRTC mode" fallback
+     * made the override compare the guess against itself and stick for
+     * good (seen live: OS X blanked the display for sleep, the heuristic
+     * swapped in a stale 8bpp 800x600 buffer, and it never let go).
+     */
+    ATIRage128Mode crtc_mode;
     bool mode_dirty;
-    bool have_valid_mode; /* has `mode` ever held a real, valid mode? */
+    bool have_valid_mode; /* has `crtc_mode` ever held a real, valid mode? */
 
     /*
      * Auto-detected framebuffer, tracked via VRAM write activity
