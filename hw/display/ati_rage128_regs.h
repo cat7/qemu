@@ -695,6 +695,55 @@
 #define R128_DST_Y_DIR_TOP_TO_BOTTOM  0x00008000
 #define R128_DST_X_DIR_LEFT_TO_RIGHT  0x80000000
 
+/*
+ * The same scaler, programmed through its own registers instead of a
+ * CNTL_SCALING packet. Mac OS X's ATI driver draws the pointer this way
+ * whenever the shape does not fit the two-colour hardware cursor (the
+ * I-beam, with its alpha halo): IOGraphics' "cursor in VRAM" callout
+ * hands the driver a 32-bit ARGB sprite, and the driver save-unders with
+ * BITBLT_MULTI, then blends the sprite in with an alpha-blended scale
+ * of it -- SRC_ALPHA / INV_SRC_ALPHA from MISC_3D_STATE_CNTL_REG, the
+ * scale function selected there too (bits 9:8), GMC_3D_FCN_EN in
+ * DP_GUI_MASTER_CNTL_C, and SCALE_DST_HEIGHT_WIDTH as the kick (the last
+ * register written, as for the mach64's scaler). Captured live from
+ * OS X 10.3 on 2026-08-18. Bit layouts as in xf86-video-r128's
+ * r128_reg.h; the RRG lists these registers but documents no fields.
+ */
+#define R128_SCALE_SRC_HEIGHT_WIDTH   0x1994
+#define R128_SCALE_OFFSET_0           0x1998
+#define R128_SCALE_PITCH              0x199c
+#define R128_SCALE_X_INC              0x19a0
+#define R128_SCALE_Y_INC              0x19a4
+#define R128_SCALE_HACC               0x19a8
+#define R128_SCALE_VACC               0x19ac
+#define R128_SCALE_DST_X_Y            0x19b0
+#define R128_SCALE_DST_HEIGHT_WIDTH   0x19b4
+#define R128_SCALE_3D_CNTL            0x1a00
+#define R128_PRIM_TEXTURE_COMBINE_CNTL 0x1a08
+#define R128_SCALE_3D_DATATYPE        0x1a20
+#define R128_TEX_CNTL                 0x1800
+#define R128_TEX_CNTL_C               0x1c9c
+#define R128_MISC_3D_STATE_CNTL_REG   0x1ca0
+#define R128_PRIM_TEX_CNTL_C          0x1cb0
+#define R128_MISC_SCALE_3D_FCN_SHIFT  8       /* 0 noop, 1 scale, 2 texmap */
+#define R128_MISC_SCALE_3D_FCN_MASK   0x3
+#define R128_MISC_SCALE_3D_SCALE      1
+#define R128_ALPHA_BLEND_SRC_SHIFT    16
+#define R128_ALPHA_BLEND_DST_SHIFT    20
+#define R128_ALPHA_BLEND_MASK         0xf
+#define R128_ALPHA_BLEND_ZERO         0
+#define R128_ALPHA_BLEND_ONE          1
+#define R128_ALPHA_BLEND_SRCCOLOR     2
+#define R128_ALPHA_BLEND_INVSRCCOLOR  3
+#define R128_ALPHA_BLEND_SRCALPHA     4
+#define R128_ALPHA_BLEND_INVSRCALPHA  5
+#define R128_ALPHA_BLEND_DSTALPHA     6
+#define R128_ALPHA_BLEND_INVDSTALPHA  7
+#define R128_ALPHA_BLEND_DSTCOLOR     8
+#define R128_ALPHA_BLEND_INVDSTCOLOR  9
+#define R128_ALPHA_BLEND_SAT          10
+#define R128_GMC_3D_FCN_EN            (1u << 28)
+
 #define R128_SCALE_DT_ARGB1555        3
 #define R128_SCALE_DT_RGB565          4
 #define R128_SCALE_DT_ARGB8888        6

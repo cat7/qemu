@@ -378,6 +378,7 @@ const char *ati_rage128_reg_name(uint32_t base);
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
 void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt);
+void ati_rage128_2d_scale_regs(ATIRage128State *s);
 bool ati_rage128_host_data_flush(ATIRage128State *s);
 
 /*
