@@ -840,6 +840,14 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
     uint32_t val = s->regs[base >> 2];
 
     switch (base) {
+    case R128_CUR_OFFSET:
+    case R128_CUR_HORZ_VERT_POSN:
+    case R128_CUR_HORZ_VERT_OFF:
+        /* the shared CUR_LOCK bit reads back through all three */
+        if (s->cur_lock) {
+            val |= R128_CUR_LOCK;
+        }
+        break;
     case R128_MM_DATA:
         val = 0;
         if ((s->regs[R128_MM_INDEX >> 2] & 0x3ffc) != R128_MM_DATA) {
@@ -1485,9 +1493,27 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_CUR_OFFSET:
     case R128_CUR_HORZ_VERT_POSN:
     case R128_CUR_HORZ_VERT_OFF:
+        /*
+         * CUR_LOCK is ONE bit aliased into bit 31 of all three registers
+         * (RRG 3-80/81); the last write to any of them sets or clears it,
+         * and unlocking is what applies a locked shape/position update
+         * atomically. OR-ing bit 31 of the three stored copies together
+         * (the old model) stayed locked for good whenever a driver locked
+         * through one register and unlocked through another -- and a
+         * locked cursor here silently drops every later update, which is
+         * how OS X 10.3's cursor vanished after a shape change.
+         */
+        s->cur_lock = (val & R128_CUR_LOCK) != 0;
+        s->regs[base >> 2] = val & ~R128_CUR_LOCK;
+        trace_ati_rage128_cur_reg(ati_rage128_reg_name(base), val,
+                                  s->cur_lock);
+        ati_rage128_cursor_update(s);
+        break;
     case R128_CUR_CLR0:
     case R128_CUR_CLR1:
         s->regs[base >> 2] = val;
+        trace_ati_rage128_cur_reg(ati_rage128_reg_name(base), val,
+                                  s->cur_lock);
         ati_rage128_cursor_update(s);
         break;
     case R128_CRTC_OFFSET:
@@ -2943,6 +2969,17 @@ static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         }
         merged = deposit32(merged, (addr & 3) * 8, size * 8, data);
         val = merged;
+        /*
+         * The cursor registers' stored copies carry no CUR_LOCK bit (it
+         * lives in s->cur_lock); a partial write that does not cover the
+         * top byte must leave the lock as it is, so put it back before
+         * the full-register write path re-derives it from bit 31.
+         */
+        if ((base == R128_CUR_OFFSET || base == R128_CUR_HORZ_VERT_POSN ||
+             base == R128_CUR_HORZ_VERT_OFF) &&
+            (addr & 3) + size < 4 && s->cur_lock) {
+            val |= R128_CUR_LOCK;
+        }
     }
     ati_rage128_reg_write32(s, base, val);
 }
@@ -3228,7 +3265,7 @@ static void ati_rage128_cursor_apply(ATIRage128State *s)
      * change shape and position together; publishing a half-updated
      * cursor is exactly the tearing the bit exists to prevent.
      */
-    if ((offs | posn | coff) & R128_CUR_LOCK) {
+    if (s->cur_lock) {
         return;
     }
     if (!on) {
