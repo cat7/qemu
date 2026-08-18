@@ -147,7 +147,7 @@ static void ati_rage128_maybe_capture_mode(ATIRage128State *s)
 
     ati_rage128_get_mode(s, &mode);
     if (ati_rage128_mode_valid(s, &mode)) {
-        s->mode = mode;
+        s->crtc_mode = mode;
         s->have_valid_mode = true;
         s->mode_dirty = true;
     }
@@ -515,10 +515,22 @@ static bool ati_rage128_update_display(void *opaque)
     ATIRage128State *s = opaque;
     ATIRage128Mode mode;
     DisplaySurface *ds;
-    bool valid;
+    bool valid, blanked;
 
     ati_rage128_get_mode(s, &mode);
     valid = ati_rage128_mode_valid(s, &mode);
+    /*
+     * DISPLAY_DIS is the guest deliberately blanking the output (display
+     * sleep, the blank phase of a mode-set), not a sign that CRTC1 was
+     * never programmed. Real hardware shows nothing; we keep showing the
+     * last frame -- but the framebuffer-guess heuristic below must not
+     * get a say, because an idle, asleep guest paints nothing and its
+     * framebuffer region looks exactly like the "dead CRTC" the
+     * heuristic exists to route around (seen live: 5 min of idle under
+     * OS X 10.3 -> Energy Saver blanks -> a stale 8bpp 800x600 buffer
+     * replaced the desktop).
+     */
+    blanked = (s->regs[R128_CRTC_EXT_CNTL >> 2] & R128_CRTC_DISPLAY_DIS) != 0;
     trace_ati_rage128_update(mode.width, mode.height, mode.bpp, valid,
                              mode.fb_offset);
     if (!valid) {
@@ -540,8 +552,9 @@ static bool ati_rage128_update_display(void *opaque)
          * advisory in practice -- actual blanking is DISPLAY_DIS in
          * CRTC_EXT_CNTL, already checked above.
          */
-        mode = s->mode;
+        mode = s->crtc_mode;
     } else {
+        s->crtc_mode = mode;
         s->have_valid_mode = true;
     }
 
@@ -556,7 +569,7 @@ static bool ati_rage128_update_display(void *opaque)
      * garbled 1024x768 over a valid 800x600, and here as the Monitors
      * panel switch snapping back).
      */
-    if (!valid && s->auto_fb_valid &&
+    if (!valid && !blanked && s->auto_fb_valid &&
         (s->auto_fb_mode.fb_offset != mode.fb_offset ||
          s->auto_fb_mode.width != mode.width ||
          s->auto_fb_mode.height != mode.height ||
