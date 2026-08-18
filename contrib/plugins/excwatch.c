@@ -34,7 +34,7 @@ static bool read_gpr(int n, uint32_t *val_out)
         return false;
     }
     buf = g_byte_array_new();
-    if (qemu_plugin_read_register(gpr_handle[n], buf) >= 0 && buf->len >= 4) {
+    if (qemu_plugin_read_register(gpr_handle[n], buf) && buf->len >= 4) {
         *val_out = ((uint32_t)buf->data[buf->len - 4] << 24) |
                    ((uint32_t)buf->data[buf->len - 3] << 16) |
                    ((uint32_t)buf->data[buf->len - 2] << 8) |
@@ -54,7 +54,7 @@ static void vcpu_discon(unsigned int vcpu_index,
     bool have_word;
     bool is_trap = false;
     bool zero_trap = false;
-    uint32_t opcode, to, ra, rb;
+    uint32_t opcode, to, ra = 0, rb = 0;
     int32_t simm;
     uint32_t ra_val = 0, rb_val = 0;
     bool have_ra = false, have_rb = false;
