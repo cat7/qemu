@@ -98,6 +98,16 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
     default:
         break;
     }
+    /*
+     * Keep the dirty-bitmap framebuffer scanner seeing engine-drawn
+     * pixels, exactly as the CPU aperture write path does. Without
+     * this, blitted content (menu bar, window interiors, host-data
+     * icons) sits correct in VRAM but the display surface never
+     * refreshes it until an unrelated CPU store happens to dirty the
+     * same scan block -- observed live as white Finder windows whose
+     * icons only appear when clicked.
+     */
+    memory_region_set_dirty(&s->vram, addr & ~7ull, 8);
 }
 
 static uint32_t ati_rage128_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,
