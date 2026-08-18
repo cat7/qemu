@@ -587,6 +587,18 @@ static bool ati_rage128_update_display(void *opaque)
         if (!crtc_region_live) {
             mode = s->auto_fb_mode;
         }
+        if (!crtc_region_live != s->auto_fb_overriding) {
+            s->auto_fb_overriding = !crtc_region_live;
+            trace_ati_rage128_mode_override(s->auto_fb_overriding,
+                                            mode.width, mode.height,
+                                            mode.bpp, mode.fb_offset,
+                                            mode.pitch);
+        }
+    } else if (s->auto_fb_overriding) {
+        s->auto_fb_overriding = false;
+        trace_ati_rage128_mode_override(false, mode.width, mode.height,
+                                        mode.bpp, mode.fb_offset,
+                                        mode.pitch);
     }
 
     /*
@@ -610,6 +622,10 @@ static bool ati_rage128_update_display(void *opaque)
     ds = qemu_console_surface(s->con);
     if (!ds || surface_width(ds) != (int)mode.width ||
         surface_height(ds) != (int)mode.height) {
+        trace_ati_rage128_surface_realloc(ds ? surface_width(ds) : 0,
+                                          ds ? surface_height(ds) : 0,
+                                          mode.width, mode.height, mode.bpp,
+                                          mode.fb_offset, mode.pitch);
         ds = qemu_create_displaysurface(mode.width, mode.height);
         qemu_console_set_surface(s->con, ds);
     }
@@ -3057,6 +3073,7 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
     }
     if (!on) {
         if (s->hw_cursor_on) {
+            trace_ati_rage128_cursor_off(s->hw_cursor_x, s->hw_cursor_y);
             s->hw_cursor_on = false;
             s->hw_cursor_sum = 0;
             qemu_console_set_mouse(s->con, 0, 0, false);
@@ -3088,8 +3105,15 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
     sum ^= clr0 ^ clr1 ^ (uint32_t)horz_off ^ ((uint32_t)vert_off << 8);
 
     if (s->hw_cursor_on && sum == s->hw_cursor_sum) {
-        /* Same image: a move only, so don't re-upload it. */
-        qemu_console_set_mouse(s->con, x, y, true);
+        /* Same image: a move only, so don't re-upload it -- and if it
+         * has not moved either (this runs on every refresh tick), do
+         * nothing at all. */
+        if (x != s->hw_cursor_x || y != s->hw_cursor_y) {
+            trace_ati_rage128_cursor_move(vram_off, x, y, sum);
+            s->hw_cursor_x = x;
+            s->hw_cursor_y = y;
+            qemu_console_set_mouse(s->con, x, y, true);
+        }
         return;
     }
 
@@ -3112,10 +3136,15 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
             c->data[row * R128_CUR_WIDTH + px] = val;
         }
     }
+    trace_ati_rage128_cursor_upload(vram_off, horz_off, vert_off, x, y,
+                                    c->data[0], c->data[64 * 4],
+                                    c->data[64 * 4 + 4]);
     qemu_console_set_cursor(s->con, c);
     cursor_unref(c);
     s->hw_cursor_on = true;
     s->hw_cursor_sum = sum;
+    s->hw_cursor_x = x;
+    s->hw_cursor_y = y;
     qemu_console_set_mouse(s->con, x, y, true);
 }
 
