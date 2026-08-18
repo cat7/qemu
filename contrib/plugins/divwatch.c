@@ -78,9 +78,10 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata)
 {
     DivInsn *d = (DivInsn *)udata;
     uint32_t ra_val = 0, rb_val = 0;
-    bool have_ra, have_rb;
+    bool have_rb;
 
-    have_ra = read_gpr(d->ra, &ra_val);
+    /* ra_val is logged for context only; it stays 0 if unreadable */
+    read_gpr(d->ra, &ra_val);
     have_rb = read_gpr(d->rb, &rb_val);
 
     if (out_fp && have_rb && rb_val == 0) {
