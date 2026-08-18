@@ -1685,6 +1685,12 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         s->dst_height = (val >> 16) & 0x3fff;
         ati_rage128_2d_blt(s);
         break;
+    case R128_SCALE_DST_HEIGHT_WIDTH:
+        /* the register-programmed scaler's kick: parameters were stored
+         * by the writes before it */
+        s->regs[base >> 2] = val;
+        ati_rage128_2d_scale_regs(s);
+        break;
     case R128_DP_GUI_MASTER_CNTL:
     case R128_DP_GUI_MASTER_CNTL_C:
         s->dp_gui_master_cntl = val & 0xf800000f;
@@ -3251,6 +3257,15 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
     trace_ati_rage128_cursor_upload(vram_off, horz_off, vert_off, x, y,
                                     c->data[0], c->data[64 * 4],
                                     c->data[64 * 4 + 4]);
+    if (trace_event_get_state_backends(TRACE_ATI_RAGE128_CURSOR_DUMP)) {
+        /* the first 2KB of VRAM: covers every sprite offset seen so far */
+        const uint8_t *v = (const uint8_t *)memory_region_get_ram_ptr(&s->vram);
+        for (row = 0; row < 128; row++) {
+            trace_ati_rage128_cursor_dump(offs, row * 16,
+                                          ldq_be_p(v + row * 16),
+                                          ldq_be_p(v + row * 16 + 8));
+        }
+    }
     qemu_console_set_cursor(s->con, c);
     cursor_unref(c);
     s->hw_cursor_on = true;

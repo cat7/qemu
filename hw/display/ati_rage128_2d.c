@@ -392,7 +392,14 @@ static uint32_t ati_rage128_scale_texel(const uint8_t *row, int sx,
         u = v = 128;
         break;
     case R128_SCALE_DT_ARGB8888:
-        return ldl_be_p(row + sx * 4) & 0xffffff;
+        /*
+         * Chip-native little-endian, alpha in the top byte, kept for the
+         * caller (the blended path needs it; the plain copy ignores it).
+         * Verified against the ARGB pointer sprite OS X's driver stages
+         * for its cursor-in-VRAM path (bytes ff ff ff 55 = white at
+         * alpha 0x55, 00 00 00 ff = opaque black -- the I-beam).
+         */
+        return ldl_le_p(row + sx * 4);
     case R128_SCALE_DT_RGB565:
     {
         uint16_t px = lduw_be_p(row + sx * 2);
@@ -424,54 +431,89 @@ static uint32_t ati_rage128_scale_texel(const uint8_t *row, int sx,
 }
 
 /*
- * CNTL_SCALING: a scaled, optionally YUV-converting copy from a source
- * image in VRAM into the destination rectangle. This is how Mac OS plays
- * video on this card -- the counterpart of the mach64's scaler pipe, and
- * it carries the same parameters for the same movie.
- *
- * Nearest-neighbour: the increments are DDA accumulator steps with 12
- * fractional bits, sitting at bits 19:4 exactly as the mach64's do.
- * Reading them unshifted gives a sixteen-fold downscale, which cannot be
- * right when the source and destination are the same size.
+ * One alpha-blend factor of MISC_3D_STATE_CNTL_REG / SCALE_3D_CNTL,
+ * evaluated per channel (0..255). Rage 128 blends
+ * dst = src * src_factor + dst * dst_factor.
  */
-void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt)
+static int ati_rage128_blend_factor(unsigned f, int sc, int sa, int dc,
+                                    int da)
+{
+    switch (f) {
+    case R128_ALPHA_BLEND_ZERO:        return 0;
+    case R128_ALPHA_BLEND_ONE:         return 255;
+    case R128_ALPHA_BLEND_SRCCOLOR:    return sc;
+    case R128_ALPHA_BLEND_INVSRCCOLOR: return 255 - sc;
+    case R128_ALPHA_BLEND_SRCALPHA:    return sa;
+    case R128_ALPHA_BLEND_INVSRCALPHA: return 255 - sa;
+    case R128_ALPHA_BLEND_DSTALPHA:    return da;
+    case R128_ALPHA_BLEND_INVDSTALPHA: return 255 - da;
+    case R128_ALPHA_BLEND_DSTCOLOR:    return dc;
+    case R128_ALPHA_BLEND_INVDSTCOLOR: return 255 - dc;
+    case R128_ALPHA_BLEND_SAT:         return MIN(sa, 255 - da);
+    default:                           return 255;
+    }
+}
+
+/* Read a destination pixel as 8-bit ARGB regardless of surface depth. */
+static uint32_t ati_rage128_dst_to_argb(uint32_t px, int bpp)
+{
+    switch (bpp) {
+    case 16:
+        return 0xff000000 | (((px >> 11) & 0x1f) << 19) |
+               (((px >> 5) & 0x3f) << 10) | ((px & 0x1f) << 3);
+    case 24:
+        return 0xff000000 | (px & 0xffffff);
+    case 32:
+        return px;
+    default:
+        return 0xff000000 | px;
+    }
+}
+
+static uint32_t ati_rage128_argb_to_dst(uint32_t argb, int bpp)
+{
+    switch (bpp) {
+    case 16:
+        return (((argb >> 19) & 0x1f) << 11) | (((argb >> 10) & 0x3f) << 5) |
+               ((argb >> 3) & 0x1f);
+    default:
+        return argb;
+    }
+}
+
+typedef struct ATIRage128ScaleOp {
+    int dst_x, dst_y, w, h;
+    uint32_t src_off, src_pitch;      /* pitch in pixels */
+    uint32_t x_inc, y_inc;            /* 4.12 fixed point */
+    unsigned dt;
+    uint32_t dst_off, dst_stride;     /* stride in bytes */
+    int bpp;
+    int sc_left, sc_top, sc_right, sc_bottom;
+    unsigned src_factor, dst_factor;  /* R128_ALPHA_BLEND_* */
+} ATIRage128ScaleOp;
+
+/*
+ * The scaler proper: a scaled, optionally YUV-converting, optionally
+ * alpha-blended copy from a source image in VRAM into the destination
+ * rectangle. Nearest-neighbour: the increments are DDA accumulator
+ * steps with 12 fractional bits.
+ */
+static void ati_rage128_2d_scale_run(ATIRage128State *s,
+                                     const ATIRage128ScaleOp *op)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    uint32_t dst_xy = pkt[R128_SCALE_PKT_DST_X_Y];
-    uint32_t dst_hw = pkt[R128_SCALE_PKT_DST_H_W];
-    uint32_t sc_tl = pkt[R128_SCALE_PKT_SC_TL];
-    uint32_t sc_br = pkt[R128_SCALE_PKT_SC_BR];
-    unsigned dt = pkt[R128_SCALE_PKT_DATATYPE] & 0xf;
-    uint32_t src_off = pkt[R128_SCALE_PKT_OFFSET] & ~7u;
-    uint32_t src_pitch = (pkt[R128_SCALE_PKT_PITCH] & 0x3fff) * 8;
-    uint32_t x_inc = pkt[R128_SCALE_PKT_X_INC] >> 4;
-    uint32_t y_inc = pkt[R128_SCALE_PKT_Y_INC] >> 4;
-    int dst_x = (dst_xy >> 16) & 0x3fff, dst_y = dst_xy & 0x3fff;
-    int w = dst_hw & 0x3fff, h = (dst_hw >> 16) & 0x3fff;
-    int sc_left = sc_tl & 0x3fff, sc_top = (sc_tl >> 16) & 0x3fff;
-    int sc_right = sc_br & 0x3fff, sc_bottom = (sc_br >> 16) & 0x3fff;
-    int bpp = ati_rage128_bpp_from_dp_datatype(s);
-    /*
-     * The packet carries its own pitch/offset for both source and
-     * destination -- its context dword sets both PITCH_OFFSET_CNTL bits,
-     * which is precisely what those bits mean. Using the engine's
-     * left-over state instead sent every scaled frame to wherever the
-     * previous operation happened to be pointing.
-     */
-    uint32_t dpo = pkt[R128_SCALE_PKT_DST_PITCH_OFF];
-    uint32_t dst_off = (dpo & R128_PITCH_OFFSET_OFF_MASK) <<
-                       R128_PITCH_OFFSET_OFF_SHIFT;
-    uint32_t dst_stride = (dpo >> R128_PITCH_OFFSET_PITCH_SHIFT) * bpp;
+    bool blend = !(op->src_factor == R128_ALPHA_BLEND_ONE &&
+                   op->dst_factor == R128_ALPHA_BLEND_ZERO);
     int src_bpp, x, y;
 
-    trace_ati_rage128_scale(dst_x, dst_y, w, h, src_off, src_pitch,
-                            x_inc, y_inc, dt);
-    if (!bpp || !dst_stride || !x_inc || !y_inc || !src_pitch ||
-        w <= 0 || h <= 0) {
+    trace_ati_rage128_scale(op->dst_x, op->dst_y, op->w, op->h, op->src_off,
+                            op->src_pitch, op->x_inc, op->y_inc, op->dt);
+    if (!op->bpp || !op->dst_stride || !op->x_inc || !op->y_inc ||
+        !op->src_pitch || op->w <= 0 || op->h <= 0) {
         return;
     }
 
-    switch (dt) {
+    switch (op->dt) {
     case R128_SCALE_DT_Y8:
         src_bpp = 1;
         break;
@@ -486,37 +528,161 @@ void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt)
         src_bpp = 4;
         break;
     default:
-        trace_ati_rage128_scale_unimp(dt);
+        trace_ati_rage128_scale_unimp(op->dt);
         return;
     }
+    if (blend) {
+        trace_ati_rage128_scale_blend(op->src_factor, op->dst_factor);
+    }
 
-    for (y = 0; y < h; y++) {
-        int dy = dst_y + y;
-        uint32_t sy = ((uint32_t)y * y_inc) >> 12;
+    for (y = 0; y < op->h; y++) {
+        int dy = op->dst_y + y;
+        uint32_t sy = ((uint32_t)y * op->y_inc) >> 12;
         const uint8_t *row;
 
-        if (dy < sc_top || dy > sc_bottom) {
+        if (dy < op->sc_top || dy > op->sc_bottom) {
             continue;
         }
-        row = vram + src_off + sy * src_pitch * (uint32_t)src_bpp;
-        if (src_off + (sy + 1) * src_pitch * (uint32_t)src_bpp >
+        row = vram + op->src_off + sy * op->src_pitch * (uint32_t)src_bpp;
+        if (op->src_off + (sy + 1) * op->src_pitch * (uint32_t)src_bpp >
             ATI_RAGE128_VRAM_SIZE) {
             break;
         }
-        for (x = 0; x < w; x++) {
-            int dx = dst_x + x;
-            uint32_t sx = ((uint32_t)x * x_inc) >> 12;
+        for (x = 0; x < op->w; x++) {
+            int dx = op->dst_x + x;
+            uint32_t sx = ((uint32_t)x * op->x_inc) >> 12;
+            uint32_t src, out;
 
-            if (dx < sc_left || dx > sc_right) {
+            if (dx < op->sc_left || dx > op->sc_right) {
                 continue;
             }
-            if ((sx + 1) * (uint32_t)src_bpp > src_pitch * (uint32_t)src_bpp) {
+            if ((sx + 1) * (uint32_t)src_bpp >
+                op->src_pitch * (uint32_t)src_bpp) {
                 break;
             }
-            ati_rage128_2d_write_pixel(s, dst_off, dst_stride, dx, dy, bpp,
-                                       ati_rage128_scale_texel(row, sx, dt));
+            src = ati_rage128_scale_texel(row, sx, op->dt);
+            if (op->dt != R128_SCALE_DT_ARGB8888) {
+                src |= 0xff000000;      /* no alpha in the source */
+            }
+            if (!blend) {
+                out = ati_rage128_argb_to_dst(src, op->bpp);
+            } else {
+                uint32_t dst = ati_rage128_dst_to_argb(
+                    ati_rage128_2d_read_pixel(s, op->dst_off, op->dst_stride,
+                                              dx, dy, op->bpp), op->bpp);
+                int sa = src >> 24, da = dst >> 24;
+                int c, shift;
+
+                out = 0;
+                for (c = 0, shift = 0; c < 4; c++, shift += 8) {
+                    int sc = (src >> shift) & 0xff, dc = (dst >> shift) & 0xff;
+                    int v = (sc * ati_rage128_blend_factor(op->src_factor, sc,
+                                                           sa, dc, da) +
+                             dc * ati_rage128_blend_factor(op->dst_factor, sc,
+                                                           sa, dc, da) +
+                             127) / 255;
+
+                    out |= (uint32_t)MIN(v, 255) << shift;
+                }
+                out = ati_rage128_argb_to_dst(out, op->bpp);
+            }
+            ati_rage128_2d_write_pixel(s, op->dst_off, op->dst_stride, dx, dy,
+                                       op->bpp, out);
         }
     }
+}
+
+/*
+ * CNTL_SCALING packet: this is how Mac OS plays video on this card --
+ * the counterpart of the mach64's scaler pipe, and it carries the same
+ * parameters for the same movie. Reading the increments unshifted gives
+ * a sixteen-fold downscale, which cannot be right when the source and
+ * destination are the same size: they sit at bits 19:4 exactly as the
+ * mach64's do.
+ */
+void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt)
+{
+    ATIRage128ScaleOp op = { 0 };
+    uint32_t dst_xy = pkt[R128_SCALE_PKT_DST_X_Y];
+    uint32_t dst_hw = pkt[R128_SCALE_PKT_DST_H_W];
+    uint32_t sc_tl = pkt[R128_SCALE_PKT_SC_TL];
+    uint32_t sc_br = pkt[R128_SCALE_PKT_SC_BR];
+    /*
+     * The packet carries its own pitch/offset for both source and
+     * destination -- its context dword sets both PITCH_OFFSET_CNTL bits,
+     * which is precisely what those bits mean. Using the engine's
+     * left-over state instead sent every scaled frame to wherever the
+     * previous operation happened to be pointing.
+     */
+    uint32_t dpo = pkt[R128_SCALE_PKT_DST_PITCH_OFF];
+
+    op.bpp = ati_rage128_bpp_from_dp_datatype(s);
+    op.dst_x = (dst_xy >> 16) & 0x3fff;
+    op.dst_y = dst_xy & 0x3fff;
+    op.w = dst_hw & 0x3fff;
+    op.h = (dst_hw >> 16) & 0x3fff;
+    op.sc_left = sc_tl & 0x3fff;
+    op.sc_top = (sc_tl >> 16) & 0x3fff;
+    op.sc_right = sc_br & 0x3fff;
+    op.sc_bottom = (sc_br >> 16) & 0x3fff;
+    op.dt = pkt[R128_SCALE_PKT_DATATYPE] & 0xf;
+    op.src_off = pkt[R128_SCALE_PKT_OFFSET] & ~7u;
+    op.src_pitch = (pkt[R128_SCALE_PKT_PITCH] & 0x3fff) * 8;
+    op.x_inc = pkt[R128_SCALE_PKT_X_INC] >> 4;
+    op.y_inc = pkt[R128_SCALE_PKT_Y_INC] >> 4;
+    op.dst_off = (dpo & R128_PITCH_OFFSET_OFF_MASK) <<
+                 R128_PITCH_OFFSET_OFF_SHIFT;
+    op.dst_stride = (dpo >> R128_PITCH_OFFSET_PITCH_SHIFT) * op.bpp;
+    op.src_factor = R128_ALPHA_BLEND_ONE;
+    op.dst_factor = R128_ALPHA_BLEND_ZERO;
+    ati_rage128_2d_scale_run(s, &op);
+}
+
+/*
+ * The scaler kicked through its registers (SCALE_DST_HEIGHT_WIDTH is the
+ * trigger, written last), drawing with the resolved 2D/3D context: the
+ * destination from DST_PITCH_OFFSET, the scissor from SC_*_C, and the
+ * blend factors and scale-function select from MISC_3D_STATE_CNTL_REG.
+ * This is Mac OS X's pointer whenever it does not fit the two-colour
+ * hardware cursor -- see the register block's comment in the header.
+ */
+void ati_rage128_2d_scale_regs(ATIRage128State *s)
+{
+    ATIRage128ScaleOp op = { 0 };
+    uint32_t misc = s->regs[R128_MISC_3D_STATE_CNTL_REG >> 2];
+    uint32_t dst_xy = s->regs[R128_SCALE_DST_X_Y >> 2];
+    uint32_t dst_hw = s->regs[R128_SCALE_DST_HEIGHT_WIDTH >> 2];
+    unsigned fcn = (misc >> R128_MISC_SCALE_3D_FCN_SHIFT) &
+                   R128_MISC_SCALE_3D_FCN_MASK;
+
+    if (fcn != R128_MISC_SCALE_3D_SCALE ||
+        !(s->dp_gui_master_cntl & R128_GMC_3D_FCN_EN)) {
+        trace_ati_rage128_scale_regs_skip(fcn, s->dp_gui_master_cntl);
+        return;
+    }
+    op.bpp = ati_rage128_bpp_from_dp_datatype(s);
+    op.dst_x = (dst_xy >> 16) & 0x3fff;
+    op.dst_y = dst_xy & 0x3fff;
+    op.w = dst_hw & 0x3fff;
+    op.h = (dst_hw >> 16) & 0x3fff;
+    op.sc_left = s->sc_left;
+    op.sc_top = s->sc_top;
+    op.sc_right = s->sc_right;
+    op.sc_bottom = s->sc_bottom;
+    if (op.sc_right == 0 && op.sc_bottom == 0) {
+        op.sc_right = 0x3fff;
+        op.sc_bottom = 0x3fff;
+    }
+    op.dt = s->regs[R128_SCALE_3D_DATATYPE >> 2] & 0xf;
+    op.src_off = s->regs[R128_SCALE_OFFSET_0 >> 2] & ~7u;
+    op.src_pitch = (s->regs[R128_SCALE_PITCH >> 2] & 0x3fff) * 8;
+    op.x_inc = s->regs[R128_SCALE_X_INC >> 2] >> 4;
+    op.y_inc = s->regs[R128_SCALE_Y_INC >> 2] >> 4;
+    op.dst_off = s->dst_offset;
+    op.dst_stride = s->dst_pitch * op.bpp;
+    op.src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) & R128_ALPHA_BLEND_MASK;
+    op.dst_factor = (misc >> R128_ALPHA_BLEND_DST_SHIFT) & R128_ALPHA_BLEND_MASK;
+    ati_rage128_2d_scale_run(s, &op);
 }
 
 void ati_rage128_2d_blt(ATIRage128State *s)

@@ -14,6 +14,22 @@
 const char *ati_rage128_reg_name(uint32_t base)
 {
     switch (base) {
+    case R128_SCALE_SRC_HEIGHT_WIDTH: return "SCALE_SRC_HEIGHT_WIDTH";
+    case R128_SCALE_OFFSET_0:        return "SCALE_OFFSET_0";
+    case R128_SCALE_PITCH:           return "SCALE_PITCH";
+    case R128_SCALE_X_INC:           return "SCALE_X_INC";
+    case R128_SCALE_Y_INC:           return "SCALE_Y_INC";
+    case R128_SCALE_HACC:            return "SCALE_HACC";
+    case R128_SCALE_VACC:            return "SCALE_VACC";
+    case R128_SCALE_DST_X_Y:         return "SCALE_DST_X_Y";
+    case R128_SCALE_DST_HEIGHT_WIDTH: return "SCALE_DST_HEIGHT_WIDTH";
+    case R128_SCALE_3D_CNTL:         return "SCALE_3D_CNTL";
+    case R128_PRIM_TEXTURE_COMBINE_CNTL: return "PRIM_TEXTURE_COMBINE_CNTL";
+    case R128_SCALE_3D_DATATYPE:     return "SCALE_3D_DATATYPE";
+    case R128_TEX_CNTL:              return "TEX_CNTL";
+    case R128_TEX_CNTL_C:            return "TEX_CNTL_C";
+    case R128_MISC_3D_STATE_CNTL_REG: return "MISC_3D_STATE_CNTL_REG";
+    case R128_PRIM_TEX_CNTL_C:       return "PRIM_TEX_CNTL_C";
     case R128_MM_INDEX:              return "MM_INDEX";
     case R128_MM_DATA:               return "MM_DATA";
     case R128_CLOCK_CNTL_INDEX:      return "CLOCK_CNTL_INDEX";
