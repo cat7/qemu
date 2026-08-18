@@ -58,7 +58,14 @@ typedef struct {
 
 static int64_t now_ns(void)
 {
-    return g_get_real_time() * 1000;
+    /*
+     * Monotonic: clock_gettime(CLOCK_MONOTONIC) / mach_absolute_time on
+     * POSIX hosts, QueryPerformanceCounter on Windows. g_get_real_time()
+     * would be GetSystemTimeAsFileTime there, whose granularity is the
+     * system timer tick (~1 ms at best) -- useless for pacing quanta that
+     * are due in a few microseconds -- and a wall clock can step anyway.
+     */
+    return g_get_monotonic_time() * 1000;
 }
 
 /*
@@ -70,7 +77,43 @@ static int64_t now_ns(void)
  * 0.25 s-granularity window and no cap, the effective rate inside the
  * calibration loop exceeded the target more than tenfold.
  */
-#define MAX_CREDIT_NS (100 * 1000)
+#ifdef _WIN32
+/*
+ * Windows sleeps in whole milliseconds: glib's g_usleep() is Sleep()
+ * rounded UP to the next millisecond, and even Sleep(1) (QEMU already
+ * calls timeBeginPeriod(1)) returns 1-2 ms later. Quantum debts here
+ * are a few microseconds, so settling each one with a sleep would
+ * over-throttle by ~10x -- the overshoot beyond MAX_CREDIT_NS is
+ * forgiven, not banked. Instead: let sub-millisecond debt ride (the
+ * window accounting is cumulative, so it stays owed), sleep only the
+ * whole milliseconds Sleep() can honour, and widen the credit cap to
+ * one millisecond so Sleep()'s own overshoot is banked rather than
+ * lost. Worst-case burst is then ~1 ms of debt plus ~1 ms of credit of
+ * target-time -- ~400k instructions at 200 MIPS, still far short of the
+ * 65536-iteration emulated-68K dbra loop this plugin exists to slow
+ * down (each 68K iteration costs on the order of ten-plus PPC
+ * instructions in the emulator).
+ */
+#define SLEEP_GRANULARITY_NS (1000 * 1000)
+#define MAX_CREDIT_NS        (1000 * 1000)
+#else
+#define MAX_CREDIT_NS        (100 * 1000)
+#endif
+
+/* Sleep off a debt; returns false if the debt is too small to sleep on. */
+static bool throttle_sleep(int64_t debt_ns)
+{
+#ifdef _WIN32
+    if (debt_ns < SLEEP_GRANULARITY_NS) {
+        return false;
+    }
+    /* whole milliseconds only: g_usleep(N * 1000) is exactly Sleep(N) */
+    g_usleep((debt_ns / SLEEP_GRANULARITY_NS) * 1000);
+#else
+    g_usleep(debt_ns / 1000);
+#endif
+    return true;
+}
 
 static void settle_quantum(vCPUGov *vcpu)
 {
@@ -86,8 +129,9 @@ static void settle_quantum(vCPUGov *vcpu)
     int64_t elapsed_ns = now - vcpu->window_start_ns;
 
     if (due_ns > elapsed_ns) {
-        g_usleep((due_ns - elapsed_ns) / 1000);
-        now = now_ns();
+        if (throttle_sleep(due_ns - elapsed_ns)) {
+            now = now_ns();
+        }
     } else if (elapsed_ns - due_ns > MAX_CREDIT_NS) {
         /* running below target (idle / MMIO-heavy): forgive the excess
          * beyond the cap instead of banking it as burst budget */
