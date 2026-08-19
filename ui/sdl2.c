@@ -1018,23 +1018,6 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 #ifdef SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED
     SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
 #endif
-#if defined(_WIN32) && defined(SDL_HINT_MOUSE_RELATIVE_MODE_WARP)
-    /*
-     * Inside a Remote Desktop session, the raw mouse input SDL's
-     * relative mode normally consumes (WM_INPUT) is starved -- RDP
-     * synthesizes pointer positions, not hardware deltas -- leaving a
-     * relative-pointer guest with a barely moving mouse. SDL's
-     * warp-based relative mode derives deltas from pointer positions
-     * instead, which RDP delivers correctly. Only forced when actually
-     * running remote; local sessions keep the lower-latency raw path.
-     * An explicit SDL_MOUSE_RELATIVE_MODE_WARP in the environment
-     * still wins (SDL_HINT_DEFAULT).
-     */
-    if (GetSystemMetrics(SM_REMOTESESSION)) {
-        SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "1",
-                                SDL_HINT_DEFAULT);
-    }
-#endif
     SDL_SetHint(SDL_HINT_WINDOWS_NO_CLOSE_ON_ALT_F4, "1");
     sdl2_set_hint_x11_force_egl();
     SDL_EnableScreenSaver();
