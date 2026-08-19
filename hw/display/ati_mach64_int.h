@@ -164,6 +164,7 @@ struct ATIMach64State {
     bool host_cursor_tracking;
     bool host_cursor_absolute;    /* track via ABS pointer events (ungrabbed) */
     bool host_cursor_elsewhere;   /* pointer is on another card's screen */
+    int64_t guest_cursor_posn_ns; /* last guest write to CUR_HORZ_VERT_POSN */
     int host_cursor_x;
     int host_cursor_y;
     bool monitor_connected;

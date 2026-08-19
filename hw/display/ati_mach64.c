@@ -837,6 +837,68 @@ static int mac_find_own_screen(ATIMach64State *s, const MacScreen *scr, int n,
     return -1;
 }
 
+/*
+ * The Cursor Device Manager keeps the AUTHORITATIVE pointer position in
+ * its CursorData record, not in the low-memory globals: whenever its VBL
+ * task runs, it rewrites MTemp/Mouse from that record -- measured live
+ * (Mac OS 8.1, single display): a position poked into MTemp/Mouse was
+ * reverted to the record's value within one frame, so clicks landed at
+ * the record's stale position while the sprite followed the host. The
+ * low-memory writes below only ever "worked" on setups where that task
+ * is starved (a second card's VBL load does it), which is why tracking
+ * behaved with two displays and misplaced clicks with one.
+ *
+ * Chain, found by diffing guest RAM across native moves and confirmed
+ * against the public CursorDevice layout (devID 'appl', Fixed
+ * resolution 100.0, 2 buttons): ExpandMem (low-mem 0x2B6) + 0x1E0 ->
+ * CDM globals; +4 -> CursorData; +8/+0xC Fixed (h,v) sub-pixel
+ * position (h first -- the guest re-synced swapped when written v,h);
+ * +0x10 Point where (v,h as usual). Both the Fixed pair and the Point are
+ * written so whichever the task reads, it propagates our position.
+ * Guarded by a consistency check (the Point must be the integer part of
+ * the Fixed pair) so a different ExpandMem layout silently does nothing.
+ */
+#define MAC_LOWMEM_EXPANDMEM   0x2b6
+#define MAC_EXPANDMEM_CRSRDEV  0x1e0
+
+static bool mac_publish_cursor_data(int x, int y)
+{
+    uint32_t em, glob, cd, fh, fv, pt;
+    uint32_t out[3];
+
+    if (!mac_read_be32(MAC_LOWMEM_EXPANDMEM, &em) ||
+        !mac_read_be32(em + MAC_EXPANDMEM_CRSRDEV, &glob) ||
+        !mac_read_be32(glob + 4, &cd) ||
+        !mac_read_be32(cd + 8, &fh) ||
+        !mac_read_be32(cd + 0xc, &fv) ||
+        !mac_read_be32(cd + 0x10, &pt)) {
+        return false;
+    }
+    /* the Fixed pair is stored (h, v); the Point is the usual (v, h) */
+    if ((int16_t)(pt & 0xffff) != (int32_t)fh >> 16 ||
+        (int16_t)(pt >> 16) != (int32_t)fv >> 16) {
+        return false;
+    }
+    out[0] = cpu_to_be32((uint32_t)x << 16);
+    out[1] = cpu_to_be32((uint32_t)y << 16);
+    out[2] = cpu_to_be32(((uint32_t)(uint16_t)y << 16) | (uint16_t)x);
+    address_space_write(&address_space_memory, cd + 8, MEMTXATTRS_UNSPECIFIED,
+                        out, sizeof(out));
+    return true;
+}
+
+/*
+ * Is the guest's own cursor task alive? When it is, it rewrites
+ * CUR_HORZ_VERT_POSN every frame from its (now host-fed) position, with
+ * the proper hotspot offset; our raw-position sprite write would only
+ * fight it. Treat a guest write within the last few frames as "alive".
+ */
+static bool ati_mach64_guest_draws_cursor(ATIMach64State *s)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->guest_cursor_posn_ns <
+           100 * SCALE_MS;
+}
+
 static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
                                          QemuInputEvent *evt)
 {
@@ -844,7 +906,7 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
     ATIMach64Mode mode;
     uint32_t point_be;
     int old_x, old_y;
-    bool was_elsewhere;
+    bool was_elsewhere, guest_draws, published;
 
     ati_mach64_get_mode(s, &mode);
     if (!ati_mach64_mode_valid(s, &mode)) {
@@ -926,6 +988,7 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
      * list gives the real arrangement, so the position published here
      * stays in the global coordinates Mac OS hit-tests clicks against.
      */
+    guest_draws = ati_mach64_guest_draws_cursor(s);
     {
         MacScreen scr[MAC_MAX_SCREENS];
         int n = mac_read_screens(scr, MAC_MAX_SCREENS);
@@ -939,8 +1002,11 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
                                    (int)mode.width - 1);
             s->host_cursor_y = MIN(MAX(s->host_cursor_y, 0),
                                    (int)mode.height - 1);
-            s->regs[ATI_CUR_HORZ_VERT_POSN >> 2] =
-                ((uint32_t)s->host_cursor_y << 16) | (uint32_t)s->host_cursor_x;
+            if (!guest_draws) {
+                s->regs[ATI_CUR_HORZ_VERT_POSN >> 2] =
+                    ((uint32_t)s->host_cursor_y << 16) |
+                    (uint32_t)s->host_cursor_x;
+            }
         } else {
             /*
              * Keep CrsrPin -- the rectangle the Cursor Manager pins the
@@ -994,7 +1060,9 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
             }
 
             s->host_cursor_elsewhere = (here != mine);
-            if (here == mine) {
+            if (guest_draws) {
+                /* the guest's own cursor task places every sprite */
+            } else if (here == mine) {
                 s->regs[ATI_CUR_HORZ_VERT_POSN >> 2] =
                     ((uint32_t)(s->host_cursor_y - scr[mine].y0) << 16) |
                     (uint32_t)(s->host_cursor_x - scr[mine].x0);
@@ -1026,7 +1094,12 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
                         MEMTXATTRS_UNSPECIFIED, &point_be, 4);
     address_space_write(&address_space_memory, MAC_LOWMEM_MOUSE,
                         MEMTXATTRS_UNSPECIFIED, &point_be, 4);
-    ati_mach64_cursor_update(s);
+    published = mac_publish_cursor_data(s->host_cursor_x, s->host_cursor_y);
+    trace_ati_mach64_host_cursor_publish(s->host_cursor_x, s->host_cursor_y,
+                                         published, guest_draws);
+    if (!guest_draws) {
+        ati_mach64_cursor_update(s);
+    }
 }
 
 static const QemuInputHandler ati_mach64_cursor_handler = {
@@ -1598,10 +1671,13 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         }
         return;
     }
+    case ATI_CUR_HORZ_VERT_POSN:
+        /* see ati_mach64_guest_draws_cursor() */
+        s->guest_cursor_posn_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        /* fall through */
     case ATI_CUR_CLR0:
     case ATI_CUR_CLR1:
     case ATI_CUR_OFFSET:
-    case ATI_CUR_HORZ_VERT_POSN:
     case ATI_CUR_HORZ_VERT_OFF:
     case ATI_GEN_TEST_CNTL:
         s->regs[reg_num] = word;
