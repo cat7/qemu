@@ -1004,6 +1004,14 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
         }
     }
 
+    trace_ati_mach64_host_cursor_evt(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                     evt->type,
+                                     evt->type == INPUT_EVENT_KIND_REL ?
+                                     evt->rel.axis : evt->abs.axis,
+                                     evt->type == INPUT_EVENT_KIND_REL ?
+                                     evt->rel.value : evt->abs.value,
+                                     s->host_cursor_x, s->host_cursor_y);
+
     point_be = cpu_to_be32(((uint32_t)(uint16_t)s->host_cursor_y << 16) |
                            (uint32_t)(uint16_t)s->host_cursor_x);
     address_space_write(&address_space_memory, MAC_LOWMEM_MTEMP,
