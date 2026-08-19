@@ -193,7 +193,6 @@ ati_rage128_monidb(int64_t ns, uint32_t raw, uint32_t y) "t=%"PRId64" GPIO_MONID
 ati_rage128_monidb_wr(int64_t ns, uint32_t val) "t=%"PRId64" GPIO_MONIDB write val=0x%08x"
 
 # ati_mach64.c
-ati_mach64_cursor_posn_suppressed(uint32_t word) "guest CUR_HORZ_VERT_POSN 0x%08x ignored (host tracking owns position)"
 ati_mach64_host_cursor_evt(int64_t now_ns, int kind, int axis, int value, int x, int y) "now=%" PRId64 " kind=%d axis=%d value=%d -> (%d,%d)"
 ati_mach64_host_cursor_drop(int reason, int a, int b) "reason=%d (1=bad-mode 2=wrong-kind 3=big-delta 4=off-desktop) a=%d b=%d"
 ati_mach64_mmio_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s -> 0x%"PRIx64
