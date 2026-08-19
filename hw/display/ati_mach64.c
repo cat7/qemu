@@ -848,6 +848,7 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
 
     ati_mach64_get_mode(s, &mode);
     if (!ati_mach64_mode_valid(s, &mode)) {
+        trace_ati_mach64_host_cursor_drop(1, mode.width, mode.height);
         return;
     }
 
@@ -900,6 +901,8 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
          * far smaller per-event deltas.
          */
         if (evt->rel.value > 256 || evt->rel.value < -256) {
+            trace_ati_mach64_host_cursor_drop(3, evt->rel.axis,
+                                              evt->rel.value);
             return;
         }
 
@@ -911,6 +914,7 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
             return;
         }
     } else {
+        trace_ati_mach64_host_cursor_drop(2, evt->type, 0);
         return;
     }
 
@@ -982,6 +986,8 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
              * the same pinning behaviour Mac OS applies via CrsrPin.
              */
             if (here < 0) {
+                trace_ati_mach64_host_cursor_drop(4, s->host_cursor_x,
+                                                  s->host_cursor_y);
                 s->host_cursor_x = old_x;
                 s->host_cursor_y = old_y;
                 return;
