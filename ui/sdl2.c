@@ -751,6 +751,19 @@ static void sdl_mouse_warp(DisplayChangeListener *dcl,
         return;
     }
 
+    /*
+     * With an absolute pointing device the HOST pointer is the source
+     * of truth: the guest cursor position published here derives from
+     * it in the first place. Warping the host pointer back, or churning
+     * cursor visibility/shape on every publish, only creates a feedback
+     * loop -- seen as a jittery cursor shadowed by a second (host)
+     * pointer. The grab logic in handle_mousemotion() alone governs
+     * host-cursor visibility in absolute mode.
+     */
+    if (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
+        return;
+    }
+
     if (on) {
         /*
          * Do not un-hide the host pointer while it is in relative mode --
