@@ -861,29 +861,55 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
      * host-tracked, since CrsrVBLTask (the VBL-driven cursor redraw
      * task) still doesn't get serviced by the guest on its own.
      */
-    if (evt->type != INPUT_EVENT_KIND_REL) {
-        return;
-    }
-
-    /*
-     * Ignore implausibly large single-event deltas: the SDL backend
-     * synthesizes window-sized relative jumps on grab/ungrab and on
-     * the pointer entering the window (warp compensation), which are
-     * not real hand motion -- integrating one slams the tracked
-     * position into a screen corner. Real pointing devices deliver
-     * far smaller per-event deltas.
-     */
-    if (evt->rel.value > 256 || evt->rel.value < -256) {
-        return;
-    }
-
     old_x = s->host_cursor_x;
     old_y = s->host_cursor_y;
     was_elsewhere = s->host_cursor_elsewhere;
-    if (evt->rel.axis == INPUT_AXIS_X) {
-        s->host_cursor_x += evt->rel.value;
-    } else if (evt->rel.axis == INPUT_AXIS_Y) {
-        s->host_cursor_y += evt->rel.value;
+
+    if (evt->type == INPUT_EVENT_KIND_ABS && s->host_cursor_absolute) {
+        /*
+         * Absolute mode: the display backend reports the host pointer
+         * position directly (0..0x7fff across this console's surface),
+         * with no pointer grab and no warping involved. This sidesteps
+         * two failure modes of the relative stream: hosts that starve
+         * raw/relative input (Remote Desktop sessions), and the
+         * warp-compensation feedback jitter of grabbed-relative mode.
+         * Map into this card's rectangle of the guest's global desktop.
+         */
+        MacScreen scr[MAC_MAX_SCREENS];
+        int n = mac_read_screens(scr, MAC_MAX_SCREENS);
+        int mine = mac_find_own_screen(s, scr, n, &mode);
+        int x0 = (mine >= 0) ? scr[mine].x0 : 0;
+        int y0 = (mine >= 0) ? scr[mine].y0 : 0;
+
+        if (evt->abs.axis == INPUT_AXIS_X) {
+            s->host_cursor_x = x0 +
+                (int)((uint64_t)evt->abs.value * mode.width / 0x8000);
+        } else if (evt->abs.axis == INPUT_AXIS_Y) {
+            s->host_cursor_y = y0 +
+                (int)((uint64_t)evt->abs.value * mode.height / 0x8000);
+        } else {
+            return;
+        }
+    } else if (evt->type == INPUT_EVENT_KIND_REL) {
+        /*
+         * Ignore implausibly large single-event deltas: the SDL backend
+         * synthesizes window-sized relative jumps on grab/ungrab and on
+         * the pointer entering the window (warp compensation), which are
+         * not real hand motion -- integrating one slams the tracked
+         * position into a screen corner. Real pointing devices deliver
+         * far smaller per-event deltas.
+         */
+        if (evt->rel.value > 256 || evt->rel.value < -256) {
+            return;
+        }
+
+        if (evt->rel.axis == INPUT_AXIS_X) {
+            s->host_cursor_x += evt->rel.value;
+        } else if (evt->rel.axis == INPUT_AXIS_Y) {
+            s->host_cursor_y += evt->rel.value;
+        } else {
+            return;
+        }
     } else {
         return;
     }
@@ -992,6 +1018,19 @@ static void ati_mach64_host_cursor_event(DeviceState *dev, QemuConsole *src,
 static const QemuInputHandler ati_mach64_cursor_handler = {
     .name  = "ATI Mach64 hardware cursor (host-tracking workaround)",
     .mask  = INPUT_EVENT_MASK_REL,
+    .event = ati_mach64_host_cursor_event,
+};
+
+/*
+ * Absolute variant: declaring ABS makes qemu_input_is_absolute() true,
+ * so display backends stop grabbing the pointer and report positions
+ * instead of raw deltas (buttons still route to the ADB mouse, whose
+ * mask alone has BTN). See the ABS branch in
+ * ati_mach64_host_cursor_event() for why this exists.
+ */
+static const QemuInputHandler ati_mach64_cursor_handler_abs = {
+    .name  = "ATI Mach64 hardware cursor (host-tracking, absolute)",
+    .mask  = INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_ABS,
     .event = ati_mach64_host_cursor_event,
 };
 
@@ -1971,6 +2010,8 @@ static void ati_mach64_realize(PCIDevice *dev, Error **errp)
      */
     if (s->host_cursor_tracking) {
         s->cursor_hs = qemu_input_handler_register(DEVICE(dev),
+                                                   s->host_cursor_absolute ?
+                                                   &ati_mach64_cursor_handler_abs :
                                                    &ati_mach64_cursor_handler);
     }
 
@@ -2026,6 +2067,15 @@ static const VMStateDescription vmstate_ati_mach64 = {
 static const Property ati_mach64_properties[] = {
     DEFINE_PROP_BOOL("host-cursor-tracking", ATIMach64State,
                      host_cursor_tracking, true),
+    /*
+     * With tracking on, derive the cursor from absolute host pointer
+     * positions instead of integrating relative deltas: no pointer
+     * grab, no warping. Fixes jittery tracking (warp-compensation
+     * feedback) and Remote Desktop sessions (which starve raw relative
+     * input). Off by default to leave established setups untouched.
+     */
+    DEFINE_PROP_BOOL("host-cursor-absolute", ATIMach64State,
+                     host_cursor_absolute, false),
     /*
      * Real Old World Macs pick which video port is the boot/console
      * display by physical monitor-sense detection, not a stored

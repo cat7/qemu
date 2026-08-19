@@ -162,6 +162,7 @@ struct ATIMach64State {
      */
     QemuInputHandlerState *cursor_hs;
     bool host_cursor_tracking;
+    bool host_cursor_absolute;    /* track via ABS pointer events (ungrabbed) */
     bool host_cursor_elsewhere;   /* pointer is on another card's screen */
     int host_cursor_x;
     int host_cursor_y;
