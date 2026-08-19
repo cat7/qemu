@@ -1584,10 +1584,25 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         }
         return;
     }
+    case ATI_CUR_HORZ_VERT_POSN:
+        /*
+         * While host-cursor tracking is active, tracking owns the
+         * sprite position (ati_mach64_host_cursor_event() writes it on
+         * every host motion event). On guests whose own CrsrVBLTask
+         * still limps along, letting its slow, stale position writes
+         * through makes the cursor snap back and forth between the
+         * live host position and positions from hundreds of ms ago --
+         * seen as heavy jitter. Shape, hotspot, colors, and the
+         * enable bit (hide/show) stay fully guest-controlled below.
+         */
+        if (s->cursor_hs) {
+            trace_ati_mach64_cursor_posn_suppressed(word);
+            return;
+        }
+        /* fall through */
     case ATI_CUR_CLR0:
     case ATI_CUR_CLR1:
     case ATI_CUR_OFFSET:
-    case ATI_CUR_HORZ_VERT_POSN:
     case ATI_CUR_HORZ_VERT_OFF:
     case ATI_GEN_TEST_CNTL:
         s->regs[reg_num] = word;
