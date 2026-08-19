@@ -97,6 +97,9 @@ struct CUDAState {
      * armed with a different duration depending on what triggered it.
      */
     QEMUTimer *sr_delay_timer;
+    /* virtual-time deadline of the pending sr_delay_timer, for the
+     * guest-access catch-up path (see cuda_sr_int_catch_up()) */
+    int64_t sr_int_due_ns;
 
     /*
      * CUDA_SET_ONE_SECOND_MODE support: once enabled, an unsolicited

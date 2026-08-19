@@ -151,7 +151,29 @@ static void cuda_delay_set_sr_int(CUDAState *s, uint64_t delay_ns)
     trace_cuda_delay_set_sr_int();
 
     expire = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns;
+    s->sr_int_due_ns = expire;
     timer_mod(s->sr_delay_timer, expire);
+}
+
+/*
+ * Deliver an overdue SR_INT inline from the guest's own register
+ * access instead of waiting for the main loop to run the timer
+ * callback. The ROM's CUDA handshake needs one sr_delay_timer firing
+ * per transferred byte; on hosts where main-loop timer service is
+ * coarse (Windows: millisecond-at-best poll granularity, sometimes far
+ * worse), boot-time CUDA traffic of thousands of bytes stretches from
+ * seconds to tens of minutes -- the ROM sits polling IFR while the
+ * expired timer waits for a main-loop wakeup. Never delivers early:
+ * only when the deadline has already passed in virtual time, so the
+ * guest-visible delay semantics are unchanged on any host.
+ */
+static void cuda_sr_int_catch_up(CUDAState *s)
+{
+    if (timer_pending(s->sr_delay_timer) &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->sr_int_due_ns) {
+        timer_del(s->sr_delay_timer);
+        cuda_set_sr_int(s);
+    }
 }
 
 /* NOTE: TIP and TREQ are negated */
@@ -939,6 +961,7 @@ static uint64_t mos6522_cuda_read(void *opaque, hwaddr addr, unsigned size)
     MOS6522State *ms = MOS6522(mcs);
 
     addr = (addr >> 9) & 0xf;
+    cuda_sr_int_catch_up(s);
     return mos6522_read(ms, addr, size);
 }
 
@@ -950,6 +973,7 @@ static void mos6522_cuda_write(void *opaque, hwaddr addr, uint64_t val,
     MOS6522State *ms = MOS6522(mcs);
 
     addr = (addr >> 9) & 0xf;
+    cuda_sr_int_catch_up(s);
     mos6522_write(ms, addr, val, size);
 }
 
