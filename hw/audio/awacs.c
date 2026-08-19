@@ -98,6 +98,33 @@ static void awacs_fifo_push(AWACSState *s, const uint8_t *data, int len)
 #define AWACS_PREBUF_NS         (60 * 1000 * 1000)
 #define AWACS_PREBUF_GIVEUP_NS  (100 * 1000 * 1000)
 
+/*
+ * Fill the backend with silence while we have no samples to give it.
+ * Backends with a looping ring (DirectSound most visibly) otherwise
+ * keep replaying whatever the ring last held once the stream ends --
+ * heard as the tail of the boot chime repeating forever. Real AWACS
+ * hardware's DAC keeps emitting silence between streams; do the same.
+ * (coreaudio solves this inside its own render callback; this covers
+ * every other backend generically.)
+ */
+static void awacs_write_silence(AWACSState *s, int avail)
+{
+    static const uint8_t zeros[1024];
+
+    avail -= avail % AWACS_FRAME_BYTES;
+    while (avail >= AWACS_FRAME_BYTES) {
+        int chunk = MIN(avail, (int)sizeof(zeros));
+        size_t written = audio_be_write(s->audio_be, s->voice,
+                                        (void *)zeros, chunk);
+
+        written -= written % AWACS_FRAME_BYTES;
+        if (!written) {
+            break;
+        }
+        avail -= written;
+    }
+}
+
 static void awacs_audio_callback(void *opaque, int avail)
 {
     AWACSState *s = AWACS(opaque);
@@ -108,6 +135,7 @@ static void awacs_audio_callback(void *opaque, int avail)
     if (s->out_fifo_count == 0) {
         /* Stream drained (or never started): next data prebuffers. */
         s->prebuffering = true;
+        awacs_write_silence(s, avail);
         return;
     }
     if (s->prebuffering) {
@@ -118,6 +146,11 @@ static void awacs_audio_callback(void *opaque, int avail)
 
         if (s->out_fifo_count < want &&
             now - s->last_push_ns < AWACS_PREBUF_GIVEUP_NS) {
+            /* No silence-fill here: zeros written while a stream is
+             * gathering would queue ahead of its real samples and add
+             * ring-depth latency to every stream start. The backend
+             * ring already holds our own trailing silence from the
+             * drained state above, so there is nothing stale to loop. */
             return;
         }
         s->prebuffering = false;
