@@ -610,6 +610,13 @@ audio_dsound_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
         return false;
     }
 
+    /*
+     * No capture device is a degraded configuration (playback-only),
+     * not a fatal one: hosts without a microphone -- notably Remote
+     * Desktop sessions without audio-in redirection -- would otherwise
+     * lose playback too. Voice-open of an input already fails cleanly
+     * on a NULL capture object (see dsound_template.h's FIELD2 check).
+     */
     hr = CoCreateInstance (
         &CLSID_DirectSoundCapture,
         NULL,
@@ -618,14 +625,18 @@ audio_dsound_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
         (void **) &s->dsound_capture
         );
     if (FAILED (hr)) {
-        dserror_set(errp, hr, "Could not create DirectSoundCapture instance");
-        return false;
+        dsound_logerr(hr, "Could not create DirectSoundCapture instance");
+        s->dsound_capture = NULL;
+    } else {
+        hr = IDirectSoundCapture_Initialize (s->dsound_capture, NULL);
+        if (FAILED(hr)) {
+            dsound_logerr(hr, "Could not initialize DirectSoundCapture");
+            IDirectSoundCapture_Release(s->dsound_capture);
+            s->dsound_capture = NULL;
+        }
     }
-
-    hr = IDirectSoundCapture_Initialize (s->dsound_capture, NULL);
-    if (FAILED(hr)) {
-        dserror_set(errp, hr, "Could not initialize DirectSoundCapture");
-        return false;
+    if (!s->dsound_capture) {
+        warn_report("dsound: no capture device, continuing playback-only");
     }
 
     hr = IDirectSound_SetCooperativeLevel (
