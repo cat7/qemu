@@ -120,6 +120,7 @@ qemu_input_find_handler(uint32_t mask, const QemuConsole *con)
             continue;
         }
         if (mask & s->handler->mask) {
+            trace_input_find_handler(mask, 1, s->id, s->handler->name);
             return s;
         }
     }
@@ -129,9 +130,11 @@ qemu_input_find_handler(uint32_t mask, const QemuConsole *con)
             continue;
         }
         if (mask & s->handler->mask) {
+            trace_input_find_handler(mask, 2, s->id, s->handler->name);
             return s;
         }
     }
+    trace_input_find_handler(mask, 0, -1, "<none>");
     return NULL;
 }
 

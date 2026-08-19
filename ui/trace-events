@@ -133,6 +133,7 @@ input_event_rel(int conidx, const char *axis, int value) "con %d, axis %s, value
 input_event_abs(int conidx, const char *axis, int value) "con %d, axis %s, value 0x%x"
 input_event_mtt(int conidx, const char *axis, int value) "con %d, axis %s, value 0x%x"
 input_event_sync(void) ""
+input_find_handler(uint32_t mask, int pass, int id, const char *name) "mask 0x%x pass %d -> handler id %d '%s'"
 
 # sdl2-input.c
 sdl2_process_key(int sdl_scancode, unsigned int lnx, const char *action) "translated SDL scancode %d to Linux scancode %u (%s)"
