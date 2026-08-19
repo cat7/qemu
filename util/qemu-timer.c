@@ -515,6 +515,59 @@ bool timer_expired(const QEMUTimer *timer_head, int64_t current_time)
     return timer_expired_ns(timer_head, current_time * timer_head->scale);
 }
 
+/*
+ * Diagnostic probe (QEMU_TIMER_LATENESS=1 in the environment): report
+ * once per second, on stderr, how late timer callbacks actually run
+ * relative to their programmed deadline. Exists to quantify a
+ * pathological main-loop timer-service delay observed on a Windows
+ * host (seconds-late one-shot timers starved the Beige G3 ROM's
+ * per-byte CUDA handshake and ADB autopoll input). Racy by design --
+ * plain counters, no locking -- good enough for a diagnostic.
+ */
+static struct {
+    int state; /* -1 unchecked, 0 off, 1 on */
+    int64_t window_start_ns;
+    uint64_t count;
+    int64_t max_late_ns;
+    int64_t sum_late_ns;
+} timer_lateness = { .state = -1 };
+
+static void timer_lateness_note(int64_t late_ns)
+{
+    int64_t now;
+
+    if (timer_lateness.state == 0) {
+        return;
+    }
+    if (timer_lateness.state < 0) {
+        const char *v = getenv("QEMU_TIMER_LATENESS");
+        timer_lateness.state = (v && *v && *v != '0') ? 1 : 0;
+        if (!timer_lateness.state) {
+            return;
+        }
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (!timer_lateness.window_start_ns) {
+        timer_lateness.window_start_ns = now;
+    }
+    timer_lateness.count++;
+    timer_lateness.sum_late_ns += late_ns;
+    if (late_ns > timer_lateness.max_late_ns) {
+        timer_lateness.max_late_ns = late_ns;
+    }
+    if (now - timer_lateness.window_start_ns >= NANOSECONDS_PER_SECOND) {
+        fprintf(stderr,
+                "timer-lateness: fires=%" PRIu64 " max=%.3fms avg=%.3fms\n",
+                timer_lateness.count,
+                timer_lateness.max_late_ns / 1e6,
+                timer_lateness.sum_late_ns / 1e6 / timer_lateness.count);
+        timer_lateness.window_start_ns = now;
+        timer_lateness.count = 0;
+        timer_lateness.max_late_ns = 0;
+        timer_lateness.sum_late_ns = 0;
+    }
+}
+
 bool timerlist_run_timers(QEMUTimerList *timer_list)
 {
     QEMUTimer *ts;
@@ -580,6 +633,8 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
             qemu_mutex_unlock(&timer_list->active_timers_lock);
             goto out;
         }
+
+        timer_lateness_note(current_time - ts->expire_time);
 
         /* remove timer from the list before calling the callback */
         timer_list->active_timers = ts->next;
