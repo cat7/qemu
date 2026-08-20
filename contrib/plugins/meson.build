@@ -17,6 +17,7 @@ contrib_plugins = [
 'rangeexec.c',
 'fbwatch.c',
 'storewatch.c',
+'loadwatch.c',
 'excburst.c',
 'stoptrigger.c',
 'traps.c',
