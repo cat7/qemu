@@ -259,9 +259,38 @@ static bool oldworld_of_partition_valid(const uint8_t *buf)
  * one below, which real Old World ROMs never look at). If a backing file
  * (nvr->blk) already holds a valid partition -- persisted from an earlier
  * run -- it's left untouched instead of being clobbered with defaults. */
+/*
+ * Old World "cold boot" POST-request flag inside the ROM's own settings
+ * area of NVRAM. Mac OS sets it (value 9 observed, Mac OS 8.1) during
+ * Shut Down so the ROM treats the next power-on as a cold boot and runs
+ * its FULL destructive RAM test -- CONCURRENTLY with the second (RAM-
+ * resident) half of the startup chime. The test sweeps all of RAM,
+ * including the chime's live DBDMA descriptor chain at phys 0x20-0xDF;
+ * the engine then fetches test-pattern words as descriptors, hits a
+ * reserved command, and goes DEAD with the command pointer short of the
+ * terminating STOP -- which the ROM's completion loop re-kicks forever
+ * (poll at 0xfff046fc/0xfff04720: retry until *cmdptr == 0x70000000).
+ * Result: half a chime, then a permanent hang, on every boot after a
+ * clean Shut Down. Real silicon evidently survives this sequence;
+ * neither we nor DingusPPC do (its project workflow deletes nvram
+ * before every run for the same reason). Until the surviving-silicon
+ * behavior is understood, scrub the flag at machine init so every
+ * emulated boot takes the (proven-good) warm-boot path -- exactly what
+ * deleting nvram.img achieved, minus losing the rest of NVRAM.
+ */
+#define OLDWORLD_POST_REQ_OFFSET 0x1043
+
 void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr)
 {
     uint8_t *buf = &nvr->data[OLDWORLD_OF_OFFSET];
+
+    if (nvr->data[OLDWORLD_POST_REQ_OFFSET]) {
+        nvr->data[OLDWORLD_POST_REQ_OFFSET] = 0;
+        if (nvr->blk) {
+            blk_pwrite(nvr->blk, OLDWORLD_POST_REQ_OFFSET, 1,
+                       &nvr->data[OLDWORLD_POST_REQ_OFFSET], 0);
+        }
+    }
 
     if (oldworld_of_partition_valid(buf)) {
         return;
