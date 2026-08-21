@@ -277,7 +277,29 @@ static void conditional_branch(DBDMA_channel *ch)
 
 static void channel_run(DBDMA_channel *ch);
 
-#define DBDMA_SYNC_CONTINUE_BURST_LIMIT 1000000
+/*
+ * Bounds a single synchronous burst (see dbdma_should_continue_sync()
+ * below) to roughly a millisecond or two of real wall-clock time, not
+ * the ~1.1-1.4 SECONDS a burst of 1000000 measured at live -- each
+ * iteration does at least one 16-byte guest-memory read/write plus
+ * register bookkeeping, and this whole burst runs with the BQL held,
+ * blocking every other device (including audio timers) for its full
+ * duration. Confirmed live: an OS X guest probing the unimplemented
+ * built-in modem's serial DMA channel (see dbdma_unassigned_rw() --
+ * real Beige G3 hardware has one, this model doesn't) armed a
+ * self-looping descriptor ring on that unassigned channel, which hit
+ * this limit and fell back to the paced timer, only to have the timer
+ * callback reset the counter and immediately re-arm a fresh
+ * million-iteration burst -- repeating for as long as the guest kept
+ * the ring running (tens of seconds observed), each cycle pegging the
+ * host CPU and stalling audio by over a second. Still comfortably
+ * larger than any real device's legitimate descriptor chain in this
+ * codebase's own history (bmac/IDE/awacs chains run to at most a few
+ * hundred descriptors), so this shouldn't change normal-path behavior
+ * for real, registered devices -- it only shortens how long a
+ * pathological unbounded ring can hog the main loop before yielding.
+ */
+#define DBDMA_SYNC_CONTINUE_BURST_LIMIT 4096
 
 /*
  * Command processing normally continues by scheduling the channel's
