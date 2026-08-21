@@ -49,6 +49,18 @@ typedef struct ESCCChannelState {
     int sunmouse_dx;
     int sunmouse_dy;
     int sunmouse_buttons;
+
+    /*
+     * DBDMA hookup (PowerMac oldworld only -- see escc_register_dma() in
+     * escc.c and macio_oldworld_realize() in hw/misc/macio/macio.c). Kept
+     * as plain fields here rather than pulling in hw/ppc/mac_dbdma.h from
+     * this shared, non-PPC-specific header, matching how hw/scsi/mesh.h
+     * and hw/net/bmac.h store their own DBDMA_io pointers as void *.
+     */
+    qemu_irq dma_tx_irq;
+    qemu_irq dma_rx_irq;
+    void *rx_dma_io; /* DBDMA_io *, saved to complete RX DMA on byte arrival */
+    bool rx_dma_waiting;
 } ESCCChannelState;
 
 struct ESCCState {
@@ -61,5 +73,13 @@ struct ESCCState {
     uint32_t disabled;
     uint32_t frequency;
 };
+
+/*
+ * PowerMac oldworld only -- see hw/misc/macio/macio.c's
+ * macio_oldworld_realize(). dbdma is a DBDMAState *, left as void * here
+ * to avoid pulling hw/ppc/mac_dbdma.h into this shared, non-PPC-specific
+ * header (matching mesh_register_dma()/bmac_register_dma()'s signatures).
+ */
+void escc_register_dma(ESCCState *s, void *dbdma);
 
 #endif

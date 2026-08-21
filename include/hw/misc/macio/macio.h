@@ -46,6 +46,18 @@
 #define OLDWORLD_CUDA_IRQ      0x12
 #define OLDWORLD_ESCCB_IRQ     0x10
 #define OLDWORLD_ESCCA_IRQ     0xf
+/*
+ * DBDMA IRQ lines for escc's two serial ports, matching the real Beige
+ * G3 device tree exactly (SourceFiles/G3/PowerMacG3-device-tree.txt,
+ * ch-a/ch-b "AAPL,interrupts": ch-a = 0xf,0x4,0x5; ch-b = 0x10,0x6,0x7 --
+ * the first entry of each is the SCC status IRQ above, the other two are
+ * these DMA IRQs). ch-a is the built-in modem port (channels 4/5), ch-b
+ * is the built-in printer port (channels 6/7) -- see escc_register_dma().
+ */
+#define OLDWORLD_ESCCA_TX_DMA_IRQ 0x4
+#define OLDWORLD_ESCCA_RX_DMA_IRQ 0x5
+#define OLDWORLD_ESCCB_TX_DMA_IRQ 0x6
+#define OLDWORLD_ESCCB_RX_DMA_IRQ 0x7
 #define OLDWORLD_IDE0_IRQ      0xd
 #define OLDWORLD_IDE0_DMA_IRQ  0x2
 #define OLDWORLD_IDE1_IRQ      0xe

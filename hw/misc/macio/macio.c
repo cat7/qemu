@@ -178,6 +178,25 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
     sbd = SYS_BUS_DEVICE(&s->escc);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_ESCCB_IRQ));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_ESCCA_IRQ));
+    /*
+     * DMA channels for the built-in modem (ch-a) and printer (ch-b)
+     * serial ports -- see escc_register_dma()'s comment in escc.c for
+     * why this exists (real hardware has these channels; nothing
+     * registered them before, so a guest arming one spun in
+     * mac_dbdma.c's generic unassigned-channel fallback instead).
+     * Pin order matches escc_init1()'s two sysbus_init_irq() loops:
+     * chn[0](B).dma_tx_irq, chn[0](B).dma_rx_irq, chn[1](A).dma_tx_irq,
+     * chn[1](A).dma_rx_irq -- i.e. pins 2-5, after the two status IRQs.
+     */
+    sysbus_connect_irq(sbd, 2,
+                       qdev_get_gpio_in(pic_dev, OLDWORLD_ESCCB_TX_DMA_IRQ));
+    sysbus_connect_irq(sbd, 3,
+                       qdev_get_gpio_in(pic_dev, OLDWORLD_ESCCB_RX_DMA_IRQ));
+    sysbus_connect_irq(sbd, 4,
+                       qdev_get_gpio_in(pic_dev, OLDWORLD_ESCCA_TX_DMA_IRQ));
+    sysbus_connect_irq(sbd, 5,
+                       qdev_get_gpio_in(pic_dev, OLDWORLD_ESCCA_RX_DMA_IRQ));
+    escc_register_dma(&s->escc, &s->dbdma);
 
     if (!qdev_realize(DEVICE(&os->nvram), BUS(&s->macio_bus), errp)) {
         return;

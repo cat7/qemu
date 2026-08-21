@@ -30,6 +30,7 @@
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "hw/char/escc.h"
+#include "hw/ppc/mac_dbdma.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "ui/console.h"
 
@@ -764,6 +765,97 @@ static void serial_event(void *opaque, QEMUChrEvent event)
     }
 }
 
+/*
+ * DBDMA hookup for the two real Beige G3 serial ports (PowerMac oldworld
+ * only -- registered from macio_oldworld_realize(), never called for
+ * sparc32/m68k/newworld users of this shared device). Real hardware
+ * device-tree confirms ch-a (built-in modem, "ttya") uses DBDMA channels
+ * 4 (TX) and 5 (RX); ch-b (built-in printer, "ttyb") uses 6 (TX) and 7
+ * (RX) -- see the OLDWORLD_ESCCx_yy_DMA_IRQ comment in macio.h.
+ *
+ * Before this, neither port had any DBDMA channel registered at all, so
+ * a guest arming one (e.g. Mac OS X probing the modem port during
+ * network setup) fell through to hw/misc/macio/mac_dbdma.c's generic
+ * dbdma_unassigned_rw() fallback -- a synthetic completion path that
+ * exists for genuinely-absent channels, not a real device's idle state.
+ * Registering these channels properly means an armed-but-unfed RX ring
+ * (no chardev backend attached by default) now sits legitimately
+ * ACTIVE/waiting forever, exactly like real hardware with nothing
+ * plugged into the port -- not looping through a synthetic shim.
+ *
+ * This does not implement real DMA-paced byte transfer (see the
+ * "Tier 2" scoping this was born from): TX is completed inline in one
+ * shot rather than paced against real per-byte DMA request timing, and
+ * RX never delivers bytes at all since no chardev backend exists on
+ * these ports by default. That's sufficient to stop the hang; genuine
+ * modem/printer passthrough would need real byte-at-a-time DMA request
+ * modeling, which is a separate, larger undertaking.
+ */
+static void escc_dma_tx_rw(DBDMA_io *io)
+{
+    ESCCChannelState *s = io->opaque;
+    int i;
+    uint8_t byte;
+
+    for (i = 0; i < io->len; i++) {
+        dma_memory_read(&address_space_memory, io->addr + i, &byte, 1,
+                        MEMTXATTRS_UNSPECIFIED);
+        if (qemu_chr_fe_backend_connected(&s->chr)) {
+            /* Matches the existing blocking PIO write path's style. */
+            qemu_chr_fe_write_all(&s->chr, &byte, 1);
+        }
+    }
+    io->len = 0;
+    io->dma_end(io);
+}
+
+static void escc_dma_tx_flush(DBDMA_io *io)
+{
+    /* TX always completes inline above; nothing left pending to flush. */
+}
+
+static void escc_dma_rx_rw(DBDMA_io *io)
+{
+    ESCCChannelState *s = io->opaque;
+
+    /*
+     * Arm and park, exactly like mesh_dma_rw()/bmac_rx_dma_rw() do while
+     * waiting for real data. No chardev backend means this legitimately
+     * never resolves -- io->dma_end() is deliberately not called here.
+     */
+    s->rx_dma_io = io;
+    s->rx_dma_waiting = true;
+}
+
+static void escc_dma_rx_flush(DBDMA_io *io)
+{
+    ESCCChannelState *s = io->opaque;
+
+    s->rx_dma_waiting = false;
+    s->rx_dma_io = NULL;
+}
+
+#define ESCC_A_TX_DMA_CHANNEL 4
+#define ESCC_A_RX_DMA_CHANNEL 5
+#define ESCC_B_TX_DMA_CHANNEL 6
+#define ESCC_B_RX_DMA_CHANNEL 7
+
+void escc_register_dma(ESCCState *s, void *dbdma)
+{
+    /* escc_init1() fixes chn[0] = channel B, chn[1] = channel A. */
+    ESCCChannelState *a = &s->chn[1];
+    ESCCChannelState *b = &s->chn[0];
+
+    DBDMA_register_channel(dbdma, ESCC_A_TX_DMA_CHANNEL, a->dma_tx_irq,
+                           escc_dma_tx_rw, escc_dma_tx_flush, a);
+    DBDMA_register_channel(dbdma, ESCC_A_RX_DMA_CHANNEL, a->dma_rx_irq,
+                           escc_dma_rx_rw, escc_dma_rx_flush, a);
+    DBDMA_register_channel(dbdma, ESCC_B_TX_DMA_CHANNEL, b->dma_tx_irq,
+                           escc_dma_tx_rw, escc_dma_tx_flush, b);
+    DBDMA_register_channel(dbdma, ESCC_B_RX_DMA_CHANNEL, b->dma_rx_irq,
+                           escc_dma_rx_rw, escc_dma_rx_flush, b);
+}
+
 static const VMStateDescription vmstate_escc_chn = {
     .name = "escc_chn",
     .version_id = 2,
@@ -1050,6 +1142,16 @@ static void escc_init1(Object *obj)
     }
     s->chn[0].otherchn = &s->chn[1];
     s->chn[1].otherchn = &s->chn[0];
+
+    /*
+     * DMA IRQ outputs, only ever connected by PowerMac oldworld's
+     * macio_oldworld_realize() -- see escc_register_dma() below. Left
+     * unconnected (harmlessly) by every other machine that uses escc.
+     */
+    for (i = 0; i < 2; i++) {
+        sysbus_init_irq(dev, &s->chn[i].dma_tx_irq);
+        sysbus_init_irq(dev, &s->chn[i].dma_rx_irq);
+    }
 
     sysbus_init_mmio(dev, &s->mmio);
 }
