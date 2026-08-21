@@ -303,6 +303,15 @@
  */
 #define R128_PM4_FIFO_DATA_EVEN      0x1000
 #define R128_PM4_FIFO_DATA_ODD       0x1004
+/*
+ * The whole 0x1000-0x13ff range is the Concurrent Command Engine's
+ * FIFO aperture (RRG-G04500-C, 2.2 "Memory Mapping": "Concurrent
+ * Command Engine registers 1000h - 13FFh"): a dword written anywhere in
+ * it is a command-FIFO push. FIFO_DATA_EVEN/ODD are merely its first
+ * two names -- the DRM driver only ever uses those two, but Mac OS's
+ * Rage 128 driver bursts up to eight dwords at 0x1000..0x101c.
+ */
+#define R128_PM4_FIFO_APER_END       0x13fc
 
 /*
  * 2D GUI (destination datapath) engine. Offsets cross-verified directly
