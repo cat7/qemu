@@ -1054,8 +1054,41 @@ static void mac_dbdma_reset(DeviceState *d)
     int i;
 
     for (i = 0; i < DBDMA_CHANNELS; i++) {
-        memset(s->channels[i].regs, 0, DBDMA_SIZE);
-        s->channels[i].sync_continue_count = 0;
+        DBDMA_channel *ch = &s->channels[i];
+
+        memset(ch->regs, 0, DBDMA_SIZE);
+        ch->sync_continue_count = 0;
+
+        /*
+         * A channel can be reset while genuinely mid-transfer -- e.g. an
+         * armed-but-unfed RX ring (bmac/mesh/escc's "waiting" pattern:
+         * processing=true, dma_end never yet called because no real
+         * data has arrived). Without this, that stale `processing=true`
+         * outlives the reset and permanently blocks DBDMA_run()'s
+         * per-channel gate (`!ch->io.processing && RUN && ACTIVE`) for
+         * this channel, since only dma_end() ever clears it -- no
+         * future CONTROL-register kick can make channel_run() run for
+         * it again, no matter how many times the new session's driver
+         * legitimately re-arms it. Confirmed live: a guest OS "Restart"
+         * (a warm reset that doesn't necessarily reach every device's
+         * own registers the way a real hardware power-on would) left
+         * bmac's RX channel exactly this stuck -- 100+ real CONTROL
+         * kicks from the new session's driver afterward, zero of which
+         * ever reached bmac_rx_dma_rw() -- so the RX ring could never
+         * be re-established and every DHCP reply landed on a
+         * permanently unarmed buffer regardless of retries.
+         * opaque/channel are identity fields set once at
+         * DBDMA_register_channel() time and must NOT be cleared here.
+         */
+        ch->io.processing = false;
+        ch->io.addr = 0;
+        ch->io.len = 0;
+        ch->io.is_last = 0;
+        ch->io.is_dma_out = 0;
+        ch->io.dma_end = NULL;
+
+        timer_del(ch->unassigned_completion_timer);
+        timer_del(ch->wait_poll_timer);
     }
 }
 
