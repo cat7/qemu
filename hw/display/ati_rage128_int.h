@@ -208,8 +208,6 @@ struct ATIRage128State {
      */
     QEMUTimer *vblank_timer;
     QEMUTimer *vblank_end_timer;
-    /* coalesces a burst of cursor-register writes into one host update */
-    QEMUTimer *cursor_timer;
 
     /*
      * Hardware I2C engine (I2C_CNTL_0/1 + I2C_DATA) serving a
