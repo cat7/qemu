@@ -52,7 +52,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SunGEMState, SUNGEM)
  * clear them
  */
 #define GREG_STAT_LATCH       (GREG_STAT_TXALL  | GREG_STAT_TXINTME | \
-                               GREG_STAT_RXDONE | GREG_STAT_RXDONE |  \
+                               GREG_STAT_TXDONE | GREG_STAT_RXDONE |  \
                                GREG_STAT_RXNOBUF | GREG_STAT_RXTAGERR)
 
 #define GREG_IMASK        0x0010UL    /* Interrupt Mask Register */
