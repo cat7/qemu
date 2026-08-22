@@ -59,29 +59,47 @@ struct MouseState {
      * asks for it. Only Mac OS X actually needs it (it scales pointer
      * speed by the resolution we declare in register 1; the classic
      * protocol's implied 200 cpi halves its pointer speed given our
-     * counts are host pixels). Classic Mac OS works fine on the plain
-     * protocol, so this can be turned off wholesale --
-     * -global adb-mouse.extended-protocol=off -- to keep a guest on the
-     * classic handler if its extended-protocol driver misbehaves.
+     * counts are host pixels).
+     *
+     * Classic Mac OS does NOT work fine on it -- it silently negotiates
+     * handler 4 on its own initiative (regardless of the post-reset
+     * default-handler property) and then builds its pointer-acceleration
+     * table from a completely different, degenerate code path: live
+     * table dumps showed a real classic-protocol (handler 2) guest gets
+     * a proper multi-segment ballistic curve, while the SAME guest under
+     * handler 4 collapses to one linear segment plus a flat-output
+     * terminator, capping the pointer at a fixed ~1.07 px per ADB poll
+     * (~90 px/s at the standard 11 ms autopoll rate) no matter how the
+     * declared resolution or our motion-scale property are tuned --
+     * confirmed mathematically (threshold and slope both scale with
+     * declared resolution, but their product, the terminator's flat
+     * output, does not) and empirically (doubling declared resolution
+     * left real injected motion just as capped; disabling the extended
+     * protocol instead made the same motion track proportionally,
+     * confirmed live on both a fresh scratch install and the user's own
+     * long-used 9.2 disk, ruling out a missing-preferences explanation).
+     * Default off so classic guests -- this machine's primary target --
+     * get the real curve; Mac OS X guests need
+     * -global adb-mouse.extended-protocol=on (its own launcher should
+     * set this alongside default-handler=1).
      */
     bool extended_protocol;
     /*
      * Handler ID reported after reset. Real Apple ADB mice report 2
      * (Classic Apple Mouse Protocol, 200 counts per inch); 1 is the
-     * 100 cpi variant. Classic Mac OS builds its pointer-acceleration
-     * curve from this: with handler 1 the guest's curve was measured
-     * (live, Mac OS 9.2) to hold just ONE segment ending at 1.49
-     * counts per frame, so every faster movement fell through to the
-     * table terminator and produced a CONSTANT ~1.07 px per report --
-     * a 63-count report moved the cursor exactly as far as a 2-count
-     * one, capping the pointer at about 90 px/s however fast the mouse
-     * was moved.
+     * 100 cpi variant. This value only matters while extended_protocol
+     * is enabled -- with it off (the default) a guest can never
+     * negotiate up to handler 4 regardless of where it started, and
+     * live table dumps confirm 1 vs 2 makes no further difference to
+     * the guest's resulting acceleration curve.
      *
-     * Mac OS X wants 1 instead: its AppleADBMouse Type 4 personality
-     * matches "3-01" (address 3, default handler 1) and negotiates the
+     * Mac OS X wants 1: its AppleADBMouse Type 4 personality matches
+     * "3-01" (address 3, default handler 1) and negotiates the
      * extended protocol from there; with 2 it stays on the classic
-     * path and halves its pointer speed. Hence the property -- classic
-     * Mac OS is this machine's primary guest, so 2 is the default.
+     * path and halves its pointer speed. That's the default here too,
+     * even though classic Mac OS is this machine's primary guest --
+     * see extended_protocol above for why classic guests don't need
+     * this property touched at all.
      */
     uint8_t default_handler;
 };
@@ -513,7 +531,7 @@ static void adb_mouse_initfn(Object *obj)
 }
 
 static const Property adb_mouse_properties[] = {
-    DEFINE_PROP_BOOL("extended-protocol", MouseState, extended_protocol, true),
+    DEFINE_PROP_BOOL("extended-protocol", MouseState, extended_protocol, false),
     DEFINE_PROP_UINT8("default-handler", MouseState, default_handler, 1),
     DEFINE_PROP_UINT8("motion-scale", MouseState, motion_scale, 1),
 };
