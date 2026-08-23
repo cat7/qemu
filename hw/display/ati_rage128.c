@@ -3589,11 +3589,15 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
      * Model a minimal AGP 2.0 capability -- advertise 1x/2x rates,
      * sideband addressing and a full request queue in the read-only
      * status word, and leave the command register guest-writable so the
-     * driver's AGP-enable handshake completes harmlessly. (The PCI-side
-     * Rage 128 retail ROM ignores this block, so it is safe on either
-     * bus.)
+     * driver's AGP-enable handshake completes harmlessly.
+     *
+     * Only the AGP card has one. A real PCI Rage 128 does not, and
+     * advertising it there would also let a guest set AGP_ENABLE on a
+     * card that has no AGP bridge behind it, which sends the engine's
+     * command fetches to an aperture nothing translates (see
+     * ati_rage128_cmd_space()).
      */
-    {
+    if (s->agp_ident) {
         int cap = pci_add_capability(dev, PCI_CAP_ID_AGP, 0, 0x0c, errp);
         if (cap < 0) {
             return;
