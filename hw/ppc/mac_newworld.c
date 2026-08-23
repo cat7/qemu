@@ -1251,6 +1251,13 @@ static void ppc_core99_init(MachineState *machine)
         sysbus_mmio_map(s, 0, 0xf0800000);
         sysbus_mmio_map(s, 1, 0xf0c00000);
         /*
+         * AGP bus memory window (see pci_unin_agp_init()). A card in the
+         * AGP slot gets its BARs assigned in here, so without this
+         * mapping the CPU cannot reach them at all and the display never
+         * lights up.
+         */
+        sysbus_mmio_map(s, 2, 0x90000000);
+        /*
          * AGP bus I/O space, 8 MB at 0xf0000000, matching the real
          * PowerMac3,4 /pci@f0000000 "ranges". Low overlap priority so the
          * fw_cfg registers mapped inside it (at 0xf0000510) keep winning
@@ -1258,7 +1265,7 @@ static void ppc_core99_init(MachineState *machine)
          * ports hit unmapped memory instead of the empty-bus 0xff.
          */
         memory_region_add_subregion_overlap(get_system_memory(), 0xf0000000,
-                                             sysbus_mmio_get_region(s, 2), -1);
+                                             sysbus_mmio_get_region(s, 3), -1);
 
         /* Uninorth internal bus */
         uninorth_internal_dev = qdev_new(

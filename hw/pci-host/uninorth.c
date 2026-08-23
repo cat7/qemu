@@ -326,8 +326,28 @@ static void pci_unin_agp_init(Object *obj)
     memory_region_init_io(&s->pci_io, OBJECT(s), &unassigned_io_ops, obj,
                           "unin-agp-isa-mmio", 0x00800000);
 
+    /*
+     * The AGP bus's memory window. Without it pci_mmio was a private
+     * address space nothing ever aliased into system memory, so a BAR
+     * on this bus was assigned an address the CPU could not reach: the
+     * card answered config cycles and got real BAR values, but every
+     * access to its framebuffer or registers went to unmapped memory,
+     * leaving an AGP-slot display permanently dark.
+     *
+     * The main bridge's hole occupies 0x80000000-0x8fffffff, and real
+     * UniNorth2 systems place the AGP slot's window immediately after
+     * it at 0x90000000 -- which is also where this machine's Apple ROM
+     * assigns BARs on this bus (observed: 0x90000000 and 0x94000000).
+     * Reserve 512 MiB, covering the real PowerMac3,4 tree's own AGP
+     * prefetchable range at 0xa0000000 as well.
+     */
+    memory_region_init_alias(&s->pci_hole, OBJECT(s),
+                             "unin-agp-hole", &s->pci_mmio,
+                             0x90000000ULL, 0x20000000ULL);
+
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
+    sysbus_init_mmio(sbd, &s->pci_hole);
     sysbus_init_mmio(sbd, &s->pci_io);
 
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
