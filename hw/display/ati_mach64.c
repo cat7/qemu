@@ -861,10 +861,19 @@ static int mac_find_own_screen(ATIMach64State *s, const MacScreen *scr, int n,
 #define MAC_LOWMEM_EXPANDMEM   0x2b6
 #define MAC_EXPANDMEM_CRSRDEV  0x1e0
 
-static bool mac_publish_cursor_data(int x, int y)
+/*
+ * Locate and validate the Classic Cursor Device Manager's CursorData
+ * record, optionally reporting the position it currently holds. The
+ * consistency check (the Point must be the integer part of the Fixed
+ * pair) is what makes this a reliable "a Classic Mac OS with a live
+ * Cursor Device Manager is running" probe: on any other guest -- Mac OS
+ * X, Open Firmware, a booting kernel -- these six chained pointer reads
+ * land on unrelated memory, and the odds of the resulting Fixed/Point
+ * pair agreeing are negligible.
+ */
+static bool mac_find_cursor_data(uint32_t *cdp, int *xp, int *yp)
 {
     uint32_t em, glob, cd, fh, fv, pt;
-    uint32_t out[3];
 
     if (!mac_read_be32(MAC_LOWMEM_EXPANDMEM, &em) ||
         !mac_read_be32(em + MAC_EXPANDMEM_CRSRDEV, &glob) ||
@@ -874,9 +883,44 @@ static bool mac_publish_cursor_data(int x, int y)
         !mac_read_be32(cd + 0x10, &pt)) {
         return false;
     }
+    /*
+     * Every link must point above the low-memory globals, into the system
+     * heap where these structures really live. Without this the walk
+     * degenerates on a guest that has no ExpandMem at all: mac_read_be32()
+     * rejects a zero address but not a zero *base*, so em == 0 sends the
+     * chain through 0x1e0 -> 0x4 -> 0x8..0x10 -- the PowerPC exception
+     * vector page, which reads back as zeros under Mac OS X, and an
+     * all-zero record satisfies the consistency check below trivially
+     * (0 == 0 >> 16). That handed back a bogus "valid" record parked at
+     * (0,0) and was exactly why OS X clicks piled up in the top-left
+     * corner.
+     */
+    if (em < 0x1000 || glob < 0x1000 || cd < 0x1000) {
+        return false;
+    }
     /* the Fixed pair is stored (h, v); the Point is the usual (v, h) */
     if ((int16_t)(pt & 0xffff) != (int32_t)fh >> 16 ||
         (int16_t)(pt >> 16) != (int32_t)fv >> 16) {
+        return false;
+    }
+    if (cdp) {
+        *cdp = cd;
+    }
+    if (xp) {
+        *xp = (int16_t)(pt & 0xffff);
+    }
+    if (yp) {
+        *yp = (int16_t)(pt >> 16);
+    }
+    return true;
+}
+
+static bool mac_publish_cursor_data(int x, int y)
+{
+    uint32_t cd;
+    uint32_t out[3];
+
+    if (!mac_find_cursor_data(&cd, NULL, NULL)) {
         return false;
     }
     out[0] = cpu_to_be32((uint32_t)x << 16);
@@ -1122,6 +1166,80 @@ static const QemuInputHandler ati_mach64_cursor_handler_abs = {
 };
 
 /*
+ * Arm the host-tracking workaround only for the guests it exists for.
+ *
+ * qemu_input_event_send() delivers each event to exactly ONE handler
+ * (the first match in registration order), so while this handler is
+ * registered it *takes* the relative-motion stream away from the ADB
+ * mouse. That is what we want under Classic Mac OS, whose CrsrVBLTask
+ * does not get serviced: we integrate the motion ourselves and publish
+ * it into the Classic low-memory globals.
+ *
+ * Under Mac OS X it is actively harmful. Those globals mean nothing
+ * there, the GDevice list this code reads does not exist (so the
+ * pointer can never leave the first screen), and, critically, the ADB
+ * mouse is left receiving button events *without* any motion -- so its
+ * position stays at the origin and every click lands in the top-left
+ * corner while the sprite we place ourselves appears to move normally.
+ *
+ * So keep it registered only while a live Classic Cursor Device Manager
+ * record is actually visible, and hand the stream back to the ADB mouse
+ * whenever it is not. Re-registering appends to the tail of the handler
+ * list, behind the ADB mouse, hence the explicit activate() to move it
+ * back to the head.
+ */
+#define ATI_MACH64_CURSOR_PROBE_TICKS 8   /* ~7-8 probes/second */
+#define ATI_MACH64_CURSOR_MISS_LIMIT  4   /* ~0.5s before handing back */
+
+static void ati_mach64_sync_cursor_handler(ATIMach64State *s)
+{
+    MacScreen scr[MAC_MAX_SCREENS];
+    int x, y;
+
+    if (!s->host_cursor_tracking) {
+        return;
+    }
+    if (++s->cursor_env_probe < ATI_MACH64_CURSOR_PROBE_TICKS) {
+        return;
+    }
+    s->cursor_env_probe = 0;
+
+    /*
+     * Two independent Classic signals must agree before we take the
+     * motion stream away from the ADB mouse: a valid CursorData record
+     * AND a walkable GDevice list. The workaround needs both to function
+     * anyway (it publishes to the former and maps screens with the
+     * latter), and requiring both means a single false positive cannot
+     * strand a non-Classic guest with a frozen pointer.
+     */
+    if (mac_read_screens(scr, MAC_MAX_SCREENS) >= 1 &&
+        mac_find_cursor_data(NULL, &x, &y)) {
+        s->cursor_env_miss = 0;
+        if (!s->cursor_hs) {
+            /*
+             * Adopt the position the guest already has, so taking over
+             * mid-session does not teleport the pointer.
+             */
+            s->host_cursor_x = x;
+            s->host_cursor_y = y;
+            s->host_cursor_elsewhere = false;
+            s->cursor_hs = qemu_input_handler_register(DEVICE(s),
+                               s->host_cursor_absolute ?
+                               &ati_mach64_cursor_handler_abs :
+                               &ati_mach64_cursor_handler);
+            qemu_input_handler_activate(s->cursor_hs);
+            trace_ati_mach64_host_cursor_arm(1, x, y);
+        }
+    } else if (s->cursor_hs &&
+               ++s->cursor_env_miss >= ATI_MACH64_CURSOR_MISS_LIMIT) {
+        s->cursor_env_miss = 0;
+        qemu_input_handler_unregister(s->cursor_hs);
+        s->cursor_hs = NULL;
+        trace_ati_mach64_host_cursor_arm(0, 0, 0);
+    }
+}
+
+/*
  * Interrupt semantics -- gated pulse (empirically the only shape both
  * boot phases accept; all four model variants were tested against the
  * real ROM on 2026-07-28, see the investigation notes' 140th pass):
@@ -1158,6 +1276,8 @@ static void ati_mach64_vblank_timer_tick(void *opaque)
     uint32_t int_cntl;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t next_blank;
+
+    ati_mach64_sync_cursor_handler(s);
 
     if ((gen_cntl & ATI_CRTC_ENABLE) && !(gen_cntl & ATI_CRTC_DISPLAY_DIS)) {
         s->regs[ATI_CRTC_INT_CNTL >> 2] |= ATI_CRTC_VBLANK_INT |
@@ -2094,16 +2214,16 @@ static void ati_mach64_realize(PCIDevice *dev, Error **errp)
      * native path (previously masked/confused by this same handler also
      * writing MBState). Cursor *position* tracking (CrsrVBLTask, the
      * VBL-driven cursor redraw task) still isn't serviced by the guest
-     * on its own, so this handler stays registered for REL events only
-     * -- see the button-handling removal note in
-     * ati_mach64_host_cursor_event().
+     * on its own, so this handler takes REL events only -- see the
+     * button-handling removal note in ati_mach64_host_cursor_event().
+     *
+     * It is NOT registered here: because it takes the motion stream away
+     * from the ADB mouse, it is armed and disarmed from the vblank tick
+     * according to whether a Classic Cursor Device Manager is actually
+     * running -- see ati_mach64_sync_cursor_handler(). Leaving it always
+     * on broke Mac OS X (clicks stuck at the top-left corner, pointer
+     * unable to reach a second display).
      */
-    if (s->host_cursor_tracking) {
-        s->cursor_hs = qemu_input_handler_register(DEVICE(dev),
-                                                   s->host_cursor_absolute ?
-                                                   &ati_mach64_cursor_handler_abs :
-                                                   &ati_mach64_cursor_handler);
-    }
 
     /*
      * DDC/I2C EDID slave on the GP_IO sense pins (I2C address 0x50),
@@ -2124,6 +2244,7 @@ static void ati_mach64_exit(PCIDevice *dev)
 
     if (s->cursor_hs) {
         qemu_input_handler_unregister(s->cursor_hs);
+        s->cursor_hs = NULL;
     }
     timer_free(s->vblank_timer);
     qemu_graphic_console_close(s->con);
