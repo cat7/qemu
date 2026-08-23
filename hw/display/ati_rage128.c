@@ -2080,12 +2080,69 @@ static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
  * window is exactly 32MB and its base is 32MB-aligned, so masking the
  * page index into the 8192-entry table is base-agnostic.
  */
-static uint32_t ati_rage128_card_read32(ATIRage128State *s, uint32_t addr,
-                                        bool gart)
+/*
+ * Where the engine fetches a command stream from. The card reaches
+ * host memory two different ways and the same small offset means
+ * different things in each, so the caller has to say which is live
+ * rather than guessing from the address.
+ */
+typedef enum {
+    R128_ADDR_LOCAL,        /* frame buffer */
+    R128_ADDR_PCIGART,      /* the card's own PCI GART */
+    R128_ADDR_AGP,          /* AGP aperture, translated by the host bridge */
+} ATIRage128AddrSpace;
+
+static ATIRage128AddrSpace ati_rage128_cmd_space(ATIRage128State *s)
 {
-    if (!gart && addr + 4 <= ATI_RAGE128_VRAM_SIZE) {
+    PCIDevice *d = PCI_DEVICE(s);
+    uint8_t cap;
+
+    if (s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu) {
+        return R128_ADDR_PCIGART;
+    }
+    /*
+     * Once the driver completes the AGP handshake -- AGP_ENABLE in this
+     * card's own AGP capability command register, which it sets on both
+     * the card and the host bridge -- its command buffers live in AGP
+     * memory, and the addresses it hands the engine are offsets into
+     * the AGP aperture rather than frame-buffer offsets.
+     */
+    cap = pci_find_capability(d, PCI_CAP_ID_AGP);
+    if (cap && (pci_get_long(d->config + cap + PCI_AGP_COMMAND) &
+                PCI_AGP_COMMAND_AGP)) {
+        return R128_ADDR_AGP;
+    }
+    return R128_ADDR_LOCAL;
+}
+
+static uint32_t ati_rage128_card_read32(ATIRage128State *s, uint32_t addr,
+                                        ATIRage128AddrSpace space)
+{
+    if (space == R128_ADDR_AGP) {
+        /*
+         * An AGP offset. The card's addresses are virtual -- "The lower
+         * 32MB maps to frame buffer, the upper 32MB to AGP_BASE +
+         * DST_OFFSET(24:0)" (RRG, DST_OFFSET) -- so fold an upper-half
+         * address down and add AGP_BASE; the host bridge's GART turns
+         * the result into a system-memory page. Without this the
+         * driver's AGP-resident indirect buffers were read out of VRAM
+         * at the same numeric offset, so the engine executed whatever
+         * happened to be in the framebuffer, wedged, and stopped
+         * retiring the fences the driver was waiting on.
+         */
+        uint32_t off = addr >= ATI_RAGE128_VRAM_SIZE ?
+                       addr - ATI_RAGE128_VRAM_SIZE : addr;
+        dma_addr_t bus = (s->regs[R128_AGP_BASE >> 2] & ~0x3fffffu) + off;
+        uint32_t val = 0;
+
+        pci_dma_read(PCI_DEVICE(s), bus, &val, sizeof(val));
+        return le32_to_cpu(val);
+    } else if (space == R128_ADDR_LOCAL) {
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
+        if (addr + 4 > ATI_RAGE128_VRAM_SIZE) {
+            return 0;
+        }
         return ldl_le_p(vram + addr);
     } else {
         uint32_t gart_base = s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu;
@@ -2109,11 +2166,12 @@ static uint32_t ati_rage128_card_read32(ATIRage128State *s, uint32_t addr,
 
 static uint32_t ati_rage128_pm4_read_ring(ATIRage128State *s)
 {
-    bool gart = s->pm4_buffer_addr & R128_AGP_OFFSET_FLAG;
+    ATIRage128AddrSpace space = s->pm4_buffer_addr & R128_AGP_OFFSET_FLAG ?
+                                ati_rage128_cmd_space(s) : R128_ADDR_LOCAL;
     uint32_t base = s->pm4_buffer_addr & ~R128_AGP_OFFSET_FLAG;
     uint32_t val;
 
-    val = ati_rage128_card_read32(s, base + s->pm4_rptr * 4, gart);
+    val = ati_rage128_card_read32(s, base + s->pm4_rptr * 4, space);
     s->pm4_rptr = (s->pm4_rptr + 1) & (s->pm4_ring_dwords - 1);
     return val;
 }
@@ -2915,18 +2973,18 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
      * treating small offsets as VRAM read all-zero/stale bytes, while
      * the guest's real command buffers sit in the GART pages.
      */
-    bool gart = (s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu) != 0;
+    ATIRage128AddrSpace space = ati_rage128_cmd_space(s);
     ATIRage128PM4Parser parser = { 0 };
     uint32_t i;
 
     trace_ati_rage128_pm4_indirect(offset, dwords,
-        dwords ? ati_rage128_card_read32(s, offset, gart) : 0);
+        dwords ? ati_rage128_card_read32(s, offset, space) : 0);
     if (dwords > 0x10000) {
         /* bogus size -- a real IB is at most a few KB */
         return;
     }
     for (i = 0; i < dwords; i++) {
-        uint32_t val = ati_rage128_card_read32(s, offset + i * 4, gart);
+        uint32_t val = ati_rage128_card_read32(s, offset + i * 4, space);
 
         trace_ati_rage128_pm4_ib_dword(i, val);
         ati_rage128_pm4_parse(s, &parser, val);

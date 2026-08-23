@@ -81,3 +81,5 @@ elroy_pci_config_data_read(uint64_t addr, int size, uint64_t val) "addr 0x%"PRIx
 elroy_pci_config_data_write(uint64_t addr, int size, uint64_t val) "addr 0x%"PRIx64" size %d val 0x%"PRIx64
 iosapic_reg_write(uint64_t reg_select, int size, uint64_t val) "reg_select 0x%"PRIx64" size %d val 0x%"PRIx64
 iosapic_reg_read(uint64_t reg_select, int size, uint64_t val) "reg_select 0x%"PRIx64" size %d val 0x%"PRIx64
+unin_agp_gart_cfg(uint32_t base, uint32_t apbase, uint32_t ctrl) "GART base 0x%"PRIx32 " aperture 0x%"PRIx32 " ctrl 0x%"PRIx32
+unin_agp_gart_translate(uint64_t addr, uint64_t entry_addr, uint32_t entry) "iova 0x%"PRIx64 " entry@0x%"PRIx64 " = 0x%"PRIx32

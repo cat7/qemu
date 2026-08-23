@@ -31,6 +31,96 @@
 #include "hw/pci-host/uninorth.h"
 #include "trace.h"
 
+/*
+ * UniNorth's AGP GART. The three registers below live in the AGP host
+ * bridge's config space directly after its AGP capability block (which
+ * ends at 0x8b), and were read off a live Mac OS 9 boot programming
+ * them in this order: GART_BASE, then AGP_BASE, then a 2xRESET pulse,
+ * then ENABLE|INVALIDATE, then ENABLE.
+ *
+ * GART_BASE holds the physical address of the translation table in its
+ * top 20 bits, with an aperture-size code in the low bits: the table
+ * has code * 1024 entries, each mapping one 4KB page, so the aperture
+ * spans code * 4MB (observed: code 8 = 8192 entries = 32MB).
+ *
+ * AGP_BASE is the aperture's base address on the AGP bus. Real
+ * UniNorth cannot place the aperture anywhere but bus address 0, and
+ * Mac OS duly writes 0 -- but honour whatever it writes rather than
+ * assuming, so a guest that does something else still works.
+ */
+#define TYPE_UNIN_AGP_IOMMU_MEMORY_REGION "unin-agp-iommu-memory-region"
+
+#define UNIN_CFG_GART_BASE      0x8c
+#define UNIN_CFG_AGP_BASE       0x90
+#define UNIN_CFG_GART_CTRL      0x94
+
+#define UNIN_GART_CTRL_INVAL    0x00000001
+#define UNIN_GART_CTRL_ENABLE   0x00000100
+#define UNIN_GART_CTRL_2XRESET  0x00010000
+
+#define UNIN_GART_PAGE_SIZE     4096
+#define UNIN_GART_PAGE_MASK     (UNIN_GART_PAGE_SIZE - 1)
+
+static IOMMUTLBEntry unin_agp_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
+                                        IOMMUAccessFlags flag, int iommu_idx)
+{
+    UNINHostState *s = container_of(iommu, UNINHostState, agp_iommu);
+    uint32_t entries = (s->gart_base & UNIN_GART_PAGE_MASK) * 1024;
+    uint64_t apsize = (uint64_t)entries * UNIN_GART_PAGE_SIZE;
+    hwaddr table, offset;
+    uint32_t entry = 0;
+    IOMMUTLBEntry ret = {
+        .target_as = &address_space_memory,
+        .iova = addr & ~(hwaddr)UNIN_GART_PAGE_MASK,
+        .translated_addr = addr & ~(hwaddr)UNIN_GART_PAGE_MASK,
+        .addr_mask = UNIN_GART_PAGE_MASK,
+        .perm = IOMMU_RW,
+    };
+
+    /*
+     * Anything outside a live aperture is a plain system-memory access:
+     * an AGP master's ordinary DMA is not translated, only the window
+     * the GART describes is.
+     */
+    if (!(s->gart_ctrl & UNIN_GART_CTRL_ENABLE) || !entries ||
+        addr < s->agp_base || addr - s->agp_base >= apsize) {
+        return ret;
+    }
+
+    table = s->gart_base & ~(hwaddr)UNIN_GART_PAGE_MASK;
+    offset = (addr - s->agp_base) >> 12;
+    address_space_read(&address_space_memory, table + offset * 4,
+                       MEMTXATTRS_UNSPECIFIED, &entry, sizeof(entry));
+    /*
+     * A GART entry is a little-endian word holding the mapped page's
+     * physical address with bit 0 as its valid flag -- read off a live
+     * Mac OS 9 table, whose entries ran 0x015c8001, 0x015c9001,
+     * 0x015ca001 ... , i.e. consecutive 4KB pages each tagged valid.
+     * An unmapped page translates nowhere; returning IOMMU_NONE fails
+     * the access instead of silently landing on page 0.
+     */
+    entry = le32_to_cpu(entry);
+    trace_unin_agp_gart_translate(addr, table + offset * 4, entry);
+    if (!(entry & 1)) {
+        ret.perm = IOMMU_NONE;
+        return ret;
+    }
+    ret.translated_addr = entry & ~(hwaddr)UNIN_GART_PAGE_MASK;
+    return ret;
+}
+
+static AddressSpace *unin_agp_dma_address_space(PCIBus *bus, void *opaque,
+                                                int devfn)
+{
+    UNINHostState *s = opaque;
+
+    return &s->agp_dma_as;
+}
+
+static const PCIIOMMUOps unin_agp_iommu_ops = {
+    .get_address_space = unin_agp_dma_address_space,
+};
+
 static int pci_unin_map_irq(PCIDevice *pci_dev, int irq_num)
 {
     return (irq_num + (pci_dev->devfn >> 3)) & 3;
@@ -295,6 +385,18 @@ static void pci_unin_agp_realize(DeviceState *dev, Error **errp)
                                    &s->pci_io,
                                    PCI_DEVFN(11, 0), 4, TYPE_PCI_BUS);
 
+    /*
+     * Route this bus's DMA through the GART (see unin_agp_translate()).
+     * With the GART disabled every access passes straight through, so
+     * this is transparent until a guest programs it.
+     */
+    memory_region_init_iommu(&s->agp_iommu, sizeof(s->agp_iommu),
+                             TYPE_UNIN_AGP_IOMMU_MEMORY_REGION, OBJECT(s),
+                             "unin-agp-iommu", UINT64_MAX);
+    address_space_init(&s->agp_dma_as, MEMORY_REGION(&s->agp_iommu),
+                       "unin-agp-dma");
+    pci_setup_iommu(h->bus, &unin_agp_iommu_ops, s);
+
     pci_create_simple(h->bus, PCI_DEVFN(11, 0), "uni-north-agp");
 }
 
@@ -464,6 +566,39 @@ static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[0x89] = 0x00;
     d->config[0x8a] = 0x00;
     d->config[0x8b] = 0x00;
+
+    /*
+     * The GART registers past the capability are guest-writable; PCI
+     * config bytes default to read-only, so open them explicitly.
+     */
+    memset(d->wmask + UNIN_CFG_GART_BASE, 0xff,
+           UNIN_CFG_GART_CTRL + 4 - UNIN_CFG_GART_BASE);
+}
+
+static void unin_agp_pci_host_config_write(PCIDevice *d, uint32_t addr,
+                                           uint32_t val, int len)
+{
+    UNINHostState *s;
+
+    pci_default_write_config(d, addr, val, len);
+
+    if (!ranges_overlap(addr, len, UNIN_CFG_GART_BASE,
+                        UNIN_CFG_GART_CTRL + 4 - UNIN_CFG_GART_BASE)) {
+        return;
+    }
+
+    s = UNI_NORTH_AGP_HOST_BRIDGE(qdev_get_parent_bus(DEVICE(d))->parent);
+    s->gart_base = pci_get_long(d->config + UNIN_CFG_GART_BASE);
+    s->agp_base = pci_get_long(d->config + UNIN_CFG_AGP_BASE);
+    s->gart_ctrl = pci_get_long(d->config + UNIN_CFG_GART_CTRL);
+    trace_unin_agp_gart_cfg(s->gart_base, s->agp_base, s->gart_ctrl);
+
+    /*
+     * An INVALIDATE is self-clearing and needs no work here: nothing
+     * caches a translation across accesses -- unin_agp_translate() re-reads
+     * the table entry every time -- so a flushed GART is already visible.
+     */
+    d->config[UNIN_CFG_GART_CTRL] &= ~UNIN_GART_CTRL_INVAL;
 }
 
 static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
@@ -541,6 +676,7 @@ static void unin_agp_pci_host_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     k->realize   = unin_agp_pci_host_realize;
+    k->config_write = unin_agp_pci_host_config_write;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_UNI_N_AGP;
     k->revision  = 0x00;
@@ -791,8 +927,24 @@ static const TypeInfo unin_info = {
     .class_init    = unin_class_init,
 };
 
+static void unin_agp_iommu_memory_region_class_init(ObjectClass *klass,
+                                                    const void *data)
+{
+    IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
+
+    imrc->translate = unin_agp_translate;
+}
+
+static const TypeInfo unin_agp_iommu_memory_region_info = {
+    .parent = TYPE_IOMMU_MEMORY_REGION,
+    .name = TYPE_UNIN_AGP_IOMMU_MEMORY_REGION,
+    .class_init = unin_agp_iommu_memory_region_class_init,
+};
+
 static void unin_register_types(void)
 {
+    type_register_static(&unin_agp_iommu_memory_region_info);
+
     type_register_static(&unin_main_pci_host_info);
     type_register_static(&u3_agp_pci_host_info);
     type_register_static(&unin_agp_pci_host_info);
