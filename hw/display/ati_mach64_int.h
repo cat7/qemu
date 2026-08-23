@@ -163,6 +163,14 @@ struct ATIMach64State {
     bool host_cursor_tracking;
     int host_cursor_x;
     int host_cursor_y;
+    /*
+     * The tracking workaround above is specific to Classic Mac OS, so it
+     * is armed only while a live Cursor Device Manager record is visible
+     * in the guest's low memory -- see ati_mach64_sync_cursor_handler().
+     * cursor_env_probe paces the check, cursor_env_miss debounces it.
+     */
+    int cursor_env_probe;
+    int cursor_env_miss;
     bool monitor_connected;
 
     /*

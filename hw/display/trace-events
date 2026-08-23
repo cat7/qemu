@@ -202,6 +202,7 @@ ati_rage128_monidb_wr(int64_t ns, uint32_t val) "t=%"PRId64" GPIO_MONIDB write v
 ati_mach64_mmio_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s -> 0x%"PRIx64
 ati_mach64_mmio_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s <- 0x%"PRIx64
 ati_mach64_vblank_irq(int level, uint32_t int_cntl) "level=%d int_cntl=0x%08x"
+ati_mach64_host_cursor_arm(int armed) "armed=%d (1=classic Mac OS seen, taking motion from the ADB mouse; 0=handing motion back)"
 ati_mach64_2d_fill(int x, int y, int w, int h, int bpp, uint32_t color, uint32_t mix, uint32_t base, int pitch) "fill at (%d,%d) %dx%d bpp=%d color=0x%x mix=0x%x base=0x%x pitch=%d"
 ati_mach64_2d_copy(int sx, int sy, int dx, int dy, int w, int h, int bpp, uint32_t sbase, uint32_t dbase, int pitch) "copy from (%d,%d) to (%d,%d) %dx%d bpp=%d sbase=0x%x dbase=0x%x pitch=%d"
 ati_mach64_2d_unimp(uint32_t dp_src, uint32_t dp_mix, uint32_t pix_width) "unimplemented op dp_src=0x%x dp_mix=0x%x pix_width=0x%x"

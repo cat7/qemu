@@ -464,6 +464,88 @@ static void ati_mach64_cursor_update(ATIMach64State *s)
 #define MAC_LOWMEM_MOUSE     0x830
 #define MAC_LOWMEM_MBSTATE   0x172
 
+/* Chain to the Cursor Device Manager's CursorData record, and the
+ * GDevice list -- read only, purely to recognise a classic Mac OS. */
+#define MAC_LOWMEM_EXPANDMEM   0x2b6
+#define MAC_EXPANDMEM_CRSRDEV  0x1e0
+#define MAC_LOWMEM_DEVICELIST  0x8a8
+#define MAC_GDEVICE_GDRECT     0x22
+
+static bool mac_read_be32(uint32_t addr, uint32_t *out)
+{
+    uint32_t v;
+
+    if (!addr || addr >= 0x10000000) {
+        return false;
+    }
+    if (address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                           &v, 4) != MEMTX_OK) {
+        return false;
+    }
+    *out = be32_to_cpu(v);
+    return true;
+}
+
+/*
+ * Is a classic Mac OS with a live Cursor Device Manager running?
+ *
+ * The consistency check (the Point must be the integer part of the Fixed
+ * pair) is what makes this discriminating: on any other guest -- Mac OS
+ * X, Open Firmware, a booting kernel -- these chained pointer reads land
+ * on unrelated memory and the odds of the pair agreeing are negligible.
+ *
+ * Each link must also point above the low-memory globals, into the
+ * system heap where these structures live. Without that the walk
+ * degenerates on a guest with no ExpandMem at all: mac_read_be32()
+ * rejects a zero address but not a zero *base*, so em == 0 sends the
+ * chain through 0x1e0 -> 0x4 -> 0x8..0x10, the PowerPC exception vector
+ * page, which reads back as zeros under Mac OS X -- and an all-zero
+ * record satisfies the consistency check trivially (0 == 0 >> 16).
+ */
+static bool mac_classic_cursor_env(void)
+{
+    uint32_t em, glob, cd, fh, fv, pt;
+
+    if (!mac_read_be32(MAC_LOWMEM_EXPANDMEM, &em) ||
+        !mac_read_be32(em + MAC_EXPANDMEM_CRSRDEV, &glob) ||
+        !mac_read_be32(glob + 4, &cd) ||
+        !mac_read_be32(cd + 8, &fh) ||
+        !mac_read_be32(cd + 0xc, &fv) ||
+        !mac_read_be32(cd + 0x10, &pt)) {
+        return false;
+    }
+    if (em < 0x1000 || glob < 0x1000 || cd < 0x1000) {
+        return false;
+    }
+    /* the Fixed pair is stored (h, v); the Point is the usual (v, h) */
+    return (int16_t)(pt & 0xffff) == (int32_t)fh >> 16 &&
+           (int16_t)(pt >> 16) == (int32_t)fv >> 16;
+}
+
+/* Second, independent classic signal: a walkable GDevice list. */
+static bool mac_has_gdevice(void)
+{
+    uint32_t handle, gd;
+    uint16_t raw[4];
+    int16_t r[4];
+    int i;
+
+    if (!mac_read_be32(MAC_LOWMEM_DEVICELIST, &handle) ||
+        !mac_read_be32(handle, &gd) || gd < 0x1000) {
+        return false;
+    }
+    if (address_space_read(&address_space_memory, gd + MAC_GDEVICE_GDRECT,
+                           MEMTXATTRS_UNSPECIFIED, raw, 8) != MEMTX_OK) {
+        return false;
+    }
+    for (i = 0; i < 4; i++) {
+        r[i] = (int16_t)be16_to_cpu(raw[i]);
+    }
+    /* top, left, bottom, right -- reject anything implausible */
+    return r[2] > r[0] && r[3] > r[1] &&
+           r[2] - r[0] <= 4096 && r[3] - r[1] <= 4096;
+}
+
 /*
  * WORKAROUND -- see the field comment on host_cursor_x/y in
  * ati_mach64.h for why this exists: real hardware never does this,
@@ -560,6 +642,59 @@ static const QemuInputHandler ati_mach64_cursor_handler = {
 };
 
 /*
+ * Arm the host-tracking workaround only for the guests it exists for.
+ *
+ * qemu_input_event_send() delivers each event to exactly ONE handler
+ * (the first match in registration order), so while this handler is
+ * registered it *takes* the relative-motion stream away from the ADB
+ * mouse. That is the intent under classic Mac OS, whose CrsrVBLTask
+ * does not get serviced: we integrate the motion ourselves and publish
+ * it into the classic low-memory globals.
+ *
+ * Under Mac OS X it is actively harmful. Those globals mean nothing
+ * there, and the ADB mouse is left receiving button events *without*
+ * any motion -- so its position stays at the origin and every click
+ * lands in the top-left corner, while the sprite we place ourselves
+ * appears to move normally. (Diagnosed on g3beige, where this card is
+ * the onboard display; the same handler is shared here.)
+ *
+ * So keep it registered only while two independent classic signals
+ * agree -- a live CursorData record and a walkable GDevice list -- and
+ * hand the stream back to the ADB mouse otherwise. Re-registering
+ * appends to the TAIL of the handler list, behind the ADB mouse, hence
+ * the explicit activate() to move it back to the head.
+ */
+#define ATI_MACH64_CURSOR_PROBE_TICKS 8   /* ~7-8 probes/second */
+#define ATI_MACH64_CURSOR_MISS_LIMIT  4   /* ~0.5s before handing back */
+
+static void ati_mach64_sync_cursor_handler(ATIMach64State *s)
+{
+    if (!s->host_cursor_tracking) {
+        return;
+    }
+    if (++s->cursor_env_probe < ATI_MACH64_CURSOR_PROBE_TICKS) {
+        return;
+    }
+    s->cursor_env_probe = 0;
+
+    if (mac_has_gdevice() && mac_classic_cursor_env()) {
+        s->cursor_env_miss = 0;
+        if (!s->cursor_hs) {
+            s->cursor_hs = qemu_input_handler_register(DEVICE(s),
+                               &ati_mach64_cursor_handler);
+            qemu_input_handler_activate(s->cursor_hs);
+            trace_ati_mach64_host_cursor_arm(1);
+        }
+    } else if (s->cursor_hs &&
+               ++s->cursor_env_miss >= ATI_MACH64_CURSOR_MISS_LIMIT) {
+        s->cursor_env_miss = 0;
+        qemu_input_handler_unregister(s->cursor_hs);
+        s->cursor_hs = NULL;
+        trace_ati_mach64_host_cursor_arm(0);
+    }
+}
+
+/*
  * Interrupt semantics -- gated pulse (empirically the only shape both
  * boot phases accept; all four model variants were tested against the
  * real ROM on 2026-07-28, see the investigation notes' 140th pass):
@@ -596,6 +731,8 @@ static void ati_mach64_vblank_timer_tick(void *opaque)
     uint32_t int_cntl;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t next_blank;
+
+    ati_mach64_sync_cursor_handler(s);
 
     if ((gen_cntl & ATI_CRTC_ENABLE) && !(gen_cntl & ATI_CRTC_DISPLAY_DIS)) {
         s->regs[ATI_CRTC_INT_CNTL >> 2] |= ATI_CRTC_VBLANK_INT |
@@ -1529,14 +1666,15 @@ static void ati_mach64_realize(PCIDevice *dev, Error **errp)
      * native path (previously masked/confused by this same handler also
      * writing MBState). Cursor *position* tracking (CrsrVBLTask, the
      * VBL-driven cursor redraw task) still isn't serviced by the guest
-     * on its own, so this handler stays registered for REL events only
-     * -- see the button-handling removal note in
-     * ati_mach64_host_cursor_event().
+     * on its own, so this handler takes REL events only -- see the
+     * button-handling removal note in ati_mach64_host_cursor_event().
+     *
+     * It is NOT registered here: because it takes the motion stream away
+     * from the ADB mouse, it is armed and disarmed from the vblank tick
+     * according to whether a classic Mac OS is actually running -- see
+     * ati_mach64_sync_cursor_handler(). Leaving it always on broke Mac
+     * OS X, whose clicks then piled up in the top-left corner.
      */
-    if (s->host_cursor_tracking) {
-        s->cursor_hs = qemu_input_handler_register(DEVICE(dev),
-                                                   &ati_mach64_cursor_handler);
-    }
 
     /*
      * DDC/I2C EDID slave on the GP_IO sense pins (I2C address 0x50),
@@ -1557,6 +1695,7 @@ static void ati_mach64_exit(PCIDevice *dev)
 
     if (s->cursor_hs) {
         qemu_input_handler_unregister(s->cursor_hs);
+        s->cursor_hs = NULL;
     }
     timer_free(s->vblank_timer);
     qemu_graphic_console_close(s->con);
