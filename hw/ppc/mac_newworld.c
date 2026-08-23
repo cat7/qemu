@@ -463,6 +463,14 @@ static void core99_internal_bus_irq_map(Core99Model model,
     }
 }
 
+static void core99_agp_bus_irq_map(Core99Model model,
+                                   DeviceState *uninorth_agp_dev,
+                                   DeviceState *pic_dev)
+{
+    /* PowerMac3,6's AGP tree matches PowerMac3,4's (same UniNorth wiring) */
+    pm34_agp_bus_irq_map(uninorth_agp_dev, pic_dev);
+}
+
 static void core99_pci_irq_map(Core99Model model,
                                DeviceState *uninorth_pci_dev,
                                DeviceState *pic_dev)
@@ -1246,6 +1254,7 @@ static void ppc_core99_init(MachineState *machine)
         /* Use values found on a real PowerMac */
         /* Uninorth AGP bus */
         uninorth_agp_dev = qdev_new(TYPE_UNI_NORTH_AGP_HOST_BRIDGE);
+        qdev_prop_set_bit(uninorth_agp_dev, "real-irq-map", rom_is_flash);
         s = SYS_BUS_DEVICE(uninorth_agp_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf0800000);
@@ -1407,9 +1416,14 @@ static void ppc_core99_init(MachineState *machine)
     /* TODO: additional PCI buses only wired up for 32-bit machines */
     if (PPC_INPUT(env) != PPC_FLAGS_INPUT_970) {
         /* Uninorth AGP bus */
-        for (i = 0; i < 4; i++) {
-            qdev_connect_gpio_out(uninorth_agp_dev, i,
-                                  qdev_get_gpio_in(pic_dev, 0x1b + i));
+        if (rom_is_flash) {
+            core99_agp_bus_irq_map(core99_machine->model, uninorth_agp_dev,
+                                   pic_dev);
+        } else {
+            for (i = 0; i < 4; i++) {
+                qdev_connect_gpio_out(uninorth_agp_dev, i,
+                                      qdev_get_gpio_in(pic_dev, 0x1b + i));
+            }
         }
 
         /* Uninorth internal bus */

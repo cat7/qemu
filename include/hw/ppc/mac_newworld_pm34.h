@@ -49,6 +49,8 @@ void pm34_place_gmac(PCIBus *internal_bus, const char *default_nic);
 void pm34_internal_bus_irq_map(DeviceState *uninorth_internal_dev,
                                DeviceState *pic_dev);
 void pm34_pci_irq_map(DeviceState *uninorth_pci_dev, DeviceState *pic_dev);
+void pm34_agp_bus_irq_map(DeviceState *uninorth_agp_dev,
+                          DeviceState *pic_dev);
 
 int pm34_macio_devfn(void);
 int pm34_usb_devfn(void);

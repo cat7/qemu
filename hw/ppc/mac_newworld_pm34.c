@@ -176,6 +176,17 @@ void pm34_place_gmac(PCIBus *internal_bus, const char *default_nic)
     pci_init_nic_in_slot(internal_bus, default_nic, NULL, "f");
 }
 
+/*
+ * Real pci@f0000000 interrupt-map: the AGP slot (device 0x10) -> 0x30.
+ * Index order matches pci_unin_agp_real_map_irq(); index 7 is the
+ * unwired spare, as on the real machine.
+ */
+void pm34_agp_bus_irq_map(DeviceState *uninorth_agp_dev, DeviceState *pic_dev)
+{
+    qdev_connect_gpio_out(uninorth_agp_dev, 0,
+                          qdev_get_gpio_in(pic_dev, 0x30));
+}
+
 /* Real pci@f4000000 interrupt-map: slots 0x0e/0x0f */
 void pm34_internal_bus_irq_map(DeviceState *uninorth_internal_dev,
                                DeviceState *pic_dev)

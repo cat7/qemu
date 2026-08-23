@@ -170,6 +170,27 @@ static int pci_unin_internal_real_map_irq(PCIDevice *pci_dev, int irq_num)
     }
 }
 
+/*
+ * Real pci@f0000000 interrupt-map: the AGP slot is device 0x10 and its
+ * INTA lands on 0x30. That is the whole table -- the mask only matches
+ * the device field, and the bridge at device 0x0b interrupts through
+ * its own "interrupts" property instead.
+ *
+ * A card here must interrupt where that table says, because the Apple
+ * ROM hands the guest the table and its driver unmasks whatever it
+ * names: Mac OS 9's Rage 128 driver enables the VBLANK interrupt and
+ * then waits for source 0x30, so pulsing the default-swizzle line
+ * instead left the cursor's VBL task never running -- the pointer sat
+ * where it started while the mouse's reports arrived and were ignored.
+ */
+static int pci_unin_agp_real_map_irq(PCIDevice *pci_dev, int irq_num)
+{
+    switch (pci_dev->devfn >> 3) {
+    case 0x10: return 0;
+    default:   return 7;
+    }
+}
+
 static void pci_unin_set_irq(void *opaque, int irq_num, int level)
 {
     UNINHostState *s = opaque;
@@ -335,11 +356,15 @@ static void pci_u3_agp_realize(DeviceState *dev, Error **errp)
     PCIHostState *h = PCI_HOST_BRIDGE(dev);
 
     h->bus = pci_register_root_bus(dev, NULL,
-                                   pci_unin_set_irq, pci_unin_map_irq,
+                                   pci_unin_set_irq,
+                                   s->real_irq_map ?
+                                       pci_unin_agp_real_map_irq :
+                                       pci_unin_map_irq,
                                    s,
                                    &s->pci_mmio,
                                    &s->pci_io,
-                                   PCI_DEVFN(11, 0), 4, TYPE_PCI_BUS);
+                                   PCI_DEVFN(11, 0),
+                                   s->real_irq_map ? 8 : 4, TYPE_PCI_BUS);
 
     pci_create_simple(h->bus, PCI_DEVFN(11, 0), "u3-agp");
 }
@@ -768,11 +793,17 @@ static const TypeInfo pci_u3_agp_info = {
     .class_init    = pci_u3_agp_class_init,
 };
 
+static const Property pci_unin_agp_props[] = {
+    /* Route the slot per the real PowerMac3,4 interrupt-map (Apple ROM) */
+    DEFINE_PROP_BOOL("real-irq-map", UNINHostState, real_irq_map, false),
+};
+
 static void pci_unin_agp_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = pci_unin_agp_realize;
+    device_class_set_props(dc, pci_unin_agp_props);
 }
 
 static const TypeInfo pci_unin_agp_info = {
