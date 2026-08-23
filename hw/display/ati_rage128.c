@@ -1083,6 +1083,18 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
                     (((s->regs[R128_CRTC_V_SYNC_STRT_WID >> 2] >> 23) & 1)
                      << 3);
             }
+        } else if (s->monid7_i2c) {
+            /*
+             * ATIMM's I2C session on pads 1/2 under MASK 0x7 (see the
+             * write handler): an open-drain bus, not a sense probe.
+             * Released pads pull up (already in y); a released pad 1
+             * carries the DDC slave's SDA. Pad 2 (SCL) must read high
+             * when released -- the sense answer for "pad 1 driven low"
+             * cleared it and stalled the master's clock-stretch wait.
+             */
+            if (!(en & 2)) {
+                y = (y & ~2u) | (s->monid_sda ? 2u : 0);
+            }
         } else if (s->monitor_connected) {
             uint32_t drv = en & 7 & ~a;   /* lines driven low */
 
@@ -1928,6 +1940,49 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                                            BITBANG_I2C_SDA, sda);
             trace_ati_rage128_monid_wr(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                                        val, scl, sda, s->monid_sda);
+        } else if (((val >> 24) & 0xf) == 0x7) {
+            /*
+             * Mac OS 9's ATI Resource Manager (ATIMM, the memory manager
+             * shared library the ATI suite loads at boot) bit-bangs I2C
+             * on pads 1 (SDA) and 2 (SCL) with the MASK nibble at 0x7 --
+             * the same value the Apple-sense probes use. Answering its
+             * START with the sense codes pulled the released SCL pad low
+             * ("sense1 low" -> Y2 = 0), so its clock-stretch wait spun
+             * ~74k reads per attempt; the long timeouts left the library
+             * wedged and the Finder's event loop blocked behind it (mouse
+             * moved, nothing else landed). Track the session here and let
+             * the read handler answer as an open-drain bus while it is
+             * open. A sense probe pulses a single pad and never clocks,
+             * so it keeps its sense answers.
+             */
+            uint32_t en = (val >> 16) & 0xf;
+            uint32_t a = val & 0xf;
+            bool sda_low = (en & 2) && !(a & 2);
+            bool scl_low = (en & 4) && !(a & 4);
+
+            if (oldmask != 0x7) {
+                s->monid7_i2c = false;
+                s->monid7_start = false;
+            }
+            if (sda_low && !s->monid7_sda_low && !scl_low) {
+                /* SDA fell with SCL released: START, or a sense1 pulse */
+                s->monid7_start = true;
+            } else if (!sda_low && s->monid7_sda_low && !scl_low) {
+                /* SDA rose with SCL released: STOP, or the pulse ending */
+                s->monid7_i2c = false;
+                s->monid7_start = false;
+            } else if (scl_low && !s->monid7_scl_low && s->monid7_start) {
+                /* the clock follows the START: a real I2C session */
+                s->monid7_i2c = true;
+                s->monid7_start = false;
+            }
+            s->monid7_sda_low = sda_low;
+            s->monid7_scl_low = scl_low;
+            bitbang_i2c_set(&s->monid_i2c, BITBANG_I2C_SCL, !scl_low);
+            s->monid_sda = bitbang_i2c_set(&s->monid_i2c, BITBANG_I2C_SDA,
+                                           !sda_low);
+            trace_ati_rage128_monid_wr(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                       val, !scl_low, !sda_low, s->monid_sda);
         }
         break;
     }
