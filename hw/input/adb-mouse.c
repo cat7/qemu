@@ -56,10 +56,10 @@ struct MouseState {
     uint8_t motion_scale;
     /*
      * Offer the Extended Apple Mouse Protocol (handler 4) when a guest
-     * asks for it. Only Mac OS X actually needs it (it scales pointer
-     * speed by the resolution we declare in register 1; the classic
-     * protocol's implied 200 cpi halves its pointer speed given our
-     * counts are host pixels).
+     * asks for it. This affects pointer speed *scaling* only: Mac OS X
+     * scales by the resolution we declare in register 1, where the
+     * classic protocol's implied 200 cpi halves its pointer speed given
+     * our counts are host pixels.
      *
      * Classic Mac OS does NOT work fine on it -- it silently negotiates
      * handler 4 on its own initiative (regardless of the post-reset
@@ -79,9 +79,14 @@ struct MouseState {
      * confirmed live on both a fresh scratch install and the user's own
      * long-used 9.2 disk, ruling out a missing-preferences explanation).
      * Default off so classic guests -- this machine's primary target --
-     * get the real curve; Mac OS X guests need
-     * -global adb-mouse.extended-protocol=on (its own launcher should
-     * set this alongside default-handler=1).
+     * get the real curve. Mac OS X guests may set
+     * -global adb-mouse.extended-protocol=on, but do not require it:
+     * this was long assumed to be mandatory for them, and that
+     * assumption misdirected a later investigation into Mac OS X clicks
+     * landing in the screen corner. The real cause was elsewhere (the
+     * mach64 host-cursor-tracking workaround taking the motion stream
+     * away from this device), and Mac OS X 10.2 was subsequently
+     * verified working with this property left off.
      */
     bool extended_protocol;
     /*
