@@ -527,6 +527,7 @@ static DirtyBitmapSnapshot *ati_rage128_take_dirty(ATIRage128State *s)
 }
 
 static void ati_rage128_cursor_update(ATIRage128State *s);
+static void ati_rage128_cursor_apply(ATIRage128State *s);
 
 static bool ati_rage128_update_display(void *opaque)
 {
@@ -743,7 +744,7 @@ static bool ati_rage128_update_display(void *opaque)
     default:
         break;
     }
-    ati_rage128_cursor_update(s);
+    ati_rage128_cursor_apply(s);
     qemu_console_update_full(s->con);
 
     return true;
@@ -3301,7 +3302,12 @@ static void ati_rage128_reset_hold(Object *obj, ResetType type)
  * 50%-alpha black -- the same approximation the mach64 uses, and the
  * classic Mac cursors only use that code to soften edges.
  */
-static void ati_rage128_cursor_update(ATIRage128State *s)
+/*
+ * Apply the cursor registers to the host pointer. Called from the
+ * coalescing timer (see ati_rage128_cursor_update) and from the display
+ * refresh path.
+ */
+static void ati_rage128_cursor_apply(ATIRage128State *s)
 {
     uint32_t posn = s->regs[R128_CUR_HORZ_VERT_POSN >> 2];
     uint32_t coff = s->regs[R128_CUR_HORZ_VERT_OFF >> 2];
@@ -3437,6 +3443,36 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
     s->hw_cursor_x = x;
     s->hw_cursor_y = y;
     qemu_console_set_mouse(s->con, x, y, true);
+}
+
+static void ati_rage128_cursor_timer(void *opaque)
+{
+    ati_rage128_cursor_apply(opaque);
+}
+
+/*
+ * A guest moves the hardware cursor with a burst of separate register
+ * writes -- Mac OS 9's Rage 128 driver does six per move: both 16-bit
+ * halves of CUR_HORZ_VERT_POSN, both halves of CUR_HORZ_VERT_OFF,
+ * CUR_OFFSET and the CRTC_GEN_CNTL enable byte, none of them under
+ * CUR_LOCK. Publishing after every one of those turned each move into
+ * several host-cursor updates, the first with the new x but the old y (a
+ * visible L-shaped hitch), and re-hashed the 1KB image every time. On
+ * real hardware the whole burst is done long before the beam next
+ * reaches the cursor; model that by applying the registers once, a
+ * moment after the first write, so the burst is seen whole. Bounded
+ * latency: the timer is not re-armed by later writes in the burst.
+ */
+static void ati_rage128_cursor_update(ATIRage128State *s)
+{
+    if (!s->cursor_timer) {
+        ati_rage128_cursor_apply(s);
+        return;
+    }
+    if (!timer_pending(s->cursor_timer)) {
+        timer_mod(s->cursor_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS);
+    }
 }
 
 /*
@@ -3615,6 +3651,8 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
                                    ati_rage128_vblank_timer_tick, s);
     s->vblank_end_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        ati_rage128_vblank_end_tick, s);
+    s->cursor_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   ati_rage128_cursor_timer, s);
     timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               ATI_RAGE128_VBLANK_PERIOD_NS);
 
@@ -3670,6 +3708,7 @@ static void ati_rage128_exit(PCIDevice *dev)
 
     timer_free(s->vblank_timer);
     timer_free(s->vblank_end_timer);
+    timer_free(s->cursor_timer);
     qemu_graphic_console_close(s->con);
 }
 
