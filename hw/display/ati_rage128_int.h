@@ -227,6 +227,18 @@ struct ATIRage128State {
     int monid_sda;           /* live SDA level fed back into MONID_Y */
     bool monid_pads12;       /* DDC session uses SDA=pad1/SCL=pad2 (FCode) */
     bool monid_ddc2;         /* host clocked SCL: DDC1 stream silenced */
+    /*
+     * A bit-banged I2C session on pads 1 (SDA) / 2 (SCL) under the
+     * Apple-sense MASK nibble 0x7 -- what Mac OS 9's "ATI Resource
+     * Manager" does. Told apart from a sense probe by its clock: a
+     * START (SDA falling while SCL is released) followed by SCL being
+     * driven low opens the session; SDA rising while SCL is released
+     * (STOP) closes it. A sense probe pulses one pad and never clocks.
+     */
+    bool monid7_i2c;         /* session open: pads answer as an I2C bus */
+    bool monid7_start;       /* START seen, waiting for the first clock */
+    bool monid7_sda_low;     /* pad 1 currently driven low */
+    bool monid7_scl_low;     /* pad 2 currently driven low */
     uint32_t ddc1_pos;       /* DDC1 EDID bitstream position (in bits) */
     uint32_t ddc1_half;      /* half-bit phase: 2 manual VSYNC pulses/bit */
 
