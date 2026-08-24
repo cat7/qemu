@@ -317,6 +317,7 @@ ati_r350_paint_multi(int n, uint32_t yx, uint32_t hw, int x, int y, int w, int h
 ati_r350_p3_payload(uint32_t opcode, int idx, uint32_t val) "packet3 op=0x%02x payload[%d]=0x%08x"
 ati_r350_pm4_reg(uint32_t reg, const char *name, uint32_t val) "packet0/1 reg 0x%04x %s <- 0x%08x"
 ati_r350_pm4_ib_dword(uint32_t idx, uint32_t val) "IB[%u] = 0x%08x"
+ati_r350_pm4_ring_dword(uint32_t idx, uint32_t val) "ring[%u] = 0x%08x"
 ati_r350_pm4_p3_hdr(uint32_t opcode, uint32_t count) "packet3 opcode=0x%02x count=%u"
 ati_r350_cursor_move(uint32_t off, int x, int y, uint32_t sum) "cursor move only @0x%x to (%d,%d) sum=0x%08x"
 ati_r350_cursor_upload(uint32_t off, unsigned hoff, unsigned voff, int x, int y, uint32_t p00, uint32_t p40, uint32_t p44) "cursor image @0x%x hoff=%u voff=%u at (%d,%d) px[0,0]=0x%08x px[0,4]=0x%08x px[4,4]=0x%08x"

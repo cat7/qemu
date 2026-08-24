@@ -1494,6 +1494,8 @@ static void ati_r350_scratch_writeback(ATIR350State *s, unsigned n);
 static void ati_r350_pm4_fifo_push(ATIR350State *s, uint32_t val);
 static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
                                      uint32_t dwords);
+static void ati_r350_pm4_parse(ATIR350State *s,
+                                  ATIR350PM4Parser *p, uint32_t val);
 
 /*
  * Re-derive the effective 2D pitch/offset and scissors from the register
@@ -1736,6 +1738,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
              * stream state (matches the driver's reset-then-restart
              * expectation) */
             s->pm4_fifo.remaining = 0;
+            s->pm4_ring.remaining = 0;
             s->pm4_rptr = 0;
             s->pm4_wptr = 0;
         }
@@ -1756,6 +1759,8 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         s->pm4_buffer_cntl = val;
         s->regs[base >> 2] = val;
         s->pm4_ring_dwords = l2qw ? 2u << l2qw : 0;
+        /* reconfiguring the ring aborts any half-parsed packet */
+        s->pm4_ring.remaining = 0;
         trace_ati_r350_cp_rb_cntl(val, s->pm4_ring_dwords,
                                   !!(val & R350_RB_NO_UPDATE),
                                   (val & R350_BUF_SWAP_MASK) >> 16);
@@ -2456,460 +2461,27 @@ static void ati_r350_pm4_run(ATIR350State *s)
     ati_r350_cp_rptr_writeback(s);
 }
 
+/*
+ * Every ring dword goes through the same packet state machine as the
+ * PIO FIFO and the indirect buffers, so a packet behaves identically
+ * no matter how it was submitted. The parser state persists in
+ * s->pm4_ring because the driver can bump the write pointer
+ * mid-packet: the remainder arrives with a later WPTR write. (The
+ * previous inline ring parser instead read payload dwords straight
+ * past the write pointer, consuming ring slots the driver had not
+ * written yet.)
+ */
 static void ati_r350_pm4_run_ring(ATIR350State *s)
 {
     int guard;
 
-    for (guard = 0; guard < 100000 && s->pm4_rptr != s->pm4_wptr; guard++) {
-        uint32_t header = ati_r350_pm4_read_ring(s);
-        uint32_t type = R350_PM4_PACKET_TYPE(header);
-        uint32_t count = R350_PM4_PACKET_COUNT(header);
-        uint32_t i;
+    for (guard = 0; guard < 1000000 && s->pm4_rptr != s->pm4_wptr;
+         guard++) {
+        uint32_t pos = s->pm4_rptr;
+        uint32_t val = ati_r350_pm4_read_ring(s);
 
-        switch (type) {
-        case 0:
-        {
-            uint32_t reg = R350_PM4_PACKET0_REG(header);
-            bool one_reg = R350_PM4_PACKET0_ONE_REG(header);
-
-            for (i = 0; i < count; i++) {
-                uint32_t data = ati_r350_pm4_read_ring(s);
-
-                ati_r350_reg_write32(s, reg & 0xfffc, data);
-                if (!one_reg) {
-                    reg += 4;
-                }
-            }
-            break;
-        }
-        case 1:
-        {
-            uint32_t reg1 = R350_PM4_PACKET1_REG1(header);
-            uint32_t reg2 = R350_PM4_PACKET1_REG2(header);
-            uint32_t data1 = ati_r350_pm4_read_ring(s);
-            uint32_t data2 = ati_r350_pm4_read_ring(s);
-
-            ati_r350_reg_write32(s, reg1 & 0xfffc, data1);
-            ati_r350_reg_write32(s, reg2 & 0xfffc, data2);
-            break;
-        }
-        case 2:
-            /* NOP/padding, no data words */
-            break;
-        case 3:
-        {
-            uint32_t opcode = R350_PM4_PACKET3_OPCODE(header);
-
-            switch (opcode) {
-            case R350_PM4_OPCODE_PAINT:
-                if (count >= 4) {
-                    /*
-                     * The drawing context and colour travel inside the
-                     * packet, and the rectangle is given as two CORNERS,
-                     * not as position + size. Decoding the corners as
-                     * DST_Y_X/DST_HEIGHT_WIDTH (the two-dword form
-                     * below) yielded wildly out-of-range rectangles --
-                     * captured live: a 233x144 window panel came out
-                     * as 7645x221 at (13040,14032) -- so every fill
-                     * fell outside the scissors and vanished, leaving
-                     * only text and lines on screen.
-                     *
-                     * When the context has GMC_LD_BRUSH_Y_X set the
-                     * packet is three dwords longer, carrying the 8x8
-                     * brush pattern and its origin inline before the
-                     * corners. See the streamed parser's copy of this
-                     * case for the capture that established it.
-                     */
-                    uint32_t gmc = ati_r350_pm4_read_ring(s);
-                    uint32_t color = ati_r350_pm4_read_ring(s);
-                    bool ld_brush = (gmc & R350_GMC_LD_BRUSH_Y_X) &&
-                                    count >= 7;
-                    uint32_t tl, br;
-                    int x1, y1, x2, y2;
-
-                    ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL, gmc);
-                    ati_r350_reg_write32(s, R350_DP_BRUSH_FRGD_CLR, color);
-                    if (ld_brush) {
-                        ati_r350_reg_write32(s, R350_BRUSH_DATA0,
-                                        ati_r350_pm4_read_ring(s));
-                        ati_r350_reg_write32(s, R350_BRUSH_DATA0 + 4,
-                                        ati_r350_pm4_read_ring(s));
-                        ati_r350_reg_write32(s, R350_BRUSH_Y_X,
-                                        ati_r350_pm4_read_ring(s));
-                    }
-                    tl = ati_r350_pm4_read_ring(s);
-                    br = ati_r350_pm4_read_ring(s);
-                    x1 = tl & 0x3fff; y1 = (tl >> 16) & 0x3fff;
-                    x2 = br & 0x3fff; y2 = (br >> 16) & 0x3fff;
-                    for (i = ld_brush ? 7 : 4; i < count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                    if (x2 > x1 && y2 > y1) {
-                        s->dst_x = x1;
-                        s->dst_y = y1;
-                        s->dst_width = x2 - x1;
-                        s->dst_height = y2 - y1;
-                        trace_ati_r350_paint_multi(0, tl, br, s->dst_x,
-                                                      s->dst_y, s->dst_width,
-                                                      s->dst_height);
-                        ati_r350_2d_blt(s);
-                    }
-                } else if (count >= 2) {
-                    uint32_t dst_y_x = ati_r350_pm4_read_ring(s);
-                    uint32_t dst_h_w = ati_r350_pm4_read_ring(s);
-
-                    s->dst_x = dst_y_x & 0x3fff;
-                    s->dst_y = (dst_y_x >> 16) & 0x3fff;
-                    s->dst_width = dst_h_w & 0x3fff;
-                    s->dst_height = (dst_h_w >> 16) & 0x3fff;
-                    for (i = 2; i < count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                    ati_r350_2d_blt(s);
-                } else {
-                    for (i = 0; i < count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                }
-                break;
-            case R350_PM4_OPCODE_PAINT_MULTI:
-            {
-                /*
-                 * Context and colour, then one or more rectangles as
-                 * (DST_X_Y, DST_WIDTH_HEIGHT) pairs -- note the field
-                 * order differs from PAINT above, which carries two
-                 * corners instead: here X and WIDTH sit in the HIGH
-                 * half and Y and HEIGHT in the low one, matching the
-                 * registers of the same names. Established from a live
-                 * capture of Mac OS drawing a dialog: successive
-                 * packets walk y = 0,1,2,3 with widths 5,3,2,1 at
-                 * x = 0 and x = 1019..1023 on a 1024-wide screen --
-                 * a window's rounded corners, pixel row by pixel row.
-                 * Reading the halves the other way round made every
-                 * one of them zero-sized, which is why button frames
-                 * never appeared.
-                 */
-                uint32_t gmc, color;
-
-                if (count < 4) {
-                    for (i = 0; i < (int)count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                    break;
-                }
-                gmc = ati_r350_pm4_read_ring(s);
-                ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL, gmc);
-                i = 1;
-                /*
-                 * A context with DST_PITCH_OFFSET_CNTL set carries the
-                 * destination pitch/offset dword before the colour
-                 * (Linux's r128 DRM clear packet); Mac OS 9's context
-                 * (0x72f036d0) has the bit clear and goes straight to
-                 * the colour.
-                 */
-                if ((gmc & R350_GMC_DST_PITCH_OFFSET_CNTL) &&
-                    i + 1 < (int)count) {
-                    ati_r350_reg_write32(s, R350_DST_PITCH_OFFSET,
-                                            ati_r350_pm4_read_ring(s));
-                    i++;
-                }
-                color = ati_r350_pm4_read_ring(s);
-                ati_r350_reg_write32(s, R350_DP_BRUSH_FRGD_CLR, color);
-                i++;
-                for (; i + 1 < (int)count; i += 2) {
-                    uint32_t dst_x_y = ati_r350_pm4_read_ring(s);
-                    uint32_t dst_w_h = ati_r350_pm4_read_ring(s);
-
-                    s->dst_y = dst_x_y & 0x3fff;
-                    s->dst_x = (dst_x_y >> 16) & 0x3fff;
-                    s->dst_height = dst_w_h & 0x3fff;
-                    s->dst_width = (dst_w_h >> 16) & 0x3fff;
-                    trace_ati_r350_paint_multi(i, dst_x_y, dst_w_h,
-                                                  s->dst_x, s->dst_y,
-                                                  s->dst_width,
-                                                  s->dst_height);
-                    if (s->dst_width && s->dst_height) {
-                        ati_r350_2d_blt(s);
-                    }
-                }
-                for (; i < (int)count; i++) {
-                    ati_r350_pm4_read_ring(s);
-                }
-                break;
-            }
-            case R350_PM4_OPCODE_BITBLT_MULTI:
-                /*
-                 * The save-under half of a window drag: a context
-                 * dword, the pitch/offset dwords the context itself
-                 * announces, and then a RUN of three-dword rectangles
-                 * -- the MULTI is not decoration. See
-                 * ati_r350_regs.h for the layout. iTunes sends nine
-                 * rectangles in one 29-dword packet, tiling a
-                 * rounded-corner window, so stopping after the first
-                 * copied a 1-pixel strip and dropped the 600x390 body:
-                 * chrome came out right, contents did not.
-                 *
-                 * How many pitch/offset dwords follow the context is
-                 * decided by that context's own SRC/DST_PITCH_OFFSET_CNTL
-                 * bits, in SRC-then-DST order (Linux's r128 DRM builds
-                 * its swap packet exactly so). Mac OS 9 sets only the
-                 * SRC bit: one dword, the screen, with DEFAULT_* as the
-                 * offscreen destination. Mac OS X 10.4 sets BOTH for
-                 * its 16x16 pointer save/restore: source, destination,
-                 * then the rectangle. Reading that as one dword plus a
-                 * rectangle turned the restore into a copy of
-                 * (pointer x) by (pointer y) pixels from a 64-pixel-wide
-                 * sprite buffer to the screen's top-left corner -- the
-                 * "corruption growing from the top-left towards the
-                 * mouse" on OS X 10.2/10.4.
-                 */
-                if (count >= R350_BITBLT_MULTI_MIN_DWORDS) {
-                    uint32_t gmc = ati_r350_pm4_read_ring(s);
-
-                    ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL, gmc);
-                    i = 1;
-                    if ((gmc & R350_GMC_SRC_PITCH_OFFSET_CNTL) &&
-                        i < (int)count) {
-                        ati_r350_reg_write32(s, R350_SRC_PITCH_OFFSET,
-                                                ati_r350_pm4_read_ring(s));
-                        i++;
-                    }
-                    if ((gmc & R350_GMC_DST_PITCH_OFFSET_CNTL) &&
-                        i < (int)count) {
-                        ati_r350_reg_write32(s, R350_DST_PITCH_OFFSET,
-                                                ati_r350_pm4_read_ring(s));
-                        i++;
-                    }
-                    for (; i + 3 <= (int)count; i += 3) {
-                        uint32_t src_x_y = ati_r350_pm4_read_ring(s);
-                        uint32_t dst_x_y = ati_r350_pm4_read_ring(s);
-                        uint32_t dst_w_h = ati_r350_pm4_read_ring(s);
-
-                        s->src_y = src_x_y & 0x3fff;
-                        s->src_x = (src_x_y >> 16) & 0x3fff;
-                        s->dst_y = dst_x_y & 0x3fff;
-                        s->dst_x = (dst_x_y >> 16) & 0x3fff;
-                        s->dst_height = dst_w_h & 0x3fff;
-                        s->dst_width = (dst_w_h >> 16) & 0x3fff;
-                        ati_r350_2d_blt(s);
-                    }
-                    for (; i < (int)count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                } else {
-                    for (i = 0; i < (int)count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                }
-                break;
-
-            case R350_PM4_OPCODE_BITBLT:
-                /*
-                 * Four dwords: context, SRC_X_Y, DST_X_Y,
-                 * DST_WIDTH_HEIGHT -- and, like the registers of those
-                 * names (and unlike PAINT's corners), X and WIDTH sit in
-                 * the HIGH half with Y and HEIGHT in the low one.
-                 *
-                 * Established from a live capture of Mac OS dragging a
-                 * window between screens, where each move issues three
-                 * blits that must tile the window exactly; only this
-                 * reading makes them do so:
-                 *   src(175,162) -> dst(195,156) 507x2
-                 *   src(175,164) -> dst(195,158) 508x258   162+2   = 164
-                 *   src(177,422) -> dst(197,416) 506x1     164+258 = 422
-                 * (the narrower first and last rows are the window's
-                 * rounded corners). Reading three dwords from index 0
-                 * took the CONTEXT dword for the source point, so every
-                 * window copy fetched its pixels from a nonsense
-                 * position -- corruption that then travelled with the
-                 * window, since this is the path that moves its bits.
-                 */
-                if (count >= 4) {
-                    uint32_t gmc = ati_r350_pm4_read_ring(s);
-                    uint32_t src_x_y = ati_r350_pm4_read_ring(s);
-                    uint32_t dst_x_y = ati_r350_pm4_read_ring(s);
-                    uint32_t dst_w_h = ati_r350_pm4_read_ring(s);
-
-                    ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL, gmc);
-                    s->src_y = src_x_y & 0x3fff;
-                    s->src_x = (src_x_y >> 16) & 0x3fff;
-                    s->dst_y = dst_x_y & 0x3fff;
-                    s->dst_x = (dst_x_y >> 16) & 0x3fff;
-                    s->dst_height = dst_w_h & 0x3fff;
-                    s->dst_width = (dst_w_h >> 16) & 0x3fff;
-                    for (i = 4; i < count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                    ati_r350_2d_blt(s);
-                } else {
-                    for (i = 0; i < count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                }
-                break;
-            case R350_PM4_OPCODE_SCALING:
-                if (count >= R350_SCALE_PKT_DWORDS) {
-                    uint32_t pkt[R350_SCALE_PKT_DWORDS];
-
-                    for (i = 0; i < R350_SCALE_PKT_DWORDS; i++) {
-                        pkt[i] = ati_r350_pm4_read_ring(s);
-                    }
-                    ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL,
-                                            pkt[R350_SCALE_PKT_GMC]);
-                    ati_r350_reg_write32(s, R350_SC_TOP_LEFT,
-                                            pkt[R350_SCALE_PKT_SC_TL]);
-                    ati_r350_reg_write32(s, R350_SC_BOTTOM_RIGHT,
-                                            pkt[R350_SCALE_PKT_SC_BR]);
-                    ati_r350_2d_scale(s, pkt);
-                }
-                for (i = R350_SCALE_PKT_DWORDS; i < count; i++) {
-                    ati_r350_pm4_read_ring(s);
-                }
-                break;
-            case R350_PM4_OPCODE_HOSTDATA_BLT:
-                if (count >= 8) {
-                    /*
-                     * Eight-dword header, then the pixel dwords. Only
-                     * three fields are needed: [0] the drawing context
-                     * (rop 0xCC, SRCCOPY, in every captured packet),
-                     * [5] DST_Y_X and [6] DST_HEIGHT_WIDTH; [7] is the
-                     * pixel dword count, which equals width x height in
-                     * every capture (72x14 -> 0x3f0, 80x12 -> 0x3c0),
-                     * and that identity is what pins this layout down.
-                     * [1]-[4] carry clip/state the driver has already
-                     * programmed through registers, so they are
-                     * skipped. Reading [0]/[1] as the rectangle -- the
-                     * short form below -- put every glyph and icon at a
-                     * nonsense position, which is why text and icons
-                     * were missing on this card.
-                     */
-                    uint32_t hdr[8];
-                    int nhdr;
-
-                    for (i = 0; i < 8; i++) {
-                        hdr[i] = ati_r350_pm4_read_ring(s);
-                    }
-                    /*
-                     * The last header dword is the pixel-dword count,
-                     * so it must equal what is left of the packet --
-                     * that identity tells the two known header lengths
-                     * apart without guessing: Linux's r128 driver emits
-                     * seven (context, pitch/offset, write mask, clip,
-                     * position, size, count) while the Mac driver emits
-                     * eight, with one extra dword before the position.
-                     */
-                    nhdr = (hdr[7] == count - 8) ? 8 :
-                           (hdr[6] == count - 7) ? 7 : 8;
-                    ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL,
-                                            hdr[0]);
-                    /*
-                     * hdr[1]/hdr[2] are the destination scissors, and
-                     * they are not decoration: the driver pads the blit
-                     * width up to a 4-pixel boundary and expects the
-                     * clip to discard the surplus. They must be
-                     * programmed AFTER the context dword, since a GMC
-                     * write with DST_CLIPPING clear resets them.
-                     */
-                    if (nhdr == 8) {
-                        ati_r350_reg_write32(s, R350_SC_TOP_LEFT, hdr[1]);
-                        ati_r350_reg_write32(s, R350_SC_BOTTOM_RIGHT,
-                                                hdr[2]);
-                    }
-                    s->dst_x = hdr[nhdr - 3] & 0x3fff;
-                    s->dst_y = (hdr[nhdr - 3] >> 16) & 0x3fff;
-                    s->dst_width = hdr[nhdr - 2] & 0x3fff;
-                    s->dst_height = (hdr[nhdr - 2] >> 16) & 0x3fff;
-                    if (nhdr == 7) {
-                        /* the 8th dword we already read is pixel data */
-                        s->host_data_acc[0] = hdr[7];
-                    }
-                    ati_r350_2d_blt(s); /* enters host-data mode */
-                    if (nhdr == 7 && s->host_data_active) {
-                        s->host_data_next = 1;
-                    }
-                    for (i = 8; i < count; i++) {
-                        uint32_t hdata = ati_r350_pm4_read_ring(s);
-
-                        if (s->host_data_active) {
-                            s->host_data_acc[s->host_data_next++] = hdata;
-                            if (s->host_data_next >= 4) {
-                                ati_r350_host_data_flush(s);
-                                s->host_data_next = 0;
-                            }
-                        }
-                    }
-                    if (s->host_data_active) {
-                        ati_r350_host_data_flush(s);
-                        s->host_data_active = false;
-                        s->host_data_next = 0;
-                    }
-                } else if (count >= 2) {
-                    uint32_t dst_y_x = ati_r350_pm4_read_ring(s);
-                    uint32_t dst_h_w = ati_r350_pm4_read_ring(s);
-
-                    s->dst_x = dst_y_x & 0x3fff;
-                    s->dst_y = (dst_y_x >> 16) & 0x3fff;
-                    s->dst_width = dst_h_w & 0x3fff;
-                    s->dst_height = (dst_h_w >> 16) & 0x3fff;
-                    ati_r350_2d_blt(s); /* enters host-data mode */
-                    for (i = 2; i < count; i++) {
-                        uint32_t hdata = ati_r350_pm4_read_ring(s);
-
-                        if (s->host_data_active) {
-                            s->host_data_acc[s->host_data_next++] = hdata;
-                            if (s->host_data_next >= 4) {
-                                ati_r350_host_data_flush(s);
-                                s->host_data_next = 0;
-                            }
-                        }
-                    }
-                    if (s->host_data_active) {
-                        ati_r350_host_data_flush(s);
-                        s->host_data_active = false;
-                        s->host_data_next = 0;
-                    }
-                } else {
-                    for (i = 0; i < count; i++) {
-                        ati_r350_pm4_read_ring(s);
-                    }
-                }
-                break;
-            case R300_PM4_OPCODE_NOP3:
-                for (i = 0; i < count; i++) {
-                    ati_r350_pm4_read_ring(s);
-                }
-                break;
-            case R300_PM4_OPCODE_DRAW_IMMD_2:
-                for (i = 0; i < count; i++) {
-                    uint32_t immd = ati_r350_pm4_read_ring(s);
-
-                    if (i < ARRAY_SIZE(s->r300_immd)) {
-                        s->r300_immd[i] = immd;
-                    }
-                }
-                if (count >= 1 && count <= ARRAY_SIZE(s->r300_immd)) {
-                    ati_r350_r300_draw_immd(s, s->r300_immd, count);
-                }
-                break;
-            case R300_PM4_OPCODE_DRAW_VBUF_2:
-                for (i = 0; i < count; i++) {
-                    uint32_t vbvf = ati_r350_pm4_read_ring(s);
-
-                    if (i == 0) {
-                        ati_r350_r300_draw_vbuf(s, vbvf);
-                    }
-                }
-                break;
-            default:
-                trace_ati_r350_pm4_unimp(opcode, count);
-                for (i = 0; i < count; i++) {
-                    ati_r350_pm4_read_ring(s);
-                }
-                break;
-            }
-            break;
-        }
-        }
+        trace_ati_r350_pm4_ring_dword(pos, val);
+        ati_r350_pm4_parse(s, &s->pm4_ring, val);
     }
 }
 
@@ -3062,14 +2634,23 @@ static void ati_r350_pm4_parse(ATIR350State *s,
         case R350_PM4_OPCODE_PAINT_MULTI:
             /*
              * [0] context, [1] colour, then (DST_X_Y, DST_WIDTH_HEIGHT)
-             * pairs -- see the ring parser's copy of this case for the
-             * live capture that established the field order.
+             * pairs -- and unlike PAINT's corners, X and WIDTH sit in
+             * the HIGH half with Y and HEIGHT in the low one, matching
+             * the registers of the same names. Established from a live
+             * capture of Mac OS drawing a dialog: successive packets
+             * walk y = 0,1,2,3 with widths 5,3,2,1 at x = 0 and
+             * x = 1019..1023 on a 1024-wide screen -- a window's
+             * rounded corners, pixel row by pixel row. Reading the
+             * halves the other way round made every one of them
+             * zero-sized, which is why button frames never appeared.
              */
             if (p->p3_param_idx == 0) {
                 /*
-                 * see the ring parser: a context with
-                 * DST_PITCH_OFFSET_CNTL set is followed by the
-                 * destination pitch/offset dword, then the colour
+                 * A context with DST_PITCH_OFFSET_CNTL set is followed
+                 * by the destination pitch/offset dword, then the
+                 * colour (Linux's r128 DRM clear packet); Mac OS 9's
+                 * context (0x72f036d0) has the bit clear and goes
+                 * straight to the colour.
                  */
                 ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL, val);
                 p->p3_params[3] = (val & R350_GMC_DST_PITCH_OFFSET_CNTL) ?
@@ -3102,8 +2683,21 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             break;
         case R350_PM4_OPCODE_BITBLT_MULTI:
             /*
-             * Same packet as the ring parser's copy; see there for the
-             * layout. The rectangle run is longer than p3_params, so each
+             * The save-under half of a window drag: a context dword,
+             * the pitch/offset dwords the context itself announces
+             * (its SRC/DST_PITCH_OFFSET_CNTL bits, in SRC-then-DST
+             * order, as Linux's r128 DRM builds its swap packet), and
+             * then a RUN of three-dword rectangles -- the MULTI is
+             * not decoration: iTunes tiles a rounded-corner window
+             * with nine rectangles in one 29-dword packet, and
+             * stopping after the first copied a 1-pixel strip and
+             * dropped the 600x390 body. Mac OS X 10.4 sets both
+             * pitch/offset bits for its 16x16 pointer save/restore;
+             * reading that as one dword plus a rectangle turned the
+             * restore into "corruption growing from the top-left
+             * towards the mouse".
+             *
+             * The rectangle run is longer than p3_params, so each
              * three-dword rectangle is gathered in place and issued as
              * soon as it completes rather than buffering the packet.
              * p3_params[3] counts the pitch/offset dwords the context
@@ -3147,7 +2741,20 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             break;
 
         case R350_PM4_OPCODE_BITBLT:
-            /* see the ring parser's copy of this case for the layout */
+            /*
+             * Four dwords: context, SRC_X_Y, DST_X_Y,
+             * DST_WIDTH_HEIGHT -- and, like the registers of those
+             * names (and unlike PAINT's corners), X and WIDTH sit in
+             * the HIGH half with Y and HEIGHT in the low one.
+             * Established from a live capture of Mac OS dragging a
+             * window between screens, where each move issues three
+             * blits that must tile the window exactly; only this
+             * reading makes them do so. Reading three dwords from
+             * index 0 took the CONTEXT dword for the source point, so
+             * every window copy fetched its pixels from a nonsense
+             * position -- corruption that then travelled with the
+             * window, since this is the path that moves its bits.
+             */
             if (p->p3_param_idx < 4) {
                 p->p3_params[p->p3_param_idx++] = val;
                 if (p->p3_param_idx == 4) {
@@ -3164,7 +2771,7 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             }
             break;
         case R350_PM4_OPCODE_SCALING:
-            /* see the ring parser's copy for the packet layout */
+            /* fixed-length packet: see R350_SCALE_PKT_* in the header */
             if (p->p3_param_idx < R350_SCALE_PKT_DWORDS) {
                 p->p3_scale[p->p3_param_idx++] = val;
                 if (p->p3_param_idx == R350_SCALE_PKT_DWORDS) {
@@ -3180,34 +2787,57 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             break;
         case R350_PM4_OPCODE_HOSTDATA_BLT:
         {
-            /* header dwords before the pixel data -- see the ring parser */
+            /*
+             * Header dwords before the pixel data. Two long layouts
+             * exist -- Linux's r128 DRM emits seven header dwords
+             * (context, pitch/offset, write mask, clip, position,
+             * size, count), the Mac driver eight, with one extra
+             * dword before the position -- and the last header dword
+             * is the pixel-dword count, which must equal what is left
+             * of the packet: that identity tells the two apart
+             * without guessing.
+             */
             uint32_t nhdr = p->p3_total >= 8 ? 8 : 2;
 
             if (p->p3_param_idx < nhdr) {
                 p->p3_params[p->p3_param_idx++] = val;
                 if (p->p3_param_idx == nhdr) {
-                    uint32_t yx = nhdr == 8 ? p->p3_params[5]
-                                            : p->p3_params[0];
-                    uint32_t hw = nhdr == 8 ? p->p3_params[6]
-                                            : p->p3_params[1];
+                    uint32_t real = nhdr;
+                    uint32_t yx, hw;
 
                     if (nhdr == 8) {
-                        /*
-                         * Context first, then the clip -- see the ring
-                         * parser's copy of this case.
-                         */
+                        real = p->p3_params[7] == p->p3_total - 8 ? 8 :
+                               p->p3_params[6] == p->p3_total - 7 ? 7 : 8;
                         ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL,
                                                 p->p3_params[0]);
+                    }
+                    if (real == 8) {
+                        /*
+                         * Context first, then the clip: the driver
+                         * pads the blit width up to a 4-pixel boundary
+                         * and expects the clip to discard the surplus,
+                         * and a GMC write with DST_CLIPPING clear
+                         * resets the scissors.
+                         */
                         ati_r350_reg_write32(s, R350_SC_TOP_LEFT,
                                                 p->p3_params[1]);
                         ati_r350_reg_write32(s, R350_SC_BOTTOM_RIGHT,
                                                 p->p3_params[2]);
                     }
+                    yx = nhdr == 2 ? p->p3_params[0]
+                                   : p->p3_params[real - 3];
+                    hw = nhdr == 2 ? p->p3_params[1]
+                                   : p->p3_params[real - 2];
                     s->dst_x = yx & 0x3fff;
                     s->dst_y = (yx >> 16) & 0x3fff;
                     s->dst_width = hw & 0x3fff;
                     s->dst_height = (hw >> 16) & 0x3fff;
                     ati_r350_2d_blt(s); /* enters host-data mode */
+                    if (nhdr == 8 && real == 7 && s->host_data_active) {
+                        /* the 8th dword already read is pixel data */
+                        s->host_data_acc[0] = p->p3_params[7];
+                        s->host_data_next = 1;
+                    }
                 }
             } else if (s->host_data_active) {
                 s->host_data_acc[s->host_data_next++] = val;
@@ -3226,7 +2856,25 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             break;
         case R300_PM4_OPCODE_DRAW_VBUF_2:
             /* single payload dword: VAP_VF_CNTL for an AOS-array draw */
-            ati_r350_r300_draw_vbuf(s, val);
+            if (p->p3_param_idx++ == 0) {
+                ati_r350_r300_draw_vbuf(s, val);
+            }
+            break;
+        case R300_PM4_OPCODE_LOAD_VBPNTR:
+            /*
+             * Same data in the same order as type-0 writes to
+             * VAP_VTX_AOS_CNT/CTL/ADDR0/ADDR1: the array count, the
+             * packed size|stride control dword, then the array
+             * addresses (Linux r100_packet3_load_vbpntr). Only the
+             * first pair of arrays is captured -- that is all the
+             * draw engine models, and all the count field of every
+             * captured OS X submission declares.
+             */
+            if (p->p3_param_idx < 4) {
+                ati_r350_reg_write32(s, R300_VAP_VTX_AOS_CNT +
+                                        p->p3_param_idx * 4, val);
+            }
+            p->p3_param_idx++;
             break;
         default:
             /*

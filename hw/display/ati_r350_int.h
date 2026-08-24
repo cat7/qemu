@@ -290,6 +290,7 @@ struct ATIR350State {
      * stream after the first IB and wedged the guest driver).
      */
     ATIR350PM4Parser pm4_fifo;
+    ATIR350PM4Parser pm4_ring;
 
     /*
      * 2D GUI (destination datapath) engine state -- ported from the
