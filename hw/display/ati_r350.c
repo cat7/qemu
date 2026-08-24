@@ -2523,6 +2523,7 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             if (p->p3_opcode != R350_PM4_OPCODE_PAINT &&
                 p->p3_opcode != R350_PM4_OPCODE_PAINT_MULTI &&
                 p->p3_opcode != R350_PM4_OPCODE_BITBLT &&
+                p->p3_opcode != R350_PM4_OPCODE_BITBLT_RECT &&
                 p->p3_opcode != R350_PM4_OPCODE_BITBLT_MULTI &&
                 p->p3_opcode != R350_PM4_OPCODE_HOSTDATA_BLT &&
                 p->p3_opcode != R350_PM4_OPCODE_SCALING &&
@@ -2766,6 +2767,27 @@ static void ati_r350_pm4_parse(ATIR350State *s,
                     s->dst_x = (p->p3_params[2] >> 16) & 0x3fff;
                     s->dst_height = p->p3_params[3] & 0x3fff;
                     s->dst_width = (p->p3_params[3] >> 16) & 0x3fff;
+                    ati_r350_2d_blt(s);
+                }
+            }
+            break;
+        case R350_PM4_OPCODE_BITBLT_RECT:
+            /*
+             * One SRC_X_Y/DST_X_Y/DST_WIDTH_HEIGHT rectangle in
+             * BITBLT's field layout, drawing context inherited from
+             * the registers -- see the define for the capture that
+             * established it. No GMC dword, so no register writes
+             * here.
+             */
+            if (p->p3_param_idx < 3) {
+                p->p3_params[p->p3_param_idx++] = val;
+                if (p->p3_param_idx == 3) {
+                    s->src_y = p->p3_params[0] & 0x3fff;
+                    s->src_x = (p->p3_params[0] >> 16) & 0x3fff;
+                    s->dst_y = p->p3_params[1] & 0x3fff;
+                    s->dst_x = (p->p3_params[1] >> 16) & 0x3fff;
+                    s->dst_height = p->p3_params[2] & 0x3fff;
+                    s->dst_width = (p->p3_params[2] >> 16) & 0x3fff;
                     ati_r350_2d_blt(s);
                 }
             }

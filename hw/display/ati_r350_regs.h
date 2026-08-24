@@ -285,6 +285,19 @@
 #define R350_PM4_OPCODE_BITBLT_MULTI  0x9b
 /* header dwords plus at least one 3-dword rectangle */
 #define R350_BITBLT_MULTI_MIN_DWORDS  5
+/*
+ * Rectangle-only blit continuation (not in any public register guide;
+ * established from live OS X 10.4 window-drag captures). Three dwords
+ * -- SRC_X_Y, DST_X_Y, DST_WIDTH_HEIGHT in BITBLT's trajectory layout
+ * -- with the whole drawing context (GMC, pitches, offsets) inherited
+ * from the registers as left by the preceding packet. Every drag step
+ * pairs one with the BITBLT_MULTI title strip: a window-body-sized
+ * screen-to-layer copy (e.g. 785x421) plus a bottom-edge strip
+ * (763x11), re-homing the window image inside the re-anchored drag
+ * layer. Dropping them leaves the body at its old layer rows: one
+ * ghost title bar per drag step, shredding on fast drags.
+ */
+#define R350_PM4_OPCODE_BITBLT_RECT   0x1b
 #define R350_PM4_OPCODE_HOSTDATA_BLT  0x94
 
 /*
