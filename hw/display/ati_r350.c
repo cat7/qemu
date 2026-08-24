@@ -6,6 +6,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
@@ -2528,10 +2529,14 @@ static void ati_r350_pm4_parse(ATIR350State *s,
                 p->p3_opcode != R350_PM4_OPCODE_HOSTDATA_BLT &&
                 p->p3_opcode != R350_PM4_OPCODE_SCALING &&
                 p->p3_opcode != R300_PM4_OPCODE_NOP3 &&
+                p->p3_opcode != R300_PM4_OPCODE_CLEAR_ZMASK &&
+                p->p3_opcode != R300_PM4_OPCODE_CLEAR_HIZ &&
+                p->p3_opcode != R300_PM4_OPCODE_CLEAR_CMASK &&
                 p->p3_opcode != R300_PM4_OPCODE_LOAD_VBPNTR &&
                 p->p3_opcode != R300_PM4_OPCODE_DRAW_IMMD_2 &&
                 p->p3_opcode != R300_PM4_OPCODE_DRAW_VBUF_2) {
                 trace_ati_r350_pm4_unimp(p->p3_opcode, p->remaining);
+                ati_r350_note_gap(s, R350_GAP_P3_OPCODE, p->p3_opcode);
             }
             break;
         }
@@ -3673,11 +3678,70 @@ static const Property ati_r350_properties[] = {
     DEFINE_EDID_PROPERTIES(ATIR350State, edid_info),
 };
 
+static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
+    [R350_GAP_P3_OPCODE]    = "packet3 opcode",
+    [R350_GAP_PRIM]         = "primitive type",
+    [R350_GAP_VTX_WALK]     = "vertex walk mode",
+    [R350_GAP_TEX_FORMAT]   = "texture format",
+    [R350_GAP_BLEND_FACTOR] = "blend factor",
+};
+
+void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
+{
+    if (kind >= R350_GAP_MAX || idx >= R350_GAP_SLOTS) {
+        return;
+    }
+    if (!s->gap_count[kind][idx]) {
+        warn_report("ati-radeon9800: unimplemented %s 0x%x -- the guest "
+                    "asked for it and the command was dropped",
+                    ati_r350_gap_names[kind], idx);
+    }
+    if (s->gap_count[kind][idx] != UINT32_MAX) {
+        s->gap_count[kind][idx]++;
+    }
+}
+
+/*
+ * `gaps` property: everything ati_r350_note_gap() has seen this run,
+ * with use counts. Read it from the monitor with
+ *   qom-get /machine/peripheral-anon/device[N] gaps
+ * after exercising a guest, and anything the model quietly ignores is
+ * named rather than left to be inferred from a wrong-looking screen.
+ *
+ * Registers are deliberately not counted here: a register this model
+ * stores but never reads back is invisible from inside the device, so
+ * that half of the coverage question stays with the offline audit
+ * script, which diffs guest writes against our own source.
+ */
+static char *ati_r350_get_gaps(Object *obj, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+    GString *out = g_string_new(NULL);
+    unsigned k, i;
+
+    for (k = 0; k < R350_GAP_MAX; k++) {
+        for (i = 0; i < R350_GAP_SLOTS; i++) {
+            if (s->gap_count[k][i]) {
+                g_string_append_printf(out, "%s%s 0x%x: %u",
+                                       out->len ? "\n" : "",
+                                       ati_r350_gap_names[k], i,
+                                       s->gap_count[k][i]);
+            }
+        }
+    }
+    if (!out->len) {
+        g_string_append(out, "none");
+    }
+    return g_string_free(out, FALSE);
+}
+
 static void ati_r350_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    object_class_property_add_str(klass, "gaps", ati_r350_get_gaps, NULL);
 
     k->class_id  = PCI_CLASS_DISPLAY_VGA;
     k->vendor_id = PCI_VENDOR_ID_ATI;

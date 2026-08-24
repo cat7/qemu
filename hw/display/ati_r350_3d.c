@@ -42,7 +42,14 @@ typedef struct R300DrawState {
     uint32_t dst_pitch;     /* bytes per scanline */
     bool textured;
     bool blend;
+    bool blend_read;                   /* READ_ENABLE: may we read dst? */
+    unsigned discard;                  /* DISCARD_SRC_PIXELS selector */
     unsigned src_factor, dst_factor;   /* RB3D_BLENDCNTL 6-bit codes */
+    unsigned comb_fcn;                 /* colour combine function */
+    unsigned a_src_factor, a_dst_factor;   /* RB3D_ABLENDCNTL, when
+                                            * SEPARATE_ALPHA is set */
+    unsigned a_comb_fcn;
+    float k_r, k_g, k_b, k_a;          /* RB3D_BLEND_COLOR constant */
     bool alpha_test;
     unsigned af_func;                  /* FG_ALPHA_FUNC compare 0-7 */
     float af_ref;
@@ -146,13 +153,20 @@ static uint32_t r300_read_dst(ATIR350State *s, const R300DrawState *d,
     return ati_r350_vram_ld32(s, addr);
 }
 
+/* the factor codes r300_blend_f() below actually implements */
+static bool r300_blend_known(unsigned code)
+{
+    return (code >= 1 && code <= 11) || (code >= 32 && code <= 46);
+}
+
 /*
  * One blend factor for one channel. `sc`/`dc` are the source and
  * destination values of the channel being blended, `sa`/`da` the
- * alphas. Codes 32+ are the GL names, 1-11 the D3D aliases.
+ * alphas, `kc`/`ka` the RB3D_BLEND_COLOR constant for this channel.
+ * Codes 32+ are the GL names, 1-11 the D3D aliases.
  */
 static float r300_blend_f(unsigned code, float sc, float sa,
-                          float dc, float da)
+                          float dc, float da, float kc, float ka)
 {
     switch (code) {
     case 1: case 32: return 0.0f;                    /* ZERO */
@@ -166,7 +180,27 @@ static float r300_blend_f(unsigned code, float sc, float sa,
     case 7: case 40: return da;                      /* DST_ALPHA */
     case 8: case 41: return 1.0f - da;
     case 11: case 42: return MIN(sa, 1.0f - da);     /* SRC_ALPHA_SATURATE */
+    case 43: return kc;                              /* CONST_COLOR */
+    case 44: return 1.0f - kc;
+    case 45: return ka;                              /* CONST_ALPHA */
+    case 46: return 1.0f - ka;
     default: return 1.0f;
+    }
+}
+
+/*
+ * How the weighted source and destination terms are combined. The
+ * no-clamp variants differ only in the intermediate, and the caller
+ * clamps on the way to the framebuffer either way.
+ */
+static float r300_blend_comb(unsigned fcn, float s, float d)
+{
+    switch (fcn) {
+    case 2: case 3: return s - d;      /* SUBTRACT */
+    case 4: return MIN(s, d);
+    case 5: return MAX(s, d);
+    case 6: case 7: return d - s;      /* REVERSE_SUBTRACT */
+    default: return s + d;             /* ADD */
     }
 }
 
@@ -259,22 +293,77 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                     continue;
                 }
             }
+            if (d->discard) {
+                /*
+                 * DISCARD_SRC_PIXELS: kill the fragment outright for
+                 * source values that could not change the destination
+                 * under the configured blend, before it costs a read.
+                 */
+                bool a0 = ca == 0.0f, a1 = ca == 1.0f;
+                bool c0 = cr == 0.0f && cg == 0.0f && cb == 0.0f;
+                bool c1 = cr == 1.0f && cg == 1.0f && cb == 1.0f;
+                bool kill;
+
+                switch (d->discard) {
+                case 1:
+                    kill = a0;
+                    break;
+                case 2:
+                    kill = c0;
+                    break;
+                case 3:
+                    kill = a0 && c0;
+                    break;
+                case 4:
+                    kill = a1;
+                    break;
+                case 5:
+                    kill = c1;
+                    break;
+                case 6:
+                    kill = a1 && c1;
+                    break;
+                default:
+                    kill = false;
+                    break;
+                }
+                if (kill) {
+                    continue;
+                }
+            }
             if (d->blend) {
-                uint32_t dst = r300_read_dst(s, d, x, y);
+                /*
+                 * READ_ENABLE clear means the blender does not fetch
+                 * the destination at all; the destination terms then
+                 * see zero rather than whatever is in memory.
+                 */
+                uint32_t dst = d->blend_read ? r300_read_dst(s, d, x, y) : 0;
                 float dr = ((dst >> 16) & 0xff) / 255.0f;
                 float dg = ((dst >> 8) & 0xff) / 255.0f;
                 float db = (dst & 0xff) / 255.0f;
                 float da = ((dst >> 24) & 0xff) / 255.0f;
                 float nr, ng, nb;
 
-                nr = cr * r300_blend_f(d->src_factor, cr, ca, dr, da) +
-                     dr * r300_blend_f(d->dst_factor, cr, ca, dr, da);
-                ng = cg * r300_blend_f(d->src_factor, cg, ca, dg, da) +
-                     dg * r300_blend_f(d->dst_factor, cg, ca, dg, da);
-                nb = cb * r300_blend_f(d->src_factor, cb, ca, db, da) +
-                     db * r300_blend_f(d->dst_factor, cb, ca, db, da);
-                ca = ca * r300_blend_f(d->src_factor, ca, ca, da, da) +
-                     da * r300_blend_f(d->dst_factor, ca, ca, da, da);
+                nr = r300_blend_comb(d->comb_fcn,
+                        cr * r300_blend_f(d->src_factor, cr, ca, dr, da,
+                                          d->k_r, d->k_a),
+                        dr * r300_blend_f(d->dst_factor, cr, ca, dr, da,
+                                          d->k_r, d->k_a));
+                ng = r300_blend_comb(d->comb_fcn,
+                        cg * r300_blend_f(d->src_factor, cg, ca, dg, da,
+                                          d->k_g, d->k_a),
+                        dg * r300_blend_f(d->dst_factor, cg, ca, dg, da,
+                                          d->k_g, d->k_a));
+                nb = r300_blend_comb(d->comb_fcn,
+                        cb * r300_blend_f(d->src_factor, cb, ca, db, da,
+                                          d->k_b, d->k_a),
+                        db * r300_blend_f(d->dst_factor, cb, ca, db, da,
+                                          d->k_b, d->k_a));
+                ca = r300_blend_comb(d->a_comb_fcn,
+                        ca * r300_blend_f(d->a_src_factor, ca, ca, da, da,
+                                          d->k_a, d->k_a),
+                        da * r300_blend_f(d->a_dst_factor, ca, ca, da, da,
+                                          d->k_a, d->k_a));
                 cr = nr;
                 cg = ng;
                 cb = nb;
@@ -372,9 +461,49 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         uint32_t bl = s->regs[R300_RB3D_BLENDCNTL >> 2];
         uint32_t af = s->regs[R300_FG_ALPHA_FUNC >> 2];
 
-        d->blend = bl & 1;
-        d->src_factor = (bl >> 16) & 0x3f;
-        d->dst_factor = (bl >> 24) & 0x3f;
+        uint32_t ab = s->regs[R300_RB3D_ABLENDCNTL >> 2];
+        uint32_t kc = s->regs[R300_RB3D_BLEND_COLOR >> 2];
+
+        d->blend = bl & R300_BLEND_ENABLE;
+        d->blend_read = bl & R300_BLEND_READ_ENABLE;
+        d->discard = (bl >> R300_BLEND_DISCARD_SHIFT) & 7;
+        d->src_factor = (bl >> R300_BLEND_SRC_SHIFT) & R300_BLEND_FACTOR_MASK;
+        d->dst_factor = (bl >> R300_BLEND_DST_SHIFT) & R300_BLEND_FACTOR_MASK;
+        d->comb_fcn = (bl >> R300_BLEND_COMB_FCN_SHIFT) & 7;
+        /*
+         * Only CBLEND carries the enables; when SEPARATE_ALPHA is set
+         * the alpha channel takes its factors and combine from ABLEND
+         * instead. Mac OS X sets it on every blended draw, with the
+         * same premultiplied ONE / ONE_MINUS_SRC_ALPHA pair in both
+         * registers -- so honouring it changes nothing on the desktop
+         * and everything for a program that sets them differently.
+         */
+        if (bl & R300_BLEND_SEPARATE_ALPHA) {
+            d->a_src_factor = (ab >> R300_BLEND_SRC_SHIFT) &
+                              R300_BLEND_FACTOR_MASK;
+            d->a_dst_factor = (ab >> R300_BLEND_DST_SHIFT) &
+                              R300_BLEND_FACTOR_MASK;
+            d->a_comb_fcn = (ab >> R300_BLEND_COMB_FCN_SHIFT) & 7;
+        } else {
+            d->a_src_factor = d->src_factor;
+            d->a_dst_factor = d->dst_factor;
+            d->a_comb_fcn = d->comb_fcn;
+        }
+        d->k_a = ((kc >> 24) & 0xff) / 255.0f;
+        d->k_r = ((kc >> 16) & 0xff) / 255.0f;
+        d->k_g = ((kc >> 8) & 0xff) / 255.0f;
+        d->k_b = (kc & 0xff) / 255.0f;
+        if (d->blend) {
+            unsigned f[4] = { d->src_factor, d->dst_factor,
+                              d->a_src_factor, d->a_dst_factor };
+            unsigned i;
+
+            for (i = 0; i < ARRAY_SIZE(f); i++) {
+                if (!r300_blend_known(f[i])) {
+                    ati_r350_note_gap(s, R350_GAP_BLEND_FACTOR, f[i]);
+                }
+            }
+        }
         /*
          * FG_ALPHA_FUNC: AF_EN in bit 11, compare function in [10:8],
          * 8-bit reference in [7:0]. OS X composes its cursor tile
@@ -397,6 +526,14 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * texel size.
      */
     d->tex_bpp = (s->regs[R300_TX_FORMAT1_0 >> 2] & 0x1f) == 0 ? 8 : 32;
+    if (d->textured) {
+        unsigned txcode = s->regs[R300_TX_FORMAT1_0 >> 2] & 0x1f;
+
+        /* everything else is being read as if it were ARGB8888 */
+        if (txcode != 0 && txcode != 0xc) {
+            ati_r350_note_gap(s, R350_GAP_TEX_FORMAT, txcode);
+        }
+    }
     /*
      * TX_FORMAT1 SEL_ALPHA ([11:9]) swizzles the alpha the shader
      * sees: 3 takes the texel's alpha component, 5 forces 1.0 (how
@@ -497,6 +634,37 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     return true;
 }
 
+/*
+ * One line segment, expanded to a quad a pixel wide across its own
+ * direction and handed to the triangle rasterizer so it picks up the
+ * same texturing, blending and clipping as everything else.
+ */
+static void r300_raster_line(ATIR350State *s, const R300DrawState *d,
+                             const R300Vtx *a, const R300Vtx *b)
+{
+    float dx = b->x - a->x, dy = b->y - a->y;
+    float len = sqrtf(dx * dx + dy * dy);
+    float nx, ny;
+    R300Vtx q[4];
+    int c;
+
+    if (len < 0.000001f) {
+        return;
+    }
+    /* half-pixel normal to the segment */
+    nx = -dy / len * 0.5f;
+    ny = dx / len * 0.5f;
+    for (c = 0; c < 4; c++) {
+        q[c] = (c == 0 || c == 3) ? *a : *b;
+    }
+    q[0].x = a->x + nx; q[0].y = a->y + ny;
+    q[1].x = b->x + nx; q[1].y = b->y + ny;
+    q[2].x = b->x - nx; q[2].y = b->y - ny;
+    q[3].x = a->x - nx; q[3].y = a->y - ny;
+    r300_raster_tri(s, d, &q[0], &q[1], &q[2]);
+    r300_raster_tri(s, d, &q[0], &q[2], &q[3]);
+}
+
 static void r300_run_prims(ATIR350State *s, R300DrawState *d,
                            const R300Vtx *vb, unsigned nvtx, unsigned prim)
 {
@@ -550,12 +718,33 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
         }
         break;
     }
+    case 2:     /* line list */
+        for (i = 0; i + 2 <= nvtx; i += 2) {
+            r300_raster_line(s, d, &vb[i], &vb[i + 1]);
+        }
+        break;
+    case 3:     /* line strip */
+        for (i = 1; i < nvtx; i++) {
+            r300_raster_line(s, d, &vb[i - 1], &vb[i]);
+        }
+        break;
+    case 12:    /* line loop: a strip that closes back on itself */
+        for (i = 1; i < nvtx; i++) {
+            r300_raster_line(s, d, &vb[i - 1], &vb[i]);
+        }
+        if (nvtx > 2) {
+            r300_raster_line(s, d, &vb[nvtx - 1], &vb[0]);
+        }
+        break;
     case 4:     /* triangle list */
+    case 7:     /* TRI_TYPE2: a triangle list with its own vertex
+                 * routing; the assembly into triangles is the same */
         for (i = 0; i + 3 <= nvtx; i += 3) {
             r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
         }
         break;
     case 5:     /* triangle fan */
+    case 15:    /* polygon: fan-assembled, convex by definition here */
         for (i = 2; i < nvtx; i++) {
             r300_raster_tri(s, d, &vb[0], &vb[i - 1], &vb[i]);
         }
@@ -563,6 +752,27 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
     case 6:     /* triangle strip */
         for (i = 2; i < nvtx; i++) {
             r300_raster_tri(s, d, &vb[i - 2], &vb[i - 1], &vb[i]);
+        }
+        break;
+    case 8:     /* rectangle list: three corners, fourth implied */
+        for (i = 0; i + 3 <= nvtx; i += 3) {
+            R300Vtx v3 = vb[i + 2];
+
+            /* the missing corner is v0 + (v1 - v0) + (v2 - v0) */
+            v3.x = vb[i + 1].x + vb[i + 2].x - vb[i].x;
+            v3.y = vb[i + 1].y + vb[i + 2].y - vb[i].y;
+            v3.s = vb[i + 1].s + vb[i + 2].s - vb[i].s;
+            v3.t = vb[i + 1].t + vb[i + 2].t - vb[i].t;
+            r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
+            r300_raster_tri(s, d, &vb[i + 1], &v3, &vb[i + 2]);
+        }
+        break;
+    case 14:    /* quad strip: each further vertex pair closes a quad
+                 * against the previous pair (Chess.app draws its board
+                 * and pieces almost entirely out of these) */
+        for (i = 2; i + 2 <= nvtx; i += 2) {
+            r300_raster_tri(s, d, &vb[i - 2], &vb[i - 1], &vb[i + 1]);
+            r300_raster_tri(s, d, &vb[i - 2], &vb[i + 1], &vb[i]);
         }
         break;
     case 13:    /* quad list */
@@ -573,6 +783,7 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
         break;
     default:
         trace_ati_r350_3d_skip(0, nvtx, prim);
+        ati_r350_note_gap(s, R350_GAP_PRIM, prim);
         break;
     }
 }
@@ -594,6 +805,12 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
 
     if (walk != 3 || !nvtx) {
         trace_ati_r350_3d_skip(vf, vsize, 0);
+        if (nvtx) {
+            /* IMMD carries its vertices inline; any other walk mode
+             * means they live somewhere we are not fetching from
+             */
+            ati_r350_note_gap(s, R350_GAP_VTX_WALK, walk);
+        }
         return;
     }
     if (!vsize) {

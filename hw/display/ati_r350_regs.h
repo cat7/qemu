@@ -846,6 +846,18 @@
 
 /* R300 3D engine (used by OS X's accelerator for all its blits) */
 #define R300_PM4_OPCODE_NOP3          0x10
+/*
+ * Clears of the compression side-structures: the Z mask, the
+ * hierarchical-Z buffer and the colour compression mask. This model
+ * stores colour and depth uncompressed, so the structures they reset
+ * do not exist here and discarding the packets is the whole of the
+ * correct behaviour -- but they are named rather than left to the
+ * unknown-opcode arm so they do not show up as gaps. Chess.app clears
+ * CMASK twice per new game.
+ */
+#define R300_PM4_OPCODE_CLEAR_ZMASK   0x32
+#define R300_PM4_OPCODE_CLEAR_HIZ     0x37
+#define R300_PM4_OPCODE_CLEAR_CMASK   0x38
 #define R300_PM4_OPCODE_LOAD_VBPNTR   0x2f
 #define R300_PM4_OPCODE_INDX_BUFFER   0x33
 #define R300_PM4_OPCODE_DRAW_VBUF_2   0x34
@@ -857,7 +869,24 @@
 #define R300_TX_FORMAT1_0             0x44c0
 #define R300_TX_FORMAT2_0             0x4500
 #define R300_TX_OFFSET_0              0x4540
+/*
+ * Colour and alpha blend control. The two registers share the factor
+ * and combine fields; only CBLEND carries the enables. Mac OS X sets
+ * SEPARATE_ALPHA on every blended draw, so ABLEND -- not CBLEND --
+ * decides what lands in the destination's alpha byte.
+ */
 #define R300_RB3D_BLENDCNTL           0x4e04
+#define R300_RB3D_ABLENDCNTL          0x4e08
+#define R300_BLEND_ENABLE             (1u << 0)
+#define R300_BLEND_SEPARATE_ALPHA     (1u << 1)
+#define R300_BLEND_READ_ENABLE        (1u << 2)
+#define R300_BLEND_DISCARD_SHIFT      3     /* [5:3], see the enum below */
+#define R300_BLEND_COMB_FCN_SHIFT     12    /* [14:12] add/sub/min/max */
+#define R300_BLEND_SRC_SHIFT          16    /* [21:16] 6-bit factor code */
+#define R300_BLEND_DST_SHIFT          24    /* [29:24] */
+#define R300_BLEND_FACTOR_MASK        0x3f
+/* constant operand for factor codes 43-46 */
+#define R300_RB3D_BLEND_COLOR         0x4e10
 #define R300_RB3D_COLOROFFSET0        0x4e28
 #define R300_RB3D_COLORPITCH0         0x4e38
 #define R300_PFS_PARAM_0_X            0x4c00

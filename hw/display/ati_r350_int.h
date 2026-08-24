@@ -69,6 +69,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIR350State, ATI_R350)
 #define ATI_R350_NUM_PLLS    64
 #define ATI_R350_FB_SCAN_BLOCK (64 * 1024)
 
+/*
+ * Kinds of "the hardware does this, we do not" gap the engines report
+ * through ati_r350_note_gap(). Each kind indexes its counters by the
+ * field value itself (an opcode, a format code), so the tally names
+ * exactly what a guest asked for and never got.
+ */
+typedef enum ATIR350GapKind {
+    R350_GAP_P3_OPCODE,      /* packet3 opcode the parser discards */
+    R350_GAP_PRIM,           /* VAP_VF_CNTL primitive type */
+    R350_GAP_VTX_WALK,       /* VAP_VF_CNTL vertex walk mode */
+    R350_GAP_TEX_FORMAT,     /* TX_FORMAT1 texel format code */
+    R350_GAP_BLEND_FACTOR,   /* RB3D_BLENDCNTL src/dst factor code */
+    R350_GAP_MAX
+} ATIR350GapKind;
+
+#define R350_GAP_SLOTS 256
+
 typedef struct ATIR350PM4Parser {
     uint32_t remaining;      /* data dwords still expected */
     uint32_t type;           /* packet type of the in-flight packet */
@@ -292,6 +309,9 @@ struct ATIR350State {
     ATIR350PM4Parser pm4_fifo;
     ATIR350PM4Parser pm4_ring;
 
+    /* unimplemented-command tally -- see ati_r350_note_gap() */
+    uint32_t gap_count[R350_GAP_MAX][R350_GAP_SLOTS];
+
     /*
      * 2D GUI (destination datapath) engine state -- ported from the
      * real upstream `ati-vga` device (hw/display/ati.c/ati_2d.c), not
@@ -437,6 +457,18 @@ struct ATIR350State {
 
 /* ati_r350_dbg.c */
 const char *ati_r350_reg_name(uint32_t base);
+
+/*
+ * Report a command the hardware understands and this model does not.
+ * Warns on the first sight of each distinct value and counts every
+ * one, so a silently dropped packet type shows up in the log the
+ * first time a guest uses it instead of years later as a rendering
+ * mystery. Packet3 opcode 0x1b -- the rectangle-only blit that moves
+ * a window's body during a drag -- went unnoticed exactly that way:
+ * its trace event existed but was never armed in any capture.
+ * Read the running tally with `qom-get <device> gaps`.
+ */
+void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx);
 
 /* ati_r350_3d.c */
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
