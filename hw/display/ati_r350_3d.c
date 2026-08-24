@@ -49,6 +49,8 @@ typedef struct R300DrawState {
     uint32_t tex_off;       /* card address of texture level 0 */
     int tex_w, tex_h;
     uint32_t tex_pitch;     /* bytes per texel row */
+    unsigned tex_bpp;       /* 32 (ARGB8888) or 8 (A8 masks) */
+    unsigned tex_sel_alpha; /* TX_FORMAT1 SEL_ALPHA swizzle */
     float flat_r, flat_g, flat_b, flat_a;
     uint8_t *vram;
 } R300DrawState;
@@ -66,7 +68,24 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
 
     tx = MIN(MAX(tx, 0), d->tex_w - 1);
     ty = MIN(MAX(ty, 0), d->tex_h - 1);
-    addr = d->tex_off + (uint32_t)ty * d->tex_pitch + (uint32_t)tx * 4;
+    addr = d->tex_off + (uint32_t)ty * d->tex_pitch +
+           (uint32_t)tx * (d->tex_bpp / 8);
+    if (d->tex_bpp == 8) {
+        /* A8 mask: alpha from the byte, black colour */
+        uint8_t a;
+
+        if (ati_r350_mc_to_vram(s, addr, &off)) {
+            if (off + 1 > ATI_R350_VRAM_SIZE) {
+                return 0;
+            }
+            a = ((uint8_t *)memory_region_get_ram_ptr(&s->vram))
+                [off ^ (ati_r350_vram_xor(s, off) & 3)];
+        } else {
+            a = (ati_r350_mc_read32(s, addr & ~3u) >> ((addr & 3) * 8))
+                & 0xff;
+        }
+        return (uint32_t)a << 24;
+    }
     if (ati_r350_mc_to_vram(s, addr, &off)) {
         if (off + 4 > ATI_R350_VRAM_SIZE) {
             return 0;
@@ -189,11 +208,17 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 float ts = w0 * v0->s + w1 * v1->s + w2 * v2->s;
                 float tt = w0 * v0->t + w1 * v1->t + w2 * v2->t;
                 uint32_t texel = r300_sample_tex(s, d, (int)ts, (int)tt);
+                float ta;
 
+                switch (d->tex_sel_alpha) {
+                case 4:  ta = 0.0f; break;
+                case 5:  ta = 1.0f; break;
+                default: ta = ((texel >> 24) & 0xff) / 255.0f; break;
+                }
                 cr *= ((texel >> 16) & 0xff) / 255.0f;
                 cg *= ((texel >> 8) & 0xff) / 255.0f;
                 cb *= (texel & 0xff) / 255.0f;
-                ca *= ((texel >> 24) & 0xff) / 255.0f;
+                ca *= ta;
             }
             if (d->alpha_test) {
                 bool pass;
@@ -342,7 +367,22 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     d->tex_off = s->regs[R300_TX_OFFSET_0 >> 2] & ~0x1fu;
     d->tex_w = (txfmt0 & 0x7ff) + 1;
     d->tex_h = ((txfmt0 >> 11) & 0x7ff) + 1;
-    d->tex_pitch = ((txfmt2 & 0x3fff) + 1) * 4;
+    /*
+     * TX_FORMAT1's low format code: 0 is the 8-bit single-channel
+     * format (window drop shadows arrive as A8 gradient masks,
+     * TX_FORMAT1=0x00124000); 0xc is ARGB8888, which everything else
+     * uses. TXPITCH counts texels, so the byte pitch scales with the
+     * texel size.
+     */
+    d->tex_bpp = (s->regs[R300_TX_FORMAT1_0 >> 2] & 0x1f) == 0 ? 8 : 32;
+    /*
+     * TX_FORMAT1 SEL_ALPHA ([11:9]) swizzles the alpha the shader
+     * sees: 3 takes the texel's alpha component, 5 forces 1.0 (how
+     * X8R8G8B8 window tiles present -- their memory alpha byte is 0,
+     * and the alpha test would discard every pixel), 4 forces 0.
+     */
+    d->tex_sel_alpha = (s->regs[R300_TX_FORMAT1_0 >> 2] >> 9) & 7;
+    d->tex_pitch = ((txfmt2 & 0x3fff) + 1) * (d->tex_bpp / 8);
     /*
      * Position transform: unless the draw bypasses the vertex program
      * (VAP_CNTL_STATUS bit 8 -- the point-sprite composites do),
