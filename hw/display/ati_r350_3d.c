@@ -32,6 +32,10 @@ typedef struct R300Vtx {
 } R300Vtx;
 
 typedef struct R300DrawState {
+    int sc_x0, sc_y0, sc_x1, sc_y1;   /* inclusive scissor window */
+    bool xform;             /* run positions through PVS matrix + viewport */
+    float mat[16];          /* row-major position matrix (PVS consts 0-3) */
+    float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
     bool textured;
@@ -39,6 +43,7 @@ typedef struct R300DrawState {
     uint32_t tex_off;       /* card address of texture level 0 */
     int tex_w, tex_h;
     uint32_t tex_pitch;     /* bytes per texel row */
+    float flat_r, flat_g, flat_b, flat_a;
     uint8_t *vram;
 } R300DrawState;
 
@@ -114,12 +119,12 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     y0 = (int)floorf(MIN(v0->y, MIN(v1->y, v2->y)));
     x1 = (int)ceilf(MAX(v0->x, MAX(v1->x, v2->x)));
     y1 = (int)ceilf(MAX(v0->y, MAX(v1->y, v2->y)));
-    x0 = MAX(x0, 0);
-    y0 = MAX(y0, 0);
-    /* no explicit dst height register; the VRAM bound in the pixel
-     * helpers is the real limit, this just caps the loop */
-    x1 = MIN(x1, 8191);
-    y1 = MIN(y1, 8191);
+    x0 = MAX(x0, MAX(d->sc_x0, 0));
+    y0 = MAX(y0, MAX(d->sc_y0, 0));
+    /* scissor right/bottom are inclusive; the VRAM bound in the pixel
+     * helpers is the real limit beyond that */
+    x1 = MIN(x1, MIN(d->sc_x1 + 1, 8191));
+    y1 = MIN(y1, MIN(d->sc_y1 + 1, 8191));
 
     for (y = y0; y < y1; y++) {
         for (x = x0; x < x1; x++) {
@@ -168,14 +173,31 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     }
 }
 
+static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v)
+{
+    float ndcx, ndcy;
+
+    if (!d->xform) {
+        return;
+    }
+    ndcx = d->mat[0] * v->x + d->mat[1] * v->y + d->mat[2] * v->z + d->mat[3];
+    ndcy = d->mat[4] * v->x + d->mat[5] * v->y + d->mat[6] * v->z + d->mat[7];
+    v->x = ndcx * d->vp[0] + d->vp[1];
+    v->y = ndcy * d->vp[2] + d->vp[3];
+}
+
 static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
                           unsigned vsize, R300Vtx *v)
 {
+    /* set by the caller for vertices that carry no colour of their own */
     v->x = r300_f32(dw[0]);
     v->y = vsize >= 2 ? r300_f32(dw[1]) : 0.0f;
     v->z = vsize >= 3 ? r300_f32(dw[2]) : 0.0f;
     v->w = vsize >= 4 ? r300_f32(dw[3]) : 1.0f;
-    v->r = v->g = v->b = v->a = 1.0f;
+    v->r = d->flat_r;
+    v->g = d->flat_g;
+    v->b = d->flat_b;
+    v->a = d->flat_a;
     v->s = v->t = 0.0f;
     if (vsize >= 12) {
         /* pos.xyzw | color.rgba | tex.stpq */
@@ -186,17 +208,189 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
         v->s = r300_f32(dw[8]);
         v->t = r300_f32(dw[9]);
     } else if (vsize >= 8) {
-        /* pos.xyzw + one more 4-dword attribute: texcoords when a
-         * texture is bound, a colour otherwise */
-        if (d->textured) {
-            v->s = r300_f32(dw[4]);
-            v->t = r300_f32(dw[5]);
+        /*
+         * pos.xyzw + texcoords. Live captures show the 8-dword layout
+         * is always position + texture coordinates -- the untextured
+         * users (window shadows via DRAW_VBUF_2) just ignore them and
+         * take the fragment constant colour like every colourless
+         * vertex. Reading the second attribute as a colour fed
+         * texcoords into the blender as RGBA.
+         */
+        v->s = r300_f32(dw[4]);
+        v->t = r300_f32(dw[5]);
+    }
+}
+
+/*
+ * 3D_DRAW_IMMD_2: dw[0] is VAP_VF_CNTL (primitive type, walk mode,
+ * vertex count), the rest is vertex data laid out VAP_VTX_SIZE dwords
+ * per vertex.
+ */
+static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
+                            unsigned vsize)
+{
+    uint32_t colorpitch = s->regs[R300_RB3D_COLORPITCH0 >> 2];
+    uint32_t txfmt0 = s->regs[R300_TX_FORMAT0_0 >> 2];
+    uint32_t txfmt2 = s->regs[R300_TX_FORMAT2_0 >> 2];
+
+    d->vram = memory_region_get_ram_ptr(&s->vram);
+    if (!ati_r350_mc_to_vram(s, s->regs[R300_RB3D_COLOROFFSET0 >> 2] & ~0x1fu,
+                             &d->dst_off)) {
+        /* colour buffer outside VRAM -- nothing we can show anyway */
+        return false;
+    }
+    d->dst_pitch = (colorpitch & 0x3fff) * 4;
+    if (!d->dst_pitch) {
+        return false;
+    }
+    d->textured = (s->regs[R300_TX_ENABLE >> 2] & 1) && vsize >= 8;
+    d->blend = s->regs[R300_RB3D_BLENDCNTL >> 2] != 0;
+    d->tex_off = s->regs[R300_TX_OFFSET_0 >> 2] & ~0x1fu;
+    d->tex_w = (txfmt0 & 0x7ff) + 1;
+    d->tex_h = ((txfmt0 >> 11) & 0x7ff) + 1;
+    d->tex_pitch = ((txfmt2 & 0x3fff) + 1) * 4;
+    /*
+     * Position transform: unless the draw bypasses the vertex program
+     * (VAP_CNTL_STATUS bit 8 -- the point-sprite composites do),
+     * positions run through the blit shader's 4x4 matrix (PVS
+     * constants 0-3) and then the SE_VPORT scale/offset. The matrix
+     * is how the driver retargets one command stream at differently
+     * sized destinations; ignoring it wrote atlas/dirty-strip draws
+     * at raw window coordinates, striping icons and the Dock.
+     */
+    /*
+     * Window scissor: SC_SCISSOR0/1 hold top-left and bottom-right,
+     * 13-bit fields biased by +1440 on R300/R400. The driver relies
+     * on it -- the menu bar redraws scissored to rows 0-21, and some
+     * passes park a zero-area scissor to mask a draw off entirely.
+     * Zero registers (engine bring-up) mean no scissor yet.
+     */
+    {
+        uint32_t sc0 = s->regs[R300_SC_SCISSOR0 >> 2];
+        uint32_t sc1 = s->regs[R300_SC_SCISSOR1 >> 2];
+
+        if (sc1) {
+            d->sc_x0 = (int)(sc0 & 0x1fff) - R300_SCISSOR_OFFSET;
+            d->sc_y0 = (int)((sc0 >> 13) & 0x1fff) - R300_SCISSOR_OFFSET;
+            d->sc_x1 = (int)(sc1 & 0x1fff) - R300_SCISSOR_OFFSET;
+            d->sc_y1 = (int)((sc1 >> 13) & 0x1fff) - R300_SCISSOR_OFFSET;
         } else {
-            v->r = r300_f32(dw[4]);
-            v->g = r300_f32(dw[5]);
-            v->b = r300_f32(dw[6]);
-            v->a = r300_f32(dw[7]);
+            d->sc_x0 = d->sc_y0 = 0;
+            d->sc_x1 = d->sc_y1 = 0x1fff;
         }
+    }
+
+    d->xform = false;
+    if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
+        s->pvs_const_dwords >= 16) {
+        int k;
+        float xs = r300_f32(s->regs[R300_SE_VPORT_XSCALE >> 2]);
+
+        if (xs != 0.0f) {
+            for (k = 0; k < 16; k++) {
+                d->mat[k] = r300_f32(s->pvs_const[k]);
+            }
+            for (k = 0; k < 6; k++) {
+                d->vp[k] = r300_f32(s->regs[(R300_SE_VPORT_XSCALE >> 2) + k]);
+            }
+            d->xform = true;
+        }
+    }
+    /*
+     * Vertices without a colour attribute take the fragment program's
+     * constant colour: OS X's solid-fill shader outputs PFS_PARAM_0
+     * (stored as 24-bit floats -- IEEE with the low mantissa byte
+     * dropped). The desktop backdrop fill arrives exactly this way, a
+     * colourless full-screen quad with the blue in PFS_PARAM_0.
+     */
+    if (vsize < 12 && !d->textured) {
+        d->flat_r = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2)] << 8);
+        d->flat_g = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2) + 1] << 8);
+        d->flat_b = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2) + 2] << 8);
+        d->flat_a = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2) + 3] << 8);
+    } else {
+        d->flat_r = d->flat_g = d->flat_b = d->flat_a = 1.0f;
+    }
+    return true;
+}
+
+static void r300_run_prims(ATIR350State *s, R300DrawState *d,
+                           const R300Vtx *vb, unsigned nvtx, unsigned prim)
+{
+    unsigned i;
+
+    switch (prim) {
+    case 1:     /* point list -- WindowServer's screen composites are
+                 * point SPRITES: RE_POINTSIZE gives the width/height
+                 * in 1/6-pixel units, GA_POINT_S0/T0 (top-left) and
+                 * S1/T1 (bottom-right) give the normalized texture
+                 * window. A full-screen layer flip is a single
+                 * 1024x768 sprite at (512,384); the menu bar repaints
+                 * as a 1023x1 strip. */
+    {
+        uint32_t psize = s->regs[R300_RE_POINTSIZE >> 2];
+        float sx = ((psize >> 16) & 0xffff) / 6.0f;
+        float sy = (psize & 0xffff) / 6.0f;
+        float s0 = r300_f32(s->regs[R300_GA_POINT_S0 >> 2]) * d->tex_w;
+        float s1 = r300_f32(s->regs[R300_GA_POINT_S1 >> 2]) * d->tex_w;
+        /*
+         * T0 pairs with the sprite's BOTTOM edge and T1 with the top
+         * (GL-style v axis): the full-screen composite arrives as
+         * T0=1, T1=0 over a layer stored top-down, and mapping T0 to
+         * the top edge mirrored the whole desktop vertically.
+         */
+        float t1 = r300_f32(s->regs[R300_GA_POINT_T0 >> 2]) * d->tex_h;
+        float t0 = r300_f32(s->regs[R300_GA_POINT_T1 >> 2]) * d->tex_h;
+
+        d->textured = s->regs[R300_TX_ENABLE >> 2] & 1;
+        for (i = 0; i < nvtx && sx > 0.0f && sy > 0.0f; i++) {
+            R300Vtx q[4];
+            int c;
+
+            for (c = 0; c < 4; c++) {
+                q[c] = vb[i];
+                if (d->textured) {
+                    /* composite sprites modulate by nothing */
+                    q[c].r = q[c].g = q[c].b = q[c].a = 1.0f;
+                }
+            }
+            q[0].x = vb[i].x - sx / 2; q[0].y = vb[i].y - sy / 2;
+            q[0].s = s0; q[0].t = t0;
+            q[1].x = vb[i].x + sx / 2; q[1].y = q[0].y;
+            q[1].s = s1; q[1].t = t0;
+            q[2].x = q[1].x; q[2].y = vb[i].y + sy / 2;
+            q[2].s = s1; q[2].t = t1;
+            q[3].x = q[0].x; q[3].y = q[2].y;
+            q[3].s = s0; q[3].t = t1;
+            r300_raster_tri(s, d, &q[0], &q[1], &q[2]);
+            r300_raster_tri(s, d, &q[0], &q[2], &q[3]);
+        }
+        break;
+    }
+    case 4:     /* triangle list */
+        for (i = 0; i + 3 <= nvtx; i += 3) {
+            r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
+        }
+        break;
+    case 5:     /* triangle fan */
+        for (i = 2; i < nvtx; i++) {
+            r300_raster_tri(s, d, &vb[0], &vb[i - 1], &vb[i]);
+        }
+        break;
+    case 6:     /* triangle strip */
+        for (i = 2; i < nvtx; i++) {
+            r300_raster_tri(s, d, &vb[i - 2], &vb[i - 1], &vb[i]);
+        }
+        break;
+    case 13:    /* quad list */
+        for (i = 0; i + 4 <= nvtx; i += 4) {
+            r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
+            r300_raster_tri(s, d, &vb[i], &vb[i + 2], &vb[i + 3]);
+        }
+        break;
+    default:
+        trace_ati_r350_3d_skip(0, nvtx, prim);
+        break;
     }
 }
 
@@ -212,9 +406,6 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
     unsigned walk = (vf >> 4) & 3;
     unsigned nvtx = (vf >> 16) & 0xffff;
     unsigned vsize = s->regs[R300_VAP_VTX_SIZE >> 2] & 0x7f;
-    uint32_t colorpitch = s->regs[R300_RB3D_COLORPITCH0 >> 2];
-    uint32_t txfmt0 = s->regs[R300_TX_FORMAT0_0 >> 2];
-    uint32_t txfmt2 = s->regs[R300_TX_FORMAT2_0 >> 2];
     R300DrawState d;
     unsigned i;
 
@@ -229,24 +420,10 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
         trace_ati_r350_3d_skip(vf, vsize, n);
         return;
     }
-
-    d.vram = memory_region_get_ram_ptr(&s->vram);
-    if (!ati_r350_mc_to_vram(s, s->regs[R300_RB3D_COLOROFFSET0 >> 2] & ~0x1fu,
-                             &d.dst_off)) {
-        /* colour buffer outside VRAM -- nothing we can show anyway */
+    if (!r300_setup_draw(s, &d, vsize)) {
         trace_ati_r350_3d_skip(vf, vsize, s->regs[R300_RB3D_COLOROFFSET0 >> 2]);
         return;
     }
-    d.dst_pitch = (colorpitch & 0x3fff) * 4;
-    if (!d.dst_pitch) {
-        return;
-    }
-    d.textured = (s->regs[R300_TX_ENABLE >> 2] & 1) && vsize >= 8;
-    d.blend = s->regs[R300_RB3D_BLENDCNTL >> 2] != 0;
-    d.tex_off = s->regs[R300_TX_OFFSET_0 >> 2] & ~0x1fu;
-    d.tex_w = (txfmt0 & 0x7ff) + 1;
-    d.tex_h = ((txfmt0 >> 11) & 0x7ff) + 1;
-    d.tex_pitch = ((txfmt2 & 0x3fff) + 1) * 4;
 
     trace_ati_r350_3d_draw(prim, nvtx, vsize, d.dst_off, d.dst_pitch,
                            d.textured, d.blend, d.tex_off);
@@ -256,32 +433,70 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
 
         for (i = 0; i < nvtx; i++) {
             r300_load_vtx(&d, &dw[1 + i * vsize], vsize, &vb[i]);
+            r300_xform_vtx(&d, &vb[i]);
         }
-        switch (prim) {
-        case 4:     /* triangle list */
-            for (i = 0; i + 3 <= nvtx; i += 3) {
-                r300_raster_tri(s, &d, &vb[i], &vb[i + 1], &vb[i + 2]);
+        r300_run_prims(s, &d, vb, nvtx, prim);
+    }
+}
+
+/*
+ * 3D_DRAW_VBUF_2: like DRAW_IMMD_2 but the single payload dword is
+ * VAP_VF_CNTL (PRIM_WALK=2) and the vertices are fetched from the
+ * vertex arrays bound at VAP_VTX_AOS_ADDR0/1 (written either directly
+ * or via 3D_LOAD_VBPNTR): each array contributes `size` dwords per
+ * vertex at `stride` dwords apart, concatenated in array order. OS X
+ * uses this for its texture page-in blits (GART-resident vertices and
+ * textures rendered into VRAM window stores).
+ */
+void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
+{
+    unsigned prim = vf & 0xf;
+    unsigned nvtx = (vf >> 16) & 0xffff;
+    uint32_t ctl = s->regs[R300_VAP_VTX_AOS_CTL >> 2];
+    uint32_t addr[2] = {
+        s->regs[R300_VAP_VTX_AOS_ADDR0 >> 2],
+        s->regs[R300_VAP_VTX_AOS_ADDR1 >> 2],
+    };
+    unsigned size[2] = { ctl & 0xff, (ctl >> 16) & 0xff };
+    unsigned stride[2] = { (ctl >> 8) & 0xff, (ctl >> 24) & 0xff };
+    unsigned vsize = size[0] + size[1];
+    R300DrawState d;
+    unsigned i, a, c;
+
+    if (!nvtx || !vsize || vsize > 16 || nvtx > 4096) {
+        trace_ati_r350_3d_skip(vf, vsize, nvtx);
+        return;
+    }
+    if (!r300_setup_draw(s, &d, vsize)) {
+        trace_ati_r350_3d_skip(vf, vsize, s->regs[R300_RB3D_COLOROFFSET0 >> 2]);
+        return;
+    }
+
+    trace_ati_r350_3d_draw(prim, nvtx, vsize, d.dst_off, d.dst_pitch,
+                           d.textured, d.blend, d.tex_off);
+
+    {
+        g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
+        uint32_t dw[16];
+
+        for (i = 0; i < nvtx; i++) {
+            unsigned n = 0;
+
+            for (a = 0; a < 2; a++) {
+                for (c = 0; c < size[a] && n < 16; c++) {
+                    dw[n++] = ati_r350_mc_read32(s,
+                        addr[a] + (i * stride[a] + c) * 4);
+                }
             }
-            break;
-        case 5:     /* triangle fan */
-            for (i = 2; i < nvtx; i++) {
-                r300_raster_tri(s, &d, &vb[0], &vb[i - 1], &vb[i]);
-            }
-            break;
-        case 6:     /* triangle strip */
-            for (i = 2; i < nvtx; i++) {
-                r300_raster_tri(s, &d, &vb[i - 2], &vb[i - 1], &vb[i]);
-            }
-            break;
-        case 13:    /* quad list */
-            for (i = 0; i + 4 <= nvtx; i += 4) {
-                r300_raster_tri(s, &d, &vb[i], &vb[i + 1], &vb[i + 2]);
-                r300_raster_tri(s, &d, &vb[i], &vb[i + 2], &vb[i + 3]);
-            }
-            break;
-        default:
-            trace_ati_r350_3d_skip(vf, vsize, prim);
-            break;
+            r300_load_vtx(&d, dw, vsize, &vb[i]);
+            r300_xform_vtx(&d, &vb[i]);
         }
+        trace_ati_r350_3d_vbuf_vtx((int32_t)(r300_f32(dw[0]) * 1000),
+                                   (int32_t)(r300_f32(dw[1]) * 1000),
+                                   size[0] >= 4 && vsize >= 8 ?
+                                   (int32_t)(r300_f32(dw[4]) * 1000) : 0,
+                                   size[0] >= 4 && vsize >= 8 ?
+                                   (int32_t)(r300_f32(dw[5]) * 1000) : 0);
+        r300_run_prims(s, &d, vb, nvtx, prim);
     }
 }
