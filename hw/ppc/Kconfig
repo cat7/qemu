@@ -131,6 +131,7 @@ config MAC_OLDWORLD
     select ATHENS_CLOCKS
     select ATI_MACH64
     select ATI_RAGE128
+    select ATI_R350
     select GRACKLE_PCI
     select HEATHROW_PIC
     select MACIO

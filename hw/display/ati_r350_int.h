@@ -1,0 +1,432 @@
+/*
+ * QEMU ATI Radeon 9800 Pro (R350) emulation
+ *
+ * Models the ATI Radeon 9800 Pro Mac Edition (PCI vendor 0x1002, device
+ * 0x4E48) as an AGP add-in graphics card for the mac99 (PowerMac3,4)
+ * machine. Forked from our ati_rage128 device: the Radeon keeps the Rage
+ * 128 register lineage for the display controller (CRTC/DAC/palette/
+ * cursor/I2C/GPIO), the 2D GUI engine (0x14xx), the scratch registers
+ * and the PM4 command-stream format, so all of that is inherited; what
+ * changes is the identity, the aperture layout (128MB frame buffer
+ * BAR, 64KB register BAR), the memory-controller address windows
+ * (MC_FB_LOCATION / MC_AGP_LOCATION -- engine and CP addresses are
+ * card addresses, not frame-buffer offsets), the CP ring (CP_RB_*,
+ * read-pointer and scratch write-back), RBBM_STATUS, the SURFACE_CNTL
+ * byte swappers that replace CONFIG_CNTL's aperture endian modes, and
+ * the R300 3D engine (not modeled: packets are parsed and skipped).
+ *
+ * Ground truth: the retail 9800 Pro Mac SE / OEM 9800 XT FCode ROMs
+ * (detokenized 2026-08-24), Mac OS X 10.4.11's ATIRadeon9700.kext, the
+ * Linux radeon DRM and X.org radeon drivers, and AMD's public R3xx
+ * register references.
+ *
+ * This work is licensed under the GNU GPL license version 2 or later.
+ */
+
+#ifndef ATI_R350_INT_H
+#define ATI_R350_INT_H
+
+#include "hw/pci/pci_device.h"
+#include "hw/display/edid.h"
+#include "hw/i2c/bitbang_i2c.h"
+#include "qemu/timer.h"
+#include "qom/object.h"
+
+#define PCI_VENDOR_ID_ATI              0x1002
+/*
+ * 0x4E48 = R350 "Radeon 9800 Pro". The PCIR header of every Mac Edition
+ * 9800 ROM we have (retail 9800 Pro SE 1.03/1.26 and Apple's OEM 9800
+ * XT 1.18/1.23) declares this ID -- even the XT, whose silicon is an
+ * R360 (0x4E4A): Mac OS X's ATIRadeon9700.kext matches 0x4E48 but not
+ * 0x4E4A, so Apple's cards are strapped to the Pro's identity. Open
+ * Firmware binds the ROM's FCode only on an exact vendor:device match.
+ */
+#define PCI_DEVICE_ID_ATI_R350         0x4e48
+
+#define TYPE_ATI_R350 "ati-radeon9800"
+OBJECT_DECLARE_SIMPLE_TYPE(ATIR350State, ATI_R350)
+
+/*
+ * Real Rage 128 BAR layout (confirmed by both the FCode's own mapping
+ * words and real-hardware lspci dumps of Rage 128 cards):
+ *   BAR0: 64MB memory, framebuffer aperture (prefetchable on real hw)
+ *   BAR1: 256 bytes I/O, register access
+ *   BAR2: 16KB memory, register aperture
+ *   Expansion ROM: 128KB
+ */
+#define ATI_R350_APER_SIZE   (128 * 1024 * 1024)
+/*
+ * 128MB: the retail 9800 Pro Mac Edition's memory (the "SE" and the
+ * OEM XT carry 256MB). The whole BAR0 aperture is the frame buffer --
+ * unlike the Rage 128 there is no second aperture image; the Radeon's
+ * byte swappers are SURFACE_CNTL's non-surface/surface swap bits.
+ * Quartz Extreme needs >= 16MB, Quartz 2D Extreme >= 64MB.
+ */
+#define ATI_R350_VRAM_SIZE   (128 * 1024 * 1024)
+#define ATI_R350_MMIO_SIZE   (64 * 1024)
+#define ATI_R350_IO_SIZE     256
+#define ATI_R350_NUM_REGS    (ATI_R350_MMIO_SIZE / 4)
+#define ATI_R350_NUM_PLLS    64
+#define ATI_R350_FB_SCAN_BLOCK (64 * 1024)
+
+typedef struct ATIR350PM4Parser {
+    uint32_t remaining;      /* data dwords still expected */
+    uint32_t type;           /* packet type of the in-flight packet */
+    uint32_t reg;            /* running register offset, packet0 */
+    bool one_reg;
+    uint32_t p1_reg1;        /* packet1's two register offsets */
+    uint32_t p1_reg2;
+    uint32_t p3_opcode;      /* packet3 2D-draw sub-state */
+    uint32_t p3_params[8];
+    uint32_t p3_scale[16];      /* R350_SCALE_PKT_DWORDS */
+    uint32_t p3_param_idx;
+    uint32_t p3_total;       /* payload dwords the packet3 declared */
+} ATIR350PM4Parser;
+
+typedef struct ATIR350Mode {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;      /* bytes per scanline */
+    uint32_t bpp;        /* bytes per pixel */
+    uint32_t fb_offset;  /* byte offset into VRAM */
+    uint32_t pix_width;  /* raw CRTC_PIX_WIDTH field, for draw dispatch */
+} ATIR350Mode;
+
+struct ATIR350State {
+    PCIDevice parent_obj;
+
+    MemoryRegion aper;        /* BAR0: 64MB aperture container */
+    MemoryRegion vram;        /* 16MB of real VRAM at aperture offset 0 */
+    MemoryRegion mmio;        /* BAR2: 16KB register file */
+    MemoryRegion io;          /* BAR1: 256-byte I/O register window */
+    QemuConsole *con;
+
+    uint32_t regs[ATI_R350_NUM_REGS];
+    uint32_t plls[ATI_R350_NUM_PLLS];
+    /* R300 memory-controller indirect register file (MC_IND_INDEX/DATA) */
+    uint32_t mc_ind[256];
+    /*
+     * Bit-banged DDC on the Radeon's dedicated GPIO_VGA_DDC / GPIO_DVI_DDC
+     * pads (same A/Y/EN lane layout as GPIO_MONID), each serving the EDID.
+     */
+    bitbang_i2c_interface vga_ddc_i2c;
+    bitbang_i2c_interface dvi_ddc_i2c;
+    int vga_ddc_sda;
+    int dvi_ddc_sda;
+
+    /* DAC palette state (PALETTE_INDEX/PALETTE_DATA) */
+    uint8_t dac_wr_index;
+    uint8_t dac_rd_index;
+    uint8_t palette[256][3];
+
+    ATIR350Mode mode;      /* what the last refresh actually drew */
+    /*
+     * The last mode CRTC1 itself described while valid. Kept apart from
+     * `mode`: when the auto-detected framebuffer overrides the CRTC, `mode`
+     * holds the guess, and using it as the "remembered CRTC mode" fallback
+     * made the override compare the guess against itself and stick for
+     * good (seen live: OS X blanked the display for sleep, the heuristic
+     * swapped in a stale 8bpp 800x600 buffer, and it never let go).
+     */
+    ATIR350Mode crtc_mode;
+    bool mode_dirty;
+    bool have_valid_mode; /* has `crtc_mode` ever held a real, valid mode? */
+
+    /*
+     * Auto-detected framebuffer, tracked via VRAM write activity
+     * rather than any register: neither real guest OS this device has
+     * been tested against (Mac OS X 10.2, Mac OS 9.2) ever programs
+     * CRTC1's "Extended" mode-set registers at all -- confirmed live,
+     * see the comment on ati_r350_scan_vram_activity() -- so the
+     * *actual* live framebuffer, whenever it isn't the one CRTC1's
+     * last-known-good mode already correctly describes, has to be
+     * found some other way. `fb_scan_activity` is a decayed
+     * hit-counter per ATI_R350_FB_SCAN_BLOCK-sized block of VRAM;
+     * a sustained run of "recently written every scan" blocks is
+     * treated as the real, currently-live framebuffer.
+     */
+    uint8_t fb_scan_activity[ATI_R350_VRAM_SIZE / ATI_R350_FB_SCAN_BLOCK];
+    uint32_t fb_scan_counter;
+    /*
+     * Dirty VRAM blocks seen by the per-refresh dirty snapshot since the
+     * activity scan last consumed them (the snapshot clears the bitmap, so
+     * there is exactly one consumer of it -- ati_r350_update_display --
+     * and the slower activity scan reads this instead).
+     */
+    bool fb_block_pending[ATI_R350_VRAM_SIZE / ATI_R350_FB_SCAN_BLOCK];
+    /* redraw the whole surface next pass regardless of dirty state */
+    bool force_redraw;
+    bool auto_fb_valid;
+    ATIR350Mode auto_fb_mode;
+    /*
+     * Adoption is gated on a candidate staying identical across two
+     * consecutive scans: while a slow canvas paint is still in
+     * progress the partial region matches a different (wrong)
+     * resolution each scan, and after painting stops the region's
+     * activity credit drains slice-by-slice in write order, shrinking
+     * the run through more wrong intermediate shapes -- both churn
+     * states never repeat the same candidate twice in a row, so the
+     * stability gate suppresses them and only the settled, fully
+     * painted region is ever adopted (verified in the qtest harness:
+     * without this gate a 6-slice gradual paint visibly cycles the
+     * display through 4+ wrong modes and can END on one).
+     */
+    bool auto_fb_pending_valid;
+
+    /*
+     * Apple Monitor Sense: report a connected MultiScan display on
+     * the MONID sense pins (default on); off = nothing plugged in
+     * (all sense lines float high).
+     */
+    bool monitor_connected;
+    /*
+     * Dual-head card (DVI-I + ADC). The DVI head always has the display;
+     * this says whether the second head (ADC/VGA connector: its DDC pad,
+     * the primary DAC's comparator and the Apple-sense lines) reports a
+     * connected display too -- off by default so Mac OS sees one screen.
+     */
+    bool second_display;
+    ATIR350Mode auto_fb_pending;
+
+    /*
+     * Same VBL model as the mach64 device: a gated pulse -- raise the
+     * VBLANK status bit (and the PCI interrupt, when enabled) at each
+     * frame's blank phase, drop the line a blank-length later. See
+     * ati_mach64.c for why the free-running and held-until-ack
+     * variants both wedged real ROM boots on that device.
+     */
+    QEMUTimer *vblank_timer;
+    QEMUTimer *vblank_end_timer;
+    /* coalesces a burst of cursor-register writes into one host update */
+    QEMUTimer *cursor_timer;
+
+    /*
+     * Hardware I2C engine (I2C_CNTL_0/1 + I2C_DATA) serving a
+     * generated EDID at DDC address 0xA0/0xA1 -- the Rage 128 has a
+     * real I2C controller (unlike the mach64's bit-banged GP_IO pins)
+     * and ATI's Mac FCode/NDRV use it for monitor detection.
+     */
+    qemu_edid_info edid_info;
+    uint8_t edid[128];
+    uint8_t i2c_offset;      /* current EDID read offset */
+    uint8_t i2c_data_fifo[16];
+    int i2c_data_len;
+    int i2c_data_pos;
+
+    /*
+     * Second DDC path: the ATI Mac drivers (Mac OS X's ndrv on mac99,
+     * and -- observed live on g3beige -- the classic Mac OS 9 driver
+     * and the card FCode too) bit-bang I2C on the GPIO_MONID pads
+     * (SDA = pad 0, SCL = pad 1), marking them with MASK nibble 0xf --
+     * distinct from the Apple-sense probes (MASK 0x7) and the FCode's
+     * EN-only convention (MASK 0). Serves the same 128-byte EDID as
+     * the hardware engine above.
+     */
+    bool host_cursor_published;   /* synthetic arrow handed to the UI */
+    bitbang_i2c_interface monid_i2c;
+    int monid_sda;           /* live SDA level fed back into MONID_Y */
+    /*
+     * A bit-banged I2C session on pads 1 (SDA) / 2 (SCL) under the
+     * Apple-sense MASK nibble 0x7 -- what Mac OS 9's "ATI Resource
+     * Manager" does. Told apart from a sense probe by its clock: a
+     * START (SDA falling while SCL is released) followed by SCL being
+     * driven low opens the session; SDA rising while SCL is released
+     * (STOP) closes it. A sense probe pulses one pad and never clocks.
+     */
+    bool monid7_i2c;         /* session open: pads answer as an I2C bus */
+    bool monid7_start;       /* START seen, waiting for the first clock */
+    bool monid7_sda_low;     /* pad 1 currently driven low */
+    bool monid7_scl_low;     /* pad 2 currently driven low */
+    uint32_t ddc1_pos;       /* DDC1 EDID bitstream position (in bits) */
+    uint32_t ddc1_half;      /* half-bit phase: 2 manual VSYNC pulses/bit */
+
+    /*
+     * PM4/CCE GUI command-FIFO ring buffer -- the mechanism the real
+     * Mac driver actually uses for register/2D submission on this
+     * card (distinct from, and used after, the older one-shot
+     * BM_GUI_TABLE descriptor engine). Register offsets and the ring
+     * living in VRAM (this PCI, non-AGP variant has no GART/system-
+     * memory command access) are cross-verified between a live trace
+     * of the real driver and independent reference source; see the
+     * comment on R350_PM4_BUFFER_OFFSET in ati_r350_regs.h.
+     * Consumed synchronously on each PM4_BUFFER_DL_WPTR write, same
+     * style as the BM engine.
+     */
+    uint32_t pm4_rptr;         /* ring read pointer, in dwords */
+    uint32_t pm4_wptr;         /* ring write pointer, in dwords */
+    /* ring base: VRAM offset, or GART offset when AGP_OFFSET_FLAG set */
+    uint32_t pm4_buffer_addr;
+    uint32_t pm4_buffer_cntl;
+    uint32_t pm4_ring_dwords;  /* ring size decoded from CNTL, 0 = no ring */
+
+    /*
+     * CCE microcode store (PM4_MICROCODE_ADDR/RADDR/DATAH/DATAL):
+     * 256 x 64-bit words, streamed as high/low pairs with the address
+     * auto-incrementing after each DATAL access -- kept so a driver
+     * that reads its upload back to verify sees exactly what it wrote.
+     */
+    uint32_t pm4_microcode[256][2];
+    uint16_t pm4_ucode_waddr;
+    uint16_t pm4_ucode_raddr;
+
+    /*
+     * PIO alternative to the ring: the real Mac driver actually
+     * submits its command stream by writing raw dwords straight to
+     * PM4_FIFO_DATA_EVEN/ODD (0x1000/0x1004, undocumented in the OEM
+     * manual but confirmed live: consecutive writes there decode as
+     * an ordinary PM4 packet stream, ending in a packet0 write of the
+     * exact 64-bit fence value the driver then polls for at
+     * GUI_SCRATCH_REG0/1). Both addresses behave identically -- they
+     * just feed the next dword into this same parser state machine.
+     */
+    /*
+     * One packet-parser state per independent command stream: the PIO
+     * FIFO stream gets a persistent one (writes arrive one dword at a
+     * time across many MMIO accesses), while each indirect-buffer
+     * dispatch runs a fresh private instance -- an IB dispatch is
+     * triggered from *inside* a FIFO packet (packet0 hitting
+     * IW_INDOFF/INDSIZE), so sharing the parser state would corrupt
+     * the framing of both streams (a real bug: it desynced the FIFO
+     * stream after the first IB and wedged the guest driver).
+     */
+    ATIR350PM4Parser pm4_fifo;
+
+    /*
+     * 2D GUI (destination datapath) engine state -- ported from the
+     * real upstream `ati-vga` device (hw/display/ati.c/ati_2d.c), not
+     * generic/free-standing; register semantics are documented on the
+     * offsets themselves in ati_r350_regs.h. These mirror upstream's
+     * ATIVGARegs 2D fields one-to-one so the ported blt logic needs no
+     * renaming.
+     */
+    uint32_t dst_offset, dst_pitch, dst_tile, dst_width, dst_height;
+    uint32_t dst_x, dst_y;
+    uint32_t src_offset, src_pitch, src_tile, src_x, src_y;
+    uint32_t dp_gui_master_cntl;
+    uint32_t dp_brush_bkgd_clr, dp_brush_frgd_clr;
+    uint32_t dp_src_frgd_clr, dp_src_bkgd_clr;
+    /*
+     * Scissors are SIGNED 14-bit fields -- the register guide gives the
+     * range as -8192..8191 ("Destination left scissor", RAGE 128 VR/GL
+     * Register Reference Manual 7.6). Holding them unsigned turned a
+     * legitimately negative left/top edge -- what the driver programs
+     * for a window hanging off the left or top of the screen -- into a
+     * huge positive one, which clips the whole drawing away.
+     */
+    int32_t sc_top, sc_left, sc_bottom, sc_right;
+    int32_t src_sc_bottom, src_sc_right;
+    uint32_t dp_cntl, dp_datatype, dp_mix, dp_write_mask;
+    uint32_t default_offset, default_pitch;
+    int32_t default_sc_bottom, default_sc_right;
+
+    /*
+     * The pitch/offset and scissor fields above are the EFFECTIVE values
+     * the drawing code uses; these are the register values they are
+     * derived from. DP_GUI_MASTER_CNTL's SRC/DST_PITCH_OFFSET_CNTL and
+     * SRC/DST_CLIPPING bits select, per operation, whether the effective
+     * value comes from the source/destination registers or from the
+     * DEFAULT_* ones -- a selection, not a transfer. Folding it straight
+     * into the effective field on every GMC write (which is what this
+     * used to do) destroys the register behind it, so the result depends
+     * on the order the driver happens to write things in. Mac OS X hits
+     * exactly that: it programs the separate SRC_PITCH/SRC_OFFSET
+     * registers rather than the packed SRC_PITCH_OFFSET, and every
+     * PAINT/BITBLT packet carries its own GMC dword, so a blit could run
+     * with a pitch left over from an earlier, differently sized surface.
+     * One 8-pixel pitch unit of staleness shears the copy by 8 pixels per
+     * row -- the diagonally streaked window contents on the Rage.
+     */
+    uint32_t src_offset_reg, src_pitch_reg, src_tile_reg;
+    uint32_t dst_offset_reg, dst_pitch_reg, dst_tile_reg;
+    int32_t sc_top_reg, sc_left_reg, sc_bottom_reg, sc_right_reg;
+    int32_t src_sc_bottom_reg, src_sc_right_reg;
+
+    /*
+     * Diagnostic: CPU stores into the frame buffer go through aperture 0,
+     * which is a plain RAM alias, so nothing in this device can see them
+     * -- and that is exactly the path that fills the driver's offscreen
+     * staging surface. Setting the "fillwatch"/"fillwatch-size" properties
+     * lays an instrumented IO window over that range of aperture 0 so the
+     * fills become visible. Writes are coalesced into contiguous runs and
+     * traced one line per run, so a full surface fill costs a line per row
+     * rather than one per store.
+     */
+    MemoryRegion vram_watch;
+    uint32_t fillwatch_off, fillwatch_size;
+    uint32_t fw_run_start, fw_run_end;
+    bool fw_active;
+
+    /*
+     * Hardware cursor (CUR_* registers). hw_cursor_on tracks whether the
+     * guest's own cursor is live, so the host-driven fallback pointer
+     * stands aside rather than fighting it for the console cursor.
+     * hw_cursor_sum is a checksum of the published image, so a shape
+     * change made by writing VRAM alone is still picked up without
+     * re-uploading an unchanged cursor on every frame.
+     */
+    bool hw_cursor_on;
+    uint32_t hw_cursor_sum;
+    /*
+     * CUR_LOCK is a single bit that merely appears in bit 31 of all three
+     * of CUR_OFFSET / CUR_HORZ_VERT_POSN / CUR_HORZ_VERT_OFF (RRG 3-80):
+     * the most recent write to any of them sets or clears it. Kept here
+     * rather than in the regs[] copies, which are stored without it.
+     */
+    bool cur_lock;
+    /* last position published to the console, so an unchanged cursor is
+     * not re-published (and re-traced) on every refresh tick */
+    int hw_cursor_x, hw_cursor_y;
+    /* the auto-detected framebuffer is currently overriding the CRTC mode
+     * (tracked so the transition can be traced, not every frame) */
+    bool auto_fb_overriding;
+    /*
+     * When the mach64's host-side pointer tracking is driving this display
+     * (its host-cursor-tracking property, which the Mac OS 9 launcher turns
+     * on), it owns the console cursor for good and the guest's own hardware
+     * cursor must stand aside -- under Mac OS 9 the guest barely updates the
+     * CUR_* registers on this card, so publishing them leaves a pointer
+     * frozen at a stale position. Under Mac OS X, where tracking is off and
+     * the guest drives the registers properly, the hardware cursor wins.
+     *
+     * Ownership is a latch, NOT a timeout. Expiring it after a second of no
+     * host updates meant that whenever the pointer sat still on the other
+     * display the hardware cursor took the console back and redisplayed its
+     * stale position -- a ghost pointer left behind on this screen, plus an
+     * artefact as the handover happened on the way across.
+     */
+    bool host_cursor_active;
+
+    /* HOST_DATA0-7/LAST accumulator, same protocol as upstream */
+    bool host_data_active;
+    uint32_t host_data_row, host_data_col, host_data_next;
+    uint32_t host_data_acc[4];
+};
+
+
+/* ati_r350_dbg.c */
+const char *ati_r350_reg_name(uint32_t base);
+
+/* ati_r350_2d.c */
+void ati_r350_2d_blt(ATIR350State *s);
+void ati_r350_2d_scale(ATIR350State *s, const uint32_t *pkt);
+void ati_r350_2d_scale_regs(ATIR350State *s);
+bool ati_r350_host_data_flush(ATIR350State *s);
+
+/*
+ * Show/position a host-driven pointer on this card's console. Used by
+ * the mach64's host-cursor-tracking workaround once the pointer crosses
+ * onto this display: this device has no hardware-cursor emulation and
+ * the guest never drives one here, so without it the pointer would
+ * simply vanish on the second screen.
+ */
+void ati_r350_host_cursor(int x, int y, bool on);
+/*
+ * Byte-lane XOR that turns a raw VRAM byte offset into the byte a
+ * little-endian consumer (CRTC, 2D engine, CP) sees there, given the
+ * SURFACE_CNTL / SURFACEn swappers in force at that address: 0 = no
+ * swap, 1 = 16-bit swap, 3 = 32-bit swap. See ati_r350_vram_xor().
+ */
+unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off);
+uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off);
+
+#endif /* ATI_R350_INT_H */

@@ -145,6 +145,12 @@ config ATI_RAGE128
     depends on PCI
     select EDID
 
+config ATI_R350
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select EDID
+
 config MACFB
     bool
     select FRAMEBUFFER
