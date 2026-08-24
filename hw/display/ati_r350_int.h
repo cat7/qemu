@@ -400,11 +400,26 @@ struct ATIR350State {
     bool host_data_active;
     uint32_t host_data_row, host_data_col, host_data_next;
     uint32_t host_data_acc[4];
+
+    /*
+     * Staging buffer for an in-flight R300 3D_DRAW_IMMD_2 payload
+     * (VAP_VF_CNTL + inline vertices). Scratch state only: a packet
+     * split across a migration is lost, like the 2D host-data
+     * accumulator above.
+     */
+    uint32_t r300_immd[16384];
 };
 
 
 /* ati_r350_dbg.c */
 const char *ati_r350_reg_name(uint32_t base);
+
+/* ati_r350_3d.c */
+void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
+
+/* ati_r350.c MC-window translation, shared with the engines */
+bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr, uint32_t *off);
+uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr);
 
 /* ati_r350_2d.c */
 void ati_r350_2d_blt(ATIR350State *s);

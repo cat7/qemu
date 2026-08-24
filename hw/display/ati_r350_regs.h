@@ -830,3 +830,20 @@
 #define R350_PLL_P2PLL_DIV_0         0x2c
 
 #endif /* ATI_R350_REGS_H */
+
+/* R300 3D engine (used by OS X's accelerator for all its blits) */
+#define R300_PM4_OPCODE_NOP3          0x10
+#define R300_PM4_OPCODE_LOAD_VBPNTR   0x2f
+#define R300_PM4_OPCODE_INDX_BUFFER   0x33
+#define R300_PM4_OPCODE_DRAW_VBUF_2   0x34
+#define R300_PM4_OPCODE_DRAW_IMMD_2   0x35
+#define R300_PM4_OPCODE_DRAW_INDX_2   0x36
+#define R300_VAP_VTX_SIZE             0x20b4
+#define R300_TX_ENABLE                0x4104
+#define R300_TX_FORMAT0_0             0x4480
+#define R300_TX_FORMAT1_0             0x44c0
+#define R300_TX_FORMAT2_0             0x4500
+#define R300_TX_OFFSET_0              0x4540
+#define R300_RB3D_BLENDCNTL           0x4e04
+#define R300_RB3D_COLOROFFSET0        0x4e28
+#define R300_RB3D_COLORPITCH0         0x4e38

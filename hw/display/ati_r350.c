@@ -22,8 +22,6 @@
 #include "ati_r350_regs.h"
 #include "trace.h"
 
-static bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr,
-                                uint32_t *off);
 
 #define ATI_R350_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
 #define ATI_R350_VBLANK_LEN_NS    (ATI_R350_VBLANK_PERIOD_NS / 8)
@@ -2247,7 +2245,7 @@ static void ati_r350_bm_gui_run(ATIR350State *s, uint32_t table)
  * numerically the same as its PCI bus address -- either way the window
  * test below resolves it locally first.
  */
-static bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr,
+bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr,
                                 uint32_t *off)
 {
     uint32_t loc = s->regs[R350_MC_FB_LOCATION >> 2];
@@ -2281,7 +2279,7 @@ static bool ati_r350_mc_to_agp(ATIR350State *s, uint32_t addr,
  * drivers byte-swap on the way out, or stage them through a swapped
  * surface -- which ati_r350_vram_ld32() honours).
  */
-static uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr)
+uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr)
 {
     uint32_t off, val = 0;
     dma_addr_t bus;
@@ -2796,6 +2794,23 @@ static void ati_r350_pm4_run_ring(ATIR350State *s)
                     }
                 }
                 break;
+            case R300_PM4_OPCODE_NOP3:
+                for (i = 0; i < count; i++) {
+                    ati_r350_pm4_read_ring(s);
+                }
+                break;
+            case R300_PM4_OPCODE_DRAW_IMMD_2:
+                for (i = 0; i < count; i++) {
+                    uint32_t immd = ati_r350_pm4_read_ring(s);
+
+                    if (i < ARRAY_SIZE(s->r300_immd)) {
+                        s->r300_immd[i] = immd;
+                    }
+                }
+                if (count >= 1 && count <= ARRAY_SIZE(s->r300_immd)) {
+                    ati_r350_r300_draw_immd(s, s->r300_immd, count);
+                }
+                break;
             default:
                 trace_ati_r350_pm4_unimp(opcode, count);
                 for (i = 0; i < count; i++) {
@@ -2849,7 +2864,10 @@ static void ati_r350_pm4_parse(ATIR350State *s,
                 p->p3_opcode != R350_PM4_OPCODE_BITBLT &&
                 p->p3_opcode != R350_PM4_OPCODE_BITBLT_MULTI &&
                 p->p3_opcode != R350_PM4_OPCODE_HOSTDATA_BLT &&
-                p->p3_opcode != R350_PM4_OPCODE_SCALING) {
+                p->p3_opcode != R350_PM4_OPCODE_SCALING &&
+                p->p3_opcode != R300_PM4_OPCODE_NOP3 &&
+                p->p3_opcode != R300_PM4_OPCODE_LOAD_VBPNTR &&
+                p->p3_opcode != R300_PM4_OPCODE_DRAW_IMMD_2) {
                 trace_ati_r350_pm4_unimp(p->p3_opcode, p->remaining);
             }
             break;
@@ -3110,6 +3128,12 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             }
             break;
         }
+        case R300_PM4_OPCODE_DRAW_IMMD_2:
+            if (p->p3_param_idx < ARRAY_SIZE(s->r300_immd)) {
+                s->r300_immd[p->p3_param_idx] = val;
+            }
+            p->p3_param_idx++;
+            break;
         default:
             /*
              * Payload of an opcode we do not model. Still advance the
@@ -3135,6 +3159,11 @@ static void ati_r350_pm4_parse(ATIR350State *s,
         ati_r350_host_data_flush(s);
         s->host_data_active = false;
         s->host_data_next = 0;
+    }
+    if (p->remaining == 0 && p->type == 3 &&
+        p->p3_opcode == R300_PM4_OPCODE_DRAW_IMMD_2 &&
+        p->p3_total >= 1 && p->p3_total <= ARRAY_SIZE(s->r300_immd)) {
+        ati_r350_r300_draw_immd(s, s->r300_immd, p->p3_total);
     }
 }
 
