@@ -53,6 +53,8 @@
 #define UNIN_CFG_GART_BASE      0x8c
 #define UNIN_CFG_AGP_BASE       0x90
 #define UNIN_CFG_GART_CTRL      0x94
+#define UNIN_CFG_INTERNAL_STATUS 0x98
+#define UNIN_INTERNAL_STATUS_AGP_IDLE 0x00000001
 
 #define UNIN_GART_CTRL_INVAL    0x00000001
 #define UNIN_GART_CTRL_ENABLE   0x00000100
@@ -598,6 +600,24 @@ static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
      */
     memset(d->wmask + UNIN_CFG_GART_BASE, 0xff,
            UNIN_CFG_GART_CTRL + 4 - UNIN_CFG_GART_BASE);
+
+    /*
+     * INTERNAL_STATUS (0x98, read-only): Mac OS X's AppleMacRiscAGP spins
+     * "while (0 == (kIOAGPIdle & configRead32(bridge, kUniNINTERNAL_STATUS)))"
+     * in setAGPEnable(false) before it touches the AGP command registers,
+     * and createAGPSpace() BEGINS with that disable. With the register
+     * unimplemented (reading 0) the spin never ends: ATIRadeon9700's
+     * start() wedges inside configureAGP holding the card nub's IOKit
+     * matching job -- when the kext personality caches hand the
+     * accelerator its probe before IONDRVFramebuffer's, that deadlocks
+     * the whole boot at the text console ("IOKitWaitQuiet() timed out",
+     * WindowServer on a VirtualDisplay); in luckier orderings it still
+     * leaves a kernel thread spinning at ~700k config reads/s, a leaked
+     * busy count on the nub, and no accelerator. This model completes
+     * every AGP transaction synchronously, so the bridge is always idle.
+     */
+    pci_set_long(d->config + UNIN_CFG_INTERNAL_STATUS,
+                 UNIN_INTERNAL_STATUS_AGP_IDLE);
 }
 
 static void unin_agp_pci_host_config_write(PCIDevice *d, uint32_t addr,
