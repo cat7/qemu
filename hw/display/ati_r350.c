@@ -2371,6 +2371,37 @@ static void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
  * than reading the registers, so a missing write-back is a silent
  * driver hang.
  */
+/* classic 16x16 arrow: data = black pixels, mask = opaque area */
+static const uint16_t ati_r350_arrow_data[16] = {
+    0x0000, 0x4000, 0x6000, 0x7000, 0x7800, 0x7c00, 0x7e00, 0x7f00,
+    0x7f80, 0x7c00, 0x6c00, 0x4600, 0x0600, 0x0300, 0x0300, 0x0000,
+};
+static const uint16_t ati_r350_arrow_mask[16] = {
+    0xc000, 0xe000, 0xf000, 0xf800, 0xfc00, 0xfe00, 0xff00, 0xff80,
+    0xffc0, 0xffe0, 0xfe00, 0xef00, 0xcf00, 0x8780, 0x0780, 0x0380,
+};
+
+static QEMUCursor *ati_r350_builtin_arrow(void)
+{
+    QEMUCursor *c = cursor_alloc(16, 16);
+    int row, col;
+
+    for (row = 0; row < 16; row++) {
+        for (col = 0; col < 16; col++) {
+            uint16_t bit = 0x8000 >> col;
+
+            if (!(ati_r350_arrow_mask[row] & bit)) {
+                c->data[row * 16 + col] = 0;            /* transparent */
+            } else if (ati_r350_arrow_data[row] & bit) {
+                c->data[row * 16 + col] = 0xff000000u;  /* black */
+            } else {
+                c->data[row * 16 + col] = 0xffffffffu;  /* white edge */
+            }
+        }
+    }
+    return c;
+}
+
 static void ati_r350_cp_rptr_writeback(ATIR350State *s)
 {
     uint32_t cntl = s->regs[R350_CP_RB_CNTL >> 2];
@@ -3643,8 +3674,12 @@ static void ati_r350_cursor_apply(ATIR350State *s)
             }
         }
         if (and_ones < R350_CUR_WIDTH * R350_CUR_HEIGHT / 8) {
-            /* leave the console cursor undefined so the UI keeps its
-             * own (host) pointer visible at the tracked position */
+            /* substitute the built-in arrow: anything defined earlier
+             * (or the box the junk decodes to) would persist otherwise,
+             * since a console cursor cannot be undefined */
+            c = ati_r350_builtin_arrow();
+            qemu_console_set_cursor(s->con, c);
+            cursor_unref(c);
             s->hw_cursor_on = true;
             s->hw_cursor_sum = sum;
             s->hw_cursor_x = x;
@@ -3732,15 +3767,6 @@ static void ati_r350_cursor_update(ATIR350State *s)
  */
 void ati_r350_host_cursor(int x, int y, bool on)
 {
-    /* classic 16x16 arrow: data = black pixels, mask = opaque area */
-    static const uint16_t arrow_data[16] = {
-        0x0000, 0x4000, 0x6000, 0x7000, 0x7800, 0x7c00, 0x7e00, 0x7f00,
-        0x7f80, 0x7c00, 0x6c00, 0x4600, 0x0600, 0x0300, 0x0300, 0x0000,
-    };
-    static const uint16_t arrow_mask[16] = {
-        0xc000, 0xe000, 0xf000, 0xf800, 0xfc00, 0xfe00, 0xff00, 0xff80,
-        0xffc0, 0xffe0, 0xfe00, 0xef00, 0xcf00, 0x8780, 0x0780, 0x0380,
-    };
     ATIR350State *s;
     Object *o = object_resolve_path_type("", TYPE_ATI_R350, NULL);
 
@@ -3755,22 +3781,8 @@ void ati_r350_host_cursor(int x, int y, bool on)
     s->hw_cursor_on = false;
 
     if (on && !s->host_cursor_published) {
-        QEMUCursor *c = cursor_alloc(16, 16);
-        int row, col;
+        QEMUCursor *c = ati_r350_builtin_arrow();
 
-        for (row = 0; row < 16; row++) {
-            for (col = 0; col < 16; col++) {
-                uint16_t bit = 0x8000 >> col;
-
-                if (!(arrow_mask[row] & bit)) {
-                    c->data[row * 16 + col] = 0;            /* transparent */
-                } else if (arrow_data[row] & bit) {
-                    c->data[row * 16 + col] = 0xff000000u;  /* black */
-                } else {
-                    c->data[row * 16 + col] = 0xffffffffu;  /* white edge */
-                }
-            }
-        }
         qemu_console_set_cursor(s->con, c);
         cursor_unref(c);
         s->host_cursor_published = true;
