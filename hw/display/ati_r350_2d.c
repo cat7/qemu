@@ -65,10 +65,24 @@ static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
          * wrote those pixels big-endian with no aperture swapper in
          * the way, so swap the little-endian DMA read back.
          */
-        if (bpp == 32 && !(addr & 3)) {
-            return bswap32(ati_r350_mc_read32(s, addr));
+        uint32_t dw = ati_r350_mc_read32(s, addr & ~3u);
+
+        switch (bpp) {
+        case 32:
+            if (!(addr & 3)) {
+                return bswap32(dw);
+            }
+            return 0;
+        case 16:
+            /* big-endian pixel bytes in host memory */
+            return bswap16((dw >> ((addr & 2) * 8)) & 0xffff);
+        case 8:
+            /* mc_read32 is a little-endian view: byte addr & 3 sits
+             * at bit position (addr & 3) * 8 */
+            return (dw >> ((addr & 3) * 8)) & 0xff;
+        default:
+            return 0;
         }
-        return 0;
     }
     xr = ati_r350_vram_xor(s, addr);
     switch (bpp) {

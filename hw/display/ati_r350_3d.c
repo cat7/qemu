@@ -33,6 +33,8 @@ typedef struct R300Vtx {
 
 typedef struct R300DrawState {
     int sc_x0, sc_y0, sc_x1, sc_y1;   /* inclusive scissor window */
+    uint32_t clip_rule;               /* RE_CLIPRECT_CNTL truth table */
+    int cr[4][4];                     /* cliprects: x0,y0,x1,y1 (BR excl) */
     bool xform;             /* run positions through PVS matrix + viewport */
     float mat[16];          /* row-major position matrix (PVS consts 0-3) */
     float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
@@ -40,6 +42,10 @@ typedef struct R300DrawState {
     uint32_t dst_pitch;     /* bytes per scanline */
     bool textured;
     bool blend;
+    unsigned src_factor, dst_factor;   /* RB3D_BLENDCNTL 6-bit codes */
+    bool alpha_test;
+    unsigned af_func;                  /* FG_ALPHA_FUNC compare 0-7 */
+    float af_ref;
     uint32_t tex_off;       /* card address of texture level 0 */
     int tex_w, tex_h;
     uint32_t tex_pitch;     /* bytes per texel row */
@@ -99,6 +105,30 @@ static uint32_t r300_read_dst(ATIR350State *s, const R300DrawState *d,
     return ati_r350_vram_ld32(s, addr);
 }
 
+/*
+ * One blend factor for one channel. `sc`/`dc` are the source and
+ * destination values of the channel being blended, `sa`/`da` the
+ * alphas. Codes 32+ are the GL names, 1-11 the D3D aliases.
+ */
+static float r300_blend_f(unsigned code, float sc, float sa,
+                          float dc, float da)
+{
+    switch (code) {
+    case 1: case 32: return 0.0f;                    /* ZERO */
+    case 2: case 33: return 1.0f;                    /* ONE */
+    case 3: case 34: return sc;                      /* SRC_COLOR */
+    case 4: case 35: return 1.0f - sc;
+    case 9: case 36: return dc;                      /* DST_COLOR */
+    case 10: case 37: return 1.0f - dc;
+    case 5: case 38: return sa;                      /* SRC_ALPHA */
+    case 6: case 39: return 1.0f - sa;
+    case 7: case 40: return da;                      /* DST_ALPHA */
+    case 8: case 41: return 1.0f - da;
+    case 11: case 42: return MIN(sa, 1.0f - da);     /* SRC_ALPHA_SATURATE */
+    default: return 1.0f;
+    }
+}
+
 static inline float r300_edge(const R300Vtx *a, const R300Vtx *b,
                               float px, float py)
 {
@@ -138,6 +168,19 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             if (w0 < 0.0f || w1 < 0.0f || w2 < -0.001f) {
                 continue;
             }
+            if (d->clip_rule != 0xffff) {
+                unsigned idx = 0, r;
+
+                for (r = 0; r < 4; r++) {
+                    if (x >= d->cr[r][0] && x < d->cr[r][2] &&
+                        y >= d->cr[r][1] && y < d->cr[r][3]) {
+                        idx |= 1u << r;
+                    }
+                }
+                if (!((d->clip_rule >> idx) & 1)) {
+                    continue;
+                }
+            }
             cr = w0 * v0->r + w1 * v1->r + w2 * v2->r;
             cg = w0 * v0->g + w1 * v1->g + w2 * v2->g;
             cb = w0 * v0->b + w1 * v1->b + w2 * v2->b;
@@ -152,17 +195,42 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 cb *= (texel & 0xff) / 255.0f;
                 ca *= ((texel >> 24) & 0xff) / 255.0f;
             }
-            if (d->blend && ca < 1.0f) {
+            if (d->alpha_test) {
+                bool pass;
+
+                switch (d->af_func) {
+                case 0: pass = false; break;                /* NEVER */
+                case 1: pass = ca < d->af_ref; break;
+                case 2: pass = ca == d->af_ref; break;
+                case 3: pass = ca <= d->af_ref; break;
+                case 4: pass = ca > d->af_ref; break;       /* GREATER */
+                case 5: pass = ca != d->af_ref; break;
+                case 6: pass = ca >= d->af_ref; break;
+                default: pass = true; break;                /* ALWAYS */
+                }
+                if (!pass) {
+                    continue;
+                }
+            }
+            if (d->blend) {
                 uint32_t dst = r300_read_dst(s, d, x, y);
                 float dr = ((dst >> 16) & 0xff) / 255.0f;
                 float dg = ((dst >> 8) & 0xff) / 255.0f;
                 float db = (dst & 0xff) / 255.0f;
                 float da = ((dst >> 24) & 0xff) / 255.0f;
+                float nr, ng, nb;
 
-                cr = cr * ca + dr * (1.0f - ca);
-                cg = cg * ca + dg * (1.0f - ca);
-                cb = cb * ca + db * (1.0f - ca);
-                ca = ca + da * (1.0f - ca);
+                nr = cr * r300_blend_f(d->src_factor, cr, ca, dr, da) +
+                     dr * r300_blend_f(d->dst_factor, cr, ca, dr, da);
+                ng = cg * r300_blend_f(d->src_factor, cg, ca, dg, da) +
+                     dg * r300_blend_f(d->dst_factor, cg, ca, dg, da);
+                nb = cb * r300_blend_f(d->src_factor, cb, ca, db, da) +
+                     db * r300_blend_f(d->dst_factor, cb, ca, db, da);
+                ca = ca * r300_blend_f(d->src_factor, ca, ca, da, da) +
+                     da * r300_blend_f(d->dst_factor, ca, ca, da, da);
+                cr = nr;
+                cg = ng;
+                cb = nb;
             }
             out = ((uint32_t)(MIN(MAX(ca, 0.0f), 1.0f) * 255.0f) << 24) |
                   ((uint32_t)(MIN(MAX(cr, 0.0f), 1.0f) * 255.0f) << 16) |
@@ -244,7 +312,33 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         return false;
     }
     d->textured = (s->regs[R300_TX_ENABLE >> 2] & 1) && vsize >= 8;
-    d->blend = s->regs[R300_RB3D_BLENDCNTL >> 2] != 0;
+    /*
+     * RB3D_BLENDCNTL (R5xx accel guide): bit 0 is ALPHA_BLEND_ENABLE,
+     * SRCBLEND lives in [21:16] and DESTBLEND in [29:24] as 6-bit
+     * factor codes (GL names from 32 up, D3D names from 1). Quartz
+     * composites premultiplied: ONE / ONE_MINUS_SRC_ALPHA. Treating
+     * any non-zero value as source-alpha blending drew window content
+     * (BLENDCNTL 0x27210006 -- blending DISABLED) translucent and
+     * drop shadows opaque black.
+     */
+    {
+        uint32_t bl = s->regs[R300_RB3D_BLENDCNTL >> 2];
+        uint32_t af = s->regs[R300_FG_ALPHA_FUNC >> 2];
+
+        d->blend = bl & 1;
+        d->src_factor = (bl >> 16) & 0x3f;
+        d->dst_factor = (bl >> 24) & 0x3f;
+        /*
+         * FG_ALPHA_FUNC: AF_EN in bit 11, compare function in [10:8],
+         * 8-bit reference in [7:0]. OS X composes its cursor tile
+         * with AF_GREATER ref 0 -- transparent cursor pixels are
+         * DISCARDED, not blended; painting them drew the cursor as an
+         * opaque black box.
+         */
+        d->alpha_test = af & (1 << 11);
+        d->af_func = (af >> 8) & 7;
+        d->af_ref = (af & 0xff) / 255.0f;
+    }
     d->tex_off = s->regs[R300_TX_OFFSET_0 >> 2] & ~0x1fu;
     d->tex_w = (txfmt0 & 0x7ff) + 1;
     d->tex_h = ((txfmt0 >> 11) & 0x7ff) + 1;
@@ -278,6 +372,31 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
             d->sc_x0 = d->sc_y0 = 0;
             d->sc_x1 = d->sc_y1 = 0x1fff;
         }
+    }
+
+    /*
+     * Clip rectangles: up to four rects plus a 16-entry truth table in
+     * RE_CLIPRECT_CNTL indexed by which rects contain the pixel
+     * (0xffff = pass everything, 0xaaaa = pass only inside rect 0).
+     * WindowServer clips every window-content draw with rect 0; the
+     * coordinates carry the same +1440 bias as the scissor, with an
+     * exclusive bottom-right. A never-written CNTL means no clipping.
+     */
+    d->clip_rule = s->regs[R300_RE_CLIPRECT_CNTL >> 2] & 0xffff;
+    if (d->clip_rule && d->clip_rule != 0xffff) {
+        int r;
+
+        for (r = 0; r < 4; r++) {
+            uint32_t tl = s->regs[(R300_RE_CLIPRECT_TL_0 >> 2) + r * 2];
+            uint32_t br = s->regs[(R300_RE_CLIPRECT_TL_0 >> 2) + r * 2 + 1];
+
+            d->cr[r][0] = (int)(tl & 0x1fff) - R300_SCISSOR_OFFSET;
+            d->cr[r][1] = (int)((tl >> 13) & 0x1fff) - R300_SCISSOR_OFFSET;
+            d->cr[r][2] = (int)(br & 0x1fff) - R300_SCISSOR_OFFSET;
+            d->cr[r][3] = (int)((br >> 13) & 0x1fff) - R300_SCISSOR_OFFSET;
+        }
+    } else {
+        d->clip_rule = 0xffff;
     }
 
     d->xform = false;

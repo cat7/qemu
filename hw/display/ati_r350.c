@@ -1518,7 +1518,7 @@ static void ati_r350_resolve_gui_context(ATIR350State *s)
     } else {
         s->src_offset = s->default_offset;
         s->src_pitch = s->default_pitch;
-        s->src_pitch_bytes = false;
+        s->src_pitch_bytes = true;
         s->src_tile = 0;
     }
 
@@ -1530,7 +1530,7 @@ static void ati_r350_resolve_gui_context(ATIR350State *s)
     } else {
         s->dst_offset = s->default_offset;
         s->dst_pitch = s->default_pitch;
-        s->dst_pitch_bytes = false;
+        s->dst_pitch_bytes = true;
         s->dst_tile = 0;
     }
 
@@ -1885,18 +1885,28 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         s->dst_y = val & 0x3fff;
         break;
     case R350_SRC_PITCH_OFFSET:
-        s->src_offset_reg = (val & 0x1fffff) << 5;
-        s->src_pitch_reg = (val & 0x7fe00000) >> 21;
-        s->src_pitch_bytes_reg = false;
-        s->src_tile_reg = val >> 31;
+        /*
+         * Radeon packed layout (R5xx accel guide / DRM): offset in
+         * [21:0] as multiples of 1KB, pitch in [29:22] as multiples
+         * of 64 bytes, tiling flags on top. (The Rage 128 packed
+         * fields this device started from were offset/32 and pitch in
+         * 8-pixel units -- live captures of OS X's scroll copies,
+         * e.g. DEFAULT_OFFSET 0x4b002658 for the 704px surface at
+         * 0x996000, decode only under the Radeon rule.)
+         */
+        s->src_offset_reg = (val & 0x3fffff) << 10;
+        s->src_pitch_reg = ((val >> 22) & 0xff) * 64;
+        s->src_pitch_bytes_reg = true;
+        s->src_tile_reg = val >> 30;
         ati_r350_resolve_gui_context(s);
         break;
     case R350_DST_PITCH_OFFSET:
     case R350_DST_PITCH_OFFSET_C:
-        s->dst_offset_reg = (val & 0x1fffff) << 5;
-        s->dst_pitch_reg = (val & 0x7fe00000) >> 21;
-        s->dst_pitch_bytes_reg = false;
-        s->dst_tile_reg = val >> 31;
+        /* Radeon packed layout, as for SRC_PITCH_OFFSET above */
+        s->dst_offset_reg = (val & 0x3fffff) << 10;
+        s->dst_pitch_reg = ((val >> 22) & 0xff) * 64;
+        s->dst_pitch_bytes_reg = true;
+        s->dst_tile_reg = val >> 30;
         ati_r350_resolve_gui_context(s);
         break;
     case R350_SRC_Y_X:
@@ -1999,7 +2009,13 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         s->dp_write_mask = val;
         break;
     case R350_DEFAULT_OFFSET:
-        s->default_offset = val & 0xfffffff0;
+        /*
+         * On Radeon this is DEFAULT_PITCH_OFFSET, packed like
+         * SRC/DST_PITCH_OFFSET: OS X's scroll copies run with the GMC
+         * defaults selected and only this register armed.
+         */
+        s->default_offset = (val & 0x3fffff) << 10;
+        s->default_pitch = ((val >> 22) & 0xff) * 64;
         ati_r350_resolve_gui_context(s);
         break;
     case R350_DEFAULT_PITCH:

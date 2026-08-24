@@ -865,3 +865,6 @@
 #define R300_SC_SCISSOR0              0x43e0
 #define R300_SC_SCISSOR1              0x43e4
 #define R300_SCISSOR_OFFSET           1440
+#define R300_FG_ALPHA_FUNC            0x4bd4
+#define R300_RE_CLIPRECT_TL_0         0x43b0
+#define R300_RE_CLIPRECT_CNTL         0x43d0
