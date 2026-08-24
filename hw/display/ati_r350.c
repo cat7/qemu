@@ -3166,6 +3166,8 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
      * the guest's real command buffers sit in the GART pages.
      */
     ATIR350PM4Parser parser = { 0 };
+    bool swap = (s->regs[R350_CP_RB_CNTL >> 2] & R350_BUF_SWAP_MASK) ==
+                R350_BUF_SWAP_32BIT;
     uint32_t i;
 
     trace_ati_r350_pm4_indirect(offset, dwords,
@@ -3177,6 +3179,17 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
     for (i = 0; i < dwords; i++) {
         uint32_t val = ati_r350_mc_read32(s, offset + i * 4);
 
+        /*
+         * CP_RB_CNTL's BUF_SWAP swapper sits on the CP's fetch port,
+         * not on the ring specifically: indirect-buffer fetches go
+         * through the same dword swapper as ring fetches. OS X's
+         * driver stores IBs with native big-endian stores and relies
+         * on this (an unswapped fetch reads its 0x80000000 NOP
+         * padding as 0x00000080 and the whole IB parses as garbage).
+         */
+        if (swap) {
+            val = bswap32(val);
+        }
         trace_ati_r350_pm4_ib_dword(i, val);
         ati_r350_pm4_parse(s, &parser, val);
     }
