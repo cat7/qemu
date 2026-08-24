@@ -3623,6 +3623,37 @@ static void ati_r350_cursor_apply(ATIR350State *s)
         return;
     }
 
+    /*
+     * Stopgap for the OS X/OS 9 Radeon ndrv, which positions and
+     * colour-programs the hardware cursor but never uploads an image
+     * (open investigation): the bits at CUR_OFFSET are then leftover
+     * boot junk that decodes to an opaque box. A real mono cursor is
+     * mostly transparent (AND plane mostly ones); when almost no AND
+     * bits are set the "image" cannot be a cursor, so hide the guest
+     * sprite entirely -- the UI then shows the host pointer at the
+     * (correctly tracked) guest position instead of the box.
+     */
+    {
+        unsigned and_ones = 0, byte;
+
+        for (row = 0; row < R350_CUR_HEIGHT; row++) {
+            for (byte = 0; byte < 8; byte++) {
+                and_ones += ctpop8(src[(row * R350_CUR_ROW_BYTES + byte)
+                                       ^ xr]);
+            }
+        }
+        if (and_ones < R350_CUR_WIDTH * R350_CUR_HEIGHT / 8) {
+            /* leave the console cursor undefined so the UI keeps its
+             * own (host) pointer visible at the tracked position */
+            s->hw_cursor_on = true;
+            s->hw_cursor_sum = sum;
+            s->hw_cursor_x = x;
+            s->hw_cursor_y = y;
+            qemu_console_set_mouse(s->con, x, y, true);
+            return;
+        }
+    }
+
     c = cursor_alloc(R350_CUR_WIDTH, R350_CUR_HEIGHT);
     for (row = 0; row < R350_CUR_HEIGHT; row++) {
         for (px = 0; px < R350_CUR_WIDTH; px++) {

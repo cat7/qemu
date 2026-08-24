@@ -51,6 +51,7 @@ typedef struct R300DrawState {
     uint32_t tex_pitch;     /* bytes per texel row */
     unsigned tex_bpp;       /* 32 (ARGB8888) or 8 (A8 masks) */
     unsigned tex_sel_alpha; /* TX_FORMAT1 SEL_ALPHA swizzle */
+    unsigned clamp_s, clamp_t; /* TX_FILTER0 clamp modes (0 = repeat) */
     float flat_r, flat_g, flat_b, flat_a;
     uint8_t *vram;
 } R300DrawState;
@@ -66,8 +67,29 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
 {
     uint32_t addr, off;
 
-    tx = MIN(MAX(tx, 0), d->tex_w - 1);
-    ty = MIN(MAX(ty, 0), d->tex_h - 1);
+    /*
+     * TX_FILTER0 clamp modes: 0 is wrap/repeat -- OS X paints its
+     * title-bar gradient by drawing a 16x20 tile as a window-wide
+     * quad and letting the sampler repeat it; clamping instead
+     * smeared whatever sat next to the tile in VRAM. Treat mirror
+     * modes as repeat, everything else clamps to the edge.
+     */
+    if (d->clamp_s <= 1 && d->tex_w > 0) {
+        tx %= d->tex_w;
+        if (tx < 0) {
+            tx += d->tex_w;
+        }
+    } else {
+        tx = MIN(MAX(tx, 0), d->tex_w - 1);
+    }
+    if (d->clamp_t <= 1 && d->tex_h > 0) {
+        ty %= d->tex_h;
+        if (ty < 0) {
+            ty += d->tex_h;
+        }
+    } else {
+        ty = MIN(MAX(ty, 0), d->tex_h - 1);
+    }
     addr = d->tex_off + (uint32_t)ty * d->tex_pitch +
            (uint32_t)tx * (d->tex_bpp / 8);
     if (d->tex_bpp == 8) {
@@ -382,6 +404,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * and the alpha test would discard every pixel), 4 forces 0.
      */
     d->tex_sel_alpha = (s->regs[R300_TX_FORMAT1_0 >> 2] >> 9) & 7;
+    d->clamp_s = s->regs[R300_TX_FILTER0_0 >> 2] & 7;
+    d->clamp_t = (s->regs[R300_TX_FILTER0_0 >> 2] >> 3) & 7;
     d->tex_pitch = ((txfmt2 & 0x3fff) + 1) * (d->tex_bpp / 8);
     /*
      * Position transform: unless the draw bypasses the vertex program

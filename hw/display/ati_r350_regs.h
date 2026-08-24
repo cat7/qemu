@@ -868,3 +868,4 @@
 #define R300_FG_ALPHA_FUNC            0x4bd4
 #define R300_RE_CLIPRECT_TL_0         0x43b0
 #define R300_RE_CLIPRECT_CNTL         0x43d0
+#define R300_TX_FILTER0_0             0x4400
