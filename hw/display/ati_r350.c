@@ -297,10 +297,18 @@ static void ati_r350_draw_32bpp(ATIR350State *s, DisplaySurface *ds,
         dst = (uint32_t *)((uint8_t *)surface_data(ds) +
                            y * surface_stride(ds));
         for (x = 0; x < mode->width; x++) {
-            /* chip-native little-endian: B,G,R,X in VRAM */
-            dst[x] = 0xff000000u | ((uint32_t)src[(4 * x + 2) ^ xr] << 16) |
-                     ((uint32_t)src[(4 * x + 1) ^ xr] << 8) |
-                     src[(4 * x) ^ xr];
+            /*
+             * Chip-native little-endian: B,G,R,X in VRAM. The DAC's
+             * palette RAM acts as a per-channel gamma LUT in direct-
+             * colour modes too -- OS X renders in linear light and
+             * relies on the ramp it loads via PALETTE_30_DATA (the
+             * accelerated desktop backdrop arrives as (8,21,55) and
+             * only becomes the Aqua blue through the LUT).
+             */
+            dst[x] = 0xff000000u |
+                     ((uint32_t)s->palette[src[(4 * x + 2) ^ xr]][0] << 16) |
+                     ((uint32_t)s->palette[src[(4 * x + 1) ^ xr]][1] << 8) |
+                     s->palette[src[(4 * x) ^ xr]][2];
         }
         src += mode->pitch;
     }
@@ -319,10 +327,12 @@ static void ati_r350_draw_24bpp(ATIR350State *s, DisplaySurface *ds,
         dst = (uint32_t *)((uint8_t *)surface_data(ds) +
                            y * surface_stride(ds));
         for (x = 0; x < mode->width; x++) {
-            /* chip-native little-endian: B,G,R in VRAM */
-            dst[x] = 0xff000000u | ((uint32_t)src[(3 * x + 2) ^ xr] << 16) |
-                     ((uint32_t)src[(3 * x + 1) ^ xr] << 8) |
-                     src[(3 * x) ^ xr];
+            /* chip-native little-endian: B,G,R in VRAM; palette RAM
+             * doubles as the per-channel gamma LUT, as in 32bpp */
+            dst[x] = 0xff000000u |
+                     ((uint32_t)s->palette[src[(3 * x + 2) ^ xr]][0] << 16) |
+                     ((uint32_t)s->palette[src[(3 * x + 1) ^ xr]][1] << 8) |
+                     s->palette[src[(3 * x) ^ xr]][2];
         }
         src += mode->pitch;
     }
@@ -1503,20 +1513,24 @@ static void ati_r350_resolve_gui_context(ATIR350State *s)
     if (gmc & R350_GMC_SRC_PITCH_OFFSET_CNTL) {
         s->src_offset = s->src_offset_reg;
         s->src_pitch = s->src_pitch_reg;
+        s->src_pitch_bytes = s->src_pitch_bytes_reg;
         s->src_tile = s->src_tile_reg;
     } else {
         s->src_offset = s->default_offset;
         s->src_pitch = s->default_pitch;
+        s->src_pitch_bytes = false;
         s->src_tile = 0;
     }
 
     if (gmc & R350_GMC_DST_PITCH_OFFSET_CNTL) {
         s->dst_offset = s->dst_offset_reg;
         s->dst_pitch = s->dst_pitch_reg;
+        s->dst_pitch_bytes = s->dst_pitch_bytes_reg;
         s->dst_tile = s->dst_tile_reg;
     } else {
         s->dst_offset = s->default_offset;
         s->dst_pitch = s->default_pitch;
+        s->dst_pitch_bytes = false;
         s->dst_tile = 0;
     }
 
@@ -1794,6 +1808,21 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         s->regs[base >> 2] = val;
         ati_r350_scratch_writeback(s, (base - R350_SCRATCH_REG_BASE) >> 2);
         break;
+    case R300_VAP_PVS_UPLOAD_ADDRESS:
+        s->regs[base >> 2] = val;
+        s->pvs_upload_addr = val;
+        s->pvs_upload_cnt = 0;
+        break;
+    case R300_VAP_PVS_UPLOAD_DATA:
+        s->regs[base >> 2] = val;
+        if (s->pvs_upload_addr == 0x200 &&
+            s->pvs_upload_cnt < ARRAY_SIZE(s->pvs_const)) {
+            s->pvs_const[s->pvs_upload_cnt] = val;
+            if (++s->pvs_upload_cnt > s->pvs_const_dwords) {
+                s->pvs_const_dwords = s->pvs_upload_cnt;
+            }
+        }
+        break;
     case R350_MC_IND_INDEX:
         s->regs[base >> 2] = val;
         break;
@@ -1833,6 +1862,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_DST_PITCH:
         s->dst_pitch_reg = val & 0x3fff;
         s->dst_tile_reg = (val >> 16) & 1;
+        s->dst_pitch_bytes_reg = true;
         ati_r350_resolve_gui_context(s);
         break;
     case R350_DST_WIDTH:
@@ -1857,6 +1887,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_SRC_PITCH_OFFSET:
         s->src_offset_reg = (val & 0x1fffff) << 5;
         s->src_pitch_reg = (val & 0x7fe00000) >> 21;
+        s->src_pitch_bytes_reg = false;
         s->src_tile_reg = val >> 31;
         ati_r350_resolve_gui_context(s);
         break;
@@ -1864,6 +1895,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_DST_PITCH_OFFSET_C:
         s->dst_offset_reg = (val & 0x1fffff) << 5;
         s->dst_pitch_reg = (val & 0x7fe00000) >> 21;
+        s->dst_pitch_bytes_reg = false;
         s->dst_tile_reg = val >> 31;
         ati_r350_resolve_gui_context(s);
         break;
@@ -1935,6 +1967,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_SRC_PITCH:
         s->src_pitch_reg = val & 0x3fff;
         s->src_tile_reg = (val >> 16) & 1;
+        s->src_pitch_bytes_reg = true;
         ati_r350_resolve_gui_context(s);
         break;
     case R350_DP_BRUSH_BKGD_CLR:
@@ -2811,6 +2844,15 @@ static void ati_r350_pm4_run_ring(ATIR350State *s)
                     ati_r350_r300_draw_immd(s, s->r300_immd, count);
                 }
                 break;
+            case R300_PM4_OPCODE_DRAW_VBUF_2:
+                for (i = 0; i < count; i++) {
+                    uint32_t vbvf = ati_r350_pm4_read_ring(s);
+
+                    if (i == 0) {
+                        ati_r350_r300_draw_vbuf(s, vbvf);
+                    }
+                }
+                break;
             default:
                 trace_ati_r350_pm4_unimp(opcode, count);
                 for (i = 0; i < count; i++) {
@@ -2867,7 +2909,8 @@ static void ati_r350_pm4_parse(ATIR350State *s,
                 p->p3_opcode != R350_PM4_OPCODE_SCALING &&
                 p->p3_opcode != R300_PM4_OPCODE_NOP3 &&
                 p->p3_opcode != R300_PM4_OPCODE_LOAD_VBPNTR &&
-                p->p3_opcode != R300_PM4_OPCODE_DRAW_IMMD_2) {
+                p->p3_opcode != R300_PM4_OPCODE_DRAW_IMMD_2 &&
+                p->p3_opcode != R300_PM4_OPCODE_DRAW_VBUF_2) {
                 trace_ati_r350_pm4_unimp(p->p3_opcode, p->remaining);
             }
             break;
@@ -3133,6 +3176,10 @@ static void ati_r350_pm4_parse(ATIR350State *s,
                 s->r300_immd[p->p3_param_idx] = val;
             }
             p->p3_param_idx++;
+            break;
+        case R300_PM4_OPCODE_DRAW_VBUF_2:
+            /* single payload dword: VAP_VF_CNTL for an AOS-array draw */
+            ati_r350_r300_draw_vbuf(s, val);
             break;
         default:
             /*

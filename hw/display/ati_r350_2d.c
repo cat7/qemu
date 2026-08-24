@@ -53,7 +53,21 @@ static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
     unsigned xr;
 
-    if (x < 0 || y < 0 || addr + bpp / 8 > ATI_R350_VRAM_SIZE) {
+    if (x < 0 || y < 0) {
+        return 0;
+    }
+    if (addr + bpp / 8 > ATI_R350_VRAM_SIZE) {
+        /*
+         * Card address outside VRAM: the engine is a bus master, so
+         * fetch through the MC/GART. This is OS X's texture page-in --
+         * a plain SRCCOPY BITBLT whose source pitch/offset point at
+         * GART-resident window backing (srcoff 0x100xxxxx). The CPU
+         * wrote those pixels big-endian with no aperture swapper in
+         * the way, so swap the little-endian DMA read back.
+         */
+        if (bpp == 32 && !(addr & 3)) {
+            return bswap32(ati_r350_mc_read32(s, addr));
+        }
         return 0;
     }
     xr = ati_r350_vram_xor(s, addr);
@@ -279,8 +293,8 @@ static void ati_r350_2d_do_blt(ATIR350State *s)
      * pixels compressed every blit 8x vertically into a self-overlapping
      * smear -- the striped-band garbled desktop.
      */
-    dst_stride = s->dst_pitch * bpp;
-    src_stride = s->src_pitch * bpp;
+    dst_stride = s->dst_pitch_bytes ? s->dst_pitch : s->dst_pitch * bpp;
+    src_stride = s->src_pitch_bytes ? s->src_pitch : s->src_pitch * bpp;
     if (!dst_stride) {
         return;
     }

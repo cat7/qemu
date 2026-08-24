@@ -338,6 +338,16 @@ struct ATIR350State {
      */
     uint32_t src_offset_reg, src_pitch_reg, src_tile_reg;
     uint32_t dst_offset_reg, dst_pitch_reg, dst_tile_reg;
+    /*
+     * Radeon's standalone SRC_PITCH/DST_PITCH registers count BYTES;
+     * the packed *_PITCH_OFFSET registers keep the Rage 128 8-pixel
+     * unit. Track which flavour each side's live value came from so
+     * the engine applies the right stride (OS X pages textures in
+     * through byte-pitch blits; treating those as 8-pixel units
+     * shredded every window into 32x-spaced slices).
+     */
+    bool src_pitch_bytes_reg, dst_pitch_bytes_reg;
+    bool src_pitch_bytes, dst_pitch_bytes;
     int32_t sc_top_reg, sc_left_reg, sc_bottom_reg, sc_right_reg;
     int32_t src_sc_bottom_reg, src_sc_right_reg;
 
@@ -402,6 +412,19 @@ struct ATIR350State {
     uint32_t host_data_acc[4];
 
     /*
+     * Vertex-program constant RAM as uploaded through
+     * VAP_PVS_UPLOAD_ADDRESS/DATA at the constant base (0x200). The
+     * OS X blit vertex shader is a plain matrix multiply: rows 0-3 of
+     * the 4x4 position matrix live in the first four vec4 constants,
+     * and every non-bypass draw runs positions through it plus the
+     * SE_VPORT transform.
+     */
+    uint32_t pvs_upload_addr;
+    uint32_t pvs_upload_cnt;
+    uint32_t pvs_const[32];
+    uint32_t pvs_const_dwords;
+
+    /*
      * Staging buffer for an in-flight R300 3D_DRAW_IMMD_2 payload
      * (VAP_VF_CNTL + inline vertices). Scratch state only: a packet
      * split across a migration is lost, like the 2D host-data
@@ -416,6 +439,7 @@ const char *ati_r350_reg_name(uint32_t base);
 
 /* ati_r350_3d.c */
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
+void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
 
 /* ati_r350.c MC-window translation, shared with the engines */
 bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr, uint32_t *off);
