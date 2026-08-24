@@ -47,6 +47,18 @@
  * UniNorth cannot place the aperture anywhere but bus address 0, and
  * Mac OS duly writes 0 -- but honour whatever it writes rather than
  * assuming, so a guest that does something else still works.
+ *
+ * The base is only 256MB-granular (AppleMacRiscAGP writes
+ * agpBaseIndex << 28), and the decode is correspondingly coarse: the
+ * whole 256MB slot belongs to the aperture, with a smaller aperture
+ * mirrored through it. OS X's Radeon driver depends on this: it
+ * programs the CP's read-pointer/scratch write-back addresses as
+ * fb_top + GART offset (card 0x08000000+, one aperture-length past
+ * the 128MB aperture's bus base of 0), so the write-back only reaches
+ * the driver's status page through the wrap. Decoding the aperture's
+ * exact byte range instead sent those write-backs to raw physical
+ * 0x08000000 and the driver hung waiting on a read pointer that never
+ * advanced (wait_for_rb_space: "Have 0, need 5").
  */
 #define TYPE_UNIN_AGP_IOMMU_MEMORY_REGION "unin-agp-iommu-memory-region"
 
@@ -84,13 +96,16 @@ static IOMMUTLBEntry unin_agp_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
      * an AGP master's ordinary DMA is not translated, only the window
      * the GART describes is.
      */
+    hwaddr slot = s->agp_base & 0xf0000000ULL;
+    hwaddr slot_len = MAX(apsize, 0x10000000ULL);
+
     if (!(s->gart_ctrl & UNIN_GART_CTRL_ENABLE) || !entries ||
-        addr < s->agp_base || addr - s->agp_base >= apsize) {
+        addr < slot || addr - slot >= slot_len) {
         return ret;
     }
 
     table = s->gart_base & ~(hwaddr)UNIN_GART_PAGE_MASK;
-    offset = (addr - s->agp_base) >> 12;
+    offset = ((addr - slot) % apsize) >> 12;
     address_space_read(&address_space_memory, table + offset * 4,
                        MEMTXATTRS_UNSPECIFIED, &entry, sizeof(entry));
     /*
