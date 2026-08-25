@@ -25,7 +25,7 @@ system_ss.add(when: 'CONFIG_VMWARE_VGA', if_true: files('vmware_vga.c'))
 system_ss.add(when: 'CONFIG_BOCHS_DISPLAY', if_true: files('bochs-display.c'))
 system_ss.add(when: 'CONFIG_ATI_MACH64', if_true: files('ati_mach64.c', 'ati_mach64_2d.c', 'ati_mach64_dbg.c'))
 system_ss.add(when: 'CONFIG_ATI_RAGE128', if_true: files('ati_rage128.c', 'ati_rage128_2d.c', 'ati_rage128_dbg.c'))
-system_ss.add(when: 'CONFIG_ATI_R350', if_true: files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c'))
+system_ss.add(when: 'CONFIG_ATI_R350', if_true: files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c'))
 
 system_ss.add(when: 'CONFIG_EXYNOS4', if_true: files('exynos4210_fimd.c'))
 system_ss.add(when: 'CONFIG_FRAMEBUFFER', if_true: files('framebuffer.c'))

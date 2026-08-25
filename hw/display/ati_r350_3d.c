@@ -37,6 +37,12 @@ typedef struct R300DrawState {
     int cr[4][4];                     /* cliprects: x0,y0,x1,y1 (BR excl) */
     bool xform;             /* run positions through PVS matrix + viewport */
     float mat[16];          /* row-major position matrix (PVS consts 0-3) */
+    R300PvsProgram vs;      /* the vertex program in force, if any */
+    bool vs_run;            /* consume it: it is uploaded and not bypassed */
+    bool vs_color;          /* take the per-vertex colour from its output */
+    unsigned vs_color_out;  /* which output register that colour is */
+    unsigned attr_size[4];  /* dwords each input register takes per vertex */
+    unsigned attr_count;
     float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
@@ -401,19 +407,27 @@ static const float r300_vtx_nowhere = -32768.0f;
  * geometry tens of thousands of pixels outside the render target and
  * filling the window with streaks.
  */
-static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v)
+static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v,
+                           const float *clip)
 {
     float cx, cy, cw;
 
     if (!d->xform) {
         return;
     }
-    cx = d->mat[0] * v->x + d->mat[1] * v->y +
-         d->mat[2] * v->z + d->mat[3] * v->w;
-    cy = d->mat[4] * v->x + d->mat[5] * v->y +
-         d->mat[6] * v->z + d->mat[7] * v->w;
-    cw = d->mat[12] * v->x + d->mat[13] * v->y +
-         d->mat[14] * v->z + d->mat[15] * v->w;
+    if (clip) {
+        /* the vertex program computed this position itself */
+        cx = clip[0];
+        cy = clip[1];
+        cw = clip[3];
+    } else {
+        cx = d->mat[0] * v->x + d->mat[1] * v->y +
+             d->mat[2] * v->z + d->mat[3] * v->w;
+        cy = d->mat[4] * v->x + d->mat[5] * v->y +
+             d->mat[6] * v->z + d->mat[7] * v->w;
+        cw = d->mat[12] * v->x + d->mat[13] * v->y +
+             d->mat[14] * v->z + d->mat[15] * v->w;
+    }
     /*
      * Nothing here clips against the w = 0 plane, so a vertex level with
      * or behind the eye has no screen position to compute. Refuse the
@@ -478,6 +492,135 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
         v->s = r300_f32(dw[4]);
         v->t = r300_f32(dw[5]);
     }
+}
+
+/*
+ * One of the vertex program's input registers, read out of this vertex.
+ *
+ * There is no VAP_INPUT_ROUTE decoding here and none is wanted: for an
+ * array (VBUF) draw the bound arrays are the layout -- array 0 lands in
+ * in[0], array 1 in in[1], and so on -- and an inline (IMMD) vertex has no
+ * array boundaries at all, so its dwords fill the input registers four at
+ * a time. Components a vertex does not supply keep the (0,0,0,1) default,
+ * which is what lets a three-dword model-space position meet a 4x4 matrix
+ * and still pick up its translation column.
+ */
+static void r300_vs_input(const R300DrawState *d, const uint32_t *dw,
+                          unsigned idx, float out[4])
+{
+    unsigned off = 0, c;
+
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    if (idx >= d->attr_count) {
+        return;
+    }
+    for (c = 0; c < idx; c++) {
+        off += d->attr_size[c];
+    }
+    for (c = 0; c < d->attr_size[idx] && c < 4; c++) {
+        out[c] = r300_f32(dw[off + c]);
+    }
+}
+
+/*
+ * A colour the program only forwards from an attribute is a colour only
+ * if the vertex actually carries that attribute. Missing ones read as the
+ * (0,0,0,1) default, and painting with it turns a draw opaque black --
+ * which is exactly what a three-dword point sprite compositing a window
+ * would become, since its one attribute is the position.
+ */
+static bool r300_vs_has_color(const R300DrawState *d)
+{
+    int src = d->vs.out_src[d->vs_color_out];
+
+    return d->vs_color && (src < 0 || (unsigned)src < d->attr_count);
+}
+
+static void r300_vs_color(R300Vtx *v, const float c[4])
+{
+    if (!isfinite(c[0]) || !isfinite(c[1]) ||
+        !isfinite(c[2]) || !isfinite(c[3])) {
+        return;
+    }
+    v->r = c[0];
+    v->g = c[1];
+    v->b = c[2];
+    v->a = c[3];
+}
+
+/*
+ * Run the vertex program for this vertex, as far as this model consumes
+ * it: the clip-space position, and the colour the rasterizer interpolates.
+ *
+ * The colour is the point of it. Chess.app's board arrives as a position
+ * and a normal and carries no colour of its own; the shade of a square is
+ * a lighting term its program computes and writes to the first colour
+ * output, so without running the program the board is drawn in whatever
+ * the fragment stage's constant happens to be. Texture coordinates stay on
+ * the attribute path -- the model interpolates those from the vertex, and
+ * the programs here compute them with a matrix that is the identity
+ * against a pixel-space sampler.
+ *
+ * Returns true when `clip` holds a position the program computed. A
+ * program that is exactly the 4x4 matrix the fixed path already applies
+ * returns false and leaves the position to it: the arithmetic is the same
+ * four dot products either way, and the desktop's every draw is that
+ * program.
+ */
+static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
+                        const uint32_t *dw, R300Vtx *v, float clip[4])
+{
+    R300PvsRegs r;
+    R300PvsGaps g;
+    unsigned a;
+
+    if (d->vs.plain_matrix) {
+        int src = d->vs.out_src[d->vs_color_out];
+        float col[4];
+
+        /*
+         * Its position is the matrix the caller already has; its colour,
+         * if it emits one at all, is an attribute forwarded unchanged.
+         */
+        if (src >= 0 && r300_vs_has_color(d)) {
+            r300_vs_input(d, dw, src, col);
+            r300_vs_color(v, col);
+        }
+        return false;
+    }
+
+    memset(&r, 0, sizeof(r));
+    for (a = 0; a < R300_PVS_IN_REGS; a++) {
+        r.in[a][3] = 1.0f;
+    }
+    for (a = 0; a < d->attr_count; a++) {
+        r300_vs_input(d, dw, a, r.in[a]);
+    }
+    memset(&g, 0, sizeof(g));
+    r300_pvs_run(&d->vs, &r, &g);
+    if (g.has_vec_op) {
+        ati_r350_note_gap(s, R350_GAP_VS_VECTOR_OP, g.vec_op);
+    }
+    if (g.has_math_op) {
+        ati_r350_note_gap(s, R350_GAP_VS_MATH_OP, g.math_op);
+    }
+    if (g.has_dst_file) {
+        ati_r350_note_gap(s, R350_GAP_VS_DST_FILE, g.dst_file);
+    }
+
+    if ((r.out_written & (1u << d->vs_color_out)) && r300_vs_has_color(d)) {
+        r300_vs_color(v, r.out[d->vs_color_out]);
+    }
+    if (!(r.out_written & 1)) {
+        /*
+         * A program that never wrote the position leaves nothing to
+         * transform; the matrix is a better answer than out[0]'s zeroes.
+         */
+        return false;
+    }
+    memcpy(clip, r.out[0], sizeof(r.out[0]));
+    return true;
 }
 
 /*
@@ -671,41 +814,75 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     }
 
     d->xform = false;
+    d->vs_run = false;
+    d->vs_color = false;
+    memset(&d->vs, 0, sizeof(d->vs));
     if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
         s->pvs_const_dwords >= 16) {
         int k;
         float xs = r300_f32(s->regs[R300_SE_VPORT_XSCALE >> 2]);
 
         if (xs != 0.0f) {
+            unsigned first_color, ncolor, first_tex, cb;
+
+            /*
+             * What the program in force is, and whether it is the plain
+             * 4x4 matrix the desktop is painted with. Deciding this per
+             * draw from the control registers -- not from how much has
+             * ever been uploaded -- is what makes the result independent
+             * of what ran before: an earlier attempt at this took the
+             * bounds from a high-water mark of the upload stream, and the
+             * same draw then rendered differently according to its
+             * history.
+             */
+            r300_pvs_out_layout(s->regs[R300_VAP_OUTPUT_VTX_FMT_0 >> 2],
+                                &first_color, &ncolor, &first_tex);
+            r300_pvs_analyse(&d->vs, s->pvs_code, s->pvs_code_slot_valid,
+                             R300_PVS_CODE_SLOTS,
+                             s->pvs_const, R300_PVS_CONST_SLOTS,
+                             s->regs[R300_VAP_PVS_CODE_CNTL_0 >> 2],
+                             s->regs[R300_VAP_PVS_CONST_CNTL >> 2],
+                             first_tex);
+            cb = d->vs.valid ? d->vs.cbase * 4 : 0;
+            if (cb + 16 > ARRAY_SIZE(s->pvs_const)) {
+                cb = 0;
+            }
             for (k = 0; k < 16; k++) {
-                d->mat[k] = r300_f32(s->pvs_const[k]);
+                d->mat[k] = r300_f32(s->pvs_const[cb + k]);
             }
             for (k = 0; k < 6; k++) {
                 d->vp[k] = r300_f32(s->regs[(R300_SE_VPORT_XSCALE >> 2) + k]);
             }
             d->xform = true;
+            d->vs_run = d->vs.valid;
+            d->vs_color_out = first_color;
+            /*
+             * The colour is the program's only when the vertex stage says
+             * it emits one and the program really writes it. A colour it
+             * merely forwards from an attribute this model is already
+             * sampling as texture coordinates is not a colour at all --
+             * the eight-dword textured vertices whose second attribute is
+             * a coordinate pair would otherwise arrive painted with it.
+             */
+            if (d->vs_run && ncolor &&
+                (d->vs.out_mask & (1u << first_color))) {
+                int src = d->vs.out_src[first_color];
+                bool computed = !d->vs.plain_matrix || src >= 0;
+                bool is_texcoord = d->textured && src >= 0 &&
+                                   (unsigned)src == (vsize >= 12 ? 2u : 1u);
+
+                d->vs_color = computed && !is_texcoord;
+            }
         }
     }
     /*
-     * Positions for this draw are whatever the uploaded vertex program
-     * computes, and nothing here executes one: the matrix above is the
-     * driver's own blit shader recovered from constants 0-3, which is
-     * the right answer only while that is the program in force. An
-     * application with a vertex program of its own -- Chess's board, and
-     * any GL scene -- has object-space coordinates rasterized as though
-     * they were screen ones, landing the geometry tens of thousands of
-     * pixels outside the render target.
-     *
-     * Which of the two a given draw got cannot be told apart from here
-     * without running the program: an application's own shader loads a
-     * full constant set exactly like the driver's, so it takes the same
-     * approximation and merely gets a wrong answer from it. The count is
-     * therefore of draws standing on that approximation, not of draws
-     * known to be wrong -- measured against the desktop's steady rate it
-     * still says plainly when something is leaning on it much harder.
+     * A draw whose program this model will not execute -- the bounds name
+     * instruction slots the guest has not uploaded -- still runs, on the
+     * matrix, and is still counted: that is the one case left where the
+     * position is an approximation rather than the program's own answer.
      */
     if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
-        s->pvs_code_dwords) {
+        s->pvs_code_dwords && !d->vs_run) {
         ati_r350_note_gap(s, R350_GAP_VTX_PROGRAM, 0);
     }
     /*
@@ -949,12 +1126,28 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
     trace_ati_r350_3d_draw(prim, nvtx, vsize, d.dst_off, d.dst_pitch,
                            d.textured, d.blend, d.tex_off);
 
+    /*
+     * Inline vertices have no array boundaries, so the vertex program's
+     * input registers take four dwords each in submission order.
+     */
+    for (i = 0; i < ARRAY_SIZE(d.attr_size) && i * 4 < vsize; i++) {
+        d.attr_size[i] = MIN(vsize - i * 4, 4u);
+    }
+    d.attr_count = i;
+
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
 
         for (i = 0; i < nvtx; i++) {
-            r300_load_vtx(&d, &dw[1 + i * vsize], vsize, vsize, &vb[i]);
-            r300_xform_vtx(&d, &vb[i]);
+            const uint32_t *vd = &dw[1 + i * vsize];
+            float clip[4];
+
+            r300_load_vtx(&d, vd, vsize, vsize, &vb[i]);
+            if (d.vs_run && r300_vs_vtx(s, &d, vd, &vb[i], clip)) {
+                r300_xform_vtx(&d, &vb[i], clip);
+            } else {
+                r300_xform_vtx(&d, &vb[i], NULL);
+            }
         }
         r300_run_prims(s, &d, vb, nvtx, prim);
     }
@@ -1033,6 +1226,11 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
     trace_ati_r350_3d_draw(prim, nvtx, vsize, d.dst_off, d.dst_pitch,
                            d.textured, d.blend, d.tex_off);
 
+    /* one vertex-program input register per bound array, in array order */
+    d.attr_size[0] = size[0];
+    d.attr_size[1] = size[1];
+    d.attr_count = size[1] ? 2 : 1;
+
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
         uint32_t dw[16];
@@ -1075,7 +1273,15 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                 }
             }
             r300_load_vtx(&d, dw, vsize, size[0], &vb[i]);
-            r300_xform_vtx(&d, &vb[i]);
+            if (d.vs_run) {
+                float clip[4];
+
+                if (r300_vs_vtx(s, &d, dw, &vb[i], clip)) {
+                    r300_xform_vtx(&d, &vb[i], clip);
+                    continue;
+                }
+            }
+            r300_xform_vtx(&d, &vb[i], NULL);
         }
         trace_ati_r350_3d_vbuf_vtx((int32_t)(r300_f32(dw[0]) * 1000),
                                    (int32_t)(r300_f32(dw[1]) * 1000),

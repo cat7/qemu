@@ -1848,11 +1848,25 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
                     s->pvs_const_dwords = idx + 1;
                 }
             }
-            s->pvs_upload_cnt++;
         } else {
-            /* vertex program instructions -- recorded, not executed */
+            /*
+             * Program instructions, four dwords to a slot. A slot counts
+             * as the guest's only once its last dword has arrived: a
+             * half-written one holds a mixture of two programs, and the
+             * interpreter has to be able to refuse to run it.
+             */
+            unsigned idx = s->pvs_upload_addr * 4 + s->pvs_upload_cnt;
+
+            if (idx < ARRAY_SIZE(s->pvs_code)) {
+                s->pvs_code[idx] = val;
+                if ((idx & 3) == 3) {
+                    s->pvs_code_slot_valid[(idx / 4) / 32] |=
+                        1u << ((idx / 4) % 32);
+                }
+            }
             s->pvs_code_dwords++;
         }
+        s->pvs_upload_cnt++;
         break;
     case R350_MC_IND_INDEX:
         s->regs[base >> 2] = val;
@@ -3802,6 +3816,9 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_BLEND_FACTOR] = "blend factor",
     [R350_GAP_VTX_PROGRAM]  = "vertex program",
     [R350_GAP_DEST_OFF_VRAM] = "destination outside VRAM",
+    [R350_GAP_VS_VECTOR_OP] = "vertex vector opcode",
+    [R350_GAP_VS_MATH_OP]   = "vertex math opcode",
+    [R350_GAP_VS_DST_FILE]  = "vertex destination file",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)

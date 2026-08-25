@@ -950,6 +950,23 @@
  */
 #define R300_PVS_CONST_START          0x200
 #define R300_VAP_PVS_UPLOAD_DATA      0x2208
+/*
+ * Which instruction slots the program in force occupies (FIRST [9:0],
+ * LAST [29:20]) and where its constants begin (CONST_BASE_OFFSET [7:0],
+ * MAX_CONST_ADDR [23:16]). Both files are RAM the guest overwrites in
+ * place, so these -- not how much has ever been uploaded -- are what say
+ * which of their contents belong to the current program.
+ */
+#define R300_VAP_PVS_CODE_CNTL_0      0x22d0
+#define R300_VAP_PVS_CONST_CNTL       0x22d4
+/*
+ * What the vertex stage emits: bit 0 the position, bits 1-4 the colours.
+ * The outputs are packed in that order, so out[1] is the first colour
+ * whenever a position is emitted -- which is how a program's lighting
+ * result is found without decoding the rasterizer's interpolator routing.
+ */
+#define R300_VAP_OUTPUT_VTX_FMT_0     0x2090
+#define R300_VAP_OUTPUT_VTX_FMT_1     0x2094
 #define R300_VAP_CNTL_STATUS          0x2140
 #define R300_VAP_VC_SWAP              0x00000003
 #define R300_VAP_VC_SWAP_16BIT        1

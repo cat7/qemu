@@ -31,6 +31,7 @@
 #include "hw/i2c/bitbang_i2c.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "ati_r350_pvs.h"
 
 #define PCI_VENDOR_ID_ATI              0x1002
 /*
@@ -83,6 +84,9 @@ typedef enum ATIR350GapKind {
     R350_GAP_BLEND_FACTOR,   /* RB3D_BLENDCNTL src/dst factor code */
     R350_GAP_VTX_PROGRAM,    /* draw needs a vertex program we don't run */
     R350_GAP_DEST_OFF_VRAM,  /* work discarded: destination outside VRAM */
+    R350_GAP_VS_VECTOR_OP,   /* PVS vector-engine opcode not implemented */
+    R350_GAP_VS_MATH_OP,     /* PVS math-engine opcode not implemented */
+    R350_GAP_VS_DST_FILE,    /* PVS destination register file not modelled */
     R350_GAP_MAX
 } ATIR350GapKind;
 
@@ -435,26 +439,21 @@ struct ATIR350State {
     uint32_t host_data_acc[4];
 
     /*
-     * Vertex-program constant RAM as uploaded through
-     * VAP_PVS_UPLOAD_ADDRESS/DATA at the constant base (0x200). The
-     * OS X blit vertex shader is a plain matrix multiply: rows 0-3 of
-     * the 4x4 position matrix live in the first four vec4 constants,
-     * and every non-bypass draw runs positions through it plus the
-     * SE_VPORT transform.
+     * Vertex-program RAM as uploaded through VAP_PVS_UPLOAD_ADDRESS/DATA.
+     * It is one flat vector-indexed address space: vectors below
+     * R300_PVS_CONST_START are program instructions, four dwords each,
+     * and from there up they are the constant file. Neither is ever
+     * cleared, so `pvs_code_slot_valid` remembers which instruction slots
+     * the guest has actually written -- the control registers alone would
+     * happily point at whatever a previous program left behind.
      */
     uint32_t pvs_upload_addr;
     uint32_t pvs_upload_cnt;
-    uint32_t pvs_const[32];
+    uint32_t pvs_const[R300_PVS_CONST_SLOTS * 4];
     uint32_t pvs_const_dwords;
-    /*
-     * Dwords the guest has uploaded to the vertex program's CODE region
-     * (upload addresses below R300_PVS_CONST_START). Nothing executes
-     * them -- the position transform below approximates the driver's own
-     * blit shader with constants 0-3 -- so this exists to tell the two
-     * cases apart: a draw that bypasses the vertex program is rendered
-     * exactly, while one that doesn't is only as right as that
-     * approximation happens to be.
-     */
+    uint32_t pvs_code[R300_PVS_CODE_SLOTS * 4];
+    uint32_t pvs_code_slot_valid[R300_PVS_CODE_SLOTS / 32];
+    /* dwords ever uploaded to the code region: is there a program at all */
     uint32_t pvs_code_dwords;
 
     /*
