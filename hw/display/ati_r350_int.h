@@ -82,6 +82,7 @@ typedef enum ATIR350GapKind {
     R350_GAP_TEX_FORMAT,     /* TX_FORMAT1 texel format code */
     R350_GAP_BLEND_FACTOR,   /* RB3D_BLENDCNTL src/dst factor code */
     R350_GAP_VTX_PROGRAM,    /* draw needs a vertex program we don't run */
+    R350_GAP_DEST_OFF_VRAM,  /* work discarded: destination outside VRAM */
     R350_GAP_MAX
 } ATIR350GapKind;
 

@@ -486,7 +486,14 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     d->vram = memory_region_get_ram_ptr(&s->vram);
     if (!ati_r350_mc_to_vram(s, s->regs[R300_RB3D_COLOROFFSET0 >> 2] & ~0x1fu,
                              &d->dst_off)) {
-        /* colour buffer outside VRAM -- nothing we can show anyway */
+        /*
+         * Colour buffer outside VRAM. Nothing here can render into it,
+         * but say so rather than dropping the draw without a word: a
+         * guest that composes somewhere we refuse to follow looks
+         * exactly like a guest that never drew at all, and the two need
+         * telling apart.
+         */
+        ati_r350_note_gap(s, R350_GAP_DEST_OFF_VRAM, 0);
         return false;
     }
     d->dst_pitch = (colorpitch & 0x3fff) * 4;

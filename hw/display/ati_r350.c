@@ -3306,6 +3306,7 @@ static void ati_r350_cursor_apply(ATIR350State *s)
         return;
     }
     if ((uint64_t)vram_off + R350_CUR_IMAGE_BYTES > ATI_R350_VRAM_SIZE) {
+        ati_r350_note_gap(s, R350_GAP_DEST_OFF_VRAM, 1);
         return;
     }
     src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + vram_off;
@@ -3710,6 +3711,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_TEX_FORMAT]   = "texture format",
     [R350_GAP_BLEND_FACTOR] = "blend factor",
     [R350_GAP_VTX_PROGRAM]  = "vertex program",
+    [R350_GAP_DEST_OFF_VRAM] = "destination outside VRAM",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
