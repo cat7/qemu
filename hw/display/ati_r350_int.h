@@ -81,6 +81,9 @@ typedef enum ATIR350GapKind {
     R350_GAP_VTX_WALK,       /* VAP_VF_CNTL vertex walk mode */
     R350_GAP_TEX_FORMAT,     /* TX_FORMAT1 texel format code */
     R350_GAP_BLEND_FACTOR,   /* RB3D_BLENDCNTL src/dst factor code */
+    R350_GAP_VS_VECTOR_OP,   /* vertex program vector-engine opcode */
+    R350_GAP_VS_MATH_OP,     /* vertex program math-engine opcode */
+    R350_GAP_VS_DST_FILE,    /* vertex program destination register file */
     R350_GAP_MAX
 } ATIR350GapKind;
 
@@ -433,16 +436,23 @@ struct ATIR350State {
     uint32_t host_data_acc[4];
 
     /*
-     * Vertex-program constant RAM as uploaded through
-     * VAP_PVS_UPLOAD_ADDRESS/DATA at the constant base (0x200). The
-     * OS X blit vertex shader is a plain matrix multiply: rows 0-3 of
-     * the 4x4 position matrix live in the first four vec4 constants,
-     * and every non-bypass draw runs positions through it plus the
-     * SE_VPORT transform.
+     * Vertex-program RAM, written through VAP_PVS_UPLOAD_ADDRESS/DATA.
+     * One flat address space: vec4 slots below R300_PVS_CONST_START
+     * hold instructions (four dwords each), slots from there up hold
+     * the constant file.
+     *
+     * The OS X blit shader is a plain matrix multiply -- four
+     * DOT_PRODUCTs of constants 0-3 against the input position -- so
+     * the desktop rendered correctly for a long time on nothing but a
+     * hardcoded 4x4 matrix. Real GL programs are not that shape:
+     * Chess.app alone uploads seven distinct programs, up to 30
+     * instructions.
      */
     uint32_t pvs_upload_addr;
     uint32_t pvs_upload_cnt;
-    uint32_t pvs_const[32];
+    uint32_t pvs_code[256 * 4];    /* R300_PVS_MAX_CODE_DWORDS */
+    uint32_t pvs_code_dwords;
+    uint32_t pvs_const[256 * 4];   /* R300_PVS_MAX_CONST_DWORDS */
     uint32_t pvs_const_dwords;
 
     /*

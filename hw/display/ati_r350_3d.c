@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include <math.h>
+#include <float.h>
 #include "hw/pci/pci_device.h"
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
@@ -377,17 +378,44 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     }
 }
 
-static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v)
+static bool r300_vs_position(ATIR350State *s, const uint32_t *dw,
+                             unsigned vsize, R300Vtx *v);
+
+/*
+ * Position from clip space to the destination surface. `ndc` already
+ * holds the program's (or the matrix's) output; the viewport scale and
+ * offset are the same either way.
+ */
+static void r300_viewport_vtx(const R300DrawState *d, R300Vtx *v,
+                              float ndcx, float ndcy)
 {
-    float ndcx, ndcy;
+    v->x = ndcx * d->vp[0] + d->vp[1];
+    v->y = ndcy * d->vp[2] + d->vp[3];
+}
+
+/*
+ * Run the uploaded vertex program for this vertex's position, falling
+ * back to the 4x4 matrix built from constants 0-3 when there is no
+ * program -- which is what OS X's blit shader amounts to anyway.
+ */
+static void r300_xform_vtx(ATIR350State *s, const R300DrawState *d,
+                           const uint32_t *dw, unsigned vsize, R300Vtx *v)
+{
+    R300Vtx p = *v;
 
     if (!d->xform) {
         return;
     }
-    ndcx = d->mat[0] * v->x + d->mat[1] * v->y + d->mat[2] * v->z + d->mat[3];
-    ndcy = d->mat[4] * v->x + d->mat[5] * v->y + d->mat[6] * v->z + d->mat[7];
-    v->x = ndcx * d->vp[0] + d->vp[1];
-    v->y = ndcy * d->vp[2] + d->vp[3];
+    if (r300_vs_position(s, dw, vsize, &p)) {
+        /* the program emits clip space; w divides through it */
+        float w = p.w != 0.0f ? p.w : 1.0f;
+
+        r300_viewport_vtx(d, v, p.x / w, p.y / w);
+        return;
+    }
+    r300_viewport_vtx(d, v,
+        d->mat[0] * v->x + d->mat[1] * v->y + d->mat[2] * v->z + d->mat[3],
+        d->mat[4] * v->x + d->mat[5] * v->y + d->mat[6] * v->z + d->mat[7]);
 }
 
 static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
@@ -635,6 +663,291 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
 }
 
 /*
+ * Vertex-program interpreter.
+ *
+ * The register files a program sees: 16 input vectors (the vertex's
+ * attributes, four dwords each in submission order), 16 outputs, and
+ * a temporary file. Only out[0] -- the clip-space position -- is
+ * consumed today; colour and texture coordinates still come from the
+ * fixed attribute layout, because which output carries them depends
+ * on the RS interpolator routing this model does not decode yet.
+ *
+ * Reading the position from the real program rather than assuming a
+ * matrix matters as soon as a program is not shaped like OS X's blit
+ * shader: Chess.app uploads seven, the longest 30 instructions.
+ */
+typedef struct R300VsRegs {
+    float in[16][4];
+    float out[16][4];
+    float tmp[32][4];
+} R300VsRegs;
+
+static void r300_vs_fetch_src(ATIR350State *s, const R300VsRegs *r,
+                              uint32_t dw, unsigned cbase, float out[4])
+{
+    unsigned type = dw & R300_PVS_SRC_REG_TYPE_MASK;
+    unsigned off = (dw >> R300_PVS_SRC_OFFSET_SHIFT) &
+                   R300_PVS_SRC_OFFSET_MASK;
+    float v[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    unsigned c;
+
+    switch (type) {
+    case R300_PVS_SRC_REG_INPUT:
+        memcpy(v, r->in[off % ARRAY_SIZE(r->in)], sizeof(v));
+        break;
+    case R300_PVS_SRC_REG_CONSTANT:
+    {
+        unsigned idx = (off + cbase) * 4;
+
+        for (c = 0; c < 4; c++) {
+            v[c] = idx + c < s->pvs_const_dwords ?
+                   r300_f32(s->pvs_const[idx + c]) : 0.0f;
+        }
+        break;
+    }
+    default:    /* temporary and alternate temporary share one file */
+        memcpy(v, r->tmp[off % ARRAY_SIZE(r->tmp)], sizeof(v));
+        break;
+    }
+
+    for (c = 0; c < 4; c++) {
+        unsigned sel = (dw >> (R300_PVS_SRC_SWIZZLE_SHIFT + 3 * c)) &
+                       R300_PVS_SRC_SWIZZLE_MASK;
+        float f = sel < 4 ? v[sel] : (sel == 4 ? 0.0f : 1.0f);
+
+        if (dw & R300_PVS_SRC_ABS) {
+            f = fabsf(f);
+        }
+        if ((dw >> (R300_PVS_SRC_MODIFIER_SHIFT + c)) & 1) {
+            f = -f;
+        }
+        out[c] = f;
+    }
+}
+
+static void r300_vs_run(ATIR350State *s, R300VsRegs *r)
+{
+    uint32_t cc = s->regs[R300_VAP_PVS_CODE_CNTL_0 >> 2];
+    unsigned first = cc & R300_PVS_INST_MASK;
+    unsigned last = (cc >> R300_PVS_LAST_INST_SHIFT) & R300_PVS_INST_MASK;
+    unsigned cbase = s->regs[R300_VAP_PVS_CONST_CNTL >> 2] &
+                     R300_PVS_CONST_BASE_MASK;
+    unsigned i, c;
+
+    for (i = first; i <= last && (i + 1) * 4 <= s->pvs_code_dwords; i++) {
+        const uint32_t *w = &s->pvs_code[i * 4];
+        uint32_t op = w[0];
+        unsigned opcode = op & R300_PVS_DST_OPCODE_MASK;
+        bool math = op & R300_PVS_DST_MATH_INST;
+        unsigned dtype = (op >> R300_PVS_DST_REG_TYPE_SHIFT) &
+                         R300_PVS_DST_REG_TYPE_MASK;
+        unsigned doff = (op >> R300_PVS_DST_OFFSET_SHIFT) &
+                        R300_PVS_DST_OFFSET_MASK;
+        unsigned we = (op >> R300_PVS_DST_WE_SHIFT) & 0xf;
+        float a[4], b[4], d[4], res[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float *dst;
+
+        r300_vs_fetch_src(s, r, w[1], cbase, a);
+        r300_vs_fetch_src(s, r, w[2], cbase, b);
+        r300_vs_fetch_src(s, r, w[3], cbase, d);
+
+        if (op & R300_PVS_DST_MACRO_INST) {
+            /* the two macro forms are a multiply-add pair */
+            for (c = 0; c < 4; c++) {
+                res[c] = a[c] * b[c] * (opcode ? 2.0f : 1.0f) + d[c];
+            }
+        } else if (math) {
+            float x = a[0], y = 0.0f;
+            bool replicate = true;
+
+            switch (opcode) {
+            case R300_ME_NO_OP:
+                continue;
+            case R300_ME_LIGHT_COEFF_DX:
+                /*
+                 * The lighting-coefficient instruction, the one math
+                 * opcode that yields a vector rather than a replicated
+                 * scalar: x holds N.L, y holds N.H and w the specular
+                 * exponent, and the result feeds a lighting term
+                 * directly. Chess.app runs it ~25k times a frame --
+                 * static disassembly of its programs finds only two
+                 * occurrences, so its weight only shows up in the
+                 * execution tally.
+                 */
+                res[0] = 1.0f;
+                res[1] = MAX(a[0], 0.0f);
+                res[2] = a[0] > 0.0f ?
+                         powf(MAX(a[1], 0.0f),
+                              MIN(MAX(a[3], -128.0f), 128.0f)) : 0.0f;
+                res[3] = 1.0f;
+                replicate = false;
+                break;
+            case R300_ME_RECIP_DX:
+            case R300_ME_RECIP_FF:
+                y = x != 0.0f ? 1.0f / x : 0.0f;
+                break;
+            case R300_ME_RECIP_SQRT_DX:
+            case R300_ME_RECIP_SQRT_FF:
+                y = x != 0.0f ? 1.0f / sqrtf(fabsf(x)) : 0.0f;
+                break;
+            case R300_ME_EXP_BASE2_DX:
+            case R300_ME_EXP_BASE2_FULL_DX:
+                y = exp2f(x);
+                break;
+            case R300_ME_LOG_BASE2_DX:
+            case R300_ME_LOG_BASE2_FULL_DX:
+                y = x > 0.0f ? log2f(x) : -FLT_MAX;
+                break;
+            case R300_ME_MULTIPLY:
+                y = x * b[0];
+                break;
+            case R300_ME_SIN:
+                y = sinf(x);
+                break;
+            case R300_ME_COS:
+                y = cosf(x);
+                break;
+            default:
+                ati_r350_note_gap(s, R350_GAP_VS_MATH_OP, opcode);
+                continue;
+            }
+            if (replicate) {
+                res[0] = res[1] = res[2] = res[3] = y;
+            }
+        } else {
+            switch (opcode) {
+            case R300_VE_NO_OP:
+                continue;
+            case R300_VE_DOT_PRODUCT:
+            {
+                float dp = a[0] * b[0] + a[1] * b[1] +
+                           a[2] * b[2] + a[3] * b[3];
+
+                res[0] = res[1] = res[2] = res[3] = dp;
+                break;
+            }
+            case R300_VE_MULTIPLY:
+            case R300_VE_MULTIPLY_CLAMP:
+                for (c = 0; c < 4; c++) {
+                    res[c] = a[c] * b[c];
+                    if (opcode == R300_VE_MULTIPLY_CLAMP) {
+                        res[c] = MIN(MAX(res[c], 0.0f), 1.0f);
+                    }
+                }
+                break;
+            case R300_VE_ADD:
+                for (c = 0; c < 4; c++) {
+                    res[c] = a[c] + b[c];
+                }
+                break;
+            case R300_VE_MULTIPLY_ADD:
+            case R300_VE_MULTIPLYX2_ADD:
+                for (c = 0; c < 4; c++) {
+                    res[c] = a[c] * b[c] *
+                             (opcode == R300_VE_MULTIPLYX2_ADD ? 2.0f : 1.0f) +
+                             d[c];
+                }
+                break;
+            case R300_VE_FRACTION:
+                for (c = 0; c < 4; c++) {
+                    res[c] = a[c] - floorf(a[c]);
+                }
+                break;
+            case R300_VE_MAXIMUM:
+                for (c = 0; c < 4; c++) {
+                    res[c] = MAX(a[c], b[c]);
+                }
+                break;
+            case R300_VE_MINIMUM:
+                for (c = 0; c < 4; c++) {
+                    res[c] = MIN(a[c], b[c]);
+                }
+                break;
+            case R300_VE_SET_GREATER_THAN_EQUAL:
+                for (c = 0; c < 4; c++) {
+                    res[c] = a[c] >= b[c] ? 1.0f : 0.0f;
+                }
+                break;
+            case R300_VE_SET_LESS_THAN:
+                for (c = 0; c < 4; c++) {
+                    res[c] = a[c] < b[c] ? 1.0f : 0.0f;
+                }
+                break;
+            case R300_VE_DISTANCE_VECTOR:
+                res[0] = 1.0f;
+                res[1] = a[1] * b[1];
+                res[2] = a[2];
+                res[3] = b[3];
+                break;
+            default:
+                ati_r350_note_gap(s, R350_GAP_VS_VECTOR_OP, opcode);
+                continue;
+            }
+        }
+
+        if (op & (math ? R300_PVS_DST_ME_SAT : R300_PVS_DST_VE_SAT)) {
+            for (c = 0; c < 4; c++) {
+                res[c] = MIN(MAX(res[c], 0.0f), 1.0f);
+            }
+        }
+
+        switch (dtype) {
+        case R300_PVS_DST_REG_OUT:
+        case R300_PVS_DST_REG_OUT_REPL_X:
+            dst = r->out[doff % ARRAY_SIZE(r->out)];
+            break;
+        case R300_PVS_DST_REG_TEMPORARY:
+        case R300_PVS_DST_REG_ALT_TEMP:
+            dst = r->tmp[doff % ARRAY_SIZE(r->tmp)];
+            break;
+        default:
+            /* the address register drives relative addressing we do
+             * not model; A0-writing programs would index constants
+             * wrongly rather than harmlessly, so say so */
+            ati_r350_note_gap(s, R350_GAP_VS_DST_FILE, dtype);
+            continue;
+        }
+        for (c = 0; c < 4; c++) {
+            if (we & (1u << c)) {
+                dst[c] = dtype == R300_PVS_DST_REG_OUT_REPL_X ? res[0] : res[c];
+            }
+        }
+    }
+}
+
+/*
+ * Transform one vertex's position with the uploaded program. Returns
+ * false when there is no usable program, leaving the caller on the
+ * matrix path.
+ */
+static bool r300_vs_position(ATIR350State *s, const uint32_t *dw,
+                             unsigned vsize, R300Vtx *v)
+{
+    R300VsRegs r;
+    unsigned i, c;
+
+    if (!s->pvs_code_dwords) {
+        return false;
+    }
+    memset(&r, 0, sizeof(r));
+    for (i = 0; i < ARRAY_SIZE(r.in) && (i + 1) * 4 <= vsize; i++) {
+        for (c = 0; c < 4; c++) {
+            r.in[i][c] = r300_f32(dw[i * 4 + c]);
+        }
+    }
+    /* a shorter final attribute still contributes what it has */
+    for (c = 0; i * 4 + c < vsize && c < 4; c++) {
+        r.in[i][c] = r300_f32(dw[i * 4 + c]);
+    }
+    r300_vs_run(s, &r);
+    v->x = r.out[0][0];
+    v->y = r.out[0][1];
+    v->z = r.out[0][2];
+    v->w = r.out[0][3];
+    return true;
+}
+
+/*
  * One line segment, expanded to a quad a pixel wide across its own
  * direction and handed to the triangle rasterizer so it picks up the
  * same texturing, blending and clipping as everything else.
@@ -833,7 +1146,7 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
 
         for (i = 0; i < nvtx; i++) {
             r300_load_vtx(&d, &dw[1 + i * vsize], vsize, &vb[i]);
-            r300_xform_vtx(&d, &vb[i]);
+            r300_xform_vtx(s, &d, &dw[1 + i * vsize], vsize, &vb[i]);
         }
         r300_run_prims(s, &d, vb, nvtx, prim);
     }
@@ -889,7 +1202,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                 }
             }
             r300_load_vtx(&d, dw, vsize, &vb[i]);
-            r300_xform_vtx(&d, &vb[i]);
+            r300_xform_vtx(s, &d, dw, vsize, &vb[i]);
         }
         trace_ati_r350_3d_vbuf_vtx((int32_t)(r300_f32(dw[0]) * 1000),
                                    (int32_t)(r300_f32(dw[1]) * 1000),

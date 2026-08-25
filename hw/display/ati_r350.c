@@ -1820,15 +1820,35 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         s->pvs_upload_cnt = 0;
         break;
     case R300_VAP_PVS_UPLOAD_DATA:
+    {
+        /*
+         * Dwords land at (selected vec4 slot * 4 + how many have
+         * arrived since the address was set), in the one flat space
+         * that holds instructions below R300_PVS_CONST_START and the
+         * constant file from there up.
+         */
+        uint32_t off = s->pvs_upload_addr * 4 + s->pvs_upload_cnt;
+
         s->regs[base >> 2] = val;
-        if (s->pvs_upload_addr == 0x200 &&
-            s->pvs_upload_cnt < ARRAY_SIZE(s->pvs_const)) {
-            s->pvs_const[s->pvs_upload_cnt] = val;
-            if (++s->pvs_upload_cnt > s->pvs_const_dwords) {
-                s->pvs_const_dwords = s->pvs_upload_cnt;
+        s->pvs_upload_cnt++;
+        if (s->pvs_upload_addr < R300_PVS_CONST_START) {
+            if (off < ARRAY_SIZE(s->pvs_code)) {
+                s->pvs_code[off] = val;
+                if (off + 1 > s->pvs_code_dwords) {
+                    s->pvs_code_dwords = off + 1;
+                }
+            }
+        } else {
+            off -= R300_PVS_CONST_START * 4;
+            if (off < ARRAY_SIZE(s->pvs_const)) {
+                s->pvs_const[off] = val;
+                if (off + 1 > s->pvs_const_dwords) {
+                    s->pvs_const_dwords = off + 1;
+                }
             }
         }
         break;
+    }
     case R350_MC_IND_INDEX:
         s->regs[base >> 2] = val;
         break;
@@ -3684,6 +3704,9 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_VTX_WALK]     = "vertex walk mode",
     [R350_GAP_TEX_FORMAT]   = "texture format",
     [R350_GAP_BLEND_FACTOR] = "blend factor",
+    [R350_GAP_VS_VECTOR_OP] = "vertex program vector opcode",
+    [R350_GAP_VS_MATH_OP]   = "vertex program math opcode",
+    [R350_GAP_VS_DST_FILE]  = "vertex program destination file",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
