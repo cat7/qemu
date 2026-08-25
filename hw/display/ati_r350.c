@@ -3743,6 +3743,65 @@ static char *ati_r350_get_gaps(Object *obj, Error **errp)
     return g_string_free(out, FALSE);
 }
 
+/*
+ * `scanout` property: which framebuffer the last refresh actually drew,
+ * and why. Read it from the monitor with
+ *   qom-get /machine/peripheral-anon/device[N] scanout
+ *
+ * A frozen or wrong-looking screen has two very different causes that
+ * look identical from outside: the guest stopped painting, or it kept
+ * painting somewhere we stopped looking. Only the second one involves
+ * the activity heuristic, and this says outright which happened --
+ * `source` names whoever chose the mode, and the CRTC's own registers
+ * are printed alongside the guess so a divergence is visible rather
+ * than inferred.
+ */
+static char *ati_r350_get_scanout(Object *obj, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+    int nblocks = ATI_R350_VRAM_SIZE / ATI_R350_FB_SCAN_BLOCK;
+    int i, cur = 0, best = 0, best_start = -1, run_start = -1, active = 0;
+    GString *out = g_string_new(NULL);
+
+    for (i = 0; i < nblocks; i++) {
+        if (s->fb_scan_activity[i] >= ATI_R350_FB_ACTIVITY_THRESH) {
+            active++;
+            if (run_start < 0) {
+                run_start = i;
+            }
+            if (++cur > best) {
+                best = cur;
+                best_start = run_start;
+            }
+        } else {
+            cur = 0;
+            run_start = -1;
+        }
+    }
+
+    g_string_append_printf(out,
+        "source: %s\n"
+        "drawn: %ux%u bpp=%u pitch=%u fb_offset=0x%x\n"
+        "crtc: %ux%u bpp=%u pitch=%u fb_offset=0x%x valid_seen=%d\n"
+        "crtc_offset_reg: 0x%x  crtc_pitch_reg: 0x%x  display_dis: %d\n"
+        "auto_fb: valid=%d %ux%u bpp=%u fb_offset=0x%x\n"
+        "activity: %d/%d blocks live, longest run %d blocks at 0x%x",
+        s->auto_fb_overriding ? "activity heuristic (CRTC overridden)"
+                              : "CRTC registers",
+        s->mode.width, s->mode.height, s->mode.bpp, s->mode.pitch,
+        s->mode.fb_offset,
+        s->crtc_mode.width, s->crtc_mode.height, s->crtc_mode.bpp,
+        s->crtc_mode.pitch, s->crtc_mode.fb_offset, s->have_valid_mode,
+        s->regs[R350_CRTC_OFFSET >> 2], s->regs[R350_CRTC_PITCH >> 2],
+        (s->regs[R350_CRTC_EXT_CNTL >> 2] & R350_CRTC_DISPLAY_DIS) != 0,
+        s->auto_fb_valid, s->auto_fb_mode.width, s->auto_fb_mode.height,
+        s->auto_fb_mode.bpp, s->auto_fb_mode.fb_offset,
+        active, nblocks, best,
+        best_start < 0 ? 0 : best_start * ATI_R350_FB_SCAN_BLOCK);
+
+    return g_string_free(out, FALSE);
+}
+
 static void ati_r350_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -3750,6 +3809,8 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     object_class_property_add_str(klass, "gaps", ati_r350_get_gaps, NULL);
+    object_class_property_add_str(klass, "scanout", ati_r350_get_scanout,
+                                  NULL);
 
     k->class_id  = PCI_CLASS_DISPLAY_VGA;
     k->vendor_id = PCI_VENDOR_ID_ATI;
