@@ -946,6 +946,20 @@
 #define R300_COLORMASK_ALPHA          (1u << 3)
 #define R300_RB3D_COLOROFFSET0        0x4e28
 #define R300_RB3D_COLORPITCH0         0x4e38
+/*
+ * Anti-aliasing resolve. With AARESOLVE_MODE set the colour buffer is
+ * the SOURCE of the draw, not its destination: the render backend
+ * filters the samples it already holds and writes the result to
+ * AARESOLVE_OFFSET, whose pitch is counted in PAIRS of pixels
+ * (AARESOLVE_PITCH is field [13:1]). A draw covering the viewport is
+ * how the resolve is kicked off. Chess ends every frame with one, and
+ * taking it for an ordinary draw painted the fragment colour over the
+ * whole scene it had just rendered.
+ */
+#define R300_RB3D_AARESOLVE_OFFSET    0x4e80
+#define R300_RB3D_AARESOLVE_PITCH     0x4e84
+#define R300_RB3D_AARESOLVE_CTL       0x4e88
+#define R300_AARESOLVE_MODE           (1u << 0)
 #define R300_PFS_PARAM_0_X            0x4c00
 #define R300_GA_POINT_S0              0x4200
 #define R300_GA_POINT_T0              0x4204

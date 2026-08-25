@@ -47,6 +47,9 @@ typedef struct R300DrawState {
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
     uint32_t wmask;         /* RB3D_COLOR_CHANNEL_MASK as an ARGB byte mask */
+    bool resolve;           /* colour buffer in AA-resolve mode */
+    uint32_t res_off;       /* the buffer being resolved FROM */
+    uint32_t res_pitch;
     bool textured;
     bool blend;
     bool blend_read;                   /* READ_ENABLE: may we read dst? */
@@ -266,6 +269,24 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 if (!((d->clip_rule >> idx) & 1)) {
                     continue;
                 }
+            }
+            if (d->resolve) {
+                /*
+                 * In resolve mode the fragment the shader produced is
+                 * not what lands: the colour buffer's own samples for
+                 * this pixel are filtered and written to the resolve
+                 * buffer. We rasterize one sample per pixel, so that
+                 * filter degenerates to a copy -- but a copy is still
+                 * the whole point of the pass, and writing the shaded
+                 * fragment instead destroys the source.
+                 */
+                uint32_t src = d->res_off + (uint32_t)y * d->res_pitch +
+                               (uint32_t)x * 4;
+
+                if (src + 4 <= ATI_R350_VRAM_SIZE) {
+                    r300_write_dst(s, d, x, y, ati_r350_vram_ld32(s, src));
+                }
+                continue;
             }
             cr = w0 * v0->r + w1 * v1->r + w2 * v2->r;
             cg = w0 * v0->g + w1 * v1->g + w2 * v2->g;
@@ -674,6 +695,34 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                    (cm & R300_COLORMASK_GREEN ? 0x0000ff00u : 0) |
                    (cm & R300_COLORMASK_BLUE  ? 0x000000ffu : 0);
     }
+    /*
+     * An AA resolve keeps rasterizing over the same geometry but sends
+     * the colour buffer's contents, not the shaded fragment, to the
+     * resolve buffer. Swap the destination here so scissor, cliprects
+     * and the write mask all keep applying unchanged.
+     */
+    d->resolve = s->regs[R300_RB3D_AARESOLVE_CTL >> 2] & R300_AARESOLVE_MODE;
+    d->res_off = 0;
+    d->res_pitch = 0;
+    if (d->resolve) {
+        uint32_t roff;
+        uint32_t rpitch = ((s->regs[R300_RB3D_AARESOLVE_PITCH >> 2] >> 1) &
+                           0x1fff) * 2 * 4;
+
+        if (!ati_r350_mc_to_vram(s,
+                                 s->regs[R300_RB3D_AARESOLVE_OFFSET >> 2] &
+                                 ~0x1fu, &roff)) {
+            ati_r350_note_gap(s, R350_GAP_DEST_OFF_VRAM, 0);
+            return false;
+        }
+        if (!rpitch) {
+            return false;
+        }
+        d->res_off = d->dst_off;
+        d->res_pitch = d->dst_pitch;
+        d->dst_off = roff;
+        d->dst_pitch = rpitch;
+    }
     d->textured = (s->regs[R300_TX_ENABLE >> 2] & 1) && vsize >= 8;
     /*
      * RB3D_BLENDCNTL (R5xx accel guide): bit 0 is ALPHA_BLEND_ENABLE,
@@ -923,11 +972,13 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->flat_r = d->flat_g = d->flat_b = d->flat_a = 1.0f;
     }
     /*
-     * Where this draw lands and which of its channels survive, read
-     * where the draw itself reads them: a post-hoc read of the mask
-     * says only what the last writer left behind.
+     * What the colour buffer was configured to do with this draw, read
+     * where the draw reads it. These three registers decide whether a
+     * draw lands at all, and a post-hoc read of them says only what the
+     * last writer left behind.
      */
-    trace_ati_r350_3d_cb(d->dst_off, d->dst_pitch, d->wmask);
+    trace_ati_r350_3d_cb(d->dst_off, d->dst_pitch, d->wmask, d->resolve,
+                         d->res_off, d->res_pitch);
     return true;
 }
 
