@@ -69,6 +69,7 @@ typedef struct R300DrawState {
     int tex_w, tex_h;
     uint32_t tex_pitch;     /* bytes per texel row */
     unsigned tex_bpp;       /* bits per texel: 8, 16 or 32 */
+    int tex_attr;           /* vertex attribute holding s,t; -1 = none */
     unsigned tex_sel[4];    /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t; /* TX_FILTER0 clamp modes (0 = repeat) */
     float flat_r, flat_g, flat_b, flat_a;
@@ -772,6 +773,38 @@ static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
     v->t = t * d->tex_h;
 }
 
+/*
+ * The texture coordinate of a vertex whose flat block holds none.
+ *
+ * r300_load_vtx() reads the coordinate at a fixed place -- the dwords
+ * after a four-dword position -- and gives up when the position
+ * attribute is narrower than that, because then those dwords belong to
+ * some other attribute. `tex_attr` is the way out where the vertex
+ * program names the attribute the coordinate really lives in: an
+ * output the program only FORWARDS is that attribute's own value, so
+ * it can be read straight from the vertex without running the
+ * interpreter, and it arrives normalised, exactly as it would out of
+ * the program (which is why it goes through r300_vs_texcoord()).
+ *
+ * Flurry.saver is the case this buys: three bound arrays holding a
+ * two-dword screen position, an RGBA colour and a two-dword
+ * coordinate. Every one of its content draws sampled texel (0,0) for
+ * every pixel of the screen.
+ */
+static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
+                               unsigned pos, R300Vtx *v)
+{
+    float c[4];
+
+    if (pos >= 4 || d->tex_attr < 0 ||
+        (unsigned)d->tex_attr >= d->attr_count ||
+        d->attr_size[d->tex_attr] < 2) {
+        return;
+    }
+    r300_vs_input(d, dw, (unsigned)d->tex_attr, c);
+    r300_vs_texcoord(d, v, c);
+}
+
 static void r300_vs_color(R300Vtx *v, const float c[4])
 {
     if (!isfinite(c[0]) || !isfinite(c[1]) ||
@@ -1117,6 +1150,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     d->vs_color = false;
     d->vs_texcoord = false;
     d->vs_tex_out = 0;
+    d->tex_attr = -1;
     memset(&d->vs, 0, sizeof(d->vs));
     if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
         s->pvs_const_dwords >= 16) {
@@ -1187,6 +1221,20 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                              d->textured && first_tex < R300_PVS_OUT_REGS &&
                              (d->vs.out_mask & (1u << first_tex));
             d->vs_tex_out = first_tex;
+            /*
+             * Where the coordinate lives in the vertex, for the vertices
+             * whose flat block does not hold one -- see
+             * r300_attr_texcoord(). Only a FORWARDED output names an
+             * attribute; the compositor's blit program multiplies its
+             * coordinate by a texture matrix instead, so out_src is -1
+             * for every draw the desktop is painted with and this is a
+             * no-op there by construction.
+             */
+            if (d->textured && d->vs.valid &&
+                first_tex < R300_PVS_OUT_REGS &&
+                (d->vs.out_mask & (1u << first_tex))) {
+                d->tex_attr = d->vs.out_src[first_tex];
+            }
         }
     }
     /*
@@ -1620,6 +1668,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                 }
             }
             r300_load_vtx(&d, dw, vsize, size[0], &vb[i]);
+            r300_attr_texcoord(&d, dw, size[0], &vb[i]);
             if (d.vs_run) {
                 float clip[4];
 
