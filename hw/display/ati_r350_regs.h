@@ -129,11 +129,17 @@
 #define R350_CUR_VERT_OFF_MASK       0x3f       /* [5:0] */
 #define R350_CUR_HORZ_OFF_SHIFT      16         /* [21:16] */
 #define R350_CUR_HORZ_OFF_MASK       0x3f
-/* 64x64 pixels, 16 bytes per row: 8 of AND mask then 8 of XOR mask */
+/*
+ * 64x64 pixels in every mode. CUR_MODE 0 packs a row into 16 bytes (8 of
+ * AND mask then 8 of XOR mask); modes 1 and 3 store one little-endian
+ * 32-bit pixel each, so 256 bytes per row and a 16KB image.
+ */
 #define R350_CUR_WIDTH               64
 #define R350_CUR_HEIGHT              64
 #define R350_CUR_ROW_BYTES           16
 #define R350_CUR_IMAGE_BYTES         (R350_CUR_HEIGHT * R350_CUR_ROW_BYTES)
+#define R350_CUR_ARGB_ROW_BYTES      (R350_CUR_WIDTH * 4)
+#define R350_CUR_ARGB_IMAGE_BYTES    (R350_CUR_HEIGHT * R350_CUR_ARGB_ROW_BYTES)
 #define R350_DAC_EXT_CNTL            0x0280
 #define R350_DDA_CONFIG              0x02e0
 #define R350_DDA_ON_OFF              0x02e4
@@ -563,6 +569,18 @@
 #define R350_PIX_WIDTH_24BPP         5
 #define R350_PIX_WIDTH_32BPP         6
 #define R350_CRTC_CUR_EN             (1 << 16)
+/*
+ * CUR_MODE selects the hardware cursor's pixel format. The Radeon ndrv in
+ * the retail 9800 ROM writes 1 for a cursor converted from a 2-bit source
+ * and 3 for one converted from a 32-bit ARGB source (static RE of its
+ * cscSetHardwareCursor path, code 0x2ad8); both store 32 bits per pixel.
+ * Mode 0 is the classic packed AND/XOR bitmap the FCode console uses.
+ */
+#define R350_CRTC_CUR_MODE_SHIFT     20
+#define R350_CRTC_CUR_MODE_MASK      7
+#define R350_CUR_MODE_MONO           0  /* 2bpp AND/XOR, CUR_CLR0/1 colours */
+#define R350_CUR_MODE_ARGB_CODED     1  /* 32bpp, transparent/invert codes */
+#define R350_CUR_MODE_ARGB_ALPHA     3  /* 32bpp, per-pixel alpha */
 #define R350_CRTC_EXT_DISP_EN        (1 << 24)
 #define R350_CRTC_EN                 (1 << 25)
 #define R350_CRTC_DISP_REQ_EN_B      (1 << 26)

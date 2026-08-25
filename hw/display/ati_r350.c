@@ -3230,20 +3230,41 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
 }
 
 /*
- * Hardware cursor. CRTC_CUR_MODE 0 -- the only mode the chip defines --
- * is a 64x64 two-colour image with transparent and inverting codes
- * (RRG-G04500-C 3.13). The image sits at CUR_OFFSET in the frame buffer
- * as 16 bytes per row: eight bytes of AND mask followed by eight of XOR
- * mask, most significant bit leftmost. (AND,XOR) selects CUR_CLR0,
- * CUR_CLR1, "leave the destination alone" or "invert it".
+ * Hardware cursor. The image always sits at CUR_OFFSET in the frame
+ * buffer and is always 64x64, but CRTC_CUR_MODE (CRTC_GEN_CNTL[22:20])
+ * picks one of three pixel formats:
  *
- * That layout was confirmed against the live image Mac OS X programs on
- * this card rather than assumed: decoded any other plausible way -- as
- * separate AND/XOR planes, or as the mach64's packed 2bpp -- the same
- * 1024 bytes come out as noise, and this way they come out as the Mac
- * arrow. Note also that CUR_CLR0/1 are plain 0x00RRGGBB here, NOT the
- * mach64's colour-in-bits-31:8 layout; the two decodes are not
- * interchangeable. QEMUCursor data is RGBA byte order, i.e. a dword of
+ *   0  a two-colour bitmap, 16 bytes per row: eight bytes of AND mask
+ *      followed by eight of XOR mask, most significant bit leftmost.
+ *      (AND,XOR) selects CUR_CLR0, CUR_CLR1, "leave the destination
+ *      alone" or "invert it". CUR_CLR0/1 are plain 0x00RRGGBB here, NOT
+ *      the mach64's colour-in-bits-31:8 layout.
+ *   1  32 bits per pixel, 256 bytes per row: 0x00RRGGBB is an opaque
+ *      colour, 0x80000000 transparent and 0x80FFFFFF inverting. This is
+ *      what the ndrv emits when it converted a 2-bit source cursor, so
+ *      it carries the classic codes but never uses CUR_CLR0/1.
+ *   3  32 bits per pixel, 256 bytes per row, straight ARGB with
+ *      per-pixel alpha; 0x00000000 is the transparent code.
+ *
+ * Modes 1 and 3 are what the retail 9800 ROM's ndrv actually programs,
+ * established by static RE of its cscSetHardwareCursor path (a deframed
+ * copy of the PEF and the tooling live in doc/radeon9800/ndrv-re/): the
+ * control handler tries VSLPrepareCursorForHardwareCursor with a 64x64
+ * ARGB descriptor first and a 64x64 2-bit one second, converts either
+ * result to 64x64 32-bit pixels, BlockCopy()s 0x4000 bytes into VRAM at
+ * (slot << 14), and writes CUR_MODE 3 or 1 to match. Mac OS X takes the
+ * ARGB descriptor (slot 0, CUR_OFFSET 0), Mac OS 9 the 2-bit one
+ * (slot 1, CUR_OFFSET 0x4000) -- both offsets seen live.
+ *
+ * The ndrv stores those pixels little-endian: it reads the aperture's
+ * byte-swap mode out of SURFACE_CNTL[21:20] and pre-swaps its buffer so
+ * that VRAM ends up holding LE dwords whichever way the swapper is set.
+ * ati_r350_vram_ld32() is therefore exactly the right reader.
+ *
+ * Mode 0's row layout is inherited from this device's ati_rage128
+ * ancestor, where it was confirmed against a live image; it has NOT been
+ * re-confirmed on the R350, which has only ever been seen in modes 1
+ * and 3. QEMUCursor data is RGBA byte order, i.e. a dword of
  * (a << 24) | (b << 16) | (g << 8) | r (ui/cursor.c).
  *
  * "Invert the destination" has no QEMUCursor equivalent, so it becomes
@@ -3270,7 +3291,15 @@ static void ati_r350_cursor_apply(ATIR350State *s)
     unsigned horz_off = (coff >> R350_CUR_HORZ_OFF_SHIFT) &
                         R350_CUR_HORZ_OFF_MASK;
     unsigned vert_off = coff & R350_CUR_VERT_OFF_MASK;
-    bool on = (s->regs[R350_CRTC_GEN_CNTL >> 2] & R350_CRTC_CUR_EN) != 0;
+    uint32_t gen_cntl = s->regs[R350_CRTC_GEN_CNTL >> 2];
+    bool on = (gen_cntl & R350_CRTC_CUR_EN) != 0;
+    unsigned cur_mode = (gen_cntl >> R350_CRTC_CUR_MODE_SHIFT) &
+                        R350_CRTC_CUR_MODE_MASK;
+    bool argb = (cur_mode == R350_CUR_MODE_ARGB_CODED ||
+                 cur_mode == R350_CUR_MODE_ARGB_ALPHA);
+    unsigned row_bytes = argb ? R350_CUR_ARGB_ROW_BYTES : R350_CUR_ROW_BYTES;
+    unsigned image_bytes = argb ? R350_CUR_ARGB_IMAGE_BYTES :
+                                  R350_CUR_IMAGE_BYTES;
     const uint8_t *src;
     uint32_t sum = 0;
     QEMUCursor *c;
@@ -3305,7 +3334,7 @@ static void ati_r350_cursor_apply(ATIR350State *s)
         }
         return;
     }
-    if ((uint64_t)vram_off + R350_CUR_IMAGE_BYTES > ATI_R350_VRAM_SIZE) {
+    if ((uint64_t)vram_off + image_bytes > ATI_R350_VRAM_SIZE) {
         ati_r350_note_gap(s, R350_GAP_DEST_OFF_VRAM, 1);
         return;
     }
@@ -3316,8 +3345,12 @@ static void ati_r350_cursor_apply(ATIR350State *s)
      * CUR_HORZ_OFF says which column of the map is drawn at CUR_HORZ_POSN,
      * so the image's own left edge belongs at POSN - OFF. Vertically the
      * driver does it differently: to push the cursor off the top it
-     * advances CUR_OFFSET by 16 bytes per hidden row *as well as* raising
-     * CUR_VERT_OFF, so the data already begins at the first visible row.
+     * advances CUR_OFFSET by one row of bytes per hidden row *as well as*
+     * raising CUR_VERT_OFF, so the data already begins at the first
+     * visible row. (The ndrv writes CUR_OFFSET = base + (hidden << 8) and
+     * CUR_VERT_OFF = hidden + 1 -- the 256-byte step is one 32-bit row,
+     * and the traces' voff=1/@0x0, voff=3/@0x200, voff=5/@0x400 triples
+     * are that arithmetic seen from outside.)
      * The top edge is therefore CUR_VERT_POSN with no correction, and the
      * final CUR_VERT_OFF rows of the map are simply not part of the
      * cursor ("Height of cursor is (64-CUR_VERT_OFF)").
@@ -3337,10 +3370,11 @@ static void ati_r350_cursor_apply(ATIR350State *s)
      * arrow tip. Mix the offset in as well.
      */
     sum = 0x811c9dc5u ^ vram_off;
-    for (row = 0; row < R350_CUR_IMAGE_BYTES; row++) {
+    for (row = 0; row < image_bytes; row++) {
         sum = (sum ^ src[row ^ xr]) * 0x01000193u;
     }
-    sum ^= clr0 ^ clr1 ^ (uint32_t)horz_off ^ ((uint32_t)vert_off << 8);
+    sum ^= clr0 ^ clr1 ^ (uint32_t)horz_off ^ ((uint32_t)vert_off << 8) ^
+           ((uint32_t)cur_mode << 16);
 
     if (s->hw_cursor_on && sum == s->hw_cursor_sum) {
         /* Same image: a move only, so don't re-upload it -- and if it
@@ -3356,16 +3390,21 @@ static void ati_r350_cursor_apply(ATIR350State *s)
     }
 
     /*
-     * Stopgap for the OS X/OS 9 Radeon ndrv, which positions and
-     * colour-programs the hardware cursor but never uploads an image
-     * (open investigation): the bits at CUR_OFFSET are then leftover
-     * boot junk that decodes to an opaque box. A real mono cursor is
-     * mostly transparent (AND plane mostly ones); when almost no AND
-     * bits are set the "image" cannot be a cursor, so hide the guest
-     * sprite entirely -- the UI then shows the host pointer at the
-     * (correctly tracked) guest position instead of the box.
+     * Mode 0 only: CUR_MODE 0 is the power-on value, so a guest that
+     * enables the sprite before it has written an image leaves us
+     * decoding whatever boot junk is at CUR_OFFSET, which comes out as
+     * an opaque box. A real mono cursor is mostly transparent (AND plane
+     * mostly ones); when almost no AND bits are set the "image" cannot
+     * be a cursor, so substitute a plain arrow rather than show the box.
+     *
+     * Modes 1 and 3 are only ever reached after the ndrv has uploaded a
+     * real image, and this guard has no meaning for a 32-bit format --
+     * it used to fire on every ndrv cursor because the ARGB pixels were
+     * being misread as AND/XOR planes, which is what hid the guest's own
+     * arrow (and made an I-beam impossible) until the modes above were
+     * decoded properly.
      */
-    {
+    if (!argb) {
         unsigned and_ones = 0, byte;
 
         for (row = 0; row < R350_CUR_HEIGHT; row++) {
@@ -3393,18 +3432,42 @@ static void ati_r350_cursor_apply(ATIR350State *s)
     c = cursor_alloc(R350_CUR_WIDTH, R350_CUR_HEIGHT);
     for (row = 0; row < R350_CUR_HEIGHT; row++) {
         for (px = 0; px < R350_CUR_WIDTH; px++) {
-            const uint8_t *line = src + row * R350_CUR_ROW_BYTES;
-            unsigned bit = 7 - (px & 7);
-            unsigned and_bit = (line[(px >> 3) ^ xr] >> bit) & 1;
-            unsigned xor_bit = (line[(8 + (px >> 3)) ^ xr] >> bit) & 1;
             uint32_t val;
 
             if (row >= R350_CUR_HEIGHT - vert_off || px < horz_off) {
                 val = 0;                        /* outside the cursor */
-            } else if (!and_bit) {
-                val = xor_bit ? clr1 : clr0;
+            } else if (argb) {
+                uint32_t p = ati_r350_vram_ld32(s, vram_off +
+                                                row * row_bytes + px * 4);
+                uint32_t rgb = ((p & 0xff) << 16) | (p & 0xff00) |
+                               ((p >> 16) & 0xff);
+
+                if (cur_mode == R350_CUR_MODE_ARGB_CODED) {
+                    /*
+                     * Bit 31 marks the two special codes; the low 24 bits
+                     * then say which. Anything else is an opaque colour.
+                     */
+                    if (!(p & 0x80000000u)) {
+                        val = 0xff000000u | rgb;
+                    } else if ((p & 0xffffffu) == 0xffffffu) {
+                        val = 0x80000000u;      /* invert */
+                    } else {
+                        val = 0;                /* transparent */
+                    }
+                } else {
+                    val = (p & 0xff000000u) | rgb;
+                }
             } else {
-                val = xor_bit ? 0x80000000u : 0;    /* invert : transparent */
+                const uint8_t *line = src + row * row_bytes;
+                unsigned bit = 7 - (px & 7);
+                unsigned and_bit = (line[(px >> 3) ^ xr] >> bit) & 1;
+                unsigned xor_bit = (line[(8 + (px >> 3)) ^ xr] >> bit) & 1;
+
+                if (!and_bit) {
+                    val = xor_bit ? clr1 : clr0;
+                } else {
+                    val = xor_bit ? 0x80000000u : 0;  /* invert : transparent */
+                }
             }
             c->data[row * R350_CUR_WIDTH + px] = val;
         }
@@ -3413,12 +3476,21 @@ static void ati_r350_cursor_apply(ATIR350State *s)
                                     c->data[0], c->data[64 * 4],
                                     c->data[64 * 4 + 4]);
     if (trace_event_get_state_backends(TRACE_ATI_R350_CURSOR_DUMP)) {
-        /* the first 2KB of VRAM: covers every sprite offset seen so far */
-        const uint8_t *v = (const uint8_t *)memory_region_get_ram_ptr(&s->vram);
-        for (row = 0; row < 128; row++) {
-            trace_ati_r350_cursor_dump(offs, row * 16,
-                                          ldq_be_p(v + row * 16),
-                                          ldq_be_p(v + row * 16 + 8));
+        /*
+         * The whole image, read FROM CUR_OFFSET and byte-lane corrected,
+         * so the log can be decoded straight back into pixels. Dumping a
+         * fixed 2KB from VRAM 0 missed the image entirely whenever the
+         * sprite lived anywhere else (Mac OS 9 puts it at 0x4000).
+         */
+        for (row = 0; row < image_bytes / 16; row++) {
+            uint64_t hi = 0, lo = 0;
+            unsigned i;
+
+            for (i = 0; i < 8; i++) {
+                hi = (hi << 8) | src[(row * 16 + i) ^ xr];
+                lo = (lo << 8) | src[(row * 16 + 8 + i) ^ xr];
+            }
+            trace_ati_r350_cursor_dump(offs, row * 16, hi, lo);
         }
     }
     qemu_console_set_cursor(s->con, c);
