@@ -2353,6 +2353,24 @@ static bool ati_r350_mc_to_agp(ATIR350State *s, uint32_t addr,
     return false;
 }
 
+const char *ati_r350_mc_describe(ATIR350State *s, uint32_t addr,
+                                 uint64_t *target)
+{
+    uint32_t off;
+    dma_addr_t bus;
+
+    if (ati_r350_mc_to_vram(s, addr, &off)) {
+        *target = off;
+        return "vram";
+    }
+    if (ati_r350_mc_to_agp(s, addr, &bus)) {
+        *target = bus;
+        return "agp";
+    }
+    *target = addr;
+    return "bus";
+}
+
 /*
  * Read one little-endian dword from card address space. Command streams
  * are little-endian regardless of guest CPU endianness (big-endian Mac

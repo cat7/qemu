@@ -975,6 +975,16 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
     R300DrawState d;
     unsigned i, a, c;
 
+    /*
+     * Record the array state this draw actually runs on. The registers
+     * hold whatever the LAST draw left behind, so reading them after
+     * the fact says nothing about any particular draw -- capture here
+     * or do not claim.
+     */
+    trace_ati_r350_3d_vbuf_aos(vf, nvtx,
+                               s->regs[R300_VAP_VTX_AOS_CNT >> 2],
+                               ctl, addr[0], addr[1]);
+
     if (!nvtx || !vsize || vsize > 16 || nvtx > 4096) {
         trace_ati_r350_3d_skip(vf, vsize, nvtx);
         return;
@@ -995,9 +1005,31 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
             unsigned n = 0;
 
             for (a = 0; a < 2; a++) {
+                unsigned base = n;
+
                 for (c = 0; c < size[a] && n < 16; c++) {
                     dw[n++] = ati_r350_mc_read32(s,
                         addr[a] + (i * stride[a] + c) * 4);
+                }
+                if (i == 0) {
+                    /*
+                     * Where this array resolved to, and the dwords the
+                     * first vertex fetched from it -- enough to tell
+                     * plausible float coordinates from garbage without
+                     * re-reading memory (which would change what the
+                     * trace observes).
+                     */
+                    uint64_t target;
+                    const char *win = ati_r350_mc_describe(s, addr[a],
+                                                           &target);
+
+                    trace_ati_r350_3d_vbuf_aos_src(a, size[a], stride[a],
+                                                   addr[a], win, target);
+                    trace_ati_r350_3d_vbuf_aos_dw(a,
+                        n > base ? dw[base] : 0,
+                        n > base + 1 ? dw[base + 1] : 0,
+                        n > base + 2 ? dw[base + 2] : 0,
+                        n > base + 3 ? dw[base + 3] : 0);
                 }
             }
             r300_load_vtx(&d, dw, vsize, &vb[i]);

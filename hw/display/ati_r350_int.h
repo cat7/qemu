@@ -489,6 +489,16 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
 /* ati_r350.c MC-window translation, shared with the engines */
 bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr, uint32_t *off);
 uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr);
+/*
+ * Trace helper: name the window a card address resolves through and
+ * return the address it resolves to ("vram" -> a VRAM byte offset,
+ * "agp" -> a bus address after AGP_BASE, "bus" -> passed through
+ * untranslated). Read-only; it exists so a trace can record where a
+ * fetch really went instead of leaving it to be inferred from
+ * post-hoc register reads.
+ */
+const char *ati_r350_mc_describe(ATIR350State *s, uint32_t addr,
+                                 uint64_t *target);
 
 /* ati_r350_2d.c */
 void ati_r350_2d_blt(ATIR350State *s);
