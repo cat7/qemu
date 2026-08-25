@@ -1829,13 +1829,27 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         break;
     case R300_VAP_PVS_UPLOAD_DATA:
         s->regs[base >> 2] = val;
-        if (s->pvs_upload_addr == 0x200 &&
-            s->pvs_upload_cnt < ARRAY_SIZE(s->pvs_const)) {
-            s->pvs_const[s->pvs_upload_cnt] = val;
-            if (++s->pvs_upload_cnt > s->pvs_const_dwords) {
-                s->pvs_const_dwords = s->pvs_upload_cnt;
+        if (s->pvs_upload_addr >= R300_PVS_CONST_START) {
+            /*
+             * The constants are a register file addressed by vector, four
+             * dwords to a vector, and an upload writes into it starting
+             * wherever UPLOAD_ADDRESS pointed. Taking the data only when
+             * that address was exactly the base dropped every partial
+             * update on the floor -- a guest rewriting one constant left
+             * the whole matrix at its previous contents, silently, and
+             * the next draw was transformed by a stale one.
+             */
+            unsigned idx = (s->pvs_upload_addr - R300_PVS_CONST_START) * 4 +
+                           s->pvs_upload_cnt;
+
+            if (idx < ARRAY_SIZE(s->pvs_const)) {
+                s->pvs_const[idx] = val;
+                if (idx + 1 > s->pvs_const_dwords) {
+                    s->pvs_const_dwords = idx + 1;
+                }
             }
-        } else if (s->pvs_upload_addr < 0x200) {
+            s->pvs_upload_cnt++;
+        } else {
             /* vertex program instructions -- recorded, not executed */
             s->pvs_code_dwords++;
         }

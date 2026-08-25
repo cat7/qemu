@@ -925,6 +925,12 @@
 #define R300_VAP_VTX_AOS_ADDR0        0x20c8
 #define R300_VAP_VTX_AOS_ADDR1        0x20cc
 #define R300_VAP_PVS_UPLOAD_ADDRESS   0x2200
+/*
+ * UPLOAD_ADDRESS is a vector index into the vertex shader's storage:
+ * below this the vectors are program instructions, from here up they are
+ * the constant file, four dwords to a vector.
+ */
+#define R300_PVS_CONST_START          0x200
 #define R300_VAP_PVS_UPLOAD_DATA      0x2208
 #define R300_VAP_CNTL_STATUS          0x2140
 #define R300_VAP_PVS_BYPASS           0x00000100
