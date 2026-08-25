@@ -178,9 +178,60 @@ static void ati_r350_maybe_capture_mode(ATIR350State *s)
  * how the hardware's swapper is built (byte-lane steering). Mode 1 =
  * 16-bit swap = XOR 1, mode 3 = 32-bit swap = XOR 3.
  */
+static unsigned ati_r350_swap_bits(uint32_t info)
+{
+    return (info & R350_NONSURF_AP0_SWP_32BPP) ? 3 :
+           (info & R350_NONSURF_AP0_SWP_16BPP) ? 1 : 0;
+}
+
+/*
+ * Walk the surfaces for `off` and, with the answer, the range of
+ * offsets that provably share it.
+ *
+ * The surface that wins is the first one containing `off`, so the
+ * answer holds across that surface's own bounds -- minus whatever an
+ * EARLIER surface would have claimed, which is why every surface that
+ * does not contain `off` still narrows the range from whichever side it
+ * lies on. Surfaces after the winner cannot change anything inside the
+ * winner's bounds, so the walk stops there. With no surface at all the
+ * range is bounded only by the surfaces that were stepped over.
+ */
+static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off)
+{
+    uint32_t lo_bound = 0, hi_bound = UINT32_MAX;
+    int i;
+
+    s->swap_val = ati_r350_swap_bits(s->regs[R350_SURFACE_CNTL >> 2]);
+    for (i = 0; i < 8; i++) {
+        uint32_t lo = s->regs[(R350_SURFACE0_LOWER_BOUND +
+                               i * R350_SURFACE_STRIDE) >> 2];
+        uint32_t hi = s->regs[(R350_SURFACE0_UPPER_BOUND +
+                               i * R350_SURFACE_STRIDE) >> 2];
+
+        if (hi <= lo) {
+            continue;               /* not a live surface */
+        }
+        if (off >= lo && off <= hi) {
+            s->swap_val = ati_r350_swap_bits(
+                s->regs[(R350_SURFACE0_INFO + i * R350_SURFACE_STRIDE) >> 2]);
+            lo_bound = MAX(lo_bound, lo);
+            hi_bound = MIN(hi_bound, hi);
+            break;
+        }
+        /* `off` is on one side of this surface; stay on that side */
+        if (off < lo) {
+            hi_bound = MIN(hi_bound, lo - 1);
+        } else {
+            lo_bound = MAX(lo_bound, hi + 1);
+        }
+    }
+    s->swap_lo = lo_bound;
+    s->swap_hi = hi_bound;
+    s->swap_valid = true;
+}
+
 unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
 {
-    uint32_t cntl = s->regs[R350_SURFACE_CNTL >> 2];
     /*
      * The surfaces' bounds are FRAME-BUFFER APERTURE OFFSETS, not card
      * addresses: the swapper sits on the host-access side of the
@@ -189,25 +240,15 @@ unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
      * DISPLAY_BASE_ADDR / MC_FB_LOCATION put the same buffer at card
      * address 0x90010000 -- comparing against the card address matched
      * nothing, so no swap was applied and white came out yellow.
+     *
+     * The walk itself is memoised: see the comment on `swap_lo` in the
+     * state. The answer is identical either way -- what the memo saves
+     * is repeating a 24-register scan for every pixel of every span.
      */
-    uint32_t mc = off;
-    int i;
-
-    for (i = 0; i < 8; i++) {
-        uint32_t lo = s->regs[(R350_SURFACE0_LOWER_BOUND +
-                               i * R350_SURFACE_STRIDE) >> 2];
-        uint32_t hi = s->regs[(R350_SURFACE0_UPPER_BOUND +
-                               i * R350_SURFACE_STRIDE) >> 2];
-        uint32_t info = s->regs[(R350_SURFACE0_INFO +
-                                 i * R350_SURFACE_STRIDE) >> 2];
-
-        if (hi > lo && mc >= lo && mc <= hi) {
-            return (info & R350_NONSURF_AP0_SWP_32BPP) ? 3 :
-                   (info & R350_NONSURF_AP0_SWP_16BPP) ? 1 : 0;
-        }
+    if (!s->swap_valid || off < s->swap_lo || off > s->swap_hi) {
+        ati_r350_swap_resolve(s, off);
     }
-    return (cntl & R350_NONSURF_AP0_SWP_32BPP) ? 3 :
-           (cntl & R350_NONSURF_AP0_SWP_16BPP) ? 1 : 0;
+    return s->swap_val;
 }
 
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off)
@@ -1886,6 +1927,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_SURFACE_CNTL:
     case R350_SURFACE0_LOWER_BOUND ... R350_SURFACE7_INFO:
         s->regs[base >> 2] = val;
+        s->swap_valid = false;      /* the memoised walk is now stale */
         s->force_redraw = true;
         trace_ati_r350_surface(ati_r350_reg_name(base), val);
         break;
@@ -3229,6 +3271,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
     memset(s->palette, 0, sizeof(s->palette));
+    s->swap_valid = false;          /* the surface registers just went */
     s->dac_wr_index = 0;
     s->dac_rd_index = 0;
     s->i2c_offset = 0;

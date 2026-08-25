@@ -128,6 +128,19 @@ struct ATIR350State {
 
     uint32_t regs[ATI_R350_NUM_REGS];
     uint32_t plls[ATI_R350_NUM_PLLS];
+    /*
+     * Memo for ati_r350_vram_xor(). Resolving the swapper means walking
+     * eight surface descriptors, three registers each, and the software
+     * rasterizer asks two or three times for every pixel it touches --
+     * which is why the surface walk sat second and third in a profile of
+     * a stalled guest. `swap_lo`..`swap_hi` is the offset range over
+     * which the walk provably cannot give a different answer than
+     * `swap_val`, so a hit costs two comparisons. Any write to a surface
+     * register clears `swap_valid`.
+     */
+    uint32_t swap_lo, swap_hi;
+    unsigned swap_val;
+    bool swap_valid;
     /* R300 memory-controller indirect register file (MC_IND_INDEX/DATA) */
     uint32_t mc_ind[256];
     /*
