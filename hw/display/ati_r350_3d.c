@@ -436,14 +436,23 @@ static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v)
     }
 }
 
+/*
+ * `pos` is how many of the leading dwords belong to the position
+ * attribute, which is not always the whole vertex: an AOS draw's first
+ * array can be three dwords of model-space x,y,z with the next array
+ * holding something else entirely. Taking w from the fourth dword
+ * regardless then feeds a foreign attribute into the perspective
+ * divide. Inline (IMMD) vertices have no array boundaries, so their
+ * caller passes the whole vertex size and nothing changes for them.
+ */
 static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
-                          unsigned vsize, R300Vtx *v)
+                          unsigned vsize, unsigned pos, R300Vtx *v)
 {
     /* set by the caller for vertices that carry no colour of their own */
     v->x = r300_f32(dw[0]);
-    v->y = vsize >= 2 ? r300_f32(dw[1]) : 0.0f;
-    v->z = vsize >= 3 ? r300_f32(dw[2]) : 0.0f;
-    v->w = vsize >= 4 ? r300_f32(dw[3]) : 1.0f;
+    v->y = pos >= 2 ? r300_f32(dw[1]) : 0.0f;
+    v->z = pos >= 3 ? r300_f32(dw[2]) : 0.0f;
+    v->w = pos >= 4 ? r300_f32(dw[3]) : 1.0f;
     v->r = d->flat_r;
     v->g = d->flat_g;
     v->b = d->flat_b;
@@ -944,7 +953,7 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
 
         for (i = 0; i < nvtx; i++) {
-            r300_load_vtx(&d, &dw[1 + i * vsize], vsize, &vb[i]);
+            r300_load_vtx(&d, &dw[1 + i * vsize], vsize, vsize, &vb[i]);
             r300_xform_vtx(&d, &vb[i]);
         }
         r300_run_prims(s, &d, vb, nvtx, prim);
@@ -1032,7 +1041,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                         n > base + 3 ? dw[base + 3] : 0);
                 }
             }
-            r300_load_vtx(&d, dw, vsize, &vb[i]);
+            r300_load_vtx(&d, dw, vsize, size[0], &vb[i]);
             r300_xform_vtx(&d, &vb[i]);
         }
         trace_ati_r350_3d_vbuf_vtx((int32_t)(r300_f32(dw[0]) * 1000),
