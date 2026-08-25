@@ -1192,19 +1192,37 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
             d->vs_run = d->vs.valid;
             d->vs_color_out = first_color;
             /*
+             * Where the coordinate lives in the vertex, for the vertices
+             * whose flat block does not hold one -- see
+             * r300_attr_texcoord(). Only a FORWARDED output names an
+             * attribute; the compositor's blit program multiplies its
+             * coordinate by a texture matrix instead, so out_src is -1
+             * for every draw the desktop is painted with and this is a
+             * no-op there by construction.
+             */
+            if (d->textured && d->vs.valid &&
+                first_tex < R300_PVS_OUT_REGS &&
+                (d->vs.out_mask & (1u << first_tex))) {
+                d->tex_attr = d->vs.out_src[first_tex];
+            }
+            /*
              * The colour is the program's only when the vertex stage says
              * it emits one and the program really writes it. A colour it
              * merely forwards from an attribute this model is already
              * sampling as texture coordinates is not a colour at all --
              * the eight-dword textured vertices whose second attribute is
              * a coordinate pair would otherwise arrive painted with it.
+             * Which attribute that is comes from the program where the
+             * program says (tex_attr), and only otherwise from the
+             * position of the coordinate in a flat vertex.
              */
             if (d->vs_run && ncolor &&
                 (d->vs.out_mask & (1u << first_color))) {
                 int src = d->vs.out_src[first_color];
                 bool computed = !d->vs.plain_matrix || src >= 0;
                 bool is_texcoord = d->textured && src >= 0 &&
-                                   (unsigned)src == (vsize >= 12 ? 2u : 1u);
+                                   src == (d->tex_attr >= 0 ? d->tex_attr :
+                                           (vsize >= 12 ? 2 : 1));
 
                 d->vs_color = computed && !is_texcoord;
             }
@@ -1221,20 +1239,6 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                              d->textured && first_tex < R300_PVS_OUT_REGS &&
                              (d->vs.out_mask & (1u << first_tex));
             d->vs_tex_out = first_tex;
-            /*
-             * Where the coordinate lives in the vertex, for the vertices
-             * whose flat block does not hold one -- see
-             * r300_attr_texcoord(). Only a FORWARDED output names an
-             * attribute; the compositor's blit program multiplies its
-             * coordinate by a texture matrix instead, so out_src is -1
-             * for every draw the desktop is painted with and this is a
-             * no-op there by construction.
-             */
-            if (d->textured && d->vs.valid &&
-                first_tex < R300_PVS_OUT_REGS &&
-                (d->vs.out_mask & (1u << first_tex))) {
-                d->tex_attr = d->vs.out_src[first_tex];
-            }
         }
     }
     /*
