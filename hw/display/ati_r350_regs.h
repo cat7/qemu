@@ -966,10 +966,30 @@
 #define R300_GA_POINT_S1              0x4208
 #define R300_GA_POINT_T1              0x420c
 #define R300_RE_POINTSIZE             0x421c
+/*
+ * Bound vertex arrays. The block is not the flat table the names
+ * suggest: each PAIR of arrays takes three registers -- one packed
+ * count/stride word covering both of them, then one address each --
+ * so arrays 2 and 3 are described by 0x20d0/0x20d4/0x20d8 and not by
+ * a continuation of the first pair's addresses. VTX_NUM_ARRAYS says
+ * how many are bound; Mac OS X's compositor binds two, Chess.app's
+ * board binds three (position, normal, texture coordinate).
+ */
 #define R300_VAP_VTX_AOS_CNT          0x20c0
-#define R300_VAP_VTX_AOS_CTL          0x20c4
-#define R300_VAP_VTX_AOS_ADDR0        0x20c8
-#define R300_VAP_VTX_AOS_ADDR1        0x20cc
+#define R300_VAP_VTX_NUM_ARRAYS_MASK  0x1f
+#define R300_VAP_VTX_AOS_ATTR(pair)   (0x20c4 + (pair) * 0xc)
+#define R300_VAP_VTX_AOS_ADDR(n)      (0x20c8 + ((n) >> 1) * 0xc + \
+                                       ((n) & 1) * 4)
+#define R300_VAP_AOS_COUNT_MASK       0x7f    /* dwords per vertex */
+#define R300_VAP_AOS_STRIDE_SHIFT     8
+#define R300_VAP_AOS_STRIDE_MASK      0x7f    /* dwords to the next vertex */
+#define R300_VAP_AOS_ODD_SHIFT        16      /* the pair's second array */
+/*
+ * How many of them this model fetches. The hardware allows sixteen;
+ * four covers every layout seen in a capture and keeps one vertex
+ * program input register per array, which is what the inputs are.
+ */
+#define R300_AOS_MAX                  4
 #define R300_VAP_PVS_UPLOAD_ADDRESS   0x2200
 /*
  * UPLOAD_ADDRESS is a vector index into the vertex shader's storage:

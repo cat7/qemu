@@ -2946,15 +2946,18 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             break;
         case R300_PM4_OPCODE_LOAD_VBPNTR:
             /*
-             * Same data in the same order as type-0 writes to
-             * VAP_VTX_AOS_CNT/CTL/ADDR0/ADDR1: the array count, the
-             * packed size|stride control dword, then the array
-             * addresses (Linux r100_packet3_load_vbpntr). Only the
-             * first pair of arrays is captured -- that is all the
-             * draw engine models, and all the count field of every
-             * captured OS X submission declares.
+             * Same data in the same order as type-0 writes to the
+             * VAP_VTX_AOS block: the array count, then for each PAIR
+             * of arrays a packed size|stride control dword followed by
+             * the two addresses (Linux r100_packet3_load_vbpntr). The
+             * packet's dwords map one for one onto the registers from
+             * VAP_VTX_AOS_CNT up, so writing them through is all this
+             * needs to do -- but only for as many arrays as the draw
+             * engine fetches. Stopping after four dwords covered a
+             * two-array binding and silently dropped the third array
+             * of anything that bound more.
              */
-            if (p->p3_param_idx < 4) {
+            if (p->p3_param_idx < 1 + (R300_AOS_MAX + 1) / 2 * 3) {
                 ati_r350_reg_write32(s, R300_VAP_VTX_AOS_CNT +
                                         p->p3_param_idx * 4, val);
             }
@@ -3819,6 +3822,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_VS_VECTOR_OP] = "vertex vector opcode",
     [R350_GAP_VS_MATH_OP]   = "vertex math opcode",
     [R350_GAP_VS_DST_FILE]  = "vertex destination file",
+    [R350_GAP_AOS_ARRAYS]   = "vertex arrays bound",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)

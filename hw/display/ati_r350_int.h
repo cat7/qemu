@@ -87,6 +87,7 @@ typedef enum ATIR350GapKind {
     R350_GAP_VS_VECTOR_OP,   /* PVS vector-engine opcode not implemented */
     R350_GAP_VS_MATH_OP,     /* PVS math-engine opcode not implemented */
     R350_GAP_VS_DST_FILE,    /* PVS destination register file not modelled */
+    R350_GAP_AOS_ARRAYS,     /* more vertex arrays bound than we fetch */
     R350_GAP_MAX
 } ATIR350GapKind;
 

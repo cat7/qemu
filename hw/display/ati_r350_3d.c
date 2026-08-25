@@ -41,7 +41,9 @@ typedef struct R300DrawState {
     bool vs_run;            /* consume it: it is uploaded and not bypassed */
     bool vs_color;          /* take the per-vertex colour from its output */
     unsigned vs_color_out;  /* which output register that colour is */
-    unsigned attr_size[4];  /* dwords each input register takes per vertex */
+    bool vs_texcoord;       /* take the texture coordinate from its output */
+    unsigned vs_tex_out;    /* which output register that coordinate is */
+    unsigned attr_size[R300_AOS_MAX];  /* dwords per vertex, per input reg */
     unsigned attr_count;
     float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
@@ -134,6 +136,7 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
     /* texture staged in GART/system memory */
     return ati_r350_mc_read32(s, addr);
 }
+
 
 static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
                            int x, int y, uint32_t argb)
@@ -498,6 +501,18 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
     v->b = d->flat_b;
     v->a = d->flat_a;
     v->s = v->t = 0.0f;
+    /*
+     * Everything below reads the vertex as one flat block whose first
+     * four dwords are the position, which is only true when the
+     * position attribute really is four dwords wide. Chess.app's board
+     * vertex is a three-dword position followed by a normal, so dwords
+     * four and five are two thirds of the normal and not a texture
+     * coordinate; sampling with them smears the texture. Such a vertex
+     * gets its coordinate from the vertex program instead.
+     */
+    if (pos < 4) {
+        return;
+    }
     if (vsize >= 12) {
         /* pos.xyzw | color.rgba | tex.stpq */
         v->r = r300_f32(dw[4]);
@@ -561,6 +576,36 @@ static bool r300_vs_has_color(const R300DrawState *d)
     int src = d->vs.out_src[d->vs_color_out];
 
     return d->vs_color && (src < 0 || (unsigned)src < d->attr_count);
+}
+
+/*
+ * The texture coordinate the program computed, in the texels this
+ * model's sampler works in.
+ *
+ * The hardware samples with normalised coordinates, so every program
+ * that emits one divides by the bound texture's size on the way out --
+ * which is why taking the raw attribute instead has worked so far:
+ * Mac OS X's compositor hands the vertex a coordinate in texels and its
+ * program's texture matrix is exactly diag(1/w, 1/h, 1, 1), so the two
+ * paths agree by construction (1887 of 1887 draws across the captures).
+ * Chess.app's board has no coordinate attribute at all -- its program
+ * generates one -- so there the attribute path samples texel (0,0) for
+ * every pixel and the board loses its texture entirely.
+ */
+static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
+                             const float c[4])
+{
+    float s = c[0], t = c[1], q = c[3];
+
+    if (!isfinite(s) || !isfinite(t)) {
+        return;
+    }
+    if (isfinite(q) && q != 0.0f && q != 1.0f) {
+        s /= q;
+        t /= q;
+    }
+    v->s = s * d->tex_w;
+    v->t = t * d->tex_h;
 }
 
 static void r300_vs_color(R300Vtx *v, const float c[4])
@@ -637,6 +682,9 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
 
     if ((r.out_written & (1u << d->vs_color_out)) && r300_vs_has_color(d)) {
         r300_vs_color(v, r.out[d->vs_color_out]);
+    }
+    if (d->vs_texcoord && (r.out_written & (1u << d->vs_tex_out))) {
+        r300_vs_texcoord(d, v, r.out[d->vs_tex_out]);
     }
     if (!(r.out_written & 1)) {
         /*
@@ -887,6 +935,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     d->xform = false;
     d->vs_run = false;
     d->vs_color = false;
+    d->vs_texcoord = false;
+    d->vs_tex_out = 0;
     memset(&d->vs, 0, sizeof(d->vs));
     if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
         s->pvs_const_dwords >= 16) {
@@ -944,6 +994,19 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
 
                 d->vs_color = computed && !is_texcoord;
             }
+            /*
+             * The texture coordinate is the program's only when the model
+             * is going to run the program at all: a program recognised as
+             * the plain matrix keeps the fast path, which never evaluates
+             * an output, and its coordinate is the attribute the vertex
+             * already carries. The two agree anyway -- that program's
+             * texture matrix is the exact inverse of the scaling below --
+             * so this is a decision about cost, not about semantics.
+             */
+            d->vs_texcoord = d->vs_run && !d->vs.plain_matrix &&
+                             d->textured && first_tex < R300_PVS_OUT_REGS &&
+                             (d->vs.out_mask & (1u << first_tex));
+            d->vs_tex_out = first_tex;
         }
     }
     /*
@@ -1261,27 +1324,46 @@ static uint32_t r300_vc_swap(uint32_t val, unsigned mode)
 /*
  * 3D_DRAW_VBUF_2: like DRAW_IMMD_2 but the single payload dword is
  * VAP_VF_CNTL (PRIM_WALK=2) and the vertices are fetched from the
- * vertex arrays bound at VAP_VTX_AOS_ADDR0/1 (written either directly
+ * vertex arrays bound at VAP_VTX_AOS_ADDR0..n (written either directly
  * or via 3D_LOAD_VBPNTR): each array contributes `size` dwords per
  * vertex at `stride` dwords apart, concatenated in array order. OS X
  * uses this for its texture page-in blits (GART-resident vertices and
  * textures rendered into VRAM window stores).
+ *
+ * How MANY arrays is VAP_VTX_NUM_ARRAYS's business and nobody else's.
+ * Fetching a fixed two was right for everything the compositor draws
+ * and wrong for Chess.app, which binds three: position, normal, and
+ * the texture coordinate its board is painted with. The third array
+ * went unread, so its vertex program's coordinate input read the
+ * (0,0,0,1) default and the board sampled one texel for every pixel.
  */
 void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
 {
     unsigned prim = vf & 0xf;
     unsigned nvtx = (vf >> 16) & 0xffff;
-    uint32_t ctl = s->regs[R300_VAP_VTX_AOS_CTL >> 2];
-    uint32_t addr[2] = {
-        s->regs[R300_VAP_VTX_AOS_ADDR0 >> 2],
-        s->regs[R300_VAP_VTX_AOS_ADDR1 >> 2],
-    };
-    unsigned size[2] = { ctl & 0xff, (ctl >> 16) & 0xff };
-    unsigned stride[2] = { (ctl >> 8) & 0xff, (ctl >> 24) & 0xff };
-    unsigned vsize = size[0] + size[1];
+    unsigned narr = s->regs[R300_VAP_VTX_AOS_CNT >> 2] &
+                    R300_VAP_VTX_NUM_ARRAYS_MASK;
+    uint32_t addr[R300_AOS_MAX];
+    unsigned size[R300_AOS_MAX], stride[R300_AOS_MAX];
+    unsigned vsize = 0;
     unsigned swap = s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_VC_SWAP;
     R300DrawState d;
     unsigned i, a, c;
+
+    if (narr > R300_AOS_MAX) {
+        ati_r350_note_gap(s, R350_GAP_AOS_ARRAYS, narr);
+        narr = R300_AOS_MAX;
+    }
+    for (a = 0; a < narr; a++) {
+        uint32_t attr = s->regs[R300_VAP_VTX_AOS_ATTR(a / 2) >> 2];
+        unsigned sh = (a & 1) ? R300_VAP_AOS_ODD_SHIFT : 0;
+
+        size[a] = (attr >> sh) & R300_VAP_AOS_COUNT_MASK;
+        stride[a] = (attr >> (sh + R300_VAP_AOS_STRIDE_SHIFT)) &
+                    R300_VAP_AOS_STRIDE_MASK;
+        addr[a] = s->regs[R300_VAP_VTX_AOS_ADDR(a) >> 2];
+        vsize += size[a];
+    }
 
     /*
      * Record the array state this draw actually runs on. The registers
@@ -1291,7 +1373,9 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
      */
     trace_ati_r350_3d_vbuf_aos(vf, nvtx,
                                s->regs[R300_VAP_VTX_AOS_CNT >> 2],
-                               ctl, addr[0], addr[1]);
+                               s->regs[R300_VAP_VTX_AOS_ATTR(0) >> 2],
+                               narr > 0 ? addr[0] : 0,
+                               narr > 1 ? addr[1] : 0);
 
     if (!nvtx || !vsize || vsize > 16 || nvtx > 4096) {
         trace_ati_r350_3d_skip(vf, vsize, nvtx);
@@ -1306,9 +1390,13 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                            d.textured, d.blend, d.tex_off);
 
     /* one vertex-program input register per bound array, in array order */
-    d.attr_size[0] = size[0];
-    d.attr_size[1] = size[1];
-    d.attr_count = size[1] ? 2 : 1;
+    d.attr_count = 0;
+    for (a = 0; a < narr; a++) {
+        d.attr_size[a] = size[a];
+        if (size[a]) {
+            d.attr_count = a + 1;
+        }
+    }
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
@@ -1317,7 +1405,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
         for (i = 0; i < nvtx; i++) {
             unsigned n = 0;
 
-            for (a = 0; a < 2; a++) {
+            for (a = 0; a < narr; a++) {
                 unsigned base = n;
 
                 for (c = 0; c < size[a] && n < 16; c++) {
