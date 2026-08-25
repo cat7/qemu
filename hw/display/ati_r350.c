@@ -1835,6 +1835,9 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
             if (++s->pvs_upload_cnt > s->pvs_const_dwords) {
                 s->pvs_const_dwords = s->pvs_upload_cnt;
             }
+        } else if (s->pvs_upload_addr < 0x200) {
+            /* vertex program instructions -- recorded, not executed */
+            s->pvs_code_dwords++;
         }
         break;
     case R350_MC_IND_INDEX:
@@ -3692,6 +3695,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_VTX_WALK]     = "vertex walk mode",
     [R350_GAP_TEX_FORMAT]   = "texture format",
     [R350_GAP_BLEND_FACTOR] = "blend factor",
+    [R350_GAP_VTX_PROGRAM]  = "vertex program",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
@@ -3701,7 +3705,7 @@ void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
     }
     if (!s->gap_count[kind][idx]) {
         warn_report("ati-radeon9800: unimplemented %s 0x%x -- the guest "
-                    "asked for it and the command was dropped",
+                    "asked for it and did not get it",
                     ati_r350_gap_names[kind], idx);
     }
     if (s->gap_count[kind][idx] != UINT32_MAX) {

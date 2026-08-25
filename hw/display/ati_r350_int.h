@@ -81,6 +81,7 @@ typedef enum ATIR350GapKind {
     R350_GAP_VTX_WALK,       /* VAP_VF_CNTL vertex walk mode */
     R350_GAP_TEX_FORMAT,     /* TX_FORMAT1 texel format code */
     R350_GAP_BLEND_FACTOR,   /* RB3D_BLENDCNTL src/dst factor code */
+    R350_GAP_VTX_PROGRAM,    /* draw needs a vertex program we don't run */
     R350_GAP_MAX
 } ATIR350GapKind;
 
@@ -444,6 +445,16 @@ struct ATIR350State {
     uint32_t pvs_upload_cnt;
     uint32_t pvs_const[32];
     uint32_t pvs_const_dwords;
+    /*
+     * Dwords the guest has uploaded to the vertex program's CODE region
+     * (upload addresses below R300_PVS_CONST_START). Nothing executes
+     * them -- the position transform below approximates the driver's own
+     * blit shader with constants 0-3 -- so this exists to tell the two
+     * cases apart: a draw that bypasses the vertex program is rendered
+     * exactly, while one that doesn't is only as right as that
+     * approximation happens to be.
+     */
+    uint32_t pvs_code_dwords;
 
     /*
      * Staging buffer for an in-flight R300 3D_DRAW_IMMD_2 payload

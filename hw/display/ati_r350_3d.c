@@ -625,6 +625,28 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         }
     }
     /*
+     * Positions for this draw are whatever the uploaded vertex program
+     * computes, and nothing here executes one: the matrix above is the
+     * driver's own blit shader recovered from constants 0-3, which is
+     * the right answer only while that is the program in force. An
+     * application with a vertex program of its own -- Chess's board, and
+     * any GL scene -- has object-space coordinates rasterized as though
+     * they were screen ones, landing the geometry tens of thousands of
+     * pixels outside the render target.
+     *
+     * Which of the two a given draw got cannot be told apart from here
+     * without running the program: an application's own shader loads a
+     * full constant set exactly like the driver's, so it takes the same
+     * approximation and merely gets a wrong answer from it. The count is
+     * therefore of draws standing on that approximation, not of draws
+     * known to be wrong -- measured against the desktop's steady rate it
+     * still says plainly when something is leaning on it much harder.
+     */
+    if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
+        s->pvs_code_dwords) {
+        ati_r350_note_gap(s, R350_GAP_VTX_PROGRAM, 0);
+    }
+    /*
      * Vertices without a colour attribute take the fragment program's
      * constant colour: OS X's solid-fill shader outputs PFS_PARAM_0
      * (stored as 24-bit floats -- IEEE with the low mantissa byte
