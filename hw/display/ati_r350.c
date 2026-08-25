@@ -3822,6 +3822,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_VS_VECTOR_OP] = "vertex vector opcode",
     [R350_GAP_VS_MATH_OP]   = "vertex math opcode",
     [R350_GAP_VS_DST_FILE]  = "vertex destination file",
+    [R350_GAP_TEX_SWIZZLE]  = "texture component select",
     [R350_GAP_AOS_ARRAYS]   = "vertex arrays bound",
 };
 

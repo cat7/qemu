@@ -911,6 +911,22 @@
  * the horizontal banding its window renders as.
  */
 #define R300_TX_PITCH_EN              (1u << 31)
+/*
+ * TX_FORMAT1 carries the texel format in [4:0] and, above it, a
+ * four-entry selector that says which of the format's own components
+ * feeds each of A, R, G and B. The components are numbered right to
+ * left, so for the 8_8_8_8 format X is the least significant byte of
+ * the texel and W the most. Mac OS X's window tiles select
+ * (W,Z,Y,X) = plain ARGB8888, but Chess.app's board texture selects
+ * (W,X,Y,Z) -- the same bytes with red and blue exchanged.
+ */
+#define R300_TX_FORMAT1_CODE_MASK     0x1f
+#define R300_TX_FORMAT1_SEL_SHIFT     9       /* A, then R, G, B */
+#define R300_TX_FORMAT1_SEL_MASK      0x7
+#define R300_TX_SEL_X                 0
+#define R300_TX_SEL_W                 3
+#define R300_TX_SEL_ZERO              4
+#define R300_TX_SEL_ONE               5
 #define R300_TX_OFFSET_0              0x4540
 /*
  * Colour and alpha blend control. The two registers share the factor

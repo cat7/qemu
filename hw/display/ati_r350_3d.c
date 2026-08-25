@@ -68,8 +68,8 @@ typedef struct R300DrawState {
     uint32_t tex_off;       /* card address of texture level 0 */
     int tex_w, tex_h;
     uint32_t tex_pitch;     /* bytes per texel row */
-    unsigned tex_bpp;       /* 32 (ARGB8888) or 8 (A8 masks) */
-    unsigned tex_sel_alpha; /* TX_FORMAT1 SEL_ALPHA swizzle */
+    unsigned tex_bpp;       /* 32 (four 8-bit components) or 8 (one) */
+    unsigned tex_sel[4];    /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t; /* TX_FILTER0 clamp modes (0 = repeat) */
     float flat_r, flat_g, flat_b, flat_a;
     uint8_t *vram;
@@ -112,7 +112,7 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
     addr = d->tex_off + (uint32_t)ty * d->tex_pitch +
            (uint32_t)tx * (d->tex_bpp / 8);
     if (d->tex_bpp == 8) {
-        /* A8 mask: alpha from the byte, black colour */
+        /* single-component format: the byte is component X */
         uint8_t a;
 
         if (ati_r350_mc_to_vram(s, addr, &off)) {
@@ -125,7 +125,7 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
             a = (ati_r350_mc_read32(s, addr & ~3u) >> ((addr & 3) * 8))
                 & 0xff;
         }
-        return (uint32_t)a << 24;
+        return a;
     }
     if (ati_r350_mc_to_vram(s, addr, &off)) {
         if (off + 4 > ATI_R350_VRAM_SIZE) {
@@ -137,6 +137,27 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
     return ati_r350_mc_read32(s, addr);
 }
 
+/*
+ * One output channel of the texture unit. `texel` holds the format's own
+ * components packed from the least significant bits up -- X, Y, Z, W --
+ * and TX_FORMAT1 says which of them (or a constant) this channel takes.
+ * Reading a texel as ARGB regardless is right only for the selector
+ * Mac OS X's tiles use; Chess.app's board texture selects the same four
+ * bytes in the opposite order, which is a red/blue exchange.
+ */
+static float r300_texel_chan(const R300DrawState *d, uint32_t texel,
+                             unsigned ch)
+{
+    unsigned sel = d->tex_sel[ch];
+
+    if (sel == R300_TX_SEL_ONE) {
+        return 1.0f;
+    }
+    if (sel > R300_TX_SEL_W) {
+        return 0.0f;                    /* ZERO, and the CUT_* variants */
+    }
+    return ((texel >> (sel * 8)) & 0xff) / 255.0f;
+}
 
 static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
                            int x, int y, uint32_t argb)
@@ -299,17 +320,11 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 float ts = w0 * v0->s + w1 * v1->s + w2 * v2->s;
                 float tt = w0 * v0->t + w1 * v1->t + w2 * v2->t;
                 uint32_t texel = r300_sample_tex(s, d, (int)ts, (int)tt);
-                float ta;
 
-                switch (d->tex_sel_alpha) {
-                case 4:  ta = 0.0f; break;
-                case 5:  ta = 1.0f; break;
-                default: ta = ((texel >> 24) & 0xff) / 255.0f; break;
-                }
-                cr *= ((texel >> 16) & 0xff) / 255.0f;
-                cg *= ((texel >> 8) & 0xff) / 255.0f;
-                cb *= (texel & 0xff) / 255.0f;
-                ca *= ta;
+                ca *= r300_texel_chan(d, texel, 0);
+                cr *= r300_texel_chan(d, texel, 1);
+                cg *= r300_texel_chan(d, texel, 2);
+                cb *= r300_texel_chan(d, texel, 3);
             }
             if (d->alpha_test) {
                 bool pass;
@@ -843,28 +858,37 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     d->tex_w = (txfmt0 & 0x7ff) + 1;
     d->tex_h = ((txfmt0 >> 11) & 0x7ff) + 1;
     /*
-     * TX_FORMAT1's low format code: 0 is the 8-bit single-channel
-     * format (window drop shadows arrive as A8 gradient masks,
-     * TX_FORMAT1=0x00124000); 0xc is ARGB8888, which everything else
+     * TX_FORMAT1's low format code: 0 is the 8-bit single-component
+     * format (window drop shadows arrive as gradient masks,
+     * TX_FORMAT1=0x00124000); 0xc is the four-byte one everything else
      * uses. TXPITCH counts texels, so the byte pitch scales with the
      * texel size.
      */
-    d->tex_bpp = (s->regs[R300_TX_FORMAT1_0 >> 2] & 0x1f) == 0 ? 8 : 32;
-    if (d->textured) {
-        unsigned txcode = s->regs[R300_TX_FORMAT1_0 >> 2] & 0x1f;
+    {
+        uint32_t txfmt1 = s->regs[R300_TX_FORMAT1_0 >> 2];
+        unsigned txcode = txfmt1 & R300_TX_FORMAT1_CODE_MASK;
+        unsigned ch;
 
-        /* everything else is being read as if it were ARGB8888 */
-        if (txcode != 0 && txcode != 0xc) {
+        d->tex_bpp = txcode == 0 ? 8 : 32;
+        /* everything else is being read as if its components were bytes */
+        if (d->textured && txcode != 0 && txcode != 0xc) {
             ati_r350_note_gap(s, R350_GAP_TEX_FORMAT, txcode);
         }
+        /*
+         * Which component feeds each of A, R, G and B. Reading the
+         * texel as ARGB regardless happens to be right for the
+         * selector Mac OS X's window tiles use, and wrong for
+         * Chess.app's board texture, which orders the same four bytes
+         * the other way round.
+         */
+        for (ch = 0; ch < 4; ch++) {
+            d->tex_sel[ch] = (txfmt1 >> (R300_TX_FORMAT1_SEL_SHIFT + ch * 3)) &
+                             R300_TX_FORMAT1_SEL_MASK;
+            if (d->textured && d->tex_sel[ch] > R300_TX_SEL_ONE) {
+                ati_r350_note_gap(s, R350_GAP_TEX_SWIZZLE, d->tex_sel[ch]);
+            }
+        }
     }
-    /*
-     * TX_FORMAT1 SEL_ALPHA ([11:9]) swizzles the alpha the shader
-     * sees: 3 takes the texel's alpha component, 5 forces 1.0 (how
-     * X8R8G8B8 window tiles present -- their memory alpha byte is 0,
-     * and the alpha test would discard every pixel), 4 forces 0.
-     */
-    d->tex_sel_alpha = (s->regs[R300_TX_FORMAT1_0 >> 2] >> 9) & 7;
     d->clamp_s = s->regs[R300_TX_FILTER0_0 >> 2] & 7;
     d->clamp_t = (s->regs[R300_TX_FILTER0_0 >> 2] >> 3) & 7;
     /*
