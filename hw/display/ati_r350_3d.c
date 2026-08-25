@@ -594,6 +594,30 @@ static bool r300_vs_has_color(const R300DrawState *d)
 }
 
 /*
+ * Whether the program's coordinate is the one to use for this vertex.
+ *
+ * Only where the attribute path has none to offer, which is exactly the
+ * case r300_load_vtx bails out of: a position attribute narrower than
+ * four dwords means the dwords after it belong to some other attribute,
+ * so there is no coordinate in the flat block to read. Chess.app's
+ * board is that case, and it is the one this buys.
+ *
+ * Everything wider keeps its attribute, and deliberately. Flurry's
+ * vertices are a four-dword position and a colour, its program is not
+ * the plain matrix, and its first texture output evaluates to (0,0) at
+ * every vertex -- measured live, 231 draws of a frame each reporting a
+ * (0,0)-(0,0) coordinate range -- so preferring the program there
+ * collapses the whole screen onto texel (0,0) and the screensaver
+ * renders black. Where Flurry's coordinate really comes from is not yet
+ * known; until it is, the attribute path is the one with a measured
+ * result behind it.
+ */
+static bool r300_vs_has_texcoord(const R300DrawState *d)
+{
+    return d->vs_texcoord && d->attr_size[0] < 4;
+}
+
+/*
  * The texture coordinate the program computed, in the texels this
  * model's sampler works in.
  *
@@ -698,7 +722,7 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
     if ((r.out_written & (1u << d->vs_color_out)) && r300_vs_has_color(d)) {
         r300_vs_color(v, r.out[d->vs_color_out]);
     }
-    if (d->vs_texcoord && (r.out_written & (1u << d->vs_tex_out))) {
+    if (r300_vs_has_texcoord(d) && (r.out_written & (1u << d->vs_tex_out))) {
         r300_vs_texcoord(d, v, r.out[d->vs_tex_out]);
     }
     if (!(r.out_written & 1)) {
@@ -1026,6 +1050,9 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
              * already carries. The two agree anyway -- that program's
              * texture matrix is the exact inverse of the scaling below --
              * so this is a decision about cost, not about semantics.
+             *
+             * The vertex's own layout decides the rest, at the point of
+             * use: see r300_vs_has_texcoord().
              */
             d->vs_texcoord = d->vs_run && !d->vs.plain_matrix &&
                              d->textured && first_tex < R300_PVS_OUT_REGS &&
