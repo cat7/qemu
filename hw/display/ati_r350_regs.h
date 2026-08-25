@@ -951,6 +951,10 @@
 #define R300_PVS_CONST_START          0x200
 #define R300_VAP_PVS_UPLOAD_DATA      0x2208
 #define R300_VAP_CNTL_STATUS          0x2140
+#define R300_VAP_VC_SWAP              0x00000003
+#define R300_VAP_VC_SWAP_16BIT        1
+#define R300_VAP_VC_SWAP_32BIT        2
+#define R300_VAP_VC_SWAP_HDW          3
 #define R300_VAP_PVS_BYPASS           0x00000100
 #define R300_SE_VPORT_XSCALE          0x1d98
 #define R300_SC_SCISSOR0              0x43e0

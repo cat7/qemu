@@ -961,6 +961,32 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
 }
 
 /*
+ * VAP_CNTL_STATUS.VC_SWAP, the vertex fetcher's own endian swapper
+ * (R3xx 3D register reference: 0 = none, 1 = 16-bit, 2 = 32-bit,
+ * 3 = half-dword). A big-endian host uses it to leave vertex arrays in
+ * memory in its native order.
+ *
+ * It only has to be applied on the way out of system memory here. VRAM
+ * in this model stores what the CPU wrote and folds the frame-buffer
+ * aperture's byte swapper into every VRAM reader instead
+ * (ati_r350_vram_xor), so a VRAM-resident array has already been put
+ * right by the time the fetch returns and swapping again would undo it.
+ */
+static uint32_t r300_vc_swap(uint32_t val, unsigned mode)
+{
+    switch (mode) {
+    case R300_VAP_VC_SWAP_16BIT:
+        return ((val & 0x00ff00ffu) << 8) | ((val >> 8) & 0x00ff00ffu);
+    case R300_VAP_VC_SWAP_32BIT:
+        return bswap32(val);
+    case R300_VAP_VC_SWAP_HDW:
+        return (val << 16) | (val >> 16);
+    default:
+        return val;
+    }
+}
+
+/*
  * 3D_DRAW_VBUF_2: like DRAW_IMMD_2 but the single payload dword is
  * VAP_VF_CNTL (PRIM_WALK=2) and the vertices are fetched from the
  * vertex arrays bound at VAP_VTX_AOS_ADDR0/1 (written either directly
@@ -981,6 +1007,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
     unsigned size[2] = { ctl & 0xff, (ctl >> 16) & 0xff };
     unsigned stride[2] = { (ctl >> 8) & 0xff, (ctl >> 24) & 0xff };
     unsigned vsize = size[0] + size[1];
+    unsigned swap = s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_VC_SWAP;
     R300DrawState d;
     unsigned i, a, c;
 
@@ -1017,8 +1044,14 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                 unsigned base = n;
 
                 for (c = 0; c < size[a] && n < 16; c++) {
-                    dw[n++] = ati_r350_mc_read32(s,
-                        addr[a] + (i * stride[a] + c) * 4);
+                    uint32_t card = addr[a] + (i * stride[a] + c) * 4;
+                    uint32_t val = ati_r350_mc_read32(s, card);
+                    uint32_t off;
+
+                    if (swap && !ati_r350_mc_to_vram(s, card, &off)) {
+                        val = r300_vc_swap(val, swap);
+                    }
+                    dw[n++] = val;
                 }
                 if (i == 0) {
                     /*
