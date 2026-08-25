@@ -377,17 +377,63 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     }
 }
 
+/*
+ * A vertex the transform cannot place: far enough outside any render
+ * target that the scissor drops it, but small enough to stay an ordinary
+ * float and an in-range int once floored.
+ */
+static const float r300_vtx_nowhere = -32768.0f;
+
+/*
+ * Position, through the vertex program's matrix and then the viewport.
+ *
+ * Every program the driver and its applications upload computes the
+ * clip-space position the same way -- four dot products of the incoming
+ * position against constants 0-3 (confirmed across all seven programs in
+ * the Chess corpus) -- so the matrix stands in for the program for that
+ * one output. What comes out is CLIP space, and clip space only becomes
+ * normalized device space after dividing by w.
+ *
+ * The compositor never needed the divide: its projection is orthographic,
+ * so w is 1 and dividing changes nothing, which is why the desktop always
+ * looked right. A perspective projection is what exposes it -- Chess's
+ * board arrived scaled by whatever its w happened to be, landing the
+ * geometry tens of thousands of pixels outside the render target and
+ * filling the window with streaks.
+ */
 static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v)
 {
-    float ndcx, ndcy;
+    float cx, cy, cw;
 
     if (!d->xform) {
         return;
     }
-    ndcx = d->mat[0] * v->x + d->mat[1] * v->y + d->mat[2] * v->z + d->mat[3];
-    ndcy = d->mat[4] * v->x + d->mat[5] * v->y + d->mat[6] * v->z + d->mat[7];
-    v->x = ndcx * d->vp[0] + d->vp[1];
-    v->y = ndcy * d->vp[2] + d->vp[3];
+    cx = d->mat[0] * v->x + d->mat[1] * v->y +
+         d->mat[2] * v->z + d->mat[3] * v->w;
+    cy = d->mat[4] * v->x + d->mat[5] * v->y +
+         d->mat[6] * v->z + d->mat[7] * v->w;
+    cw = d->mat[12] * v->x + d->mat[13] * v->y +
+         d->mat[14] * v->z + d->mat[15] * v->w;
+    /*
+     * Nothing here clips against the w = 0 plane, so a vertex level with
+     * or behind the eye has no screen position to compute. Refuse the
+     * division rather than let an infinity or a NaN reach the rasterizer:
+     * a NaN compares false against every bound, so it survives the
+     * scissor and floors into an INT_MIN rectangle that smears across the
+     * whole surface. Park the vertex off-screen instead -- the same
+     * treatment the raw, untransformable coordinates need, since those
+     * are unbounded floats that floor into nonsense of their own.
+     */
+    if (!isfinite(cx) || !isfinite(cy) || !isfinite(cw) ||
+        fabsf(cw) < 0.000001f) {
+        v->x = v->y = r300_vtx_nowhere;
+        return;
+    }
+    v->x = (cx / cw) * d->vp[0] + d->vp[1];
+    v->y = (cy / cw) * d->vp[2] + d->vp[3];
+    if (!isfinite(v->x) || !isfinite(v->y)) {
+        v->x = v->y = r300_vtx_nowhere;
+    }
 }
 
 static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
