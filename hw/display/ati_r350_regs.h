@@ -930,6 +930,20 @@
 #define R300_BLEND_FACTOR_MASK        0x3f
 /* constant operand for factor codes 43-46 */
 #define R300_RB3D_BLEND_COLOR         0x4e10
+/*
+ * RB3D_COLOR_CHANNEL_MASK: one write-enable per destination channel,
+ * blue in bit 0 through alpha in bit 3. The colour buffer discards the
+ * quad outright when every channel is masked off. Chess draws each
+ * piece twice -- once with the alpha channel masked (0x7) and once
+ * whole -- and masks colour off completely (0x0) for its depth-only
+ * passes, so ignoring this register both loses the destination alpha
+ * and paints depth passes as if they were content.
+ */
+#define R300_RB3D_COLOR_CHANNEL_MASK  0x4e0c
+#define R300_COLORMASK_BLUE           (1u << 0)
+#define R300_COLORMASK_GREEN          (1u << 1)
+#define R300_COLORMASK_RED            (1u << 2)
+#define R300_COLORMASK_ALPHA          (1u << 3)
 #define R300_RB3D_COLOROFFSET0        0x4e28
 #define R300_RB3D_COLORPITCH0         0x4e38
 #define R300_PFS_PARAM_0_X            0x4c00

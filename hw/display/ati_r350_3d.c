@@ -46,6 +46,7 @@ typedef struct R300DrawState {
     float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
+    uint32_t wmask;         /* RB3D_COLOR_CHANNEL_MASK as an ARGB byte mask */
     bool textured;
     bool blend;
     bool blend_read;                   /* READ_ENABLE: may we read dst? */
@@ -139,6 +140,10 @@ static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
 
     if (addr + 4 > ATI_R350_VRAM_SIZE) {
         return;
+    }
+    if (d->wmask != 0xffffffff) {
+        /* masked-off channels keep whatever the destination holds */
+        argb = (argb & d->wmask) | (ati_r350_vram_ld32(s, addr) & ~d->wmask);
     }
     xr = ati_r350_vram_xor(s, addr);
     d->vram[(addr + 0) ^ xr] = argb & 0xff;
@@ -652,6 +657,23 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     if (!d->dst_pitch) {
         return false;
     }
+    {
+        uint32_t cm = s->regs[R300_RB3D_COLOR_CHANNEL_MASK >> 2];
+
+        if (!(cm & (R300_COLORMASK_BLUE | R300_COLORMASK_GREEN |
+                    R300_COLORMASK_RED | R300_COLORMASK_ALPHA))) {
+            /*
+             * Every channel masked off: the colour buffer discards the
+             * quads. Chess's depth-only passes arrive this way, and
+             * shading them smeared a texture across the board.
+             */
+            return false;
+        }
+        d->wmask = (cm & R300_COLORMASK_ALPHA ? 0xff000000u : 0) |
+                   (cm & R300_COLORMASK_RED   ? 0x00ff0000u : 0) |
+                   (cm & R300_COLORMASK_GREEN ? 0x0000ff00u : 0) |
+                   (cm & R300_COLORMASK_BLUE  ? 0x000000ffu : 0);
+    }
     d->textured = (s->regs[R300_TX_ENABLE >> 2] & 1) && vsize >= 8;
     /*
      * RB3D_BLENDCNTL (R5xx accel guide): bit 0 is ALPHA_BLEND_ENABLE,
@@ -900,6 +922,12 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     } else {
         d->flat_r = d->flat_g = d->flat_b = d->flat_a = 1.0f;
     }
+    /*
+     * Where this draw lands and which of its channels survive, read
+     * where the draw itself reads them: a post-hoc read of the mask
+     * says only what the last writer left behind.
+     */
+    trace_ati_r350_3d_cb(d->dst_off, d->dst_pitch, d->wmask);
     return true;
 }
 
