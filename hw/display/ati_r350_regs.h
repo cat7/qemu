@@ -914,6 +914,19 @@
 #define R300_PVS_MAX_CONST_DWORDS     (256 * 4)
 #define R300_VAP_CNTL_STATUS          0x2140
 #define R300_VAP_PVS_BYPASS           0x00000100
+/*
+ * What the vertex stage emits, and therefore which program output
+ * index carries what: out[0] is the position, then one output per
+ * colour the format declares, then the texture coordinates. So the
+ * first texcoord output is 1 + (number of colours present), and the
+ * rasterizer's texture interpolator reads that one.
+ */
+#define R300_VAP_OUTPUT_VTX_FMT_0     0x2090
+#define R300_VAP_OUT_POS_PRESENT      (1u << 0)
+#define R300_VAP_OUT_COLOR_SHIFT      1      /* four colour-present bits */
+#define R300_VAP_OUT_COLOR_COUNT      4
+#define R300_VAP_OUTPUT_VTX_FMT_1     0x2094
+#define R300_VAP_OUT_TEX0_COMP_MASK   0x7    /* components of texcoord 0 */
 /* program bounds: first/last instruction slot, 10 bits each */
 #define R300_VAP_PVS_CODE_CNTL_0      0x22d0
 #define R300_PVS_FIRST_INST_SHIFT     0

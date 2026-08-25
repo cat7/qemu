@@ -378,8 +378,8 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     }
 }
 
-static bool r300_vs_position(ATIR350State *s, const uint32_t *dw,
-                             unsigned vsize, R300Vtx *v);
+static bool r300_vs_shade(ATIR350State *s, const R300DrawState *d,
+                          const uint32_t *dw, unsigned vsize, R300Vtx *v);
 
 /*
  * Position from clip space to the destination surface. `ndc` already
@@ -406,11 +406,14 @@ static void r300_xform_vtx(ATIR350State *s, const R300DrawState *d,
     if (!d->xform) {
         return;
     }
-    if (r300_vs_position(s, dw, vsize, &p)) {
+    if (r300_vs_shade(s, d, dw, vsize, &p)) {
         /* the program emits clip space; w divides through it */
         float w = p.w != 0.0f ? p.w : 1.0f;
 
-        r300_viewport_vtx(d, v, p.x / w, p.y / w);
+        p.x /= w;
+        p.y /= w;
+        *v = p;
+        r300_viewport_vtx(d, v, p.x, p.y);
         return;
     }
     r300_viewport_vtx(d, v,
@@ -680,6 +683,7 @@ typedef struct R300VsRegs {
     float in[16][4];
     float out[16][4];
     float tmp[32][4];
+    uint32_t out_written;   /* bit per out[] index the program wrote */
 } R300VsRegs;
 
 static void r300_vs_fetch_src(ATIR350State *s, const R300VsRegs *r,
@@ -895,6 +899,7 @@ static void r300_vs_run(ATIR350State *s, R300VsRegs *r)
         case R300_PVS_DST_REG_OUT:
         case R300_PVS_DST_REG_OUT_REPL_X:
             dst = r->out[doff % ARRAY_SIZE(r->out)];
+            r->out_written |= 1u << (doff % ARRAY_SIZE(r->out));
             break;
         case R300_PVS_DST_REG_TEMPORARY:
         case R300_PVS_DST_REG_ALT_TEMP:
@@ -916,14 +921,28 @@ static void r300_vs_run(ATIR350State *s, R300VsRegs *r)
 }
 
 /*
- * Transform one vertex's position with the uploaded program. Returns
- * false when there is no usable program, leaving the caller on the
- * matrix path.
+ * Run the uploaded program for one vertex and take from it whatever
+ * the declared output format says it produced: always the position,
+ * and -- when the program really writes them -- the colour and the
+ * texture coordinate too.
+ *
+ * Which output index carries the texture coordinate follows from
+ * VAP_OUTPUT_VTX_FMT: position, then one output per declared colour,
+ * then the texcoords. Reading it from the program matters because a
+ * GL program transforms its texture coordinates (Chess.app multiplies
+ * them by a second matrix); taking the raw vertex attribute instead
+ * samples the texture at untransformed coordinates.
+ *
+ * Returns false when there is no usable program, leaving the caller
+ * on the matrix path.
  */
-static bool r300_vs_position(ATIR350State *s, const uint32_t *dw,
-                             unsigned vsize, R300Vtx *v)
+static bool r300_vs_shade(ATIR350State *s, const R300DrawState *d,
+                          const uint32_t *dw, unsigned vsize, R300Vtx *v)
 {
     R300VsRegs r;
+    uint32_t fmt0 = s->regs[R300_VAP_OUTPUT_VTX_FMT_0 >> 2];
+    uint32_t fmt1 = s->regs[R300_VAP_OUTPUT_VTX_FMT_1 >> 2];
+    unsigned tex_out = 1;
     unsigned i, c;
 
     if (!s->pvs_code_dwords) {
@@ -940,10 +959,49 @@ static bool r300_vs_position(ATIR350State *s, const uint32_t *dw,
         r.in[i][c] = r300_f32(dw[i * 4 + c]);
     }
     r300_vs_run(s, &r);
+
     v->x = r.out[0][0];
     v->y = r.out[0][1];
     v->z = r.out[0][2];
     v->w = r.out[0][3];
+
+    for (i = 0; i < R300_VAP_OUT_COLOR_COUNT; i++) {
+        if (fmt0 & (1u << (R300_VAP_OUT_COLOR_SHIFT + i))) {
+            tex_out++;
+        }
+    }
+    /*
+     * Only take a colour from the program when the vertex actually
+     * carries one: in a 8-dword vertex the second attribute is a
+     * texture coordinate, and the blit shader's out[1] is a plain
+     * passthrough of it, which would land texture coordinates in the
+     * colour channels.
+     */
+    if ((fmt0 & (1u << R300_VAP_OUT_COLOR_SHIFT)) &&
+        (r.out_written & 2) && vsize >= 12) {
+        v->r = r.out[1][0];
+        v->g = r.out[1][1];
+        v->b = r.out[1][2];
+        v->a = r.out[1][3];
+    }
+    if ((fmt1 & R300_VAP_OUT_TEX0_COMP_MASK) && tex_out < ARRAY_SIZE(r.out) &&
+        (r.out_written & (1u << tex_out))) {
+        float q = r.out[tex_out][3];
+        float ts = r.out[tex_out][0];
+        float tt = r.out[tex_out][1];
+
+        /* a projective coordinate arrives pre-divide */
+        if (q != 0.0f && q != 1.0f) {
+            ts /= q;
+            tt /= q;
+        }
+        /*
+         * Program-supplied coordinates are normalized; the sampler
+         * works in texels.
+         */
+        v->s = ts * d->tex_w;
+        v->t = tt * d->tex_h;
+    }
     return true;
 }
 
