@@ -1041,6 +1041,35 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
 {
     unsigned i;
 
+    /*
+     * Where this draw actually lands, straight from the transformed
+     * vertices. Offline replay of a command stream has to reconstruct
+     * this and can get it wrong -- reading it from the engine is the
+     * ground truth to check such a reconstruction against.
+     */
+    if (trace_event_get_state_backends(TRACE_ATI_R350_3D_RECT) && nvtx) {
+        float x0 = vb[0].x, y0 = vb[0].y, x1 = x0, y1 = y0;
+        float s0 = vb[0].s, t0 = vb[0].t, s1 = s0, t1 = t0;
+
+        for (i = 1; i < nvtx; i++) {
+            x0 = MIN(x0, vb[i].x); x1 = MAX(x1, vb[i].x);
+            y0 = MIN(y0, vb[i].y); y1 = MAX(y1, vb[i].y);
+            s0 = MIN(s0, vb[i].s); s1 = MAX(s1, vb[i].s);
+            t0 = MIN(t0, vb[i].t); t1 = MAX(t1, vb[i].t);
+        }
+        if (prim == 1) {
+            /* a point sprite covers RE_POINTSIZE around its centre */
+            uint32_t psize = s->regs[R300_RE_POINTSIZE >> 2];
+            float hw = ((psize >> 16) & 0xffff) / 12.0f;
+            float hh = (psize & 0xffff) / 12.0f;
+
+            x0 -= hw; x1 += hw;
+            y0 -= hh; y1 += hh;
+        }
+        trace_ati_r350_3d_rect(d->dst_off, (int)x0, (int)y0, (int)x1, (int)y1,
+                               (int)s0, (int)t0, (int)s1, (int)t1);
+    }
+
     switch (prim) {
     case 1:     /* point list -- WindowServer's screen composites are
                  * point SPRITES: RE_POINTSIZE gives the width/height
