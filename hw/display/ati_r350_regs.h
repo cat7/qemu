@@ -393,6 +393,24 @@
 #define R350_CLR_CMP_FN_NOT_EQUAL    4
 #define R350_CLR_CMP_FN_EQUAL        5
 #define R350_CLR_CMP_SRC_SOURCE      0x01000000
+/*
+ * The 2D engine's byte-swap control for data it bus-masters out of host
+ * memory. Same four codes as every other swapper on this chip
+ * (TX_OFFSET.ENDIAN_SWAP, RB3D_COLORPITCH.COLORENDIAN, SURFACEn_INFO):
+ * 0 none, 1 16-bit, 2 32-bit, 3 half-dword.
+ *
+ * Neither AMD register reference we have covers the 2D block, so the
+ * name is established from the driver instead: Mac OS X's
+ * ATIRadeon9700.kext emits this register in
+ * write_2dblit_cmds_for_copy_buffer_using_DMA() carrying the same
+ * bpp-keyed code (8/16/32bpp -> 0/1/2) that set_display_mode_and_vram()
+ * feeds to SURFACE_CNTL and SURFACEn_INFO. A capture of one Chess.app
+ * session agrees exactly: of 1613 BITBLTs, the 23 eight-bit ones and
+ * the 136 that page in OpenGL textures carry 0, and the 1454 that page
+ * in CoreGraphics ARGB surfaces carry 2.
+ */
+#define R350_GUI_HOST_SWAP_CNTL      0x15d4
+#define R350_GUI_HOST_SWAP_MASK      0x00000003
 #define R350_DP_SRC_FRGD_CLR         0x15d8
 #define R350_DP_SRC_BKGD_CLR         0x15dc
 #define R350_SC_LEFT                 0x1640

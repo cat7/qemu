@@ -45,6 +45,25 @@ static int ati_r350_bpp_from_dp_datatype(ATIR350State *s)
     }
 }
 
+/*
+ * GUI_HOST_SWAP_CNTL as a byte-lane XOR, in the same encoding
+ * ati_r350_vram_xor() returns: 32-bit swap reverses all four lanes,
+ * 16-bit swap reverses each pair, half-dword swaps the two halves.
+ */
+static unsigned ati_r350_host_swap_xor(ATIR350State *s)
+{
+    switch (s->regs[R350_GUI_HOST_SWAP_CNTL >> 2] & R350_GUI_HOST_SWAP_MASK) {
+    case 1:
+        return 1;
+    case 2:
+        return 3;
+    case 3:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
 static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
                                           uint32_t stride, int x, int y,
                                           int bpp)
@@ -59,27 +78,57 @@ static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
     if (addr + bpp / 8 > ATI_R350_VRAM_SIZE) {
         /*
          * Card address outside VRAM: the engine is a bus master, so
-         * fetch through the MC/GART. This is OS X's texture page-in --
+         * fetch through the MC/GART. This is OS X's surface page-in --
          * a plain SRCCOPY BITBLT whose source pitch/offset point at
-         * GART-resident window backing (srcoff 0x100xxxxx). The CPU
-         * wrote those pixels big-endian with no aperture swapper in
-         * the way, so swap the little-endian DMA read back.
+         * GART-resident staging (srcoff 0x100xxxxx).
+         *
+         * The engine copies bytes out of host memory, and how the host
+         * laid those bytes out is GUI_HOST_SWAP_CNTL's business -- see
+         * the register's comment for how it was identified. Two
+         * producers page surfaces in through this one call with
+         * byte-identical blit registers and opposite byte orders, and
+         * this register is the only thing that separates them:
+         *
+         *   - the OpenGL driver stages a texture as GL_RGBA bytes, i.e.
+         *     already in the order the texture unit's little-endian
+         *     texel wants, and asks for no swap (code 0);
+         *   - CoreGraphics stages a window surface as native big-endian
+         *     ARGB dwords and asks for the 32-bit swap (code 2), which
+         *     is what turns them into the little-endian ARGB the
+         *     compositor's TX_FORMAT component select declares.
+         *
+         * Modelled the same way as every other swapper on this chip: as
+         * an XOR on the byte lane, exactly like ati_r350_vram_xor().
+         * Hard-coding the 32-bit swap here was right for CoreGraphics
+         * and wrong for the GL driver -- it is why Chess.app's wood
+         * board came out red with green and blue exchanged. The 8bpp
+         * case is the standing control: every eight-bit page-in carries
+         * code 0, and window drop shadows (TX_FORMAT 0x00124000, alpha
+         * from component 0) have always decoded correctly.
+         *
+         * Only the bus-master path consults it. A VRAM-to-VRAM copy has
+         * card-native bytes on both sides and no host order to
+         * reconcile, which is also what keeps window drags -- screen to
+         * layer, taken while this register reads 2 -- unswapped.
          */
         uint32_t dw = ati_r350_mc_read32(s, addr & ~3u);
+        unsigned sx = ati_r350_host_swap_xor(s);
+        unsigned lane = addr & 3;
 
         switch (bpp) {
         case 32:
-            if (!(addr & 3)) {
-                return bswap32(dw);
+            if (addr & 3) {
+                return 0;
             }
-            return 0;
+            return ((dw >> ((0 ^ sx) * 8)) & 0xff) |
+                   ((dw >> ((1 ^ sx) * 8)) & 0xff) << 8 |
+                   ((dw >> ((2 ^ sx) * 8)) & 0xff) << 16 |
+                   ((dw >> ((3 ^ sx) * 8)) & 0xff) << 24;
         case 16:
-            /* big-endian pixel bytes in host memory */
-            return bswap16((dw >> ((addr & 2) * 8)) & 0xffff);
+            return ((dw >> ((lane ^ sx) * 8)) & 0xff) |
+                   ((dw >> (((lane + 1) ^ sx) * 8)) & 0xff) << 8;
         case 8:
-            /* mc_read32 is a little-endian view: byte addr & 3 sits
-             * at bit position (addr & 3) * 8 */
-            return (dw >> ((addr & 3) * 8)) & 0xff;
+            return (dw >> ((lane ^ sx) * 8)) & 0xff;
         default:
             return 0;
         }
