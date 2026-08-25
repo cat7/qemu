@@ -68,7 +68,8 @@ typedef struct R300DrawState {
     uint32_t tex_off;       /* card address of texture level 0 */
     int tex_w, tex_h;
     uint32_t tex_pitch;     /* bytes per texel row */
-    unsigned tex_bpp;       /* bits per texel: 8, 16 or 32 */
+    unsigned tex_bpp;       /* bits per texel: 8, 16, 32 or 64 */
+    unsigned tex_code;      /* TX_FORMAT1 TXFORMAT, to tell 16bpp/64bpp apart */
     int tex_attr;           /* vertex attribute holding s,t; -1 = none */
     unsigned tex_sel[4];    /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t; /* TX_FILTER0 clamp modes (0 = repeat) */
@@ -80,6 +81,52 @@ static inline float r300_f32(uint32_t v)
 {
     union { uint32_t u; float f; } c = { .u = v };
     return c.f;
+}
+
+/*
+ * Every format this model decodes is handed to r300_texel_chan() in one
+ * shape: the four components as bytes, X in the low lane and W in the
+ * high one, exactly as TX_FMT_8_8_8_8 already arrives. Narrower or wider
+ * components are widened or reduced to eight bits here, so the
+ * TX_FORMAT1 component select stays one piece of code for every format
+ * rather than growing a per-format extraction rule.
+ */
+static inline uint32_t r300_pack_xyzw(uint32_t x, uint32_t y,
+                                      uint32_t z, uint32_t w)
+{
+    return (x & 0xff) | ((y & 0xff) << 8) |
+           ((z & 0xff) << 16) | ((w & 0xff) << 24);
+}
+
+/* 5-bit component to 8 bits, replicating the high bits so 31 maps to 255 */
+static inline uint32_t r300_c5to8(uint32_t c)
+{
+    return (c << 3) | (c >> 2);
+}
+
+/*
+ * TX_FMT_1_5_5_5 (TXFORMAT code 0xb, 16 bits per texel). Components are
+ * numbered right to left, so Component0 is bits [4:0], Component1
+ * [9:5], Component2 [14:10] and Component3 the single bit 15 -- which
+ * under the usual (W,Z,Y,X) select is plain ARGB1555.
+ */
+static inline uint32_t r300_texel_1555(uint32_t v)
+{
+    return r300_pack_xyzw(r300_c5to8(v & 0x1f),
+                          r300_c5to8((v >> 5) & 0x1f),
+                          r300_c5to8((v >> 10) & 0x1f),
+                          (v >> 15) & 1 ? 0xff : 0);
+}
+
+/*
+ * TX_FMT_16_16_16_16 (code 0xe, 64 bits per texel), from the two dwords
+ * in ascending address order: Component0 is the low half of the first,
+ * Component3 the high half of the second. The pipeline below carries
+ * eight bits per channel, so each component keeps its high byte.
+ */
+static inline uint32_t r300_texel_16x4(uint32_t lo, uint32_t hi)
+{
+    return r300_pack_xyzw(lo >> 8, lo >> 24, hi >> 8, hi >> 24);
 }
 
 static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
@@ -130,24 +177,44 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
     }
     if (d->tex_bpp == 16) {
         /*
-         * Two-component format (TX_FMT_8_8): the texel is one 16-bit
-         * unit, component X in its low byte and Y in its high one.
-         * The byte lanes go through the same aperture swapper as every
-         * other VRAM read -- a 32-bit swapper reverses the lanes of a
-         * halfword just as it does for the 2D engine's 16bpp path.
+         * One 16-bit unit per texel, assembled from its two bytes in
+         * ascending address order. The byte lanes go through the same
+         * aperture swapper as every other VRAM read -- a 32-bit swapper
+         * reverses the lanes of a halfword just as it does for the 2D
+         * engine's 16bpp path. TX_FMT_8_8 is then already in the packed
+         * shape (X the low byte, Y the high one); TX_FMT_1_5_5_5 has to
+         * have its components spread into their own lanes.
          */
         unsigned xr;
+        uint32_t v;
 
         if (!ati_r350_mc_to_vram(s, addr, &off)) {
-            return (ati_r350_mc_read32(s, addr & ~3u) >>
-                    ((addr & 2) * 8)) & 0xffff;
-        }
-        if (off + 2 > ATI_R350_VRAM_SIZE) {
+            v = (ati_r350_mc_read32(s, addr & ~3u) >>
+                 ((addr & 2) * 8)) & 0xffff;
+        } else if (off + 2 > ATI_R350_VRAM_SIZE) {
             return 0;
+        } else {
+            xr = ati_r350_vram_xor(s, off);
+            v = (uint32_t)d->vram[off ^ xr] |
+                ((uint32_t)d->vram[(off + 1) ^ xr] << 8);
         }
-        xr = ati_r350_vram_xor(s, off);
-        return (uint32_t)d->vram[off ^ xr] |
-               ((uint32_t)d->vram[(off + 1) ^ xr] << 8);
+        return d->tex_code == R300_TX_FMT_1_5_5_5 ? r300_texel_1555(v) : v;
+    }
+    if (d->tex_bpp == 64) {
+        /*
+         * TX_FMT_16_16_16_16. The swapper is a byte-lane permutation
+         * inside each dword, so the two halves of the texel are read
+         * exactly as two independent dwords, in address order.
+         */
+        if (ati_r350_mc_to_vram(s, addr, &off)) {
+            if (off + 8 > ATI_R350_VRAM_SIZE) {
+                return 0;
+            }
+            return r300_texel_16x4(ati_r350_vram_ld32(s, off),
+                                   ati_r350_vram_ld32(s, off + 4));
+        }
+        return r300_texel_16x4(ati_r350_mc_read32(s, addr),
+                               ati_r350_mc_read32(s, addr + 4));
     }
     if (ati_r350_mc_to_vram(s, addr, &off)) {
         if (off + 4 > ATI_R350_VRAM_SIZE) {
@@ -1044,24 +1111,43 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * [4:0]): 0 is TX_FMT_8, the single-component format window drop
      * shadows arrive in (TX_FORMAT1=0x00124000); 3 is TX_FMT_8_8, the
      * two-component luminance/alpha sprite Flurry.saver's particles
-     * are drawn with; 0xc is TX_FMT_8_8_8_8, what everything else
-     * uses. Components are numbered from the low bits up, so the same
-     * `texel >> (sel * 8)` extraction serves all three. TXPITCH counts
-     * texels, so the byte pitch scales with the texel size -- reading
-     * an 8_8 texture as four bytes per texel doubled both the pitch
-     * and the stride and made one dword span two texels.
+     * are drawn with; 0xb is TX_FMT_1_5_5_5, which Abstract.saver
+     * asks for; 0xc is TX_FMT_8_8_8_8, what the compositor and most
+     * apps use; 0xe is TX_FMT_16_16_16_16, which RSS Visualizer.saver
+     * asks for. r300_sample_tex() hands all of them to the component
+     * select as four bytes, so one selector implementation serves
+     * every format. TXPITCH counts texels, so the byte pitch scales
+     * with the texel size -- reading an 8_8 texture as four bytes per
+     * texel doubled both the pitch and the stride and made one dword
+     * span two texels.
      */
     {
         uint32_t txfmt1 = s->regs[R300_TX_FORMAT1_0 >> 2];
         unsigned txcode = txfmt1 & R300_TX_FORMAT1_CODE_MASK;
         unsigned ch;
 
-        d->tex_bpp = txcode == R300_TX_FMT_8 ? 8 :
-                     txcode == R300_TX_FMT_8_8 ? 16 : 32;
-        /* everything else is being read as if its components were bytes */
-        if (d->textured && txcode != R300_TX_FMT_8 &&
-            txcode != R300_TX_FMT_8_8 && txcode != R300_TX_FMT_8_8_8_8) {
-            ati_r350_note_gap(s, R350_GAP_TEX_FORMAT, txcode);
+        d->tex_code = txcode;
+        switch (txcode) {
+        case R300_TX_FMT_8:
+            d->tex_bpp = 8;
+            break;
+        case R300_TX_FMT_8_8:
+        case R300_TX_FMT_1_5_5_5:
+            d->tex_bpp = 16;
+            break;
+        case R300_TX_FMT_16_16_16_16:
+            d->tex_bpp = 64;
+            break;
+        case R300_TX_FMT_8_8_8_8:
+            d->tex_bpp = 32;
+            break;
+        default:
+            /* the rest are being read as if their components were bytes */
+            d->tex_bpp = 32;
+            if (d->textured) {
+                ati_r350_note_gap(s, R350_GAP_TEX_FORMAT, txcode);
+            }
+            break;
         }
         /*
          * Which component feeds each of A, R, G and B. Reading the
