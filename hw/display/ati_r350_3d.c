@@ -68,7 +68,7 @@ typedef struct R300DrawState {
     uint32_t tex_off;       /* card address of texture level 0 */
     int tex_w, tex_h;
     uint32_t tex_pitch;     /* bytes per texel row */
-    unsigned tex_bpp;       /* 32 (four 8-bit components) or 8 (one) */
+    unsigned tex_bpp;       /* bits per texel: 8, 16 or 32 */
     unsigned tex_sel[4];    /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t; /* TX_FILTER0 clamp modes (0 = repeat) */
     float flat_r, flat_g, flat_b, flat_a;
@@ -126,6 +126,27 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
                 & 0xff;
         }
         return a;
+    }
+    if (d->tex_bpp == 16) {
+        /*
+         * Two-component format (TX_FMT_8_8): the texel is one 16-bit
+         * unit, component X in its low byte and Y in its high one.
+         * The byte lanes go through the same aperture swapper as every
+         * other VRAM read -- a 32-bit swapper reverses the lanes of a
+         * halfword just as it does for the 2D engine's 16bpp path.
+         */
+        unsigned xr;
+
+        if (!ati_r350_mc_to_vram(s, addr, &off)) {
+            return (ati_r350_mc_read32(s, addr & ~3u) >>
+                    ((addr & 2) * 8)) & 0xffff;
+        }
+        if (off + 2 > ATI_R350_VRAM_SIZE) {
+            return 0;
+        }
+        xr = ati_r350_vram_xor(s, off);
+        return (uint32_t)d->vram[off ^ xr] |
+               ((uint32_t)d->vram[(off + 1) ^ xr] << 8);
     }
     if (ati_r350_mc_to_vram(s, addr, &off)) {
         if (off + 4 > ATI_R350_VRAM_SIZE) {
@@ -986,20 +1007,27 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     d->tex_w = (txfmt0 & 0x7ff) + 1;
     d->tex_h = ((txfmt0 >> 11) & 0x7ff) + 1;
     /*
-     * TX_FORMAT1's low format code: 0 is the 8-bit single-component
-     * format (window drop shadows arrive as gradient masks,
-     * TX_FORMAT1=0x00124000); 0xc is the four-byte one everything else
-     * uses. TXPITCH counts texels, so the byte pitch scales with the
-     * texel size.
+     * TX_FORMAT1's low format code (R3xx register reference, TXFORMAT
+     * [4:0]): 0 is TX_FMT_8, the single-component format window drop
+     * shadows arrive in (TX_FORMAT1=0x00124000); 3 is TX_FMT_8_8, the
+     * two-component luminance/alpha sprite Flurry.saver's particles
+     * are drawn with; 0xc is TX_FMT_8_8_8_8, what everything else
+     * uses. Components are numbered from the low bits up, so the same
+     * `texel >> (sel * 8)` extraction serves all three. TXPITCH counts
+     * texels, so the byte pitch scales with the texel size -- reading
+     * an 8_8 texture as four bytes per texel doubled both the pitch
+     * and the stride and made one dword span two texels.
      */
     {
         uint32_t txfmt1 = s->regs[R300_TX_FORMAT1_0 >> 2];
         unsigned txcode = txfmt1 & R300_TX_FORMAT1_CODE_MASK;
         unsigned ch;
 
-        d->tex_bpp = txcode == 0 ? 8 : 32;
+        d->tex_bpp = txcode == R300_TX_FMT_8 ? 8 :
+                     txcode == R300_TX_FMT_8_8 ? 16 : 32;
         /* everything else is being read as if its components were bytes */
-        if (d->textured && txcode != 0 && txcode != 0xc) {
+        if (d->textured && txcode != R300_TX_FMT_8 &&
+            txcode != R300_TX_FMT_8_8 && txcode != R300_TX_FMT_8_8_8_8) {
             ati_r350_note_gap(s, R350_GAP_TEX_FORMAT, txcode);
         }
         /*

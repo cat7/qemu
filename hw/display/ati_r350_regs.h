@@ -921,6 +921,10 @@
  * (W,X,Y,Z) -- the same bytes with red and blue exchanged.
  */
 #define R300_TX_FORMAT1_CODE_MASK     0x1f
+/* TXFORMAT codes this model decodes; the rest are counted as a gap */
+#define R300_TX_FMT_8                 0x00    /* one 8-bit component */
+#define R300_TX_FMT_8_8               0x03    /* two: X low byte, Y high */
+#define R300_TX_FMT_8_8_8_8           0x0c    /* four, X the low byte */
 #define R300_TX_FORMAT1_SEL_SHIFT     9       /* A, then R, G, B */
 #define R300_TX_FORMAT1_SEL_MASK      0x7
 #define R300_TX_SEL_X                 0
