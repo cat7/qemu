@@ -924,109 +924,10 @@
 #define R300_VAP_VTX_AOS_CTL          0x20c4
 #define R300_VAP_VTX_AOS_ADDR0        0x20c8
 #define R300_VAP_VTX_AOS_ADDR1        0x20cc
-/*
- * Vertex-program RAM is one flat vec4-indexed address space selected
- * by UPLOAD_ADDRESS, with UPLOAD_DATA writing dwords that follow on:
- * slots below CONST_START are program instructions, four dwords each,
- * and slots from CONST_START up are the constant file. Address 1030
- * (POINT_VPORT_SCALE_OFFSET) is a separate point-size vector, not part
- * of either.
- */
 #define R300_VAP_PVS_UPLOAD_ADDRESS   0x2200
 #define R300_VAP_PVS_UPLOAD_DATA      0x2208
-#define R300_PVS_CONST_START          512
-#define R300_PVS_MAX_CODE_DWORDS      (256 * 4)
-#define R300_PVS_MAX_CONST_DWORDS     (256 * 4)
 #define R300_VAP_CNTL_STATUS          0x2140
 #define R300_VAP_PVS_BYPASS           0x00000100
-/*
- * What the vertex stage emits, and therefore which program output
- * index carries what: out[0] is the position, then one output per
- * colour the format declares, then the texture coordinates. So the
- * first texcoord output is 1 + (number of colours present), and the
- * rasterizer's texture interpolator reads that one.
- */
-#define R300_VAP_OUTPUT_VTX_FMT_0     0x2090
-#define R300_VAP_OUT_POS_PRESENT      (1u << 0)
-#define R300_VAP_OUT_COLOR_SHIFT      1      /* four colour-present bits */
-#define R300_VAP_OUT_COLOR_COUNT      4
-#define R300_VAP_OUTPUT_VTX_FMT_1     0x2094
-#define R300_VAP_OUT_TEX0_COMP_MASK   0x7    /* components of texcoord 0 */
-/* program bounds: first/last instruction slot, 10 bits each */
-#define R300_VAP_PVS_CODE_CNTL_0      0x22d0
-#define R300_PVS_FIRST_INST_SHIFT     0
-#define R300_PVS_LAST_INST_SHIFT      20
-#define R300_PVS_INST_MASK            0x3ff
-/* constant file base, added to every const[] index a program names */
-#define R300_VAP_PVS_CONST_CNTL       0x22d4
-#define R300_PVS_CONST_BASE_MASK      0xffff
-
-/*
- * PVS instruction encoding (4 dwords). Word 0 is the opcode and
- * destination; words 1-3 are the three source operands.
- */
-#define R300_PVS_DST_OPCODE_MASK      0x3f
-#define R300_PVS_DST_MATH_INST        (1u << 6)
-#define R300_PVS_DST_MACRO_INST       (1u << 7)
-#define R300_PVS_DST_REG_TYPE_SHIFT   8
-#define R300_PVS_DST_REG_TYPE_MASK    0xf
-#define R300_PVS_DST_OFFSET_SHIFT     13
-#define R300_PVS_DST_OFFSET_MASK      0x7f
-#define R300_PVS_DST_WE_SHIFT         20      /* four write-enable bits */
-#define R300_PVS_DST_VE_SAT           (1u << 24)
-#define R300_PVS_DST_ME_SAT           (1u << 25)
-
-#define R300_PVS_SRC_REG_TYPE_MASK    0x3
-#define R300_PVS_SRC_ABS              (1u << 3)
-#define R300_PVS_SRC_OFFSET_SHIFT     5
-#define R300_PVS_SRC_OFFSET_MASK      0xff
-#define R300_PVS_SRC_SWIZZLE_SHIFT    13      /* four 3-bit selectors */
-#define R300_PVS_SRC_SWIZZLE_MASK     0x7
-#define R300_PVS_SRC_MODIFIER_SHIFT   25      /* four per-channel negates */
-
-/* destination register files */
-#define R300_PVS_DST_REG_TEMPORARY    0
-#define R300_PVS_DST_REG_A0           1
-#define R300_PVS_DST_REG_OUT          2
-#define R300_PVS_DST_REG_OUT_REPL_X   3
-#define R300_PVS_DST_REG_ALT_TEMP     4
-#define R300_PVS_DST_REG_INPUT        5
-
-/* source register files */
-#define R300_PVS_SRC_REG_TEMPORARY    0
-#define R300_PVS_SRC_REG_INPUT        1
-#define R300_PVS_SRC_REG_CONSTANT     2
-#define R300_PVS_SRC_REG_ALT_TEMP     3
-
-/* vector-engine opcodes (word 0 without R300_PVS_DST_MATH_INST) */
-#define R300_VE_NO_OP                 0
-#define R300_VE_DOT_PRODUCT           1
-#define R300_VE_MULTIPLY              2
-#define R300_VE_ADD                   3
-#define R300_VE_MULTIPLY_ADD          4
-#define R300_VE_DISTANCE_VECTOR       5
-#define R300_VE_FRACTION              6
-#define R300_VE_MAXIMUM               7
-#define R300_VE_MINIMUM               8
-#define R300_VE_SET_GREATER_THAN_EQUAL 9
-#define R300_VE_SET_LESS_THAN         10
-#define R300_VE_MULTIPLYX2_ADD        11
-#define R300_VE_MULTIPLY_CLAMP        12
-
-/* math-engine opcodes (scalar, replicated across the write mask) */
-#define R300_ME_NO_OP                 0
-#define R300_ME_EXP_BASE2_DX          1
-#define R300_ME_LOG_BASE2_DX          2
-#define R300_ME_LIGHT_COEFF_DX        4
-#define R300_ME_RECIP_DX              6
-#define R300_ME_RECIP_FF              7
-#define R300_ME_RECIP_SQRT_DX         8
-#define R300_ME_RECIP_SQRT_FF         9
-#define R300_ME_MULTIPLY              10
-#define R300_ME_EXP_BASE2_FULL_DX     11
-#define R300_ME_LOG_BASE2_FULL_DX     12
-#define R300_ME_SIN                   16
-#define R300_ME_COS                   17
 #define R300_SE_VPORT_XSCALE          0x1d98
 #define R300_SC_SCISSOR0              0x43e0
 #define R300_SC_SCISSOR1              0x43e4
