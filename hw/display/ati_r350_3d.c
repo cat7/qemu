@@ -37,6 +37,7 @@ typedef struct R300DrawState {
     uint32_t clip_rule;               /* RE_CLIPRECT_CNTL truth table */
     int cr[4][4];                     /* cliprects: x0,y0,x1,y1 (BR excl) */
     bool xform;             /* run positions through PVS matrix + viewport */
+    bool vs_interp;         /* program needs the interpreter, not the matrix */
     float mat[16];          /* row-major position matrix (PVS consts 0-3) */
     float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
@@ -382,6 +383,70 @@ static bool r300_vs_shade(ATIR350State *s, const R300DrawState *d,
                           const uint32_t *dw, unsigned vsize, R300Vtx *v);
 
 /*
+ * Is the loaded program nothing more than the blit shader's matrix
+ * multiply -- four DOT_PRODUCTs of constants 0-3 against input 0 into
+ * out[0]?
+ *
+ * This is what OS X uploads for essentially every desktop draw, and
+ * the interpreter is far more expensive per vertex than the six
+ * multiply-adds the matrix path needs: a kilobyte of register file
+ * cleared, then three swizzled source fetches per instruction. Once
+ * any program has been uploaded the interpreter would otherwise run
+ * for all of them, and the cost shows up as the emulator falling
+ * behind rather than as anything visibly wrong.
+ *
+ * Checked once per draw; the per-vertex path then costs nothing.
+ */
+static bool r300_vs_is_plain_matrix(ATIR350State *s)
+{
+    uint32_t cc = s->regs[R300_VAP_PVS_CODE_CNTL_0 >> 2];
+    unsigned first = cc & R300_PVS_INST_MASK;
+    unsigned last = (cc >> R300_PVS_LAST_INST_SHIFT) & R300_PVS_INST_MASK;
+    unsigned i;
+
+    /* the matrix path reads the constant file from its base */
+    if (s->regs[R300_VAP_PVS_CONST_CNTL >> 2] & R300_PVS_CONST_BASE_MASK) {
+        return false;
+    }
+    if (last < first || last - first > 8) {
+        return false;
+    }
+    for (i = 0; i < 4; i++) {
+        const uint32_t *w;
+        uint32_t op;
+
+        if ((first + i + 1) * 4 > s->pvs_code_dwords) {
+            return false;
+        }
+        w = &s->pvs_code[(first + i) * 4];
+        op = w[0];
+        if ((op & R300_PVS_DST_OPCODE_MASK) != R300_VE_DOT_PRODUCT ||
+            (op & (R300_PVS_DST_MATH_INST | R300_PVS_DST_MACRO_INST))) {
+            return false;
+        }
+        /* writes exactly channel i of out[0] */
+        if (((op >> R300_PVS_DST_REG_TYPE_SHIFT) &
+             R300_PVS_DST_REG_TYPE_MASK) != R300_PVS_DST_REG_OUT ||
+            ((op >> R300_PVS_DST_OFFSET_SHIFT) &
+             R300_PVS_DST_OFFSET_MASK) != 0 ||
+            ((op >> R300_PVS_DST_WE_SHIFT) & 0xf) != (1u << i)) {
+            return false;
+        }
+        /* row i of the constant file against input 0 */
+        if ((w[1] & R300_PVS_SRC_REG_TYPE_MASK) !=
+            R300_PVS_SRC_REG_CONSTANT ||
+            ((w[1] >> R300_PVS_SRC_OFFSET_SHIFT) &
+             R300_PVS_SRC_OFFSET_MASK) != i ||
+            (w[2] & R300_PVS_SRC_REG_TYPE_MASK) != R300_PVS_SRC_REG_INPUT ||
+            ((w[2] >> R300_PVS_SRC_OFFSET_SHIFT) &
+             R300_PVS_SRC_OFFSET_MASK) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
  * Position from clip space to the destination surface. `ndc` already
  * holds the program's (or the matrix's) output; the viewport scale and
  * offset are the same either way.
@@ -406,7 +471,7 @@ static void r300_xform_vtx(ATIR350State *s, const R300DrawState *d,
     if (!d->xform) {
         return;
     }
-    if (r300_vs_shade(s, d, dw, vsize, &p)) {
+    if (d->vs_interp && r300_vs_shade(s, d, dw, vsize, &p)) {
         /* the program emits clip space; w divides through it */
         float w = p.w != 0.0f ? p.w : 1.0f;
 
@@ -574,7 +639,15 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     d->tex_sel_alpha = (s->regs[R300_TX_FORMAT1_0 >> 2] >> 9) & 7;
     d->clamp_s = s->regs[R300_TX_FILTER0_0 >> 2] & 7;
     d->clamp_t = (s->regs[R300_TX_FILTER0_0 >> 2] >> 3) & 7;
-    d->tex_pitch = ((txfmt2 & 0x3fff) + 1) * (d->tex_bpp / 8);
+    /*
+     * The pitch register only applies when TX_FORMAT0 says so;
+     * otherwise rows are exactly the texture's width.
+     */
+    if (txfmt0 & R300_TX_PITCH_EN) {
+        d->tex_pitch = ((txfmt2 & 0x3fff) + 1) * (d->tex_bpp / 8);
+    } else {
+        d->tex_pitch = (uint32_t)d->tex_w * (d->tex_bpp / 8);
+    }
     /*
      * Position transform: unless the draw bypasses the vertex program
      * (VAP_CNTL_STATUS bit 8 -- the point-sprite composites do),
@@ -645,6 +718,12 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                 d->vp[k] = r300_f32(s->regs[(R300_SE_VPORT_XSCALE >> 2) + k]);
             }
             d->xform = true;
+            /*
+             * Decide once per draw, not once per vertex: the plain
+             * matrix shape goes down the cheap path.
+             */
+            d->vs_interp = s->pvs_code_dwords &&
+                           !r300_vs_is_plain_matrix(s);
         }
     }
     /*

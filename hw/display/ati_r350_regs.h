@@ -526,6 +526,20 @@
 #define R350_MPP_GP_INT              (1 << 18)
 #define R350_GUI_IDLE_INT            (1 << 19)
 #define R350_VIPH_INT                (1 << 24)
+/*
+ * The software interrupt, which is how the driver learns that work it
+ * submitted has finished: it enables SW_INT in GEN_INT_CNTL, the
+ * command stream raises the interrupt by writing SW_INT_FIRE to
+ * GEN_INT_STATUS, and the handler acknowledges by writing SW_INT back.
+ *
+ * Mac OS X's driver sleeps on this. With it unimplemented the ring
+ * drains correctly and nothing looks wrong from the device's side --
+ * read pointer equal to write pointer, no unimplemented commands --
+ * while the guest waits forever for a completion signal that never
+ * arrives, at low CPU with a dead user interface.
+ */
+#define R350_SW_INT                  (1 << 25)   /* status: pending/ack */
+#define R350_SW_INT_FIRE             (1 << 26)   /* status: write to raise */
 #define R350_GEN_INT_ACK_MASK        (R350_CRTC_VBLANK_INT | \
                                       R350_CRTC_VLINE_INT | \
                                       R350_CRTC_VSYNC_INT | \
@@ -533,7 +547,8 @@
                                       R350_FP_DETECT_INT | \
                                       R350_BUSMASTER_EOL_INT | \
                                       R350_I2C_INT | R350_MPP_GP_INT | \
-                                      R350_GUI_IDLE_INT | R350_VIPH_INT)
+                                      R350_GUI_IDLE_INT | R350_VIPH_INT | \
+                                      R350_SW_INT)
 
 /* CRTC_GEN_CNTL */
 #define R350_CRTC_DBL_SCAN_EN        (1 << 0)
@@ -868,6 +883,16 @@
 #define R300_TX_FORMAT0_0             0x4480
 #define R300_TX_FORMAT1_0             0x44c0
 #define R300_TX_FORMAT2_0             0x4500
+/*
+ * TX_FORMAT0 bit 31 says whether TX_FORMAT2 carries the row pitch at
+ * all. With it clear the pitch register is not in use and the rows are
+ * as wide as the texture, whatever TX_FORMAT2 happens to hold -- and
+ * what it holds is then stale: Chess.app leaves 16383 in it while
+ * sampling a 128-pixel-wide texture, which taken literally puts every
+ * row 64KB apart and samples each one from unrelated memory. That is
+ * the horizontal banding its window renders as.
+ */
+#define R300_TX_PITCH_EN              (1u << 31)
 #define R300_TX_OFFSET_0              0x4540
 /*
  * Colour and alpha blend control. The two registers share the factor

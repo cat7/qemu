@@ -1626,6 +1626,14 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_GEN_INT_STATUS:
         /* write-1-to-acknowledge */
         s->regs[base >> 2] &= ~(val & R350_GEN_INT_ACK_MASK);
+        /*
+         * SW_INT_FIRE is a command, not a status bit to clear: the
+         * command stream writes it to raise the software interrupt
+         * that tells the driver its submitted work is done.
+         */
+        if (val & R350_SW_INT_FIRE) {
+            s->regs[base >> 2] |= R350_SW_INT;
+        }
         trace_ati_r350_int_ack(val, s->regs[base >> 2]);
         ati_r350_update_irq(s);
         break;
