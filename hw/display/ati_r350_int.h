@@ -32,6 +32,7 @@
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "ati_r350_pvs.h"
+#include "ati_r350_cap.h"
 
 #define PCI_VENDOR_ID_ATI              0x1002
 /*
@@ -409,6 +410,27 @@ struct ATIR350State {
     bool fw_active;
 
     /*
+     * Diagnostic: 3D draw capture. When the "draw-capture" property names
+     * a file, every draw the rasterizer runs is also written there as a
+     * self-contained record -- the resolved draw state, the transformed
+     * vertices, the texture, and the destination rectangle before and
+     * after the draw. `cap_fp` is NULL unless the property was given, and
+     * that pointer is the only thing the draw path tests, so an unarmed
+     * capture costs one predictable branch per draw and changes nothing.
+     * See ati_r350_cap.h for the record format.
+     */
+    char *cap_path;
+    FILE *cap_fp;
+    uint32_t cap_max;           /* records to take before closing the file */
+    uint32_t cap_max_px;        /* skip a draw whose rectangle exceeds this */
+    uint32_t cap_index;         /* records written so far */
+    uint32_t cap_skipped;
+    struct {
+        uint32_t off, len, xr, hash, rec;
+    } cap_tex[R350_CAP_TEX_CACHE];
+    unsigned cap_tex_n;
+
+    /*
      * Hardware cursor (CUR_* registers). hw_cursor_on tracks whether the
      * guest's own cursor is live, so the host-driven fallback pointer
      * stands aside rather than fighting it for the console cursor.
@@ -495,6 +517,10 @@ const char *ati_r350_reg_name(uint32_t base);
  * Read the running tally with `qom-get <device> gaps`.
  */
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx);
+
+/* sizes of the private draw-capture payload structs (ati_r350_cap.h) */
+uint32_t ati_r350_cap_state_bytes(void);
+uint32_t ati_r350_cap_vtx_bytes(void);
 
 /* ati_r350_3d.c */
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);

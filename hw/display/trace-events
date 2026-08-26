@@ -363,3 +363,4 @@ ati_r350_3d_cb(uint32_t dst, uint32_t pitch, uint32_t wmask, int resolve, uint32
 ati_r350_3d_vbuf_aos(uint32_t vf, uint32_t nvtx, uint32_t cnt, uint32_t ctl, uint32_t addr0, uint32_t addr1) "R300 vbuf vf_cntl=0x%08x nvtx=%u AOS_CNT=0x%08x CTL=0x%08x ADDR0=0x%08x ADDR1=0x%08x"
 ati_r350_3d_vbuf_aos_src(uint32_t idx, uint32_t size, uint32_t stride, uint32_t addr, const char *win, uint64_t target) "R300 vbuf aos%u size=%u stride=%u card=0x%08x -> %s 0x%" PRIx64
 ati_r350_3d_vbuf_aos_dw(uint32_t idx, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3) "R300 vbuf aos%u dw 0x%08x 0x%08x 0x%08x 0x%08x"
+ati_r350_3d_cap(uint32_t idx, uint32_t prim, uint32_t nvtx, int x0, int y0, int x1, int y1, uint32_t tex) "R300 capture #%u prim=%u nvtx=%u rect(%d,%d)-(%d,%d) tex=%u bytes"

@@ -1428,8 +1428,8 @@ static void r300_raster_line(ATIR350State *s, const R300DrawState *d,
     r300_raster_tri(s, d, &q[0], &q[2], &q[3]);
 }
 
-static void r300_run_prims(ATIR350State *s, R300DrawState *d,
-                           const R300Vtx *vb, unsigned nvtx, unsigned prim)
+static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
+                              const R300Vtx *vb, unsigned nvtx, unsigned prim)
 {
     unsigned i;
 
@@ -1577,6 +1577,276 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
         trace_ati_r350_3d_skip(0, nvtx, prim);
         ati_r350_note_gap(s, R350_GAP_PRIM, prim);
         break;
+    }
+}
+
+/*
+ * Draw capture, for the offline GL replay harness in
+ * doc/radeon9800/gl-replay/. Everything below runs only when the
+ * "draw-capture" property named a file; see ati_r350_cap.h for what a
+ * record holds and why the capture is taken here rather than off the
+ * command stream.
+ */
+static uint32_t r300_cap_hash(const uint8_t *p, uint32_t len)
+{
+    uint32_t h = 2166136261u;
+    uint32_t i;
+
+    for (i = 0; i < len; i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h;
+}
+
+/*
+ * A record carries one swapper xor per region, so a region the swapper
+ * does not treat uniformly cannot be represented and its draw is skipped
+ * rather than recorded wrong. Surface descriptors cover contiguous
+ * multi-page ranges, so a stride well under a page settles it.
+ */
+static bool r300_cap_xor(ATIR350State *s, uint32_t off, uint32_t len,
+                         unsigned *xr)
+{
+    unsigned v = ati_r350_vram_xor(s, off);
+    uint32_t i;
+
+    for (i = 256; i < len; i += 256) {
+        if (ati_r350_vram_xor(s, off + i) != v) {
+            return false;
+        }
+    }
+    if (len && ati_r350_vram_xor(s, off + len - 1) != v) {
+        return false;
+    }
+    *xr = v;
+    return true;
+}
+
+/*
+ * Where this draw can write: the primitive's own bounding box, widened
+ * by a pixel because a line is expanded across its direction and a
+ * rectangle list implies a fourth corner, then clipped exactly the way
+ * r300_raster_tri() clips its scan.
+ */
+static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
+                          const R300Vtx *vb, unsigned nvtx, unsigned prim,
+                          int *rx0, int *ry0, int *rx1, int *ry1)
+{
+    float fx0 = vb[0].x, fy0 = vb[0].y, fx1 = fx0, fy1 = fy0;
+    int x0, y0, x1, y1;
+    unsigned i;
+
+    for (i = 1; i < nvtx; i++) {
+        fx0 = MIN(fx0, vb[i].x); fx1 = MAX(fx1, vb[i].x);
+        fy0 = MIN(fy0, vb[i].y); fy1 = MAX(fy1, vb[i].y);
+    }
+    if (prim == 8) {
+        /* the corner a rectangle list leaves implied */
+        for (i = 0; i + 3 <= nvtx; i += 3) {
+            float px = vb[i + 1].x + vb[i + 2].x - vb[i].x;
+            float py = vb[i + 1].y + vb[i + 2].y - vb[i].y;
+
+            fx0 = MIN(fx0, px); fx1 = MAX(fx1, px);
+            fy0 = MIN(fy0, py); fy1 = MAX(fy1, py);
+        }
+    }
+    if (prim == 1) {
+        uint32_t psize = s->regs[R300_RE_POINTSIZE >> 2];
+        float hw = ((psize >> 16) & 0xffff) / 12.0f;
+        float hh = (psize & 0xffff) / 12.0f;
+
+        fx0 -= hw; fx1 += hw;
+        fy0 -= hh; fy1 += hh;
+    }
+    if (!isfinite(fx0) || !isfinite(fy0) || !isfinite(fx1) ||
+        !isfinite(fy1) || fx0 < -100000.0f || fx1 > 100000.0f ||
+        fy0 < -100000.0f || fy1 > 100000.0f) {
+        return false;
+    }
+    x0 = (int)floorf(fx0) - 1;
+    y0 = (int)floorf(fy0) - 1;
+    x1 = (int)ceilf(fx1) + 1;
+    y1 = (int)ceilf(fy1) + 1;
+    x0 = MAX(x0, MAX(d->sc_x0, 0));
+    y0 = MAX(y0, MAX(d->sc_y0, 0));
+    x1 = MIN(x1, MIN(d->sc_x1 + 1, 8191));
+    y1 = MIN(y1, MIN(d->sc_y1 + 1, 8191));
+    if (x1 <= x0 || y1 <= y0 || !d->dst_pitch) {
+        return false;
+    }
+    /* every byte of the rectangle has to be inside VRAM to be captured */
+    while (y1 > y0 &&
+           d->dst_off + (uint32_t)(y1 - 1) * d->dst_pitch +
+           (uint32_t)x1 * 4 > ATI_R350_VRAM_SIZE) {
+        y1--;
+    }
+    if (y1 <= y0) {
+        return false;
+    }
+    *rx0 = x0; *ry0 = y0; *rx1 = x1; *ry1 = y1;
+    return true;
+}
+
+/* one packed copy of the destination rectangle, raw VRAM bytes */
+static void r300_cap_read_rect(const R300DrawState *d, int x0, int y0,
+                               int x1, int y1, uint8_t *out)
+{
+    uint32_t row = (uint32_t)(x1 - x0) * 4;
+    int y;
+
+    for (y = y0; y < y1; y++) {
+        memcpy(out + (uint32_t)(y - y0) * row,
+               d->vram + d->dst_off + (uint32_t)y * d->dst_pitch +
+               (uint32_t)x0 * 4, row);
+    }
+}
+
+static void r300_cap_write(ATIR350State *s, const void *p, size_t n)
+{
+    if (s->cap_fp && fwrite(p, 1, n, s->cap_fp) != n) {
+        fclose(s->cap_fp);
+        s->cap_fp = NULL;
+    }
+}
+
+static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
+                          const R300Vtx *vb, unsigned nvtx, unsigned prim)
+{
+    R350CapRecHdr h = { 0 };
+    R300DrawState st;
+    g_autofree uint8_t *before = NULL;
+    g_autofree uint8_t *after = NULL;
+    unsigned dxr = 0, txr = 0;
+    uint32_t tex_off = 0, tex_len = 0, tex_hash = 0;
+    int x0, y0, x1, y1;
+    unsigned i;
+
+    /*
+     * A draw is recorded only when a record can describe it exactly.
+     * Anything else is counted and rasterized as usual: a capture that
+     * quietly stored an approximation would be worse than a short one,
+     * because the harness reading it cannot tell the two apart.
+     */
+    if (d->resolve ||
+        !r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1) ||
+        (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0) > s->cap_max_px ||
+        !r300_cap_xor(s, d->dst_off + (uint32_t)y0 * d->dst_pitch,
+                      (uint32_t)(y1 - 1 - y0) * d->dst_pitch +
+                      (uint32_t)x1 * 4, &dxr)) {
+        s->cap_skipped++;
+        r300_raster_prims(s, d, vb, nvtx, prim);
+        return;
+    }
+    if (d->textured || prim == 1) {
+        uint32_t last;
+
+        tex_len = d->tex_pitch * (uint32_t)d->tex_h;
+        if (!tex_len || !ati_r350_mc_to_vram(s, d->tex_off, &tex_off) ||
+            !ati_r350_mc_to_vram(s, d->tex_off + tex_len - 1, &last) ||
+            last != tex_off + tex_len - 1 ||
+            !r300_cap_xor(s, tex_off, tex_len, &txr)) {
+            s->cap_skipped++;
+            r300_raster_prims(s, d, vb, nvtx, prim);
+            return;
+        }
+        tex_hash = r300_cap_hash(d->vram + tex_off, tex_len);
+    }
+
+    h.magic = R350_CAP_REC_MAGIC;
+    h.index = s->cap_index;
+    h.prim = prim;
+    h.nvtx = nvtx;
+    h.x0 = x0; h.y0 = y0; h.x1 = x1; h.y1 = y1;
+    h.rect_bytes = (uint32_t)(x1 - x0) * 4 * (uint32_t)(y1 - y0);
+    h.dst_xor = dxr;
+    h.tex_xor = txr;
+    h.tex_vram_off = tex_off;
+    h.tex_bytes = tex_len;
+    h.txfmt1 = s->regs[R300_TX_FORMAT1_0 >> 2];
+    h.pointsize = s->regs[R300_RE_POINTSIZE >> 2];
+    h.point_s0 = s->regs[R300_GA_POINT_S0 >> 2];
+    h.point_s1 = s->regs[R300_GA_POINT_S1 >> 2];
+    h.point_t0 = s->regs[R300_GA_POINT_T0 >> 2];
+    h.point_t1 = s->regs[R300_GA_POINT_T1 >> 2];
+    h.tx_enable = s->regs[R300_TX_ENABLE >> 2];
+    h.flags = (d->vs_run ? R350_CAP_F_VS_RUN : 0) |
+              (d->vs.plain_matrix ? R350_CAP_F_PLAIN_MAT : 0);
+
+    for (i = 0; tex_len && i < s->cap_tex_n; i++) {
+        if (s->cap_tex[i].off == tex_off && s->cap_tex[i].len == tex_len &&
+            s->cap_tex[i].xr == txr && s->cap_tex[i].hash == tex_hash) {
+            h.tex_bytes = 0;
+            h.tex_ref = s->cap_tex[i].rec;
+            h.flags |= R350_CAP_F_TEXDEDUP;
+            break;
+        }
+    }
+    if (tex_len && !(h.flags & R350_CAP_F_TEXDEDUP)) {
+        i = s->cap_index % R350_CAP_TEX_CACHE;
+        s->cap_tex[i].off = tex_off;
+        s->cap_tex[i].len = tex_len;
+        s->cap_tex[i].xr = txr;
+        s->cap_tex[i].hash = tex_hash;
+        s->cap_tex[i].rec = s->cap_index;
+        if (s->cap_tex_n < R350_CAP_TEX_CACHE) {
+            s->cap_tex_n++;
+        }
+    }
+
+    /*
+     * The VRAM pointer and the vertex program are the only members of
+     * the state that are not plain data, and nothing below
+     * r300_run_prims() reads either, so a record drops both: the harness
+     * substitutes its own VRAM and never resurrects a program.
+     */
+    st = *d;
+    st.vram = NULL;
+    memset(&st.vs, 0, sizeof(st.vs));
+
+    before = g_malloc(h.rect_bytes);
+    after = g_malloc(h.rect_bytes);
+    r300_cap_read_rect(d, x0, y0, x1, y1, before);
+    r300_raster_prims(s, d, vb, nvtx, prim);
+    r300_cap_read_rect(d, x0, y0, x1, y1, after);
+
+    r300_cap_write(s, &h, sizeof(h));
+    r300_cap_write(s, &st, sizeof(st));
+    r300_cap_write(s, vb, sizeof(*vb) * nvtx);
+    if (h.tex_bytes) {
+        r300_cap_write(s, d->vram + tex_off, h.tex_bytes);
+    }
+    r300_cap_write(s, before, h.rect_bytes);
+    r300_cap_write(s, after, h.rect_bytes);
+    trace_ati_r350_3d_cap(s->cap_index, prim, nvtx, x0, y0, x1, y1,
+                          h.tex_bytes);
+    s->cap_index++;
+    if (s->cap_fp) {
+        fflush(s->cap_fp);
+        if (s->cap_index >= s->cap_max) {
+            fclose(s->cap_fp);
+            s->cap_fp = NULL;
+        }
+    }
+}
+
+/* the two sizes a capture file's header has to agree on with its reader */
+uint32_t ati_r350_cap_state_bytes(void)
+{
+    return sizeof(R300DrawState);
+}
+
+uint32_t ati_r350_cap_vtx_bytes(void)
+{
+    return sizeof(R300Vtx);
+}
+
+static void r300_run_prims(ATIR350State *s, R300DrawState *d,
+                           const R300Vtx *vb, unsigned nvtx, unsigned prim)
+{
+    if (s->cap_fp && nvtx) {
+        r300_cap_draw(s, d, vb, nvtx, prim);
+    } else {
+        r300_raster_prims(s, d, vb, nvtx, prim);
     }
 }
 

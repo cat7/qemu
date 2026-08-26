@@ -3684,6 +3684,36 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                                             &s->vram_watch, 1);
     }
 
+    /*
+     * Optional diagnostic 3D draw capture (see the cap_ fields in the
+     * header and ati_r350_cap.h). The file is opened here and the draw
+     * path tests nothing but the resulting FILE *, so a device realized
+     * without the property is untouched by any of it.
+     */
+    if (s->cap_path && s->cap_path[0]) {
+        R350CapFileHdr h = { 0 };
+
+        s->cap_fp = fopen(s->cap_path, "wb");
+        if (!s->cap_fp) {
+            error_setg_errno(errp, errno, "cannot open draw-capture file %s",
+                             s->cap_path);
+            return;
+        }
+        memcpy(h.magic, R350_CAP_MAGIC, sizeof(h.magic));
+        h.hdr_bytes = sizeof(h);
+        h.rec_hdr_bytes = sizeof(R350CapRecHdr);
+        h.state_bytes = ati_r350_cap_state_bytes();
+        h.vtx_bytes = ati_r350_cap_vtx_bytes();
+        h.vram_bytes = ATI_R350_VRAM_SIZE;
+        if (fwrite(&h, 1, sizeof(h), s->cap_fp) != sizeof(h)) {
+            error_setg_errno(errp, errno, "cannot write draw-capture file %s",
+                             s->cap_path);
+            fclose(s->cap_fp);
+            s->cap_fp = NULL;
+            return;
+        }
+    }
+
     memory_region_init_io(&s->mmio, obj, &ati_r350_mmio_ops, s,
                           "ati-r350-mmio", ATI_R350_MMIO_SIZE);
     /*
@@ -3822,6 +3852,10 @@ static void ati_r350_exit(PCIDevice *dev)
     timer_free(s->vblank_end_timer);
     timer_free(s->cursor_timer);
     qemu_graphic_console_close(s->con);
+    if (s->cap_fp) {
+        fclose(s->cap_fp);
+        s->cap_fp = NULL;
+    }
 }
 
 static const VMStateDescription vmstate_ati_r350 = {
@@ -3851,6 +3885,16 @@ static const Property ati_r350_properties[] = {
     DEFINE_PROP_UINT32("fillwatch", ATIR350State, fillwatch_off, 0),
     DEFINE_PROP_UINT32("fillwatch-size", ATIR350State, fillwatch_size, 0),
     DEFINE_PROP_BOOL("second-display", ATIR350State, second_display, false),
+    /*
+     * Diagnostic only: name a file and every draw the 3D engine runs is
+     * written to it as a self-contained replay record for
+     * doc/radeon9800/gl-replay/. Unset -- the default -- the capture code
+     * never runs.
+     */
+    DEFINE_PROP_STRING("draw-capture", ATIR350State, cap_path),
+    DEFINE_PROP_UINT32("draw-capture-max", ATIR350State, cap_max, 256),
+    DEFINE_PROP_UINT32("draw-capture-max-px", ATIR350State, cap_max_px,
+                       256 * 256),
     DEFINE_EDID_PROPERTIES(ATIR350State, edid_info),
 };
 
