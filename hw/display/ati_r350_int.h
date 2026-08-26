@@ -139,7 +139,7 @@ typedef enum ATIR350GlFallback {
  * silently shaping what the offload covers.
  */
 #define R300_GL_TRI_MAX     512
-#define R300_GL_PASS_MAX    8
+#define R300_GL_PASS_MAX    64
 
 /*
  * How many decoded textures are kept, and the largest one kept. Eight

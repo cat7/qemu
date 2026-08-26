@@ -2225,11 +2225,11 @@ static bool r300_gl_fallback(ATIR350State *s, ATIR350GlFallback why,
  * disagree the offload draws different geometry from the oracle, which
  * is the one divergence gl=verify could not attribute.
  *
- * Point lists, line lists, strips and loops are deliberately absent.
- * A point SPRITE is a whole per-vertex quad expansion driven by
- * registers the request does not carry, and a line is expanded across
- * its direction; both are milestone M3 work at the earliest. They fall
- * back and are counted.
+ * Point lists and lines are deliberately absent. A point SPRITE is a
+ * whole per-vertex quad expansion driven by registers the vertex buffer
+ * does not carry, so it is synthesised by r300_gl_point_list() beside
+ * the rectangle list rather than indexed here. Lines are expanded
+ * across their direction and still fall back, and are counted.
  */
 static unsigned r300_gl_tris(unsigned prim, unsigned nvtx, unsigned *idx,
                              unsigned max)
@@ -2276,6 +2276,66 @@ static unsigned r300_gl_tris(unsigned prim, unsigned nvtx, unsigned *idx,
         return 0;
     }
 #undef R300_GL_EMIT
+    return n / 3;
+}
+
+/*
+ * A point SPRITE is a whole quad per vertex, expanded from registers the
+ * vertex buffer knows nothing about: RE_POINTSIZE gives its size in
+ * sixths of a pixel and GA_POINT_S0/S1/T0/T1 the texture window, with
+ * T0 pairing with the sprite's BOTTOM edge and T1 with its top. The
+ * expansion below is r300_raster_prims()'s case 1, vertex for vertex,
+ * and it has to stay that way: WindowServer composites whole layers as
+ * single sprites, so getting it wrong is getting the desktop wrong.
+ *
+ * Worth offloading rather than leaving to fall back, because a fallback
+ * costs far more than the draw. Flurry.saver issues one sprite per
+ * frame between two draws the backend does render, and handing the
+ * render target back for it flushed and re-seeded the whole thing twice
+ * a frame -- 5369 of the 6839 flushes in one measured session.
+ */
+static unsigned r300_gl_point_list(ATIR350State *s, R300DrawState *d,
+                                   const R300Vtx *vb, unsigned nvtx,
+                                   R300Vtx *out, unsigned max)
+{
+    uint32_t psize = s->regs[R300_RE_POINTSIZE >> 2];
+    float sx = ((psize >> 16) & 0xffff) / 6.0f;
+    float sy = (psize & 0xffff) / 6.0f;
+    float s0 = r300_f32(s->regs[R300_GA_POINT_S0 >> 2]) * d->tex_w;
+    float s1 = r300_f32(s->regs[R300_GA_POINT_S1 >> 2]) * d->tex_w;
+    float t1 = r300_f32(s->regs[R300_GA_POINT_T0 >> 2]) * d->tex_h;
+    float t0 = r300_f32(s->regs[R300_GA_POINT_T1 >> 2]) * d->tex_h;
+    unsigned n = 0, i;
+
+    /*
+     * The sprite path re-derives this from TX_ENABLE alone -- a trap the
+     * ledger names, because the setup flag is not the sprite's state.
+     */
+    d->textured = s->regs[R300_TX_ENABLE >> 2] & 1;
+    if (!(sx > 0.0f) || !(sy > 0.0f)) {
+        return 0;
+    }
+    for (i = 0; i < nvtx && n + 6 <= max; i++) {
+        R300Vtx q[4];
+        int c;
+
+        for (c = 0; c < 4; c++) {
+            q[c] = vb[i];
+            if (d->textured) {
+                q[c].r = q[c].g = q[c].b = q[c].a = 1.0f;
+            }
+        }
+        q[0].x = vb[i].x - sx / 2; q[0].y = vb[i].y - sy / 2;
+        q[0].s = s0; q[0].t = t0;
+        q[1].x = vb[i].x + sx / 2; q[1].y = q[0].y;
+        q[1].s = s1; q[1].t = t0;
+        q[2].x = q[1].x; q[2].y = vb[i].y + sy / 2;
+        q[2].s = s1; q[2].t = t1;
+        q[3].x = q[0].x; q[3].y = q[2].y;
+        q[3].s = s0; q[3].t = t1;
+        out[n++] = q[0]; out[n++] = q[1]; out[n++] = q[2];
+        out[n++] = q[0]; out[n++] = q[2]; out[n++] = q[3];
+    }
     return n / 3;
 }
 
@@ -2794,9 +2854,11 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * stay the draw as the guest issued it -- only `gvb`/`idx` are the
      * expansion GL is handed.
      */
-    if (prim == 8) {
-        rect_vb = g_new(R300Vtx, (size_t)nvtx * 2 + 6);
-        ntri = r300_gl_rect_list(vb, nvtx, rect_vb, nvtx * 2 + 6);
+    if (prim == 8 || prim == 1) {
+        rect_vb = g_new(R300Vtx, (size_t)nvtx * 6 + 6);
+        ntri = prim == 8
+               ? r300_gl_rect_list(vb, nvtx, rect_vb, nvtx * 6 + 6)
+               : r300_gl_point_list(s, d, vb, nvtx, rect_vb, nvtx * 6 + 6);
         idx = g_new(unsigned, (size_t)ntri * 3 + 3);
         for (i = 0; i < ntri * 3; i++) {
             idx[i] = i;
