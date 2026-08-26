@@ -1937,6 +1937,229 @@ uint32_t ati_r350_cap_vtx_bytes(void)
  * render falls back to the software rasterizer PER DRAW and is counted
  * -- a correct hybrid frame beats a complete GL frame that is wrong.
  */
+/*
+ * =====================================================================
+ * GL-OWNED RENDER TARGET
+ * =====================================================================
+ *
+ * The offload keeps the render target on the host GPU across draws.
+ * That is where M3's speed comes from -- M2 uploaded the destination
+ * rectangle twice and read it back for every single draw, 5.2 ms of the
+ * 6.5 ms a full-screen draw cost on this host -- and it is also the one
+ * place in this project where being wrong is SILENT. So the rules are
+ * written down here, and every one of them is enforced by a call
+ * somewhere rather than by a convention.
+ *
+ * THE INVARIANT. At any moment either no target is resident (`gl_res`
+ * false, and the device behaves exactly as gl=off does), or:
+ *
+ *   - the resident target is the VRAM rectangle at `gl_res_off` with
+ *     pitch `gl_res_pitch` under swapper xor `gl_res_xr`;
+ *   - inside the SEEDED rectangle (gl_v*) the GPU copy is correct;
+ *   - inside the DRAWN rectangle (gl_d*), which is always contained in
+ *     the seeded one, the GPU copy is NEWER than VRAM;
+ *   - outside the seeded rectangle the GPU holds nothing anyone may read.
+ *
+ * WHO MAY LOOK, AND WHAT THEY MUST DO FIRST. Everything that reads or
+ * writes VRAM outside the 3D draw path calls ati_r350_gl_release() or
+ * ati_r350_gl_touch() before doing so, which fetches the drawn
+ * rectangle back and stops trusting the GPU copy:
+ *
+ *   scanout            ati_r350_update_display(), and the cursor's own
+ *                      VRAM read, which runs off a timer
+ *   the 2D engine      every blit, host-data push and scaler run
+ *   the CP             ring and indirect-buffer fetches, write-backs
+ *   MM_DATA            the register-indirect CPU window
+ *   a 3D draw that     r300_run_prims(), before the software rasterizer
+ *   falls back         touches the same VRAM
+ *   a texture fetch    r300_run_prims(), when the sampled range overlaps
+ *   reset, unrealize   ati_r350_reset_hold(), ati_r350_exit()
+ *
+ * THE ONE READER THAT CANNOT BE HOOKED, and what is done about it. The
+ * guest CPU reaches VRAM through a plain RAM BAR: its loads are host
+ * loads and no callback exists to intercept them, and its stores are
+ * visible only after the fact through the dirty bitmap. So residency is
+ * never allowed to survive a point at which the guest could execute an
+ * instruction. In this device that point is exact rather than
+ * approximate: a whole ring or indirect buffer is drained inside the
+ * single guest store to CP_RB_WPTR or CP_IB_BUFSZ that kicked it, with
+ * the BQL held throughout, so no guest instruction, no display refresh
+ * and no monitor command can interleave with a burst of draws. Each of
+ * those three entry points releases on the way out. A burst is
+ * therefore the exact lifetime of a resident target, and the rule needs
+ * no dirty-bitmap tracking to be correct.
+ *
+ * The cost of that conservatism is one seed per burst, and it is
+ * measured rather than assumed: `gl-stats` reports the flush count and
+ * the pixels moved each way, which is what says whether the batching is
+ * working. If a guest turns out to submit one draw per burst the
+ * numbers say so directly.
+ *
+ * gl=verify never lets a GPU pixel reach VRAM at all -- the drawn
+ * rectangle is not recorded, so a flush has nothing to do, and the
+ * software rasterizer's write to VRAM invalidates the GPU copy behind
+ * it. A verify session's VRAM is byte-identical to a gl=off session's,
+ * which is the property that makes it a measurement.
+ */
+#define R300_GL_SURF_MAX 4096
+
+/* the VRAM bytes the seeded rectangle covers; empty when nothing is */
+static bool r300_gl_span(ATIR350State *s, uint32_t *lo, uint32_t *hi)
+{
+    if (!s->gl_res || s->gl_vy1 <= s->gl_vy0) {
+        return false;
+    }
+    *lo = s->gl_res_off + (uint32_t)s->gl_vy0 * s->gl_res_pitch;
+    *hi = s->gl_res_off + (uint32_t)s->gl_vy1 * s->gl_res_pitch;
+    return true;
+}
+
+/* the host GPU's newer bytes, back into VRAM, and marked for the display */
+static void r300_gl_flush(ATIR350State *s)
+{
+    uint8_t *vram;
+    int y, w, h;
+
+    if (!s->gl_res || s->gl_dx1 <= s->gl_dx0 || s->gl_dy1 <= s->gl_dy0) {
+        return;
+    }
+    w = s->gl_dx1 - s->gl_dx0;
+    h = s->gl_dy1 - s->gl_dy0;
+    vram = memory_region_get_ram_ptr(&s->vram);
+    if (ati_r350_gl_fetch(s->gl_ctx, s->gl_dx0, s->gl_dy0, w, h,
+                          vram + s->gl_res_off, s->gl_res_pitch,
+                          s->gl_res_xr)) {
+        for (y = s->gl_dy0; y < s->gl_dy1; y++) {
+            uint64_t lo = s->gl_res_off + (uint32_t)y * s->gl_res_pitch +
+                          (uint32_t)s->gl_dx0 * 4;
+            uint64_t hi = (lo + (uint32_t)w * 4 + 7) & ~7ull;
+
+            memory_region_set_dirty(&s->vram, lo & ~7ull, hi - (lo & ~7ull));
+        }
+        s->gl_flushes++;
+        s->gl_flush_px += (uint64_t)w * h;
+    }
+    s->gl_dx0 = s->gl_dx1 = s->gl_dy0 = s->gl_dy1 = 0;
+}
+
+/* stop trusting the GPU copy, WITHOUT writing it back */
+static void r300_gl_discard(ATIR350State *s)
+{
+    s->gl_dx0 = s->gl_dx1 = s->gl_dy0 = s->gl_dy1 = 0;
+    s->gl_vx0 = s->gl_vx1 = s->gl_vy0 = s->gl_vy1 = 0;
+}
+
+void ati_r350_gl_release(ATIR350State *s)
+{
+    if (!s->gl_res) {
+        return;
+    }
+    r300_gl_flush(s);
+    r300_gl_discard(s);
+    s->gl_res = false;
+}
+
+void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
+{
+    uint32_t lo, hi;
+
+    if (!r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
+        return;
+    }
+    ati_r350_gl_release(s);
+}
+
+/*
+ * Make `d`'s colour buffer the resident target and make sure the GPU
+ * holds the rectangle this draw is about to blend against. Growing the
+ * backend texture throws its contents away, so anything drawn goes back
+ * to VRAM before that happens.
+ */
+static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
+                         unsigned xr, int x0, int y0, int x1, int y1)
+{
+    bool lost = false;
+    int ux0, uy0, ux1, uy1;
+
+    if (x1 > R300_GL_SURF_MAX || y1 > R300_GL_SURF_MAX) {
+        return false;
+    }
+    if (s->gl_res && (s->gl_res_off != d->dst_off ||
+                      s->gl_res_pitch != d->dst_pitch ||
+                      s->gl_res_xr != xr)) {
+        ati_r350_gl_release(s);         /* a different target entirely */
+    }
+    if (x1 > s->gl_tex_w || y1 > s->gl_tex_h) {
+        r300_gl_flush(s);               /* the grow below discards it */
+    }
+    if (!ati_r350_gl_target(s->gl_ctx, x1, y1, &lost)) {
+        ati_r350_gl_release(s);
+        return false;
+    }
+    if (lost) {
+        s->gl_tex_w = MAX(x1, s->gl_tex_w);
+        s->gl_tex_h = MAX(y1, s->gl_tex_h);
+        r300_gl_discard(s);
+    }
+    s->gl_res = true;
+    s->gl_res_off = d->dst_off;
+    s->gl_res_pitch = d->dst_pitch;
+    s->gl_res_xr = xr;
+
+    if (s->gl_vx1 > s->gl_vx0 && x0 >= s->gl_vx0 && y0 >= s->gl_vy0 &&
+        x1 <= s->gl_vx1 && y1 <= s->gl_vy1) {
+        return true;                    /* the GPU already has it */
+    }
+    if (s->gl_vx1 <= s->gl_vx0) {
+        ux0 = x0; uy0 = y0; ux1 = x1; uy1 = y1;
+    } else {
+        ux0 = MIN(s->gl_vx0, x0); uy0 = MIN(s->gl_vy0, y0);
+        ux1 = MAX(s->gl_vx1, x1); uy1 = MAX(s->gl_vy1, y1);
+    }
+    /*
+     * Seed the bounding rectangle MINUS what is already seeded, as up to
+     * four strips. Everything drawn so far lies inside the seeded
+     * rectangle, so none of the four can overwrite a GPU-newer pixel --
+     * which is what makes growing the region safe without a flush.
+     */
+    {
+        const uint8_t *base = d->vram + d->dst_off;
+        struct { int x0, y0, x1, y1; } strip[4];
+        unsigned k, n = 0;
+
+        if (s->gl_vx1 <= s->gl_vx0) {
+            strip[n].x0 = ux0; strip[n].y0 = uy0;
+            strip[n].x1 = ux1; strip[n].y1 = uy1; n++;
+        } else {
+            strip[n].x0 = ux0; strip[n].y0 = uy0;
+            strip[n].x1 = ux1; strip[n].y1 = s->gl_vy0; n++;
+            strip[n].x0 = ux0; strip[n].y0 = s->gl_vy1;
+            strip[n].x1 = ux1; strip[n].y1 = uy1; n++;
+            strip[n].x0 = ux0; strip[n].y0 = s->gl_vy0;
+            strip[n].x1 = s->gl_vx0; strip[n].y1 = s->gl_vy1; n++;
+            strip[n].x0 = s->gl_vx1; strip[n].y0 = s->gl_vy0;
+            strip[n].x1 = ux1; strip[n].y1 = s->gl_vy1; n++;
+        }
+        for (k = 0; k < n; k++) {
+            int sw = strip[k].x1 - strip[k].x0;
+            int sh = strip[k].y1 - strip[k].y0;
+
+            if (sw <= 0 || sh <= 0) {
+                continue;
+            }
+            if (!ati_r350_gl_seed(s->gl_ctx, strip[k].x0, strip[k].y0,
+                                  sw, sh, base, d->dst_pitch, xr)) {
+                ati_r350_gl_release(s);
+                return false;
+            }
+            s->gl_seed_px += (uint64_t)sw * sh;
+        }
+    }
+    s->gl_vx0 = ux0; s->gl_vy0 = uy0;
+    s->gl_vx1 = ux1; s->gl_vy1 = uy1;
+    return true;
+}
+
 static bool r300_gl_fallback(ATIR350State *s, ATIR350GlFallback why,
                              unsigned prim, unsigned nvtx)
 {
@@ -2256,30 +2479,6 @@ static void r300_gl_rd_rect(const R300DrawState *d, unsigned xr,
     }
 }
 
-static void r300_gl_wr_rect(ATIR350State *s, const R300DrawState *d,
-                            unsigned xr, int x0, int y0, int w, int h,
-                            const uint8_t *rgba)
-{
-    int x, y;
-
-    for (y = 0; y < h; y++) {
-        uint32_t addr = d->dst_off + (uint32_t)(y0 + y) * d->dst_pitch +
-                        (uint32_t)x0 * 4;
-        uint8_t *p = d->vram + addr;
-        const uint8_t *i = rgba + (size_t)y * w * 4;
-        uint64_t lo = addr & ~7ull;
-        uint64_t hi = (addr + (uint32_t)w * 4 + 7) & ~7ull;
-
-        for (x = 0; x < w; x++, p += 4, i += 4) {
-            p[2 ^ xr] = i[0];
-            p[1 ^ xr] = i[1];
-            p[0 ^ xr] = i[2];
-            p[3 ^ xr] = i[3];
-        }
-        memory_region_set_dirty(&s->vram, lo, hi - lo);
-    }
-}
-
 /*
  * The texture, decoded by the device's OWN r300_sample_tex() and
  * r300_texel_chan(): format decode, bytes per texel, the aperture
@@ -2552,9 +2751,18 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if (d->textured) {
         r300_gl_decode_tex(s, d, s->gl_texbuf);
     }
-    r300_gl_rd_rect(d, xr, x0, y0, w, h, s->gl_before);
+    /*
+     * The target becomes resident here, and this is the last point at
+     * which the draw can still be refused: everything above it is pure
+     * inspection, nothing has been seeded, and a fallback costs nothing.
+     */
+    if (!r300_gl_bind(s, d, xr, x0, y0, x1, y1)) {
+        return r300_gl_fallback(s, R350_GLF_SURFACE, prim, nvtx);
+    }
 
     req.x0 = x0; req.y0 = y0; req.w = w; req.h = h;
+    req.surf_w = s->gl_tex_w;
+    req.surf_h = s->gl_tex_h;
     req.verts = s->gl_verts;
     req.nvert = ntri * 3;
     req.pass = npass > 1 ? s->gl_pass_first : NULL;
@@ -2580,10 +2788,14 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.a_comb_fcn = d->a_comb_fcn;
     req.k_r = d->k_r; req.k_g = d->k_g;
     req.k_b = d->k_b; req.k_a = d->k_a;
-    req.before = s->gl_before;
-    req.out = s->gl_out;
+    /* only verify wants the pixels on the host; see the coherency block */
+    req.out = s->gl_mode == R350_GL_VERIFY ? s->gl_out : NULL;
 
+    if (s->gl_mode == R350_GL_VERIFY) {
+        r300_gl_rd_rect(d, xr, x0, y0, w, h, s->gl_before);
+    }
     if (!ati_r350_gl_draw(s->gl_ctx, &req)) {
+        ati_r350_gl_release(s);
         return r300_gl_fallback(s, R350_GLF_BACKEND, prim, nvtx);
     }
     s->gl_drawn++;
@@ -2593,13 +2805,23 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
         /*
          * Both paths ran; the software one is what lands. The offload is
          * being measured here, not trusted, so VRAM must come out of a
-         * verify session byte-identical to a gl=off session.
+         * verify session byte-identical to a gl=off session -- which is
+         * why the drawn rectangle is never recorded and the GPU copy is
+         * dropped, unwritten, the moment the rasterizer changes VRAM
+         * underneath it.
          */
         r300_raster_prims(s, d, vb, nvtx, prim);
         r300_gl_verify(s, d, prim, ntri, xr, x0, y0, w, h);
+        r300_gl_discard(s);
         return true;
     }
-    r300_gl_wr_rect(s, d, xr, x0, y0, w, h, s->gl_out);
+    /* the GPU now holds bytes VRAM does not, over this rectangle */
+    if (s->gl_dx1 <= s->gl_dx0) {
+        s->gl_dx0 = x0; s->gl_dy0 = y0; s->gl_dx1 = x1; s->gl_dy1 = y1;
+    } else {
+        s->gl_dx0 = MIN(s->gl_dx0, x0); s->gl_dy0 = MIN(s->gl_dy0, y0);
+        s->gl_dx1 = MAX(s->gl_dx1, x1); s->gl_dy1 = MAX(s->gl_dy1, y1);
+    }
     return true;
 }
 
@@ -2648,12 +2870,35 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
     if (nvtx && trace_event_get_state_backends(TRACE_ATI_R350_3D_RECT)) {
         r300_trace_rect(s, d, vb, nvtx, prim);
     }
+    /*
+     * A draw that samples the resident target as a texture reads it out
+     * of VRAM, and the resolve path reads the colour buffer itself.
+     * Both are ordinary VRAM readers as far as the rules go: give the
+     * target back first. Chess's compositor does exactly this -- it
+     * samples the resolve buffer the board was rendered into.
+     */
+    if (unlikely(s->gl_res)) {
+        if (d->textured && d->tex_pitch && d->tex_h > 0) {
+            uint32_t toff;
+
+            if (ati_r350_mc_to_vram(s, d->tex_off, &toff)) {
+                ati_r350_gl_sync(s, toff,
+                                 (uint32_t)d->tex_h * d->tex_pitch);
+            }
+        }
+        if (d->resolve) {
+            ati_r350_gl_release(s);
+        }
+    }
     if (s->cap_fp && nvtx) {
+        ati_r350_gl_release(s);
         r300_cap_draw(s, d, vb, nvtx, prim);
     } else if (s->gl_ctx && nvtx &&
                r300_gl_prims(s, d, vb, nvtx, prim)) {
         /* the backend rendered it (and, under verify, so did we) */
     } else {
+        /* the software rasterizer writes VRAM the GPU copy shadows */
+        ati_r350_gl_release(s);
         r300_raster_prims(s, d, vb, nvtx, prim);
     }
 }

@@ -582,11 +582,14 @@ typedef struct ATIR350ScaleOp {
 static void ati_r350_2d_scale_run(ATIR350State *s,
                                      const ATIR350ScaleOp *op)
 {
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint8_t *vram;
     bool blend = !(op->src_factor == R350_ALPHA_BLEND_ONE &&
                    op->dst_factor == R350_ALPHA_BLEND_ZERO);
     int src_bpp, x, y;
 
+    /* the scaler reads VRAM directly, around ati_r350_2d_read_pixel() */
+    ati_r350_gl_release(s);
+    vram = memory_region_get_ram_ptr(&s->vram);
     trace_ati_r350_scale(op->dst_x, op->dst_y, op->w, op->h, op->src_off,
                             op->src_pitch, op->x_inc, op->y_inc, op->dt);
     if (!op->bpp || !op->dst_stride || !op->x_inc || !op->y_inc ||
@@ -770,6 +773,17 @@ void ati_r350_2d_blt(ATIR350State *s)
 {
     uint32_t src_source = s->dp_mix & R350_DP_SRC_SOURCE;
 
+    /*
+     * The 2D engine reads and writes VRAM through its own per-pixel
+     * path, and a blit's source or destination is regularly the surface
+     * the 3D engine has been rendering into -- a texture upload, a
+     * window's backing store, the framebuffer itself. Give the target
+     * back rather than reasoning per blit about which is which: see
+     * "GL-OWNED RENDER TARGET" in ati_r350_3d.c. `gl-stats` counts the
+     * flushes, so if this turns out to be the expensive hook it says so.
+     */
+    ati_r350_gl_release(s);
+
     trace_ati_r350_2d_blt((s->src_x << 16) | s->src_y,
                              (s->dst_x << 16) | s->dst_y,
                              s->dst_width, s->dst_height,
@@ -842,6 +856,8 @@ bool ati_r350_host_data_flush(ATIR350State *s)
         s->host_data_active = false;
         return false;
     }
+    /* CPU-pushed pixels land in VRAM behind the 3D engine's back */
+    ati_r350_gl_release(s);
 
     bypp = bpp / 8;
     dst_stride = s->dst_pitch * bpp; /* pitch is in 8-pixel units */

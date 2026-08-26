@@ -44,8 +44,13 @@
  *     classes and which this host runs at 0.074 ms for a whole 1024x768
  *     surface. That is what lets a self-overlapping blended draw be
  *     ORDERED on the GPU rather than handed back to the software
- *     rasterizer -- this host has neither ARB_ nor NV_texture_barrier
- *     (measured, doc/radeon9800/glbench).
+ *     rasterizer. GL 4.1 has no ARB_texture_barrier; this host does
+ *     offer GL_NV_texture_barrier, which would let the colour buffer be
+ *     sampled directly and save the copy, and it is deliberately not
+ *     used: the copy costs 0.074 ms against roughly 0.16 ms of
+ *     per-pass overhead measured in total, and a vendor extension that
+ *     no Windows GL or ANGLE path is promised to have is a poor thing
+ *     for correctness to rest on.
  *   - it is also what lets the render target STAY on the GPU across
  *     draws, so the destination is neither uploaded nor read back per
  *     draw. In the same bench a 1024x768 readback taken away from a
@@ -69,8 +74,11 @@
 struct R350GlCtx {
     CGLContextObj ctx;
     GLuint prog, vao, vbo, fbo, cbuf, tex, dst;
-    /* the FBO's current size, so a same-sized request reuses it */
+    /* the resident target's size; a request smaller than it reuses it */
     int fb_w, fb_h;
+    /* staging for the two swapper orders GL cannot produce directly */
+    uint8_t *stage;
+    size_t stage_sz;
     char desc[128];
     /* uniform locations, resolved once at link time */
     GLint u_rect, u_org, u_texsize, u_clamp, u_textured;
@@ -430,6 +438,7 @@ void ati_r350_gl_close(R350GlCtx *g)
         CGLSetCurrentContext(NULL);
         CGLDestroyContext(g->ctx);
     }
+    g_free(g->stage);
     g_free(g);
 }
 
@@ -438,12 +447,151 @@ const char *ati_r350_gl_describe(R350GlCtx *g)
     return g ? g->desc : "none";
 }
 
+/*
+ * Emulated VRAM stores a pixel with its bytes permuted by the aperture
+ * swapper's xor: byte (2^xr) is red, (1^xr) green, (0^xr) blue and
+ * (3^xr) alpha. GL can be asked for two of the four orders directly --
+ * GL_BGRA_INTEGER with GL_UNSIGNED_BYTE is xr 0 and with
+ * GL_UNSIGNED_INT_8_8_8_8 is xr 3, probed rather than reasoned about
+ * (doc/radeon9800/glbench/fmtprobe.c) -- so a transfer could be a
+ * straight DMA at the target's own pitch with no per-pixel work.
+ *
+ * It is not worth having, and that is a MEASUREMENT rather than a
+ * preference. On this host, 1024x768 each way:
+ *
+ *   seed   packed xr3 1.51 ms   BGRA bytes xr0 1.12 ms   staged 0.55 ms
+ *   fetch  packed xr3 1.81 ms   BGRA bytes xr0 1.02 ms   staged 1.00 ms
+ *
+ * The driver's packed-format paths are slower than reading plain RGBA
+ * bytes and permuting them on the CPU, by two to three times. So every
+ * xor goes through the same staging buffer, which is also one code path
+ * instead of three and one less thing to be portable about. The two
+ * implementations were checked against each other first: a round trip
+ * through the packed format and through the staging permute disagree on
+ * 0 of 3145728 bytes.
+ */
+static uint8_t *gl_stage(R350GlCtx *g, size_t need)
+{
+    if (need > g->stage_sz) {
+        g->stage = g_realloc(g->stage, need);
+        g->stage_sz = need;
+    }
+    return g->stage;
+}
+
+bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
+{
+    *lost = false;
+    if (!g || w <= 0 || h <= 0) {
+        return false;
+    }
+    if (w <= g->fb_w && h <= g->fb_h) {
+        return true;
+    }
+    /*
+     * Grow only, and never shrink: a target that alternates between two
+     * sizes would otherwise throw its contents away on every change.
+     * Growing does lose them, and the caller is told so.
+     */
+    w = MAX(w, g->fb_w);
+    h = MAX(h, g->fb_h);
+    if (w > 16384 || h > 16384) {
+        return false;
+    }
+    CGLSetCurrentContext(g->ctx);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g->cbuf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, w, h, 0, GL_RGBA_INTEGER,
+                 GL_UNSIGNED_BYTE, NULL);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g->dst);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, w, h, 0, GL_RGBA_INTEGER,
+                 GL_UNSIGNED_BYTE, NULL);
+    glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, g->cbuf, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
+        glGetError() != GL_NO_ERROR) {
+        g->fb_w = g->fb_h = 0;
+        return false;
+    }
+    g->fb_w = w;
+    g->fb_h = h;
+    *lost = true;
+    return true;
+}
+
+bool ati_r350_gl_seed(R350GlCtx *g, int x0, int y0, int w, int h,
+                      const uint8_t *base, unsigned pitch, unsigned xr)
+{
+    uint8_t *st;
+    int x, y;
+
+    if (!g || w <= 0 || h <= 0 ||
+        x0 < 0 || y0 < 0 || x0 + w > g->fb_w || y0 + h > g->fb_h) {
+        return false;
+    }
+    st = gl_stage(g, (size_t)w * h * 4);
+    for (y = 0; y < h; y++) {
+        const uint8_t *p = base + (size_t)(y0 + y) * pitch + (size_t)x0 * 4;
+        uint8_t *o = st + (size_t)y * w * 4;
+
+        for (x = 0; x < w; x++, p += 4, o += 4) {
+            o[0] = p[2 ^ xr];           /* R */
+            o[1] = p[1 ^ xr];           /* G */
+            o[2] = p[0 ^ xr];           /* B */
+            o[3] = p[3 ^ xr];           /* A */
+        }
+    }
+    CGLSetCurrentContext(g->ctx);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g->cbuf);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, w, h, GL_RGBA_INTEGER,
+                    GL_UNSIGNED_BYTE, st);
+    return glGetError() == GL_NO_ERROR;
+}
+
+bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                       uint8_t *base, unsigned pitch, unsigned xr)
+{
+    uint8_t *st;
+    int x, y;
+
+    if (!g || w <= 0 || h <= 0 ||
+        x0 < 0 || y0 < 0 || x0 + w > g->fb_w || y0 + h > g->fb_h) {
+        return false;
+    }
+    st = gl_stage(g, (size_t)w * h * 4);
+    CGLSetCurrentContext(g->ctx);
+    glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, g->cbuf, 0);
+    glReadPixels(x0, y0, w, h, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, st);
+    for (y = 0; y < h; y++) {
+        uint8_t *p = base + (size_t)(y0 + y) * pitch + (size_t)x0 * 4;
+        const uint8_t *i = st + (size_t)y * w * 4;
+
+        for (x = 0; x < w; x++, p += 4, i += 4) {
+            p[2 ^ xr] = i[0];
+            p[1 ^ xr] = i[1];
+            p[0 ^ xr] = i[2];
+            p[3 ^ xr] = i[3];
+        }
+    }
+    return glGetError() == GL_NO_ERROR;
+}
+
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 {
     static const uint8_t white[4] = { 255, 255, 255, 255 };
     int sx0, sy0, sx1, sy1;
 
-    if (!g || r->w <= 0 || r->h <= 0 || !r->nvert) {
+    if (!g || r->w <= 0 || r->h <= 0 || !r->nvert ||
+        r->surf_w > g->fb_w || r->surf_h > g->fb_h) {
         return false;
     }
     /*
@@ -454,48 +602,33 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      */
     CGLSetCurrentContext(g->ctx);
 
-    /* the colour buffer, seeded with what the draw is blending against */
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g->cbuf);
-    if (g->fb_w != r->w || g->fb_h != r->h) {
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->w, r->h, 0,
-                     GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, r->before);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, g->dst);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->w, r->h, 0,
-                     GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g->cbuf);
-        g->fb_w = r->w;
-        g->fb_h = r->h;
-    } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->w, r->h, GL_RGBA_INTEGER,
-                        GL_UNSIGNED_BYTE, r->before);
-    }
     glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                            GL_TEXTURE_2D, g->cbuf, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        g->fb_w = g->fb_h = 0;
-        return false;
-    }
-    glViewport(0, 0, r->w, r->h);
+    /*
+     * The whole target, not the draw's rectangle. Device coordinates are
+     * therefore target coordinates throughout: u_rect maps them to NDC
+     * without an offset and u_org is zero, so gl_FragCoord.xy is the
+     * device pixel plus a half. M2 rendered into a rectangle-sized FBO
+     * and carried x0/y0 in both places, where any error in the pair
+     * cancelled itself; here the offsets are gone rather than paired.
+     */
+    glViewport(0, 0, r->surf_w, r->surf_h);
 
     /*
      * The blend samples the destination through an integer sampler
      * rather than through GL's blender, so that the device's truncating
      * pack is reproduced exactly. The bytes come from the colour buffer
-     * itself, copied on the GPU -- M2 uploaded the same rectangle a
-     * second time from the host, which the bench measures at 1.44 ms per
-     * full-screen draw against 0.074 ms for the copy.
+     * itself, copied on the GPU over the draw's own rectangle -- M2
+     * uploaded them from the host for every draw, which the bench
+     * measures at 1.44 ms full screen against 0.074 ms for the copy.
      */
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, g->dst);
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, r->w, r->h);
+    if (r->blend && r->blend_read) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g->dst);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, r->x0, r->y0,
+                            r->x0, r->y0, r->w, r->h);
+    }
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g->tex);
@@ -514,9 +647,8 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
                  (GLsizeiptr)sizeof(float) * R350_GL_VSTRIDE * r->nvert,
                  r->verts, GL_STREAM_DRAW);
 
-    glUniform4f(g->u_rect, (float)r->x0, (float)r->y0,
-                (float)r->w, (float)r->h);
-    glUniform2f(g->u_org, (float)r->x0, (float)r->y0);
+    glUniform4f(g->u_rect, 0.0f, 0.0f, (float)r->surf_w, (float)r->surf_h);
+    glUniform2f(g->u_org, 0.0f, 0.0f);
     glUniform2i(g->u_texsize, r->tex_w, r->tex_h);
     glUniform2i(g->u_clamp, r->clamp_s, r->clamp_t);
     glUniform1i(g->u_textured, r->textured);
@@ -530,11 +662,16 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     glUniform3i(g->u_afac, r->a_src_factor, r->a_dst_factor, r->a_comb_fcn);
     glUniform4f(g->u_konst, r->k_r, r->k_g, r->k_b, r->k_a);
 
-    /* the scissor, and the one cliprect it absorbed, in rectangle space */
-    sx0 = MAX(r->sx0 - r->x0, 0);
-    sy0 = MAX(r->sy0 - r->y0, 0);
-    sx1 = MIN(r->sx1 - r->x0, r->w);
-    sy1 = MIN(r->sy1 - r->y0, r->h);
+    /*
+     * Scissor, the one cliprect it absorbed, AND the draw's rectangle.
+     * The rectangle used to bound the draw by being the whole
+     * framebuffer; now it has to be said out loud, because it is also
+     * the only region the caller seeded and the only one it will fetch.
+     */
+    sx0 = MAX(r->sx0, r->x0);
+    sy0 = MAX(r->sy0, r->y0);
+    sx1 = MIN(r->sx1, r->x0 + r->w);
+    sy1 = MIN(r->sy1, r->y0 + r->h);
     glEnable(GL_SCISSOR_TEST);
     glScissor(sx0, sy0, MAX(sx1 - sx0, 0), MAX(sy1 - sy0, 0));
 
@@ -555,8 +692,8 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
             if (p) {
                 glActiveTexture(GL_TEXTURE1);
                 glBindTexture(GL_TEXTURE_2D, g->dst);
-                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                                    r->w, r->h);
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, r->x0, r->y0,
+                                    r->x0, r->y0, r->w, r->h);
                 glActiveTexture(GL_TEXTURE0);
             }
             glDrawArrays(GL_TRIANGLES, (GLint)r->pass[p],
@@ -565,7 +702,11 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     } else {
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
     }
-    glReadPixels(0, 0, r->w, r->h, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, r->out);
+    if (r->out) {
+        /* gl=verify only; the resident target keeps the pixels otherwise */
+        glReadPixels(r->x0, r->y0, r->w, r->h, GL_RGBA_INTEGER,
+                     GL_UNSIGNED_BYTE, r->out);
+    }
 
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_SCISSOR_TEST);
@@ -582,6 +723,24 @@ R350GlCtx *ati_r350_gl_open(const char **err)
 
 void ati_r350_gl_close(R350GlCtx *g)
 {
+}
+
+bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
+{
+    *lost = false;
+    return false;
+}
+
+bool ati_r350_gl_seed(R350GlCtx *g, int x0, int y0, int w, int h,
+                      const uint8_t *base, unsigned pitch, unsigned xr)
+{
+    return false;
+}
+
+bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                       uint8_t *base, unsigned pitch, unsigned xr)
+{
+    return false;
 }
 
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req)

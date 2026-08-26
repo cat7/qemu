@@ -124,6 +124,7 @@ typedef enum ATIR350GlFallback {
     R350_GLF_CLIPRULE,      /* a genuine 4-rect cliprect truth table */
     R350_GLF_TEXTURE,       /* texture too large to decode per draw */
     R350_GLF_SELFBLEND,     /* self-overlapping blend needing too many passes */
+    R350_GLF_SURFACE,       /* target too large, or it would not resize */
     R350_GLF_BACKEND,       /* the backend itself declined the request */
     R350_GLF_MAX
 } ATIR350GlFallback;
@@ -516,6 +517,21 @@ struct ATIR350State {
     float gl_bbox[R300_GL_TRI_MAX][4];
     uint64_t gl_multipass;      /* draws that needed more than one pass */
     uint64_t gl_passes;         /* ... and how many passes in total */
+    /*
+     * The GL-owned render target (milestone M3). The rules that keep it
+     * coherent with emulated VRAM are stated in full at "GL-OWNED RENDER
+     * TARGET" in ati_r350_3d.c; these are the four facts they need.
+     * `gl_res` says a target is resident at all and is the ONLY thing
+     * the hot hooks test.
+     */
+    bool gl_res;
+    uint32_t gl_res_off, gl_res_pitch;
+    unsigned gl_res_xr;
+    int gl_tex_w, gl_tex_h;             /* the backend texture's extent */
+    int gl_vx0, gl_vy0, gl_vx1, gl_vy1; /* seeded: the GPU copy is good */
+    int gl_dx0, gl_dy0, gl_dx1, gl_dy1; /* drawn: the GPU copy is NEWER */
+    uint64_t gl_flushes;                /* fetches back into VRAM */
+    uint64_t gl_flush_px, gl_seed_px;   /* ... and pixels moved each way */
 
     /*
      * Hardware cursor (CUR_* registers). hw_cursor_on tracks whether the
@@ -611,6 +627,34 @@ uint32_t ati_r350_cap_vtx_bytes(void);
 
 /* why a draw went to the software rasterizer instead of the GL backend */
 const char *ati_r350_gl_fb_name(ATIR350GlFallback why);
+
+/*
+ * GL-OWNED RENDER TARGET -- the coherency hooks. The rules are stated
+ * in full where they are implemented, at "GL-OWNED RENDER TARGET" in
+ * ati_r350_3d.c; what follows is how the rest of the device obeys them.
+ *
+ * ati_r350_gl_release() gives the target back: anything the host GPU
+ * holds is fetched into VRAM first, and the GPU copy stops being
+ * trusted. Call it before ANY code that reads or writes VRAM outside
+ * the 3D draw path, and at every boundary where the guest CPU might run
+ * -- which in this device means the end of a command-processor run,
+ * because a whole ring or indirect buffer is drained inside one guest
+ * store and nothing else can interleave with it.
+ *
+ * ati_r350_gl_touch() is the same thing for code that names a range and
+ * is hot enough to care: it costs one predictable branch when no target
+ * is resident, which is always the case with the default gl=off.
+ */
+void ati_r350_gl_release(ATIR350State *s);
+void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len);
+
+static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
+                                     uint32_t len)
+{
+    if (unlikely(s->gl_res)) {
+        ati_r350_gl_sync(s, off, len);
+    }
+}
 
 /* ati_r350_3d.c */
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);

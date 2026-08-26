@@ -658,6 +658,13 @@ static bool ati_r350_update_display(void *opaque)
     bool valid, blanked, redraw;
     uint64_t fb_len;
 
+    /*
+     * Before the dirty snapshot, not after: a flush marks the rows it
+     * writes, and those marks are how this function decides to redraw
+     * at all. Releasing later would let a frame the GPU rendered sit
+     * unnoticed until something else dirtied the same page.
+     */
+    ati_r350_gl_release(s);
     snap = ati_r350_take_dirty(s);
     ati_r350_get_mode(s, &mode);
     valid = ati_r350_mode_valid(s, &mode);
@@ -1050,6 +1057,7 @@ static uint32_t ati_r350_reg_read32(ATIR350State *s, uint32_t base)
             uint32_t off = s->regs[R350_MM_INDEX >> 2] & 0x7ffffffc;
 
             if (off + 4 <= ATI_R350_VRAM_SIZE) {
+                ati_r350_gl_touch(s, off, 4);
                 val = ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->vram)
                                + off);
             }
@@ -1639,6 +1647,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
             uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
             if (off + 4 <= ATI_R350_VRAM_SIZE) {
+                ati_r350_gl_touch(s, off, 4);
                 stl_le_p(vram + off, val);
                 memory_region_set_dirty(&s->vram, off, 4);
             }
@@ -2440,6 +2449,7 @@ uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr)
     dma_addr_t bus;
 
     if (ati_r350_mc_to_vram(s, addr, &off)) {
+        ati_r350_gl_touch(s, off, 4);
         return ati_r350_vram_ld32(s, off);
     }
     if (!ati_r350_mc_to_agp(s, addr, &bus)) {
@@ -2458,6 +2468,7 @@ static void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
         if (off + 4 <= ATI_R350_VRAM_SIZE) {
+            ati_r350_gl_touch(s, off, 4);
             stl_le_p(vram + off, val);
             memory_region_set_dirty(&s->vram, off, 4);
         }
@@ -2560,6 +2571,13 @@ static void ati_r350_pm4_run(ATIR350State *s)
     }
     ati_r350_pm4_run_ring(s);
     ati_r350_cp_rptr_writeback(s);
+    /*
+     * A whole ring is drained inside the guest store that kicked it, so
+     * this is the first moment the guest CPU could look at VRAM again --
+     * and its loads through the frame-buffer BAR cannot be trapped. See
+     * "GL-OWNED RENDER TARGET" in ati_r350_3d.c.
+     */
+    ati_r350_gl_release(s);
 }
 
 /*
@@ -3042,6 +3060,7 @@ static void ati_r350_pm4_parse(ATIR350State *s,
 static void ati_r350_pm4_fifo_push(ATIR350State *s, uint32_t val)
 {
     ati_r350_pm4_parse(s, &s->pm4_fifo, val);
+    ati_r350_gl_release(s);
 }
 
 /*
@@ -3094,6 +3113,7 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
         trace_ati_r350_pm4_ib_dword(i, val);
         ati_r350_pm4_parse(s, &parser, val);
     }
+    ati_r350_gl_release(s);
 }
 
 /*
@@ -3269,6 +3289,11 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
 {
     ATIR350State *s = ATI_R350(obj);
 
+    if (s->gl_ctx) {
+        /* the surface descriptors are about to go: resolve it first */
+        ati_r350_gl_release(s);
+        s->gl_tex_w = s->gl_tex_h = 0;
+    }
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
     memset(s->palette, 0, sizeof(s->palette));
@@ -3417,6 +3442,8 @@ static void ati_r350_cursor_apply(ATIR350State *s)
         ati_r350_note_gap(s, R350_GAP_DEST_OFF_VRAM, 1);
         return;
     }
+    /* the sprite could be sitting inside a target the GPU still holds */
+    ati_r350_gl_touch(s, vram_off, (uint32_t)image_bytes);
     src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + vram_off;
     xr = ati_r350_vram_xor(s, vram_off);
 
@@ -3885,6 +3912,7 @@ static void ati_r350_exit(PCIDevice *dev)
         fclose(s->cap_fp);
         s->cap_fp = NULL;
     }
+    ati_r350_gl_release(s);
     ati_r350_gl_close(s->gl_ctx);
     s->gl_ctx = NULL;
     g_free(s->gl_before);
@@ -4014,6 +4042,7 @@ static const char *const ati_r350_gl_fb_names[R350_GLF_MAX] = {
     [R350_GLF_CLIPRULE] = "cliprect truth table",
     [R350_GLF_TEXTURE]  = "texture size",
     [R350_GLF_SELFBLEND] = "self-overlapping blend",
+    [R350_GLF_SURFACE]  = "render target size",
     [R350_GLF_BACKEND]  = "backend declined",
 };
 
@@ -4057,6 +4086,16 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                            ati_r350_gl_describe(s->gl_ctx), s->gl_drawn, fb,
                            s->gl_drawn + fb
                            ? 100.0 * s->gl_drawn / (s->gl_drawn + fb) : 0.0);
+    /*
+     * The coherency measurement the roadmap's E2.4 asks for: how often
+     * the resident render target had to be handed back to VRAM, and how
+     * many pixels crossed the bus each way. A flush count near the draw
+     * count means the target is not staying resident and the batching
+     * is not working.
+     */
+    g_string_append_printf(out, "\nresident target: %" PRIu64 " flushes, %"
+                           PRIu64 " px out, %" PRIu64 " px in",
+                           s->gl_flushes, s->gl_flush_px, s->gl_seed_px);
     if (s->gl_multipass) {
         /*
          * How much work the self-overlap ordering is doing. A blended

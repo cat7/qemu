@@ -12,9 +12,21 @@
  *
  * Coordinates in a request are the device's own: y increases downward
  * and the origin is the render target's top-left corner. The backend
- * renders into an offscreen buffer of the request's rectangle, seeded
- * from `before`, and leaves the result in `out`. It never touches VRAM,
- * a QEMU display backend, or a window.
+ * never touches a QEMU display backend or a window.
+ *
+ * The render target is RESIDENT (milestone M3). ati_r350_gl_target()
+ * sizes it, ati_r350_gl_seed() copies emulated VRAM into it and
+ * ati_r350_gl_fetch() copies it back out, and between those the caller
+ * may draw into it as often as it likes without a byte crossing the
+ * bus. M2 uploaded the destination rectangle twice and read it back for
+ * every single draw; on this host that was 5.2 ms of the 6.5 ms a
+ * full-screen draw cost (doc/radeon9800/glbench).
+ *
+ * What that buys has to be paid for in coherency, and the rules are
+ * stated where they are enforced -- see "GL-OWNED RENDER TARGET" in
+ * ati_r350_3d.c. The backend's own part of the contract is only this:
+ * it holds one target, it holds it until told otherwise, and seed and
+ * fetch are the only ways bytes move.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -41,10 +53,20 @@
 #define R350_GL_VSTRIDE 33
 
 typedef struct R350GlReq {
-    /* destination rectangle, in the render target's own coordinates */
+    /*
+     * Every coordinate below is a coordinate IN THE RESIDENT TARGET,
+     * with (0,0) its top-left pixel and y increasing downward. Row k of
+     * the target is row k of the GL texture -- there is no flip
+     * anywhere, in either direction, which is the only arrangement in
+     * which a seed, a draw and a fetch can be composed in any order and
+     * still agree.
+     */
+    /* destination rectangle: the bounding box this draw may write */
     int x0, y0, w, h;
     /* scissor, same coordinates, bottom-right exclusive */
     int sx0, sy0, sx1, sy1;
+    /* the whole target's extent, which is what the draw renders into */
+    int surf_w, surf_h;
 
     const float *verts;         /* R350_GL_VSTRIDE floats per vertex */
     unsigned nvert;             /* 3 * triangle count */
@@ -80,8 +102,13 @@ typedef struct R350GlReq {
     int a_src_factor, a_dst_factor, a_comb_fcn;
     float k_r, k_g, k_b, k_a;
 
-    const uint8_t *before;      /* RGBA8 w*h: the destination as it stands */
-    uint8_t *out;               /* RGBA8 w*h: where the backend leaves it */
+    /*
+     * Where to leave a packed RGBA8 copy of the drawn rectangle, or
+     * NULL. Only gl=verify wants one: the target is resident, so the
+     * ordinary path leaves the pixels on the GPU and fetches them when
+     * something outside the 3D engine needs to look.
+     */
+    uint8_t *out;
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;
@@ -95,8 +122,31 @@ R350GlCtx *ati_r350_gl_open(const char **err);
 void ati_r350_gl_close(R350GlCtx *g);
 
 /*
- * Render one request. Returns false if the backend could not run it,
- * in which case `out` is undefined and the caller must fall back.
+ * Size the resident render target to at least w x h. Returns false if
+ * it could not be created, and sets *lost when the previous contents
+ * did not survive -- the caller then has to seed again whatever it
+ * needs, because nothing else can tell it.
+ */
+bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost);
+
+/*
+ * Move one rectangle between emulated VRAM and the resident target.
+ * `base` addresses the target's own pixel (0,0) in VRAM, `pitch` is its
+ * bytes per row, and `xr` is the aperture swapper's byte-lane xor over
+ * it -- byte (2^xr) of a pixel is red, (1^xr) green, (0^xr) blue and
+ * (3^xr) alpha. GL can be asked for two of the four orders directly,
+ * and measurably should not be: see the comment above ati_r350_gl_seed()
+ * for the numbers.
+ */
+bool ati_r350_gl_seed(R350GlCtx *g, int x0, int y0, int w, int h,
+                      const uint8_t *base, unsigned pitch, unsigned xr);
+bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                       uint8_t *base, unsigned pitch, unsigned xr);
+
+/*
+ * Render one request into the resident target. Returns false if the
+ * backend could not run it, in which case the target is unchanged and
+ * the caller must fall back.
  */
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req);
 
