@@ -46,6 +46,8 @@ typedef struct R300DrawState {
     unsigned attr_size[R300_AOS_MAX];  /* dwords per vertex, per input reg */
     unsigned attr_count;
     float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
+    bool vte_xs, vte_xo;    /* VAP_VTE_CNTL: apply that scale/offset at all */
+    bool vte_ys, vte_yo;
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
     uint32_t wmask;         /* RB3D_COLOR_CHANNEL_MASK as an ARGB byte mask */
@@ -764,8 +766,34 @@ static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v,
         v->x = v->y = r300_vtx_nowhere;
         return;
     }
-    v->x = (cx / cw) * d->vp[0] + d->vp[1];
-    v->y = (cy / cw) * d->vp[2] + d->vp[3];
+    /*
+     * The viewport's scale and offset are enabled per component, and a
+     * guest that is already handing over screen coordinates turns the
+     * offset off rather than writing zero into it. iTunes Artwork's
+     * per-frame erase is one such draw: a full-surface point sprite at
+     * VTE 0x405 -- scales on at 1.0, offsets OFF -- which the model
+     * displaced by the whole SE_VPORT offset, so it erased only the
+     * bottom-right quadrant of the saver's surface and left the rest
+     * showing whatever that VRAM held before.
+     *
+     * The both-enabled arm is written out as the one expression it has
+     * always been rather than as a scale followed by an add: the
+     * compiler contracts it into a fused multiply-add, and splitting
+     * the two would round in between and move pixels in every draw
+     * this model has ever got right.
+     */
+    if (d->vte_xs) {
+        v->x = d->vte_xo ? (cx / cw) * d->vp[0] + d->vp[1]
+                         : (cx / cw) * d->vp[0];
+    } else {
+        v->x = d->vte_xo ? cx / cw + d->vp[1] : cx / cw;
+    }
+    if (d->vte_ys) {
+        v->y = d->vte_yo ? (cy / cw) * d->vp[2] + d->vp[3]
+                         : (cy / cw) * d->vp[2];
+    } else {
+        v->y = d->vte_yo ? cy / cw + d->vp[3] : cy / cw;
+    }
     if (!isfinite(v->x) || !isfinite(v->y)) {
         v->x = v->y = r300_vtx_nowhere;
     }
@@ -1327,6 +1355,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     }
 
     d->xform = false;
+    d->vte_xs = d->vte_xo = d->vte_ys = d->vte_yo = false;
     d->vs_run = false;
     d->vs_color = false;
     d->vs_texcoord = false;
@@ -1336,6 +1365,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
         s->pvs_const_dwords >= 16) {
         int k;
+        uint32_t vte;
         float xs = r300_f32(s->regs[R300_SE_VPORT_XSCALE >> 2]);
 
         if (xs != 0.0f) {
@@ -1369,6 +1399,25 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
             for (k = 0; k < 6; k++) {
                 d->vp[k] = r300_f32(s->regs[(R300_SE_VPORT_XSCALE >> 2) + k]);
             }
+            vte = s->regs[R300_VAP_VTE_CNTL >> 2];
+            /*
+             * The two format bits describe the perspective divide this
+             * model performs unconditionally: XY_FMT clear means the
+             * setup engine still has to divide x and y by w, and
+             * W0_FMT set means the w it was handed is w rather than
+             * 1/w. Every draw in every capture reads them that way.
+             * Anything else would need a different divide, so say so
+             * rather than transform the vertex wrongly in silence.
+             */
+            if ((vte & (R300_VTE_VTX_XY_FMT | R300_VTE_VTX_W0_FMT)) !=
+                R300_VTE_VTX_W0_FMT) {
+                ati_r350_note_gap(s, R350_GAP_VTE_FMT,
+                                  (vte >> 8) & (R350_GAP_SLOTS - 1));
+            }
+            d->vte_xs = vte & R300_VTE_VPORT_X_SCALE_ENA;
+            d->vte_xo = vte & R300_VTE_VPORT_X_OFFSET_ENA;
+            d->vte_ys = vte & R300_VTE_VPORT_Y_SCALE_ENA;
+            d->vte_yo = vte & R300_VTE_VPORT_Y_OFFSET_ENA;
             d->xform = true;
             d->vs_run = d->vs.valid;
             d->vs_color_out = first_color;

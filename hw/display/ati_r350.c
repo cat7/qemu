@@ -3911,6 +3911,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_VS_DST_FILE]  = "vertex destination file",
     [R350_GAP_TEX_SWIZZLE]  = "texture component select",
     [R350_GAP_AOS_ARRAYS]   = "vertex arrays bound",
+    [R350_GAP_VTE_FMT]      = "viewport vertex format",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)

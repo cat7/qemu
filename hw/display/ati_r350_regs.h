@@ -914,6 +914,23 @@
 #define R300_PM4_OPCODE_DRAW_VBUF_2   0x34
 #define R300_PM4_OPCODE_DRAW_IMMD_2   0x35
 #define R300_PM4_OPCODE_DRAW_INDX_2   0x36
+/*
+ * Viewport Transform Engine control. The scale and the offset are
+ * enabled per component and independently (R3xx 3D register reference,
+ * VAP:VAP_VTE_CNTL) -- a guest that hands the engine coordinates
+ * already in screen units turns the offset off and leaves the scale at
+ * 1.0, and applying SE_VPORT_?OFFSET anyway displaces the whole draw.
+ * Bit 8 VTX_XY_FMT and bit 10 VTX_W0_FMT describe the perspective
+ * divide the model always performs; every capture we hold reads them
+ * 0 and 1 respectively, which is exactly that divide.
+ */
+#define R300_VAP_VTE_CNTL             0x20b0
+#define R300_VTE_VPORT_X_SCALE_ENA    0x00000001
+#define R300_VTE_VPORT_X_OFFSET_ENA   0x00000002
+#define R300_VTE_VPORT_Y_SCALE_ENA    0x00000004
+#define R300_VTE_VPORT_Y_OFFSET_ENA   0x00000008
+#define R300_VTE_VTX_XY_FMT           0x00000100
+#define R300_VTE_VTX_W0_FMT           0x00000400
 #define R300_VAP_VTX_SIZE             0x20b4
 #define R300_TX_ENABLE                0x4104
 #define R300_TX_FORMAT0_0             0x4480

@@ -90,6 +90,7 @@ typedef enum ATIR350GapKind {
     R350_GAP_VS_DST_FILE,    /* PVS destination register file not modelled */
     R350_GAP_TEX_SWIZZLE,    /* TX_FORMAT1 component select not modelled */
     R350_GAP_AOS_ARRAYS,     /* more vertex arrays bound than we fetch */
+    R350_GAP_VTE_FMT,        /* VAP_VTE_CNTL vertex format bit not modelled */
     R350_GAP_MAX
 } ATIR350GapKind;
 
