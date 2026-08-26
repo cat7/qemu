@@ -25,7 +25,16 @@ system_ss.add(when: 'CONFIG_VMWARE_VGA', if_true: files('vmware_vga.c'))
 system_ss.add(when: 'CONFIG_BOCHS_DISPLAY', if_true: files('bochs-display.c'))
 system_ss.add(when: 'CONFIG_ATI_MACH64', if_true: files('ati_mach64.c', 'ati_mach64_2d.c', 'ati_mach64_dbg.c'))
 system_ss.add(when: 'CONFIG_ATI_RAGE128', if_true: files('ati_rage128.c', 'ati_rage128_2d.c', 'ati_rage128_dbg.c'))
-system_ss.add(when: 'CONFIG_ATI_R350', if_true: files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c'))
+# ati_r350_gl.c is the host-GPU rendering backend (phase 2). On darwin it
+# is CGL + desktop GL 3.3 core, offscreen: no window, no QEMU display
+# backend, and deliberately NOT CONFIG_OPENGL, which cannot be enabled on
+# this host at all (libepoxy on darwin ships no epoxy/egl.h). Elsewhere the
+# file compiles to a stub that reports there is no backend.
+r350_gl_deps = []
+if host_os == 'darwin'
+  r350_gl_deps += dependency('appleframeworks', modules: 'OpenGL')
+endif
+system_ss.add(when: 'CONFIG_ATI_R350', if_true: [files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c', 'ati_r350_gl.c'), r350_gl_deps])
 
 system_ss.add(when: 'CONFIG_EXYNOS4', if_true: files('exynos4210_fimd.c'))
 system_ss.add(when: 'CONFIG_FRAMEBUFFER', if_true: files('framebuffer.c'))
