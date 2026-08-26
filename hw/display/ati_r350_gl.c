@@ -132,16 +132,16 @@ static const char *vs_src =
 "#extension GL_ARB_gpu_shader5 : require\n"
 "layout(location = 0) in vec2 a_pos;\n"
 "layout(location = 1) in vec4 a_col;\n"
-"layout(location = 2) in vec2 a_st;\n"
+"layout(location = 2) in vec4 a_st;\n"
 "layout(location = 3) in vec2 a_p0;\n"
 "layout(location = 4) in vec2 a_p1;\n"
 "layout(location = 5) in vec2 a_p2;\n"
 "layout(location = 6) in vec4 a_c0;\n"
 "layout(location = 7) in vec4 a_c1;\n"
 "layout(location = 8) in vec4 a_c2;\n"
-"layout(location = 9) in vec2 a_t0;\n"
-"layout(location = 10) in vec2 a_t1;\n"
-"layout(location = 11) in vec2 a_t2;\n"
+"layout(location = 9) in vec4 a_t0;\n"
+"layout(location = 10) in vec4 a_t1;\n"
+"layout(location = 11) in vec4 a_t2;\n"
 "layout(location = 12) in float a_inv;\n"
 "layout(location = 13) in vec4 a_s0;\n"
 "layout(location = 14) in vec4 a_s1;\n"
@@ -153,9 +153,9 @@ static const char *vs_src =
 "flat out vec4 f_c0;\n"
 "flat out vec4 f_c1;\n"
 "flat out vec4 f_c2;\n"
-"flat out vec2 f_t0;\n"
-"flat out vec2 f_t1;\n"
-"flat out vec2 f_t2;\n"
+"flat out vec4 f_t0;\n"
+"flat out vec4 f_t1;\n"
+"flat out vec4 f_t2;\n"
 "flat out float f_inv;\n"
 "flat out vec4 f_s0;\n"
 "flat out vec4 f_s1;\n"
@@ -204,9 +204,9 @@ static const char *fs_src =
 "flat in vec4 f_c0;\n"
 "flat in vec4 f_c1;\n"
 "flat in vec4 f_c2;\n"
-"flat in vec2 f_t0;\n"
-"flat in vec2 f_t1;\n"
-"flat in vec2 f_t2;\n"
+"flat in vec4 f_t0;\n"
+"flat in vec4 f_t1;\n"
+"flat in vec4 f_t2;\n"
 "flat in float f_inv;\n"
 "flat in vec4 f_s0;\n"
 "flat in vec4 f_s1;\n"
@@ -277,8 +277,14 @@ static const char *fs_src =
 "    precise float w1 = d1 * inv;\n"
 "    precise float w2 = 1.0 - w0 - w1;\n"
 "    c = fma(vec4(w2), f_c2, fma(vec4(w1), f_c1, w0 * f_c0));\n"
-"    precise vec2 st = fma(vec2(w2), f_t2,\n"
-"                          fma(vec2(w1), f_t1, w0 * f_t0));\n"
+/*
+ * Coordinate set 0. Component for component this is the expression the
+ * single-coordinate shader computed, so widening the attribute did not
+ * move a pixel; the further sets are interpolated the same way where
+ * the program names them.
+ */
+"    precise vec2 st = fma(vec2(w2), f_t2.xy,\n"
+"                          fma(vec2(w1), f_t1.xy, w0 * f_t0.xy));\n"
 "    ts = st.x; tt = st.y;\n"
 /*
  * The fragment program's inputs, in the units it reads them: the texel
@@ -635,13 +641,22 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     glDisable(GL_BLEND);
 
     {
-        static const struct { GLint loc, n, off; } at[] = {
-            { 0, 2, 0 }, { 1, 4, 2 }, { 2, 2, 6 },
-            { 3, 2, 8 }, { 4, 2, 10 }, { 5, 2, 12 },
-            { 6, 4, 14 }, { 7, 4, 18 }, { 8, 4, 22 },
-            { 9, 2, 26 }, { 10, 2, 28 }, { 11, 2, 30 },
-            { 12, 1, 32 },
-            { 13, 4, 33 }, { 14, 4, 37 }, { 15, 4, 41 },
+        /*
+         * Sixteen attributes exactly, which is all GL 3.3 core
+         * guarantees -- see the coordinate-set note in ati_r350_gl.h.
+         * Every offset is derived from C rather than written out, so
+         * the table and R350_GL_VSTRIDE cannot drift apart.
+         */
+        const int C = R350_GL_TEXCOORDS;
+        const struct { GLint loc, n, off; } at[] = {
+            { 0, 2, 0 }, { 1, 4, 2 }, { 2, 2 * C, 6 },
+            { 3, 2, 6 + 2 * C }, { 4, 2, 8 + 2 * C }, { 5, 2, 10 + 2 * C },
+            { 6, 4, 12 + 2 * C }, { 7, 4, 16 + 2 * C }, { 8, 4, 20 + 2 * C },
+            { 9, 2 * C, 24 + 2 * C }, { 10, 2 * C, 24 + 4 * C },
+            { 11, 2 * C, 24 + 6 * C },
+            { 12, 1, 24 + 8 * C },
+            { 13, 4, 25 + 8 * C }, { 14, 4, 29 + 8 * C },
+            { 15, 4, 33 + 8 * C },
         };
 
         glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
@@ -917,24 +932,26 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     }
 
     glActiveTexture(GL_TEXTURE0);
-    if (r->textured && r->tex_slot <= R350_GL_TEXSLOTS) {
-        unsigned sl = r->tex_slot;
+    if ((r->textured & 1) && r->tex_slot[0] <= R350_GL_TEXSLOTS) {
+        unsigned sl = r->tex_slot[0];
 
         glBindTexture(GL_TEXTURE_2D, g->tex[sl]);
-        if (r->tex_fresh && r->tex) {
+        if (r->tex_fresh[0] && r->tex[0]) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            if (g->tex_w[sl] == r->tex_w && g->tex_h[sl] == r->tex_h) {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->tex_w, r->tex_h,
-                                GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, r->tex);
+            if (g->tex_w[sl] == r->tex_w[0] && g->tex_h[sl] == r->tex_h[0]) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->tex_w[0],
+                                r->tex_h[0], GL_RGBA_INTEGER,
+                                GL_UNSIGNED_BYTE, r->tex[0]);
             } else {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->tex_w,
-                             r->tex_h, 0, GL_RGBA_INTEGER,
-                             GL_UNSIGNED_BYTE, r->tex);
-                g->tex_w[sl] = r->tex_w;
-                g->tex_h[sl] = r->tex_h;
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->tex_w[0],
+                             r->tex_h[0], 0, GL_RGBA_INTEGER,
+                             GL_UNSIGNED_BYTE, r->tex[0]);
+                g->tex_w[sl] = r->tex_w[0];
+                g->tex_h[sl] = r->tex_h[0];
             }
-        } else if (g->tex_w[sl] != r->tex_w || g->tex_h[sl] != r->tex_h) {
+        } else if (g->tex_w[sl] != r->tex_w[0] ||
+                   g->tex_h[sl] != r->tex_h[0]) {
             /*
              * The caller said the slot was current and it is not. That
              * can only be a bookkeeping error, and rendering from the
@@ -954,9 +971,9 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 
     glUniform4f(p->u_rect, 0.0f, 0.0f, (float)r->surf_w, (float)r->surf_h);
     glUniform2f(p->u_org, 0.0f, 0.0f);
-    glUniform2i(p->u_texsize, r->tex_w, r->tex_h);
-    glUniform2i(p->u_clamp, r->clamp_s, r->clamp_t);
-    glUniform1i(p->u_textured, r->textured);
+    glUniform2i(p->u_texsize, r->tex_w[0], r->tex_h[0]);
+    glUniform2i(p->u_clamp, r->clamp_s[0], r->clamp_t[0]);
+    glUniform1i(p->u_textured, r->textured & 1);
     glUniform1i(p->u_alphatest, r->alpha_test);
     glUniform1i(p->u_affunc, r->af_func);
     glUniform1f(p->u_afref, r->af_ref);

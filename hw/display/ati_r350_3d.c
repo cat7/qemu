@@ -38,8 +38,33 @@ typedef struct R300Vtx {
      * plus a specular term this model had no second colour to carry.
      */
     float r1, g1, b1, a1;
-    float s, t;
+    /*
+     * The interpolated texture coordinate SETS, `tc[k][0]` and
+     * `tc[k][1]` being set k's s and t. The rasterizer routes each set
+     * to a frame register of its own (R300UsRs::tex_reg), and a
+     * fragment program may sample several units with any of them --
+     * Mac OS X 10.5's compositor fetches unit 0 with set 0 and unit 1
+     * with set 1 in a single program.
+     */
+    float tc[R300_TEXCOORDS][2];
 } R300Vtx;
+
+/*
+ * One bound texture unit. The TX_* register blocks are sixteen deep with
+ * a four-byte stride, so unit u's state is simply the u'th word of each
+ * block; everything the sampler and the GL decode need is resolved into
+ * here once per draw.
+ */
+typedef struct R300TexUnit {
+    bool en;                /* TX_ENABLE names this unit */
+    uint32_t off;           /* card address of texture level 0 */
+    int w, h;
+    uint32_t pitch;         /* bytes per texel row */
+    unsigned bpp;           /* bits per texel: 8, 16, 32 or 64 */
+    unsigned code;          /* TX_FORMAT1 TXFORMAT, to tell the widths apart */
+    unsigned sel[4];        /* TX_FORMAT1 component select, A R G B */
+    unsigned clamp_s, clamp_t;  /* TX_FILTER0 clamp modes (0 = repeat) */
+} R300TexUnit;
 
 typedef struct R300DrawState {
     int sc_x0, sc_y0, sc_x1, sc_y1;   /* inclusive scissor window */
@@ -61,8 +86,13 @@ typedef struct R300DrawState {
     const R300UsProgram *fs;
     bool fs_run;            /* this model can execute it */
     bool fs_col1;           /* it names a second interpolated colour */
-    bool vs_texcoord;       /* take the texture coordinate from its output */
-    unsigned vs_tex_out;    /* which output register that coordinate is */
+    /*
+     * Per coordinate SET: take it from the vertex program's output, and
+     * which output register that is. The sets the vertex stage declares
+     * are consecutive outputs from `first_texcoord`.
+     */
+    bool vs_texcoord[R300_TEXCOORDS];
+    unsigned vs_tex_out[R300_TEXCOORDS];
     unsigned attr_size[R300_AOS_MAX];  /* dwords per vertex, per input reg */
     unsigned attr_count;
     float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
@@ -87,17 +117,41 @@ typedef struct R300DrawState {
     bool alpha_test;
     unsigned af_func;                  /* FG_ALPHA_FUNC compare 0-7 */
     float af_ref;
-    uint32_t tex_off;       /* card address of texture level 0 */
-    int tex_w, tex_h;
-    uint32_t tex_pitch;     /* bytes per texel row */
-    unsigned tex_bpp;       /* bits per texel: 8, 16, 32 or 64 */
-    unsigned tex_code;      /* TX_FORMAT1 TXFORMAT, to tell 16bpp/64bpp apart */
-    int tex_attr;           /* vertex attribute holding s,t; -1 = none */
-    unsigned tex_sel[4];    /* TX_FORMAT1 component select, A R G B */
-    unsigned clamp_s, clamp_t; /* TX_FILTER0 clamp modes (0 = repeat) */
+    R300TexUnit tex[R300_TEX_UNITS];
+    /* vertex attribute holding each coordinate set's s,t; -1 = none */
+    int tex_attr[R300_TEXCOORDS];
+    /*
+     * Which unit's texture size each coordinate set is scaled by. This
+     * model samples in TEXELS while the hardware samples normalised, so
+     * a coordinate the vertex stage produced is multiplied by the bound
+     * texture's dimensions on the way out of the vertex stage -- and
+     * with more than one unit bound there is a choice of which. It is
+     * the FIRST unit the fragment program fetches with that set, which
+     * for every single-texture draw is unit 0 and therefore exactly the
+     * arithmetic that predates multitexturing.
+     */
+    unsigned tc_unit[R300_TEXCOORDS];
+    /*
+     * How many coordinate sets this draw actually carries -- one past
+     * the highest the fragment program's routing names, and 1 for every
+     * draw that predates multitexturing. The rasterizer interpolates
+     * exactly this many, so a single-texture draw pays nothing.
+     */
+    unsigned ntc;
     float flat_r, flat_g, flat_b, flat_a;
     uint8_t *vram;
 } R300DrawState;
+
+/*
+ * The GL backend's contract states its own texture-unit and coordinate-
+ * set counts rather than including this file's headers -- it is meant to
+ * be replaceable without the draw path noticing. That independence is
+ * only safe if the two agree, so it is checked here rather than trusted.
+ * The capture format repeats the unit count for the same reason.
+ */
+QEMU_BUILD_BUG_ON(R350_GL_TEXUNITS != R300_TEX_UNITS);
+QEMU_BUILD_BUG_ON(R350_GL_TEXCOORDS != R300_TEXCOORDS);
+QEMU_BUILD_BUG_ON(R350_CAP_TEX_UNITS != R300_TEX_UNITS);
 
 static inline float r300_f32(uint32_t v)
 {
@@ -152,8 +206,9 @@ static inline uint32_t r300_texel_16x4(uint32_t lo, uint32_t hi)
 }
 
 static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
-                                int tx, int ty)
+                                unsigned unit, int tx, int ty)
 {
+    const R300TexUnit *u = &d->tex[unit];
     uint32_t addr, off;
 
     /*
@@ -163,25 +218,25 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
      * smeared whatever sat next to the tile in VRAM. Treat mirror
      * modes as repeat, everything else clamps to the edge.
      */
-    if (d->clamp_s <= 1 && d->tex_w > 0) {
-        tx %= d->tex_w;
+    if (u->clamp_s <= 1 && u->w > 0) {
+        tx %= u->w;
         if (tx < 0) {
-            tx += d->tex_w;
+            tx += u->w;
         }
     } else {
-        tx = MIN(MAX(tx, 0), d->tex_w - 1);
+        tx = MIN(MAX(tx, 0), u->w - 1);
     }
-    if (d->clamp_t <= 1 && d->tex_h > 0) {
-        ty %= d->tex_h;
+    if (u->clamp_t <= 1 && u->h > 0) {
+        ty %= u->h;
         if (ty < 0) {
-            ty += d->tex_h;
+            ty += u->h;
         }
     } else {
-        ty = MIN(MAX(ty, 0), d->tex_h - 1);
+        ty = MIN(MAX(ty, 0), u->h - 1);
     }
-    addr = d->tex_off + (uint32_t)ty * d->tex_pitch +
-           (uint32_t)tx * (d->tex_bpp / 8);
-    if (d->tex_bpp == 8) {
+    addr = u->off + (uint32_t)ty * u->pitch +
+           (uint32_t)tx * (u->bpp / 8);
+    if (u->bpp == 8) {
         /* single-component format: the byte is component X */
         uint8_t a;
 
@@ -197,7 +252,7 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
         }
         return a;
     }
-    if (d->tex_bpp == 16) {
+    if (u->bpp == 16) {
         /*
          * One 16-bit unit per texel, assembled from its two bytes in
          * ascending address order. The byte lanes go through the same
@@ -220,9 +275,9 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
             v = (uint32_t)d->vram[off ^ xr] |
                 ((uint32_t)d->vram[(off + 1) ^ xr] << 8);
         }
-        return d->tex_code == R300_TX_FMT_1_5_5_5 ? r300_texel_1555(v) : v;
+        return u->code == R300_TX_FMT_1_5_5_5 ? r300_texel_1555(v) : v;
     }
-    if (d->tex_bpp == 64) {
+    if (u->bpp == 64) {
         /*
          * TX_FMT_16_16_16_16. The swapper is a byte-lane permutation
          * inside each dword, so the two halves of the texel are read
@@ -256,10 +311,10 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
  * Mac OS X's tiles use; Chess.app's board texture selects the same four
  * bytes in the opposite order, which is a red/blue exchange.
  */
-static float r300_texel_chan(const R300DrawState *d, uint32_t texel,
+static float r300_texel_chan(const R300TexUnit *u, uint32_t texel,
                              unsigned ch)
 {
-    unsigned sel = d->tex_sel[ch];
+    unsigned sel = u->sel[ch];
 
     if (sel == R300_TX_SEL_ONE) {
         return 1.0f;
@@ -469,15 +524,15 @@ static void r300_us_sample(void *ctx, unsigned unit, bool proj,
     const R300DrawState *d = c->d;
     uint32_t t;
 
-    if (unit != 0 || !d->textured) {
+    if (unit >= R300_TEX_UNITS || !d->tex[unit].en) {
         texel[0] = texel[1] = texel[2] = texel[3] = 1.0f;
         return;
     }
-    t = r300_sample_tex(c->s, d, (int)coord[0], (int)coord[1]);
-    texel[0] = r300_texel_chan(d, t, 1);
-    texel[1] = r300_texel_chan(d, t, 2);
-    texel[2] = r300_texel_chan(d, t, 3);
-    texel[3] = r300_texel_chan(d, t, 0);
+    t = r300_sample_tex(c->s, d, unit, (int)coord[0], (int)coord[1]);
+    texel[0] = r300_texel_chan(&d->tex[unit], t, 1);
+    texel[1] = r300_texel_chan(&d->tex[unit], t, 2);
+    texel[2] = r300_texel_chan(&d->tex[unit], t, 3);
+    texel[3] = r300_texel_chan(&d->tex[unit], t, 0);
 }
 
 /*
@@ -492,7 +547,8 @@ static void r300_us_sample(void *ctx, unsigned unit, bool proj,
  * upload and wrong for the rest.
  */
 static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
-                                 float ts, float tt, const float col[2][4])
+                                 const float tc[R300_TEXCOORDS][2],
+                                 const float col[2][4])
 {
     const R300UsProgram *p = d->fs;
     unsigned n;
@@ -511,10 +567,12 @@ static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
      * predates indirection levels the executor samples the same texel
      * the caller used to hand over.
      */
-    if (p->rs.tex_reg >= 0) {
-        float *r = f->r[p->rs.tex_reg];
+    for (n = 0; n < R300_TEXCOORDS; n++) {
+        if (p->rs.tex_reg[n] >= 0) {
+            float *r = f->r[p->rs.tex_reg[n]];
 
-        r[0] = ts; r[1] = tt; r[2] = 0.0f; r[3] = 1.0f;
+            r[0] = tc[n][0]; r[1] = tc[n][1]; r[2] = 0.0f; r[3] = 1.0f;
+        }
     }
     for (n = 0; n < R300_US_RS_COLS; n++) {
         if (p->rs.col_reg[n] >= 0) {
@@ -689,8 +747,10 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             ca = w0 * v0->a + w1 * v1->a + w2 * v2->a;
             if (d->fs_run) {
                 float tex[4], col[2][4], fsout[4];
-                float ts = w0 * v0->s + w1 * v1->s + w2 * v2->s;
-                float tt = w0 * v0->t + w1 * v1->t + w2 * v2->t;
+                float ts = w0 * v0->tc[0][0] + w1 * v1->tc[0][0] +
+                           w2 * v2->tc[0][0];
+                float tt = w0 * v0->tc[0][1] + w1 * v1->tc[0][1] +
+                           w2 * v2->tc[0][1];
 
                 if (d->fs->fast) {
                     /*
@@ -698,15 +758,19 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                      * so its one fetch is done for it here -- the same
                      * sampler the executor would have called, hoisted
                      * out of a program that cannot need a second one.
+                     * `fast` is granted only to a program whose single
+                     * fetch is unit 0 addressed by coordinate set 0, so
+                     * the hoist has exactly one thing to sample and the
+                     * further sets below are never its business.
                      */
-                    if (d->textured && d->fs->tex_dst >= 0) {
-                        uint32_t texel = r300_sample_tex(s, d, (int)ts,
+                    if (d->tex[0].en && d->fs->tex_dst >= 0) {
+                        uint32_t texel = r300_sample_tex(s, d, 0, (int)ts,
                                                          (int)tt);
 
-                        tex[0] = r300_texel_chan(d, texel, 1);
-                        tex[1] = r300_texel_chan(d, texel, 2);
-                        tex[2] = r300_texel_chan(d, texel, 3);
-                        tex[3] = r300_texel_chan(d, texel, 0);
+                        tex[0] = r300_texel_chan(&d->tex[0], texel, 1);
+                        tex[1] = r300_texel_chan(&d->tex[0], texel, 2);
+                        tex[2] = r300_texel_chan(&d->tex[0], texel, 3);
+                        tex[3] = r300_texel_chan(&d->tex[0], texel, 0);
                     } else {
                         tex[0] = tex[1] = tex[2] = tex[3] = 1.0f;
                     }
@@ -743,8 +807,30 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 } else {
                     R300SampleCtx sc = { s, d };
                     R300UsRegs f;
+                    float tc[R300_TEXCOORDS][2];
+                    unsigned k;
 
-                    r300_fs_frame(d, &f, ts, tt, col);
+                    /*
+                     * The further coordinate sets are interpolated only
+                     * on this arm. A program that needs one is running
+                     * the general interpreter anyway; the specialised
+                     * path above is a single unit-0 fetch by
+                     * construction, so it must not pay for them.
+                     * `ntc` is how many sets the routing named, so a
+                     * one-coordinate program does no extra work at all.
+                     */
+                    tc[0][0] = ts;
+                    tc[0][1] = tt;
+                    for (k = 1; k < d->ntc; k++) {
+                        tc[k][0] = w0 * v0->tc[k][0] + w1 * v1->tc[k][0] +
+                                   w2 * v2->tc[k][0];
+                        tc[k][1] = w0 * v0->tc[k][1] + w1 * v1->tc[k][1] +
+                                   w2 * v2->tc[k][1];
+                    }
+                    for (; k < R300_TEXCOORDS; k++) {
+                        tc[k][0] = tc[k][1] = 0.0f;
+                    }
+                    r300_fs_frame(d, &f, tc, col);
                     r300_us_run(d->fs, &f, r300_us_sample, &sc);
                     if (f.kill) {
                         continue;       /* TEXKILL */
@@ -988,7 +1074,7 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
     v->b = d->flat_b;
     v->a = d->flat_a;
     v->r1 = v->g1 = v->b1 = v->a1 = 0.0f;
-    v->s = v->t = 0.0f;
+    memset(v->tc, 0, sizeof(v->tc));
     /*
      * Everything below reads the vertex as one flat block whose first
      * four dwords are the position, which is only true when the
@@ -1007,8 +1093,8 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
         v->g = r300_f32(dw[5]);
         v->b = r300_f32(dw[6]);
         v->a = r300_f32(dw[7]);
-        v->s = r300_f32(dw[8]);
-        v->t = r300_f32(dw[9]);
+        v->tc[0][0] = r300_f32(dw[8]);
+        v->tc[0][1] = r300_f32(dw[9]);
     } else if (vsize >= 8) {
         /*
          * pos.xyzw + texcoords. Live captures show the 8-dword layout
@@ -1018,8 +1104,8 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
          * vertex. Reading the second attribute as a colour fed
          * texcoords into the blender as RGBA.
          */
-        v->s = r300_f32(dw[4]);
-        v->t = r300_f32(dw[5]);
+        v->tc[0][0] = r300_f32(dw[4]);
+        v->tc[0][1] = r300_f32(dw[5]);
     }
 }
 
@@ -1081,8 +1167,9 @@ static bool r300_vs_has_color(const R300DrawState *d)
  * every pixel and the board loses its texture entirely.
  */
 static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
-                             const float c[4])
+                             unsigned set, const float c[4])
 {
+    const R300TexUnit *u = &d->tex[d->tc_unit[set]];
     float s = c[0], t = c[1], q = c[3];
 
     if (!isfinite(s) || !isfinite(t)) {
@@ -1092,8 +1179,8 @@ static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
         s /= q;
         t /= q;
     }
-    v->s = s * d->tex_w;
-    v->t = t * d->tex_h;
+    v->tc[set][0] = s * u->w;
+    v->tc[set][1] = t * u->h;
 }
 
 /*
@@ -1128,13 +1215,18 @@ static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
                                R300Vtx *v)
 {
     float c[4];
+    unsigned k;
 
-    if (d->tex_attr < 0 || (unsigned)d->tex_attr >= d->attr_count ||
-        d->attr_size[d->tex_attr] < 2) {
-        return;
+    for (k = 0; k < d->ntc; k++) {
+        int a = d->tex_attr[k];
+
+        if (a < 0 || (unsigned)a >= d->attr_count ||
+            d->attr_size[a] < 2) {
+            continue;
+        }
+        r300_vs_input(d, dw, (unsigned)a, c);
+        r300_vs_texcoord(d, v, k, c);
     }
-    r300_vs_input(d, dw, (unsigned)d->tex_attr, c);
-    r300_vs_texcoord(d, v, c);
 }
 
 /*
@@ -1154,13 +1246,14 @@ static void r300_trace_texcoord(const R300DrawState *d, const uint32_t *dw,
     if (!trace_event_get_state_backends(TRACE_ATI_R350_3D_TEXCOORD)) {
         return;
     }
-    if (d->tex_attr >= 0 && (unsigned)d->tex_attr < d->attr_count) {
-        r300_vs_input(d, dw, (unsigned)d->tex_attr, c);
+    if (d->tex_attr[0] >= 0 && (unsigned)d->tex_attr[0] < d->attr_count) {
+        r300_vs_input(d, dw, (unsigned)d->tex_attr[0], c);
     }
-    trace_ati_r350_3d_texcoord(d->tex_attr, d->tex_w, d->tex_h,
+    trace_ati_r350_3d_texcoord(d->tex_attr[0], d->tex[0].w, d->tex[0].h,
                                (int32_t)(c[0] * 1000), (int32_t)(c[1] * 1000),
                                (int32_t)(c[3] * 1000),
-                               (int32_t)(v->s * 1000), (int32_t)(v->t * 1000));
+                               (int32_t)(v->tc[0][0] * 1000),
+                               (int32_t)(v->tc[0][1] * 1000));
 }
 
 static void r300_vs_color(R300Vtx *v, const float c[4])
@@ -1259,8 +1352,11 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
     if (d->vs_color2 && (r.out_written & (1u << d->vs_color2_out))) {
         r300_vs_color1(v, r.out[d->vs_color2_out]);
     }
-    if (d->vs_texcoord && (r.out_written & (1u << d->vs_tex_out))) {
-        r300_vs_texcoord(d, v, r.out[d->vs_tex_out]);
+    for (a = 0; a < d->ntc; a++) {
+        if (d->vs_texcoord[a] &&
+            (r.out_written & (1u << d->vs_tex_out[a]))) {
+            r300_vs_texcoord(d, v, a, r.out[d->vs_tex_out[a]]);
+        }
     }
     if (!(r.out_written & 1)) {
         /*
@@ -1356,7 +1452,7 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
     const uint32_t *regs = s->regs;
     float konst[R300_US_CONSTS][4];
     uint64_t sig;
-    unsigned i;
+    unsigned i, tc_named = 0;
 
     /*
      * One decode per program, not per draw: the signature is the four
@@ -1497,6 +1593,41 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
     d->fs = p;
     d->fs_run = p->valid && p->expressible;
     d->fs_col1 = d->fs_run && p->rs.col_reg[1] >= 0;
+    /*
+     * How many interpolated coordinate sets this draw carries, and what
+     * each of them is scaled by. The rasterizer works in TEXELS while
+     * the hardware samples normalised, so a coordinate the vertex stage
+     * produces is multiplied by a bound texture's size -- and once more
+     * than one unit is bound, WHICH texture is a question the program
+     * answers: the set feeds whichever unit fetches with it.
+     *
+     * A fetch whose source register is not one the rasterizer routed is
+     * a dependent read of an ALU result and names no set at all, so it
+     * is passed over. Every draw that predates multitexturing lands on
+     * ntc 1 and unit 0, which is the arithmetic it always had.
+     */
+    d->ntc = 1;
+    for (i = 0; i < R300_TEXCOORDS; i++) {
+        d->tc_unit[i] = 0;
+        if (p->rs.tex_reg[i] >= 0) {
+            d->ntc = i + 1;
+        }
+    }
+    for (i = 0; d->fs_run && i < p->ntex; i++) {
+        const R300UsTex *t = &p->tex[i];
+        unsigned k;
+
+        if ((t->op != R300_US_TEXOP_LD && t->op != R300_US_TEXOP_PROJ) ||
+            t->unit >= R300_TEX_UNITS) {
+            continue;
+        }
+        for (k = 0; k < d->ntc; k++) {
+            if (p->rs.tex_reg[k] == t->src && !(tc_named & (1u << k))) {
+                d->tc_unit[k] = t->unit;
+                tc_named |= 1u << k;
+            }
+        }
+    }
     s->us_draws++;
     if (p->valid && !p->expressible) {
         s->us_refused++;
@@ -1513,6 +1644,98 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
 }
 
 /*
+ * One texture unit's state, out of its own word of each TX_* register
+ * block. The blocks are sixteen deep with a four-byte stride, so unit u
+ * is simply the u'th word of each -- and the same code therefore serves
+ * every unit, which is what multitexturing needs and what reading
+ * TX_OFFSET_0 by name could never give.
+ *
+ * `en` carries the DRAW-level gate as well as TX_ENABLE's bit, because
+ * a vertex with no room for a texture coordinate cannot sample whatever
+ * the register says. Gaps are reported only for a unit that is enabled:
+ * the other fifteen blocks hold whatever the last guest to use them
+ * left, and reporting on those would be inventing telemetry.
+ */
+static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
+{
+    R300TexUnit *u = &d->tex[unit];
+    uint32_t txfmt0 = s->regs[(R300_TX_FORMAT0_0 >> 2) + unit];
+    uint32_t txfmt1 = s->regs[(R300_TX_FORMAT1_0 >> 2) + unit];
+    uint32_t txfmt2 = s->regs[(R300_TX_FORMAT2_0 >> 2) + unit];
+    uint32_t filt0 = s->regs[(R300_TX_FILTER0_0 >> 2) + unit];
+    unsigned txcode = txfmt1 & R300_TX_FORMAT1_CODE_MASK;
+    unsigned ch;
+
+    u->en = d->textured && (s->regs[R300_TX_ENABLE >> 2] & (1u << unit));
+    u->off = s->regs[(R300_TX_OFFSET_0 >> 2) + unit] & ~0x1fu;
+    u->w = (txfmt0 & 0x7ff) + 1;
+    u->h = ((txfmt0 >> 11) & 0x7ff) + 1;
+    /*
+     * TX_FORMAT1's low format code (R3xx register reference, TXFORMAT
+     * [4:0]): 0 is TX_FMT_8, the single-component format window drop
+     * shadows arrive in (TX_FORMAT1=0x00124000); 3 is TX_FMT_8_8, the
+     * two-component luminance/alpha sprite Flurry.saver's particles
+     * are drawn with; 0xb is TX_FMT_1_5_5_5, which Abstract.saver
+     * asks for; 0xc is TX_FMT_8_8_8_8, what the compositor and most
+     * apps use; 0xe is TX_FMT_16_16_16_16, which RSS Visualizer.saver
+     * asks for. r300_sample_tex() hands all of them to the component
+     * select as four bytes, so one selector implementation serves
+     * every format. TXPITCH counts texels, so the byte pitch scales
+     * with the texel size -- reading an 8_8 texture as four bytes per
+     * texel doubled both the pitch and the stride and made one dword
+     * span two texels.
+     */
+    u->code = txcode;
+    switch (txcode) {
+    case R300_TX_FMT_8:
+        u->bpp = 8;
+        break;
+    case R300_TX_FMT_8_8:
+    case R300_TX_FMT_1_5_5_5:
+        u->bpp = 16;
+        break;
+    case R300_TX_FMT_16_16_16_16:
+        u->bpp = 64;
+        break;
+    case R300_TX_FMT_8_8_8_8:
+        u->bpp = 32;
+        break;
+    default:
+        /* the rest are being read as if their components were bytes */
+        u->bpp = 32;
+        if (u->en) {
+            ati_r350_note_gap(s, R350_GAP_TEX_FORMAT, txcode);
+        }
+        break;
+    }
+    /*
+     * Which component feeds each of A, R, G and B. Reading the
+     * texel as ARGB regardless happens to be right for the
+     * selector Mac OS X's window tiles use, and wrong for
+     * Chess.app's board texture, which orders the same four bytes
+     * the other way round.
+     */
+    for (ch = 0; ch < 4; ch++) {
+        u->sel[ch] = (txfmt1 >> (R300_TX_FORMAT1_SEL_SHIFT + ch * 3)) &
+                     R300_TX_FORMAT1_SEL_MASK;
+        if (u->en && u->sel[ch] > R300_TX_SEL_ONE) {
+            ati_r350_note_gap(s, R350_GAP_TEX_SWIZZLE, u->sel[ch]);
+        }
+    }
+    u->clamp_s = filt0 & 7;
+    u->clamp_t = (filt0 >> 3) & 7;
+    /*
+     * The pitch register only applies when TX_FORMAT0 says so;
+     * otherwise rows are exactly the texture's width.
+     */
+    if (txfmt0 & R300_TX_PITCH_EN) {
+        u->pitch = ((txfmt2 & 0x3fff) + 1) * (u->bpp / 8);
+    } else {
+        u->pitch = (uint32_t)u->w * (u->bpp / 8);
+    }
+}
+
+/*
  * 3D_DRAW_IMMD_2: dw[0] is VAP_VF_CNTL (primitive type, walk mode,
  * vertex count), the rest is vertex data laid out VAP_VTX_SIZE dwords
  * per vertex.
@@ -1521,8 +1744,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                             unsigned vsize)
 {
     uint32_t colorpitch = s->regs[R300_RB3D_COLORPITCH0 >> 2];
-    uint32_t txfmt0 = s->regs[R300_TX_FORMAT0_0 >> 2];
-    uint32_t txfmt2 = s->regs[R300_TX_FORMAT2_0 >> 2];
+    unsigned i;
 
     d->vram = memory_region_get_ram_ptr(&s->vram);
     if (!ati_r350_mc_to_vram(s, s->regs[R300_RB3D_COLOROFFSET0 >> 2] & ~0x1fu,
@@ -1635,11 +1857,11 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         if (d->blend) {
             unsigned f[4] = { d->src_factor, d->dst_factor,
                               d->a_src_factor, d->a_dst_factor };
-            unsigned i;
+            unsigned n;
 
-            for (i = 0; i < ARRAY_SIZE(f); i++) {
-                if (!r300_blend_known(f[i])) {
-                    ati_r350_note_gap(s, R350_GAP_BLEND_FACTOR, f[i]);
+            for (n = 0; n < ARRAY_SIZE(f); n++) {
+                if (!r300_blend_known(f[n])) {
+                    ati_r350_note_gap(s, R350_GAP_BLEND_FACTOR, f[n]);
                 }
             }
         }
@@ -1654,77 +1876,17 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->af_func = (af >> 8) & 7;
         d->af_ref = (af & 0xff) / 255.0f;
     }
-    d->tex_off = s->regs[R300_TX_OFFSET_0 >> 2] & ~0x1fu;
-    d->tex_w = (txfmt0 & 0x7ff) + 1;
-    d->tex_h = ((txfmt0 >> 11) & 0x7ff) + 1;
-    /*
-     * TX_FORMAT1's low format code (R3xx register reference, TXFORMAT
-     * [4:0]): 0 is TX_FMT_8, the single-component format window drop
-     * shadows arrive in (TX_FORMAT1=0x00124000); 3 is TX_FMT_8_8, the
-     * two-component luminance/alpha sprite Flurry.saver's particles
-     * are drawn with; 0xb is TX_FMT_1_5_5_5, which Abstract.saver
-     * asks for; 0xc is TX_FMT_8_8_8_8, what the compositor and most
-     * apps use; 0xe is TX_FMT_16_16_16_16, which RSS Visualizer.saver
-     * asks for. r300_sample_tex() hands all of them to the component
-     * select as four bytes, so one selector implementation serves
-     * every format. TXPITCH counts texels, so the byte pitch scales
-     * with the texel size -- reading an 8_8 texture as four bytes per
-     * texel doubled both the pitch and the stride and made one dword
-     * span two texels.
-     */
-    {
-        uint32_t txfmt1 = s->regs[R300_TX_FORMAT1_0 >> 2];
-        unsigned txcode = txfmt1 & R300_TX_FORMAT1_CODE_MASK;
-        unsigned ch;
-
-        d->tex_code = txcode;
-        switch (txcode) {
-        case R300_TX_FMT_8:
-            d->tex_bpp = 8;
-            break;
-        case R300_TX_FMT_8_8:
-        case R300_TX_FMT_1_5_5_5:
-            d->tex_bpp = 16;
-            break;
-        case R300_TX_FMT_16_16_16_16:
-            d->tex_bpp = 64;
-            break;
-        case R300_TX_FMT_8_8_8_8:
-            d->tex_bpp = 32;
-            break;
-        default:
-            /* the rest are being read as if their components were bytes */
-            d->tex_bpp = 32;
-            if (d->textured) {
-                ati_r350_note_gap(s, R350_GAP_TEX_FORMAT, txcode);
-            }
-            break;
-        }
-        /*
-         * Which component feeds each of A, R, G and B. Reading the
-         * texel as ARGB regardless happens to be right for the
-         * selector Mac OS X's window tiles use, and wrong for
-         * Chess.app's board texture, which orders the same four bytes
-         * the other way round.
-         */
-        for (ch = 0; ch < 4; ch++) {
-            d->tex_sel[ch] = (txfmt1 >> (R300_TX_FORMAT1_SEL_SHIFT + ch * 3)) &
-                             R300_TX_FORMAT1_SEL_MASK;
-            if (d->textured && d->tex_sel[ch] > R300_TX_SEL_ONE) {
-                ati_r350_note_gap(s, R350_GAP_TEX_SWIZZLE, d->tex_sel[ch]);
-            }
-        }
+    for (i = 0; i < R300_TEX_UNITS; i++) {
+        r300_tex_setup(s, d, i);
     }
-    d->clamp_s = s->regs[R300_TX_FILTER0_0 >> 2] & 7;
-    d->clamp_t = (s->regs[R300_TX_FILTER0_0 >> 2] >> 3) & 7;
     /*
-     * The pitch register only applies when TX_FORMAT0 says so;
-     * otherwise rows are exactly the texture's width.
+     * The fragment program is resolved HERE, before the vertex stage
+     * below, because it is what says how many coordinate sets this draw
+     * carries and which unit's texture scales each of them -- and the
+     * vertex stage has to produce exactly those.
      */
-    if (txfmt0 & R300_TX_PITCH_EN) {
-        d->tex_pitch = ((txfmt2 & 0x3fff) + 1) * (d->tex_bpp / 8);
-    } else {
-        d->tex_pitch = (uint32_t)d->tex_w * (d->tex_bpp / 8);
+    if (!r300_fs_setup(s, d)) {
+        return false;
     }
     /*
      * Position transform: unless the draw bypasses the vertex program
@@ -1786,9 +1948,11 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     d->vte_xs = d->vte_xo = d->vte_ys = d->vte_yo = false;
     d->vs_run = false;
     d->vs_color = false;
-    d->vs_texcoord = false;
-    d->vs_tex_out = 0;
-    d->tex_attr = -1;
+    for (i = 0; i < R300_TEXCOORDS; i++) {
+        d->vs_texcoord[i] = false;
+        d->vs_tex_out[i] = 0;
+        d->tex_attr[i] = -1;
+    }
     memset(&d->vs, 0, sizeof(d->vs));
     if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
         s->pvs_const_dwords >= 16) {
@@ -1858,10 +2022,13 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
              * for every draw the desktop is painted with and this is a
              * no-op there by construction.
              */
-            if (d->textured && d->vs.valid &&
-                first_tex < R300_PVS_OUT_REGS &&
-                (d->vs.out_mask & (1u << first_tex))) {
-                d->tex_attr = d->vs.out_src[first_tex];
+            for (i = 0; i < d->ntc; i++) {
+                unsigned o = first_tex + i;
+
+                if (d->textured && d->vs.valid && o < R300_PVS_OUT_REGS &&
+                    (d->vs.out_mask & (1u << o))) {
+                    d->tex_attr[i] = d->vs.out_src[o];
+                }
             }
             /*
              * The colour is the program's only when the vertex stage says
@@ -1879,7 +2046,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                 int src = d->vs.out_src[first_color];
                 bool computed = !d->vs.plain_matrix || src >= 0;
                 bool is_texcoord = d->textured && src >= 0 &&
-                                   src == (d->tex_attr >= 0 ? d->tex_attr :
+                                   src == (d->tex_attr[0] >= 0 ?
+                                           d->tex_attr[0] :
                                            (vsize >= 12 ? 2 : 1));
 
                 d->vs_color = computed && !is_texcoord;
@@ -1893,10 +2061,14 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
              * texture matrix is the exact inverse of the scaling below --
              * so this is a decision about cost, not about semantics.
              */
-            d->vs_texcoord = d->vs_run && !d->vs.plain_matrix &&
-                             d->textured && first_tex < R300_PVS_OUT_REGS &&
-                             (d->vs.out_mask & (1u << first_tex));
-            d->vs_tex_out = first_tex;
+            for (i = 0; i < d->ntc; i++) {
+                unsigned o = first_tex + i;
+
+                d->vs_texcoord[i] = d->vs_run && !d->vs.plain_matrix &&
+                                    d->textured && o < R300_PVS_OUT_REGS &&
+                                    (d->vs.out_mask & (1u << o));
+                d->vs_tex_out[i] = o;
+            }
             /*
              * The second colour, for the fragment program that adds one.
              * VAP_OUTPUT_VTX_FMT_0 packs the colours after the position,
@@ -1933,9 +2105,6 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->flat_a = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2) + 3] << 8);
     } else {
         d->flat_r = d->flat_g = d->flat_b = d->flat_a = 1.0f;
-    }
-    if (!r300_fs_setup(s, d)) {
-        return false;
     }
     /*
      * What the colour buffer was configured to do with this draw, read
@@ -1996,18 +2165,30 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
         uint32_t psize = s->regs[R300_RE_POINTSIZE >> 2];
         float sx = ((psize >> 16) & 0xffff) / 6.0f;
         float sy = (psize & 0xffff) / 6.0f;
-        float s0 = r300_f32(s->regs[R300_GA_POINT_S0 >> 2]) * d->tex_w;
-        float s1 = r300_f32(s->regs[R300_GA_POINT_S1 >> 2]) * d->tex_w;
+        float s0 = r300_f32(s->regs[R300_GA_POINT_S0 >> 2]) * d->tex[0].w;
+        float s1 = r300_f32(s->regs[R300_GA_POINT_S1 >> 2]) * d->tex[0].w;
         /*
          * T0 pairs with the sprite's BOTTOM edge and T1 with the top
          * (GL-style v axis): the full-screen composite arrives as
          * T0=1, T1=0 over a layer stored top-down, and mapping T0 to
          * the top edge mirrored the whole desktop vertically.
          */
-        float t1 = r300_f32(s->regs[R300_GA_POINT_T0 >> 2]) * d->tex_h;
-        float t0 = r300_f32(s->regs[R300_GA_POINT_T1 >> 2]) * d->tex_h;
+        float t1 = r300_f32(s->regs[R300_GA_POINT_T0 >> 2]) * d->tex[0].h;
+        float t0 = r300_f32(s->regs[R300_GA_POINT_T1 >> 2]) * d->tex[0].h;
+        unsigned u;
 
+        /*
+         * The sprite path re-derives `textured` from TX_ENABLE alone --
+         * a point vertex has no room for a coordinate, so the vertex
+         * size gate the setup applied does not apply here. The per-unit
+         * enables have to follow it, or a unit would stay switched off
+         * against the flag that is meant to speak for it.
+         */
         d->textured = s->regs[R300_TX_ENABLE >> 2] & 1;
+        for (u = 0; u < R300_TEX_UNITS; u++) {
+            d->tex[u].en = d->textured &&
+                           (s->regs[R300_TX_ENABLE >> 2] & (1u << u));
+        }
         for (i = 0; i < nvtx && sx > 0.0f && sy > 0.0f; i++) {
             R300Vtx q[4];
             int c;
@@ -2020,13 +2201,13 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
                 }
             }
             q[0].x = vb[i].x - sx / 2; q[0].y = vb[i].y - sy / 2;
-            q[0].s = s0; q[0].t = t0;
+            q[0].tc[0][0] = s0; q[0].tc[0][1] = t0;
             q[1].x = vb[i].x + sx / 2; q[1].y = q[0].y;
-            q[1].s = s1; q[1].t = t0;
+            q[1].tc[0][0] = s1; q[1].tc[0][1] = t0;
             q[2].x = q[1].x; q[2].y = vb[i].y + sy / 2;
-            q[2].s = s1; q[2].t = t1;
+            q[2].tc[0][0] = s1; q[2].tc[0][1] = t1;
             q[3].x = q[0].x; q[3].y = q[2].y;
-            q[3].s = s0; q[3].t = t1;
+            q[3].tc[0][0] = s0; q[3].tc[0][1] = t1;
             r300_raster_tri(s, d, &q[0], &q[1], &q[2]);
             r300_raster_tri(s, d, &q[0], &q[2], &q[3]);
         }
@@ -2071,12 +2252,17 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
     case 8:     /* rectangle list: three corners, fourth implied */
         for (i = 0; i + 3 <= nvtx; i += 3) {
             R300Vtx v3 = vb[i + 2];
+            unsigned k;
 
             /* the missing corner is v0 + (v1 - v0) + (v2 - v0) */
             v3.x = vb[i + 1].x + vb[i + 2].x - vb[i].x;
             v3.y = vb[i + 1].y + vb[i + 2].y - vb[i].y;
-            v3.s = vb[i + 1].s + vb[i + 2].s - vb[i].s;
-            v3.t = vb[i + 1].t + vb[i + 2].t - vb[i].t;
+            for (k = 0; k < R300_TEXCOORDS; k++) {
+                v3.tc[k][0] = vb[i + 1].tc[k][0] + vb[i + 2].tc[k][0] -
+                              vb[i].tc[k][0];
+                v3.tc[k][1] = vb[i + 1].tc[k][1] + vb[i + 2].tc[k][1] -
+                              vb[i].tc[k][1];
+            }
             r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
             r300_raster_tri(s, d, &vb[i + 1], &v3, &vb[i + 2]);
         }
@@ -2238,10 +2424,11 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
     R300DrawState st;
     g_autofree uint8_t *before = NULL;
     g_autofree uint8_t *after = NULL;
-    unsigned dxr = 0, txr = 0;
-    uint32_t tex_off = 0, tex_len = 0, tex_hash = 0;
+    uint32_t tex_hash[R300_TEX_UNITS] = { 0 };
+    uint32_t tx_enable = s->regs[R300_TX_ENABLE >> 2];
+    unsigned dxr = 0;
     int x0, y0, x1, y1;
-    unsigned i;
+    unsigned i, u;
 
     /*
      * A draw is recorded only when a record can describe it exactly.
@@ -2259,19 +2446,33 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
         r300_raster_prims(s, d, vb, nvtx, prim);
         return;
     }
-    if (d->textured || prim == 1) {
-        uint32_t last;
+    /*
+     * Every unit this draw samples, each with its own range. The point
+     * sprite path re-derives its texturing from TX_ENABLE after the
+     * setup ran, so a prim=1 draw is recorded on the register rather
+     * than on the flag -- which is what the single-texture code did
+     * too, one unit at a time.
+     */
+    for (u = 0; u < R300_TEX_UNITS; u++) {
+        const R300TexUnit *tu = &d->tex[u];
+        uint32_t off, last, len;
 
-        tex_len = d->tex_pitch * (uint32_t)d->tex_h;
-        if (!tex_len || !ati_r350_mc_to_vram(s, d->tex_off, &tex_off) ||
-            !ati_r350_mc_to_vram(s, d->tex_off + tex_len - 1, &last) ||
-            last != tex_off + tex_len - 1 ||
-            !r300_cap_xor(s, tex_off, tex_len, &txr)) {
+        if (!tu->en && !(prim == 1 && (tx_enable & (1u << u)))) {
+            continue;
+        }
+        len = tu->pitch * (uint32_t)tu->h;
+        if (!len || !ati_r350_mc_to_vram(s, tu->off, &off) ||
+            !ati_r350_mc_to_vram(s, tu->off + len - 1, &last) ||
+            last != off + len - 1 ||
+            !r300_cap_xor(s, off, len, &h.tex[u].xor)) {
             s->cap_skipped++;
             r300_raster_prims(s, d, vb, nvtx, prim);
             return;
         }
-        tex_hash = r300_cap_hash(d->vram + tex_off, tex_len);
+        h.tex[u].vram_off = off;
+        h.tex[u].bytes = len;
+        h.tex[u].txfmt1 = s->regs[(R300_TX_FORMAT1_0 >> 2) + u];
+        tex_hash[u] = r300_cap_hash(d->vram + off, len);
     }
 
     h.magic = R350_CAP_REC_MAGIC;
@@ -2281,37 +2482,42 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
     h.x0 = x0; h.y0 = y0; h.x1 = x1; h.y1 = y1;
     h.rect_bytes = (uint32_t)(x1 - x0) * 4 * (uint32_t)(y1 - y0);
     h.dst_xor = dxr;
-    h.tex_xor = txr;
-    h.tex_vram_off = tex_off;
-    h.tex_bytes = tex_len;
-    h.txfmt1 = s->regs[R300_TX_FORMAT1_0 >> 2];
     h.pointsize = s->regs[R300_RE_POINTSIZE >> 2];
     h.point_s0 = s->regs[R300_GA_POINT_S0 >> 2];
     h.point_s1 = s->regs[R300_GA_POINT_S1 >> 2];
     h.point_t0 = s->regs[R300_GA_POINT_T0 >> 2];
     h.point_t1 = s->regs[R300_GA_POINT_T1 >> 2];
-    h.tx_enable = s->regs[R300_TX_ENABLE >> 2];
+    h.tx_enable = tx_enable;
     h.flags = (d->vs_run ? R350_CAP_F_VS_RUN : 0) |
               (d->vs.plain_matrix ? R350_CAP_F_PLAIN_MAT : 0);
 
-    for (i = 0; tex_len && i < s->cap_tex_n; i++) {
-        if (s->cap_tex[i].off == tex_off && s->cap_tex[i].len == tex_len &&
-            s->cap_tex[i].xr == txr && s->cap_tex[i].hash == tex_hash) {
-            h.tex_bytes = 0;
-            h.tex_ref = s->cap_tex[i].rec;
-            h.flags |= R350_CAP_F_TEXDEDUP;
-            break;
+    for (u = 0; u < R300_TEX_UNITS; u++) {
+        R350CapTex *t = &h.tex[u];
+
+        if (!t->bytes) {
+            continue;
         }
-    }
-    if (tex_len && !(h.flags & R350_CAP_F_TEXDEDUP)) {
-        i = s->cap_index % R350_CAP_TEX_CACHE;
-        s->cap_tex[i].off = tex_off;
-        s->cap_tex[i].len = tex_len;
-        s->cap_tex[i].xr = txr;
-        s->cap_tex[i].hash = tex_hash;
-        s->cap_tex[i].rec = s->cap_index;
-        if (s->cap_tex_n < R350_CAP_TEX_CACHE) {
-            s->cap_tex_n++;
+        for (i = 0; i < s->cap_tex_n; i++) {
+            if (s->cap_tex[i].off == t->vram_off &&
+                s->cap_tex[i].len == t->bytes &&
+                s->cap_tex[i].xr == t->xor &&
+                s->cap_tex[i].hash == tex_hash[u]) {
+                t->bytes = 0;
+                t->ref = s->cap_tex[i].rec;
+                t->dedup = 1;
+                break;
+            }
+        }
+        if (!t->dedup) {
+            i = s->cap_index % R350_CAP_TEX_CACHE;
+            s->cap_tex[i].off = t->vram_off;
+            s->cap_tex[i].len = t->bytes;
+            s->cap_tex[i].xr = t->xor;
+            s->cap_tex[i].hash = tex_hash[u];
+            s->cap_tex[i].rec = s->cap_index;
+            if (s->cap_tex_n < R350_CAP_TEX_CACHE) {
+                s->cap_tex_n++;
+            }
         }
     }
 
@@ -2338,13 +2544,15 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
     r300_cap_write(s, &st, sizeof(st));
     r300_cap_write(s, &s->us_prog, sizeof(s->us_prog));
     r300_cap_write(s, vb, sizeof(*vb) * nvtx);
-    if (h.tex_bytes) {
-        r300_cap_write(s, d->vram + tex_off, h.tex_bytes);
+    for (u = 0; u < R300_TEX_UNITS; u++) {
+        if (h.tex[u].bytes) {
+            r300_cap_write(s, d->vram + h.tex[u].vram_off, h.tex[u].bytes);
+        }
     }
     r300_cap_write(s, before, h.rect_bytes);
     r300_cap_write(s, after, h.rect_bytes);
     trace_ati_r350_3d_cap(s->cap_index, prim, nvtx, x0, y0, x1, y1,
-                          h.tex_bytes);
+                          h.tex[0].bytes);
     s->cap_index++;
     if (s->cap_fp) {
         fflush(s->cap_fp);
@@ -2918,17 +3126,21 @@ static unsigned r300_gl_point_list(ATIR350State *s, R300DrawState *d,
     uint32_t psize = s->regs[R300_RE_POINTSIZE >> 2];
     float sx = ((psize >> 16) & 0xffff) / 6.0f;
     float sy = (psize & 0xffff) / 6.0f;
-    float s0 = r300_f32(s->regs[R300_GA_POINT_S0 >> 2]) * d->tex_w;
-    float s1 = r300_f32(s->regs[R300_GA_POINT_S1 >> 2]) * d->tex_w;
-    float t1 = r300_f32(s->regs[R300_GA_POINT_T0 >> 2]) * d->tex_h;
-    float t0 = r300_f32(s->regs[R300_GA_POINT_T1 >> 2]) * d->tex_h;
-    unsigned n = 0, i;
+    float s0 = r300_f32(s->regs[R300_GA_POINT_S0 >> 2]) * d->tex[0].w;
+    float s1 = r300_f32(s->regs[R300_GA_POINT_S1 >> 2]) * d->tex[0].w;
+    float t1 = r300_f32(s->regs[R300_GA_POINT_T0 >> 2]) * d->tex[0].h;
+    float t0 = r300_f32(s->regs[R300_GA_POINT_T1 >> 2]) * d->tex[0].h;
+    unsigned n = 0, i, u;
 
     /*
      * The sprite path re-derives this from TX_ENABLE alone -- a trap the
      * ledger names, because the setup flag is not the sprite's state.
      */
     d->textured = s->regs[R300_TX_ENABLE >> 2] & 1;
+    for (u = 0; u < R300_TEX_UNITS; u++) {
+        d->tex[u].en = d->textured &&
+                       (s->regs[R300_TX_ENABLE >> 2] & (1u << u));
+    }
     if (!(sx > 0.0f) || !(sy > 0.0f)) {
         return 0;
     }
@@ -2943,13 +3155,13 @@ static unsigned r300_gl_point_list(ATIR350State *s, R300DrawState *d,
             }
         }
         q[0].x = vb[i].x - sx / 2; q[0].y = vb[i].y - sy / 2;
-        q[0].s = s0; q[0].t = t0;
+        q[0].tc[0][0] = s0; q[0].tc[0][1] = t0;
         q[1].x = vb[i].x + sx / 2; q[1].y = q[0].y;
-        q[1].s = s1; q[1].t = t0;
+        q[1].tc[0][0] = s1; q[1].tc[0][1] = t0;
         q[2].x = q[1].x; q[2].y = vb[i].y + sy / 2;
-        q[2].s = s1; q[2].t = t1;
+        q[2].tc[0][0] = s1; q[2].tc[0][1] = t1;
         q[3].x = q[0].x; q[3].y = q[2].y;
-        q[3].s = s0; q[3].t = t1;
+        q[3].tc[0][0] = s0; q[3].tc[0][1] = t1;
         out[n++] = q[0]; out[n++] = q[1]; out[n++] = q[2];
         out[n++] = q[0]; out[n++] = q[2]; out[n++] = q[3];
     }
@@ -2969,11 +3181,16 @@ static unsigned r300_gl_rect_list(const R300Vtx *vb, unsigned nvtx,
 
     for (i = 0; i + 3 <= nvtx && n + 6 <= max; i += 3) {
         R300Vtx v3 = vb[i + 2];
+        unsigned k;
 
         v3.x = vb[i + 1].x + vb[i + 2].x - vb[i].x;
         v3.y = vb[i + 1].y + vb[i + 2].y - vb[i].y;
-        v3.s = vb[i + 1].s + vb[i + 2].s - vb[i].s;
-        v3.t = vb[i + 1].t + vb[i + 2].t - vb[i].t;
+        for (k = 0; k < R300_TEXCOORDS; k++) {
+            v3.tc[k][0] = vb[i + 1].tc[k][0] + vb[i + 2].tc[k][0] -
+                          vb[i].tc[k][0];
+            v3.tc[k][1] = vb[i + 1].tc[k][1] + vb[i + 2].tc[k][1] -
+                          vb[i].tc[k][1];
+        }
         out[n++] = vb[i]; out[n++] = vb[i + 1]; out[n++] = vb[i + 2];
         out[n++] = vb[i + 1]; out[n++] = v3; out[n++] = vb[i + 2];
     }
@@ -3314,39 +3531,40 @@ static void r300_gl_rd_rect(const R300DrawState *d, unsigned xr,
 #define R300_GL_TEX_MAX (1024 * 1024)
 
 static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
-                               uint8_t *rgba)
+                               unsigned unit, uint8_t *rgba)
 {
+    const R300TexUnit *u = &d->tex[unit];
     int tx, ty;
 
-    for (ty = 0; ty < d->tex_h; ty++) {
-        for (tx = 0; tx < d->tex_w; tx++) {
-            uint32_t texel = r300_sample_tex(s, d, tx, ty);
-            uint8_t *p = rgba + ((size_t)ty * d->tex_w + tx) * 4;
+    for (ty = 0; ty < u->h; ty++) {
+        for (tx = 0; tx < u->w; tx++) {
+            uint32_t texel = r300_sample_tex(s, d, unit, tx, ty);
+            uint8_t *p = rgba + ((size_t)ty * u->w + tx) * 4;
 
-            p[0] = (uint8_t)(r300_texel_chan(d, texel, 1) * 255.0f + 0.5f);
-            p[1] = (uint8_t)(r300_texel_chan(d, texel, 2) * 255.0f + 0.5f);
-            p[2] = (uint8_t)(r300_texel_chan(d, texel, 3) * 255.0f + 0.5f);
-            p[3] = (uint8_t)(r300_texel_chan(d, texel, 0) * 255.0f + 0.5f);
+            p[0] = (uint8_t)(r300_texel_chan(u, texel, 1) * 255.0f + 0.5f);
+            p[1] = (uint8_t)(r300_texel_chan(u, texel, 2) * 255.0f + 0.5f);
+            p[2] = (uint8_t)(r300_texel_chan(u, texel, 3) * 255.0f + 0.5f);
+            p[3] = (uint8_t)(r300_texel_chan(u, texel, 0) * 255.0f + 0.5f);
         }
     }
 }
 
 /* everything the decode above depends on, and nothing else */
 static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
-                             const R300DrawState *d, uint32_t off,
+                             const R300TexUnit *u, uint32_t off,
                              uint32_t len, unsigned xr)
 {
     return s->gl_tex[k].live &&
            s->gl_tex[k].off == off && s->gl_tex[k].len == len &&
-           s->gl_tex[k].pitch == d->tex_pitch &&
-           s->gl_tex[k].bpp == d->tex_bpp &&
-           s->gl_tex[k].code == d->tex_code &&
-           s->gl_tex[k].w == d->tex_w && s->gl_tex[k].h == d->tex_h &&
+           s->gl_tex[k].pitch == u->pitch &&
+           s->gl_tex[k].bpp == u->bpp &&
+           s->gl_tex[k].code == u->code &&
+           s->gl_tex[k].w == u->w && s->gl_tex[k].h == u->h &&
            s->gl_tex[k].xr == xr &&
-           s->gl_tex[k].sel[0] == d->tex_sel[0] &&
-           s->gl_tex[k].sel[1] == d->tex_sel[1] &&
-           s->gl_tex[k].sel[2] == d->tex_sel[2] &&
-           s->gl_tex[k].sel[3] == d->tex_sel[3];
+           s->gl_tex[k].sel[0] == u->sel[0] &&
+           s->gl_tex[k].sel[1] == u->sel[1] &&
+           s->gl_tex[k].sel[2] == u->sel[2] &&
+           s->gl_tex[k].sel[3] == u->sel[3];
 }
 
 /*
@@ -3357,29 +3575,31 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
  * buffer and not cached -- there would be no range to invalidate it on.
  */
 static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
-                                      unsigned *slot, int *fresh)
+                                      unsigned unit, unsigned *slot,
+                                      int *fresh)
 {
+    const R300TexUnit *u = &d->tex[unit];
     uint32_t off, len;
     unsigned k, victim = 0, xr = 0;
-    size_t need = (size_t)d->tex_w * d->tex_h * 4;
+    size_t need = (size_t)u->w * u->h * 4;
 
     *slot = R350_GL_TEXSLOTS;           /* the scratch: uploaded every time */
     *fresh = 1;
 
-    len = (uint32_t)d->tex_h * d->tex_pitch;
+    len = (uint32_t)u->h * u->pitch;
     /*
      * Not cacheable, so decoded into the scratch: too big to keep, no
      * range to invalidate on, or -- new with the dirty guard -- a range
      * spanning more pages than a baseline has room to describe.
      */
-    if ((size_t)d->tex_w * d->tex_h > R300_GL_TEXCACHE_MAX ||
-        !d->tex_pitch || !len ||
-        !ati_r350_mc_to_vram(s, d->tex_off, &off) ||
+    if ((size_t)u->w * u->h > R300_GL_TEXCACHE_MAX ||
+        !u->pitch || !len ||
+        !ati_r350_mc_to_vram(s, u->off, &off) ||
         (uint64_t)off + len > ATI_R350_VRAM_SIZE ||
         r300_gl_pages(s, off, len) > R300_GL_DIRTY_PAGES ||
         !r300_cap_xor(s, off, len, &xr)) {
         s->gl_tex_miss++;
-        r300_gl_decode_tex(s, d, s->gl_texbuf);
+        r300_gl_decode_tex(s, d, unit, s->gl_texbuf);
         return s->gl_texbuf;
     }
     for (k = 0; k < R300_GL_TEXCACHE; k++) {
@@ -3391,13 +3611,13 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
          * killed here and falls through to the decode below, with its
          * now-free slot the natural victim.
          */
-        if (r300_gl_tex_same(s, k, d, off, len, xr) &&
+        if (r300_gl_tex_same(s, k, u, off, len, xr) &&
             !r300_gl_tex_current(s, k)) {
             s->gl_tex[k].live = false;
             s->gl_tex[k].up = false;
             s->gl_tex_stale++;
         }
-        if (r300_gl_tex_same(s, k, d, off, len, xr)) {
+        if (r300_gl_tex_same(s, k, u, off, len, xr)) {
             s->gl_tex[k].used = ++s->gl_tex_seq;
             s->gl_tex_hit++;
             *slot = k;
@@ -3422,17 +3642,17 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
         s->gl_tex[victim].rgba = g_realloc(s->gl_tex[victim].rgba, need);
         s->gl_tex[victim].sz = need;
     }
-    r300_gl_decode_tex(s, d, s->gl_tex[victim].rgba);
+    r300_gl_decode_tex(s, d, unit, s->gl_tex[victim].rgba);
     s->gl_tex[victim].off = off;
     s->gl_tex[victim].len = len;
-    s->gl_tex[victim].pitch = d->tex_pitch;
-    s->gl_tex[victim].bpp = d->tex_bpp;
-    s->gl_tex[victim].code = d->tex_code;
-    s->gl_tex[victim].w = d->tex_w;
-    s->gl_tex[victim].h = d->tex_h;
+    s->gl_tex[victim].pitch = u->pitch;
+    s->gl_tex[victim].bpp = u->bpp;
+    s->gl_tex[victim].code = u->code;
+    s->gl_tex[victim].w = u->w;
+    s->gl_tex[victim].h = u->h;
     s->gl_tex[victim].xr = xr;
     for (k = 0; k < 4; k++) {
-        s->gl_tex[victim].sel[k] = d->tex_sel[k];
+        s->gl_tex[victim].sel[k] = u->sel[k];
     }
     s->gl_tex[victim].used = ++s->gl_tex_seq;
     s->gl_tex[victim].epoch = s->gl_epoch;
@@ -3460,22 +3680,43 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
 static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
                         const R300Vtx *t1, const R300Vtx *t2, float inv)
 {
+    const unsigned C = R300_TEXCOORDS;
+    unsigned k;
+
     v[0] = me->x; v[1] = me->y;
     v[2] = me->r; v[3] = me->g; v[4] = me->b; v[5] = me->a;
-    v[6] = me->s; v[7] = me->t;
-    v[8] = t0->x;  v[9] = t0->y;
-    v[10] = t1->x; v[11] = t1->y;
-    v[12] = t2->x; v[13] = t2->y;
-    v[14] = t0->r; v[15] = t0->g; v[16] = t0->b; v[17] = t0->a;
-    v[18] = t1->r; v[19] = t1->g; v[20] = t1->b; v[21] = t1->a;
-    v[22] = t2->r; v[23] = t2->g; v[24] = t2->b; v[25] = t2->a;
-    v[26] = t0->s; v[27] = t0->t;
-    v[28] = t1->s; v[29] = t1->t;
-    v[30] = t2->s; v[31] = t2->t;
-    v[32] = inv;
-    v[33] = t0->r1; v[34] = t0->g1; v[35] = t0->b1; v[36] = t0->a1;
-    v[37] = t1->r1; v[38] = t1->g1; v[39] = t1->b1; v[40] = t1->a1;
-    v[41] = t2->r1; v[42] = t2->g1; v[43] = t2->b1; v[44] = t2->a1;
+    for (k = 0; k < C; k++) {
+        v[6 + 2 * k] = me->tc[k][0];
+        v[7 + 2 * k] = me->tc[k][1];
+    }
+    v[6 + 2 * C] = t0->x;  v[7 + 2 * C] = t0->y;
+    v[8 + 2 * C] = t1->x;  v[9 + 2 * C] = t1->y;
+    v[10 + 2 * C] = t2->x; v[11 + 2 * C] = t2->y;
+    v[12 + 2 * C] = t0->r; v[13 + 2 * C] = t0->g;
+    v[14 + 2 * C] = t0->b; v[15 + 2 * C] = t0->a;
+    v[16 + 2 * C] = t1->r; v[17 + 2 * C] = t1->g;
+    v[18 + 2 * C] = t1->b; v[19 + 2 * C] = t1->a;
+    v[20 + 2 * C] = t2->r; v[21 + 2 * C] = t2->g;
+    v[22 + 2 * C] = t2->b; v[23 + 2 * C] = t2->a;
+    /*
+     * Every set of one corner together, so that each corner's whole
+     * coordinate block is one vertex attribute in the shader.
+     */
+    for (k = 0; k < C; k++) {
+        v[24 + 2 * C + 2 * k] = t0->tc[k][0];
+        v[25 + 2 * C + 2 * k] = t0->tc[k][1];
+        v[24 + 4 * C + 2 * k] = t1->tc[k][0];
+        v[25 + 4 * C + 2 * k] = t1->tc[k][1];
+        v[24 + 6 * C + 2 * k] = t2->tc[k][0];
+        v[25 + 6 * C + 2 * k] = t2->tc[k][1];
+    }
+    v[24 + 8 * C] = inv;
+    v[25 + 8 * C] = t0->r1; v[26 + 8 * C] = t0->g1;
+    v[27 + 8 * C] = t0->b1; v[28 + 8 * C] = t0->a1;
+    v[29 + 8 * C] = t1->r1; v[30 + 8 * C] = t1->g1;
+    v[31 + 8 * C] = t1->b1; v[32 + 8 * C] = t1->a1;
+    v[33 + 8 * C] = t2->r1; v[34 + 8 * C] = t2->g1;
+    v[35 + 8 * C] = t2->b1; v[36 + 8 * C] = t2->a1;
 }
 
 /*
@@ -3576,12 +3817,17 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     g_autofree unsigned *idx = NULL;
     const R300Vtx *gvb = vb;
     R350GlReq req = { 0 };
-    const uint8_t *texbuf = NULL;
-    unsigned ntri = 0, npass = 1, i, xr = 0, texslot = R350_GL_TEXSLOTS;
-    int texfresh = 1;
+    const uint8_t *texbuf[R300_TEX_UNITS] = { NULL };
+    unsigned texslot[R300_TEX_UNITS];
+    int texfresh[R300_TEX_UNITS];
+    unsigned ntri = 0, npass = 1, i, xr = 0;
     int x0, y0, x1, y1, w, h;
     size_t rect_sz, texels = 0;
 
+    for (i = 0; i < R300_TEX_UNITS; i++) {
+        texslot[i] = R350_GL_TEXSLOTS;
+        texfresh[i] = 1;
+    }
     if (d->resolve) {
         return r300_gl_fallback(s, R350_GLF_RESOLVE, prim, nvtx);
     }
@@ -3677,11 +3923,17 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
                       (uint32_t)x1 * 4, &xr)) {
         return r300_gl_fallback(s, R350_GLF_XOR, prim, nvtx);
     }
-    if (d->textured) {
-        texels = (size_t)d->tex_w * d->tex_h;
-        if (!texels || texels > R300_GL_TEX_MAX) {
+    for (i = 0; i < R300_TEX_UNITS; i++) {
+        size_t n;
+
+        if (!d->tex[i].en) {
+            continue;
+        }
+        n = (size_t)d->tex[i].w * d->tex[i].h;
+        if (!n || n > R300_GL_TEX_MAX) {
             return r300_gl_fallback(s, R350_GLF_TEXTURE, prim, nvtx);
         }
+        texels = MAX(texels, n);
     }
 
     /* scratch, grown on demand and reused for the life of the device */
@@ -3715,8 +3967,10 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
                         &gvb[idx[src + k]], t0, t1, t2, inv);
         }
     }
-    if (d->textured) {
-        texbuf = r300_gl_texture(s, d, &texslot, &texfresh);
+    for (i = 0; i < R300_TEX_UNITS; i++) {
+        if (d->tex[i].en) {
+            texbuf[i] = r300_gl_texture(s, d, i, &texslot[i], &texfresh[i]);
+        }
     }
     /*
      * The target becomes resident here, and this is the last point at
@@ -3734,14 +3988,16 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.nvert = ntri * 3;
     req.pass = npass > 1 ? s->gl_pass_first : NULL;
     req.npass = npass;
-    req.tex = d->textured ? texbuf : NULL;
-    req.tex_slot = texslot;
-    req.tex_fresh = texfresh;
-    req.tex_w = d->tex_w;
-    req.tex_h = d->tex_h;
-    req.clamp_s = d->clamp_s;
-    req.clamp_t = d->clamp_t;
-    req.textured = d->textured;
+    for (i = 0; i < R300_TEX_UNITS; i++) {
+        req.tex[i] = d->tex[i].en ? texbuf[i] : NULL;
+        req.tex_slot[i] = texslot[i];
+        req.tex_fresh[i] = texfresh[i];
+        req.tex_w[i] = d->tex[i].w;
+        req.tex_h[i] = d->tex[i].h;
+        req.clamp_s[i] = d->tex[i].clamp_s;
+        req.clamp_t[i] = d->tex[i].clamp_t;
+        req.textured |= d->tex[i].en ? (1u << i) : 0;
+    }
     req.wmask = d->wmask;
     req.alpha_test = d->alpha_test;
     req.af_func = d->af_func;
@@ -3814,14 +4070,14 @@ static void r300_trace_rect(ATIR350State *s, const R300DrawState *d,
                             const R300Vtx *vb, unsigned nvtx, unsigned prim)
 {
     float x0 = vb[0].x, y0 = vb[0].y, x1 = x0, y1 = y0;
-    float s0 = vb[0].s, t0 = vb[0].t, s1 = s0, t1 = t0;
+    float s0 = vb[0].tc[0][0], t0 = vb[0].tc[0][1], s1 = s0, t1 = t0;
     unsigned i;
 
     for (i = 1; i < nvtx; i++) {
         x0 = MIN(x0, vb[i].x); x1 = MAX(x1, vb[i].x);
         y0 = MIN(y0, vb[i].y); y1 = MAX(y1, vb[i].y);
-        s0 = MIN(s0, vb[i].s); s1 = MAX(s1, vb[i].s);
-        t0 = MIN(t0, vb[i].t); t1 = MAX(t1, vb[i].t);
+        s0 = MIN(s0, vb[i].tc[0][0]); s1 = MAX(s1, vb[i].tc[0][0]);
+        t0 = MIN(t0, vb[i].tc[0][1]); t1 = MAX(t1, vb[i].tc[0][1]);
     }
     if (prim == 1) {
         /* a point sprite covers RE_POINTSIZE around its centre */
@@ -3850,12 +4106,15 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
      * samples the resolve buffer the board was rendered into.
      */
     if (unlikely(s->gl_res)) {
-        if (d->textured && d->tex_pitch && d->tex_h > 0) {
+        unsigned u;
+
+        for (u = 0; u < R300_TEX_UNITS; u++) {
+            const R300TexUnit *t = &d->tex[u];
             uint32_t toff;
 
-            if (ati_r350_mc_to_vram(s, d->tex_off, &toff)) {
-                ati_r350_gl_sync(s, toff,
-                                 (uint32_t)d->tex_h * d->tex_pitch);
+            if (t->en && t->pitch && t->h > 0 &&
+                ati_r350_mc_to_vram(s, t->off, &toff)) {
+                ati_r350_gl_sync(s, toff, (uint32_t)t->h * t->pitch);
             }
         }
         if (d->resolve) {
@@ -3913,7 +4172,7 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
     }
 
     trace_ati_r350_3d_draw(prim, nvtx, vsize, d.dst_off, d.dst_pitch,
-                           d.textured, d.blend, d.tex_off);
+                           d.textured, d.blend, d.tex[0].off);
 
     /*
      * Inline vertices have no array boundaries, so the vertex program's
@@ -4038,7 +4297,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
     }
 
     trace_ati_r350_3d_draw(prim, nvtx, vsize, d.dst_off, d.dst_pitch,
-                           d.textured, d.blend, d.tex_off);
+                           d.textured, d.blend, d.tex[0].off);
 
     /* one vertex-program input register per bound array, in array order */
     d.attr_count = 0;

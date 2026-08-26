@@ -35,28 +35,42 @@
 #define ATI_R350_GL_H
 
 /*
+ * Interpolated texture coordinate SETS a request carries, and texture
+ * UNITS it can bind. A set is per-vertex data, a unit is bound texture
+ * state, and a fragment program may sample any unit with any set.
+ *
+ * Two sets is not an arbitrary number: the layout below spends one
+ * vertex ATTRIBUTE on each corner's coordinates, GL 3.3 core guarantees
+ * only sixteen attributes, and at two sets this layout uses exactly
+ * sixteen. A third would have to reclaim one first. The device asserts
+ * that these two agree with its own R300_TEXCOORDS and R300_TEX_UNITS.
+ */
+#define R350_GL_TEXCOORDS 2
+#define R350_GL_TEXUNITS  8
+
+/*
  * Floats per vertex in a request's vertex array. Each vertex carries
- * its own position, colour and texture coordinate AND its whole
+ * its own position, colour and texture coordinates AND its whole
  * triangle's, flat: the fragment stage rebuilds the software
  * rasterizer's own barycentric weights from them, which is what makes
  * the two paths agree to the last bit rather than merely to the eye.
- * The layout, in order:
+ * The layout, in order, with C = R350_GL_TEXCOORDS:
  *
- *   0..1    x, y            this vertex
- *   2..5    r, g, b, a
- *   6..7    s, t
- *   8..13   triangle vertex 0/1/2 positions
- *   14..25  triangle vertex 0/1/2 colours
- *   26..31  triangle vertex 0/1/2 texture coordinates
- *   32      1.0f / signed area, computed on the HOST
- *   33..44  triangle vertex 0/1/2 SECOND colours
+ *   0..1              x, y            this vertex
+ *   2..5              r, g, b, a
+ *   6..(5+2C)         s, t per coordinate set, set 0 first
+ *   (6+2C)..(11+2C)   triangle vertex 0/1/2 positions
+ *   (12+2C)..(23+2C)  triangle vertex 0/1/2 colours
+ *   (24+2C)..(23+8C)  triangle vertex 0/1/2 coordinates, all sets each
+ *   (24+8C)           1.0f / signed area, computed on the HOST
+ *   (25+8C)..(36+8C)  triangle vertex 0/1/2 SECOND colours
  *
  * The second colour is the one a fragment program can add to the
  * modulated texel -- Chess.app's specular term -- and it is carried at
  * the corners like the first so the fragment stage interpolates it with
  * the same weights.
  */
-#define R350_GL_VSTRIDE 45
+#define R350_GL_VSTRIDE (37 + 8 * R350_GL_TEXCOORDS)
 
 /*
  * How many uploaded textures the backend keeps, plus one: slot
@@ -109,21 +123,28 @@ typedef struct R350GlReq {
     unsigned npass;
 
     /*
-     * The texture, RGBA8, and WHICH of the backend's texture objects it
-     * belongs in. The caller already decides when a decoded texture is
-     * still current -- it owns the VRAM ranges the answer depends on --
-     * so it names a slot and says whether the bytes are new. A slot
-     * whose bytes are unchanged is bound and not re-uploaded, which on
-     * this host is 0.93 ms of caller time per full-screen draw.
-     * `tex` may be NULL when tex_fresh is false. A slot of exactly
-     * R350_GL_TEXSLOTS is the scratch, which is always uploaded.
+     * The bound textures, RGBA8, one entry per texture UNIT, and WHICH
+     * of the backend's texture objects each belongs in. The caller
+     * already decides when a decoded texture is still current -- it owns
+     * the VRAM ranges the answer depends on -- so it names a slot and
+     * says whether the bytes are new. A slot whose bytes are unchanged
+     * is bound and not re-uploaded, which on this host is 0.93 ms of
+     * caller time per full-screen draw. `tex` may be NULL when
+     * tex_fresh is false. A slot of exactly R350_GL_TEXSLOTS is the
+     * scratch, which is always uploaded -- and no two units in one
+     * request may name it, because there is only one.
+     *
+     * `textured` is a MASK of the units this draw samples; a unit
+     * outside it reads white, which is what leaves a modulate program
+     * computing its colour operand alone.
      */
-    const uint8_t *tex;
-    unsigned tex_slot;          /* <= R350_GL_TEXSLOTS; the last is scratch */
-    int tex_fresh;              /* upload `tex` into that slot first */
-    int tex_w, tex_h;
-    int clamp_s, clamp_t;       /* TX_FILTER0 clamp modes; <= 1 is repeat */
-    int textured;
+    const uint8_t *tex[R350_GL_TEXUNITS];
+    unsigned tex_slot[R350_GL_TEXUNITS];    /* <= R350_GL_TEXSLOTS */
+    int tex_fresh[R350_GL_TEXUNITS];        /* upload `tex` into that slot */
+    int tex_w[R350_GL_TEXUNITS], tex_h[R350_GL_TEXUNITS];
+    /* TX_FILTER0 clamp modes; <= 1 is repeat */
+    int clamp_s[R350_GL_TEXUNITS], clamp_t[R350_GL_TEXUNITS];
+    uint32_t textured;
 
     uint32_t wmask;             /* RB3D_COLOR_CHANNEL_MASK as an ARGB mask */
 

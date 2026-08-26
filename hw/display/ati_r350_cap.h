@@ -28,11 +28,19 @@
 #ifndef ATI_R350_CAP_H
 #define ATI_R350_CAP_H
 
-#define R350_CAP_MAGIC      "R350CAP2"
+#define R350_CAP_MAGIC      "R350CAP3"
 #define R350_CAP_REC_MAGIC  0x52334452u         /* "R3DR" */
 
 /* how many recently written textures are remembered for deduplication */
 #define R350_CAP_TEX_CACHE  64
+
+/*
+ * Texture units a record describes. It is R300_TEX_UNITS, repeated here
+ * rather than included, because this header is the reader's half of the
+ * contract and must not drag the device's own headers into a harness;
+ * ati_r350_3d.c asserts the two agree at compile time.
+ */
+#define R350_CAP_TEX_UNITS  8
 
 typedef struct R350CapFileHdr {
     char magic[8];
@@ -50,7 +58,9 @@ typedef struct R350CapFileHdr {
  *   R300DrawState  state    (vram pointer, vertex program, fs pointer cleared)
  *   R300UsProgram  fs            the FRAGMENT program this draw ran
  *   R300Vtx        vb[nvtx]
- *   uint8_t        tex[tex_bytes]        raw VRAM bytes, swapper NOT applied
+ *   uint8_t        tex[u][tex[u].bytes]  each bound unit's raw VRAM bytes,
+ *                                        in ascending unit order, swapper
+ *                                        NOT applied
  *   uint8_t        before[rect_bytes]    raw VRAM bytes of the destination
  *   uint8_t        after[rect_bytes]     the same bytes after the draw
  *
@@ -60,9 +70,21 @@ typedef struct R350CapFileHdr {
  * self-contained test case at all.
  *
  * `rect_bytes` is (x1 - x0) * 4 * (y1 - y0): the rows are packed, not
- * at the destination pitch. A record whose texture repeats one already
- * written sets tex_bytes to 0 and names the earlier record in tex_ref.
+ * at the destination pitch. A unit whose texture repeats one already
+ * written sets its `bytes` to 0 and names the earlier record in `ref`;
+ * a unit this draw does not sample has `bytes` 0 and `dedup` 0, which
+ * is also what every record written before multitexturing existed says
+ * about units one and up.
  */
+typedef struct R350CapTex {
+    uint32_t xor;               /* aperture swapper xor over the texture */
+    uint32_t vram_off;          /* where it resolved to in VRAM */
+    uint32_t bytes;             /* 0 when deduplicated or not sampled */
+    uint32_t ref;               /* record whose texture this one repeats */
+    uint32_t txfmt1;            /* TX_FORMAT1_n, for family bookkeeping */
+    uint32_t dedup;             /* the bytes are in record `ref` */
+} R350CapTex;
+
 typedef struct R350CapRecHdr {
     uint32_t magic;
     uint32_t index;             /* draw ordinal within the capture */
@@ -71,11 +93,7 @@ typedef struct R350CapRecHdr {
     int32_t x0, y0, x1, y1;     /* destination rect, top-left inclusive */
     uint32_t rect_bytes;
     uint32_t dst_xor;           /* aperture swapper xor over the rect */
-    uint32_t tex_xor;           /* ... and over the texture */
-    uint32_t tex_vram_off;      /* where the texture resolved to in VRAM */
-    uint32_t tex_bytes;
-    uint32_t tex_ref;           /* record whose texture this one repeats */
-    uint32_t txfmt1;            /* TX_FORMAT1_0, for family bookkeeping */
+    R350CapTex tex[R350_CAP_TEX_UNITS];
     uint32_t flags;
     /* the registers the point-sprite path reads at raster time */
     uint32_t pointsize;
@@ -89,7 +107,6 @@ typedef struct R350CapRecHdr {
  * 4x4 matrix. A family filter needs both -- "plain-matrix program" is
  * half the definition of the compositor's blit quad.
  */
-#define R350_CAP_F_TEXDEDUP (1u << 0)   /* texture is in record tex_ref */
 #define R350_CAP_F_VS_RUN   (1u << 1)   /* a vertex program was executed */
 #define R350_CAP_F_PLAIN_MAT (1u << 2)  /* ... and it was the plain matrix */
 

@@ -145,7 +145,9 @@ static void us_decode_rs(R300UsRs *rs, R300UsGaps *gaps,
     unsigned n, ninst = (rs_inst_count & R300_RS_INST_COUNT_MASK) + 1;
     unsigned ncol = 0;
 
-    rs->tex_reg = -1;
+    for (n = 0; n < R300_TEXCOORDS; n++) {
+        rs->tex_reg[n] = -1;
+    }
     for (n = 0; n < R300_US_RS_COLS; n++) {
         rs->col_reg[n] = -1;
         rs->col_pkt[n] = 0;
@@ -164,11 +166,11 @@ static void us_decode_rs(R300UsRs *rs, R300UsGaps *gaps,
                 (rs_ip[id] & R300_RS_IP_TEX_PTR_MASK) != 0) {
                 /* a second interpolated coordinate: not emitted here */
                 us_gap_rs(gaps, 1);
-            } else if (rs->tex_reg >= 0) {
+            } else if (rs->tex_reg[0] >= 0) {
                 us_gap_rs(gaps, 2);
             } else {
-                rs->tex_reg = (v >> R300_RS_INST_TEX_ADDR_SHIFT) &
-                              R300_RS_INST_TEX_ADDR_MASK;
+                rs->tex_reg[0] = (v >> R300_RS_INST_TEX_ADDR_SHIFT) &
+                                 R300_RS_INST_TEX_ADDR_MASK;
             }
         }
         if ((v >> R300_RS_INST_COL_CN_SHIFT) & 0x7) {
@@ -401,7 +403,9 @@ void r300_us_analyse(R300UsProgram *p,
 
     memset(p, 0, sizeof(*p));
     p->tex_dst = -1;
-    p->rs.tex_reg = -1;
+    for (i = 0; i < R300_TEXCOORDS; i++) {
+        p->rs.tex_reg[i] = -1;
+    }
     p->rs.col_reg[0] = p->rs.col_reg[1] = -1;
 
     /*
@@ -582,10 +586,12 @@ void r300_us_analyse(R300UsProgram *p,
             p->nregs_used = t->dst + 1u;
         }
     }
-    /* the register the rasterizer drops the interpolated coordinate in */
-    if (p->rs.tex_reg >= 0 &&
-        (unsigned)p->rs.tex_reg + 1u > p->nregs_used) {
-        p->nregs_used = p->rs.tex_reg + 1u;
+    /* the registers the rasterizer drops the interpolated coordinates in */
+    for (i = 0; i < R300_TEXCOORDS; i++) {
+        if (p->rs.tex_reg[i] >= 0 &&
+            (unsigned)p->rs.tex_reg[i] + 1u > p->nregs_used) {
+            p->nregs_used = p->rs.tex_reg[i] + 1u;
+        }
     }
     for (i = 0; i < R300_US_RS_COLS; i++) {
         if (p->rs.col_reg[i] >= 0 &&

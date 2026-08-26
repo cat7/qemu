@@ -21,6 +21,28 @@
 #ifndef ATI_R350_US_H
 #define ATI_R350_US_H
 
+/*
+ * How many texture units this model binds, and how many interpolated
+ * texture coordinate SETS the rasterizer carries. The two are
+ * independent: a unit is bound texture state (TX_OFFSET_n and friends,
+ * whose register blocks are sixteen deep on this part), a coordinate set
+ * is interpolated per-vertex data that any number of units may sample
+ * with.
+ *
+ * Both numbers are chosen from measurement plus one hard constraint.
+ * Mac OS X 10.5's compositor fetches from units 0, 1 and 2 and routes
+ * two coordinate sets (RS_IP TEX_PTR 0 and 4) -- that is the whole of
+ * what the Leopard corpus shows. Units cost draw state only, so there is
+ * headroom; COORDINATE SETS cost a vertex ATTRIBUTE in the GL backend,
+ * and GL 3.3 core guarantees only sixteen of those, which the layout in
+ * ati_r350_gl.h already fills exactly at two sets. A third set is
+ * therefore not a constant change on its own -- it needs the dead
+ * per-vertex `a_st` attribute reclaimed first -- and until a guest is
+ * seen to want one it is reported as a gap rather than approximated.
+ */
+#define R300_TEX_UNITS          8
+#define R300_TEXCOORDS         2
+
 /* instruction RAM, and the pixel stack frame the instructions address */
 #define R300_US_ALU_SLOTS       64
 #define R300_US_TEX_SLOTS       32
@@ -218,15 +240,21 @@ typedef void (*R300UsSampleFn)(void *ctx, unsigned unit, bool proj,
 /*
  * Which frame register the rasterizer drops each interpolated quantity
  * into, resolved out of RS_INST/RS_IP. The vertex stage of this model
- * emits one texture coordinate and two colours, so an RS instruction
- * naming a third colour or a second coordinate is refused rather than
- * approximated. `col_pkt[n]` is RS_IP's COL_PTR -- which of the vertex
- * stage's colour outputs feeds frame register `col_reg[n]`.
+ * emits R300_TEXCOORDS texture coordinate sets and two colours, so an RS
+ * instruction naming a third colour, or a coordinate set past that
+ * number, is refused rather than approximated. `col_pkt[n]` is RS_IP's
+ * COL_PTR -- which of the vertex stage's colour outputs feeds frame
+ * register `col_reg[n]`.
+ *
+ * `tex_reg[k]` is the frame register interpolated coordinate SET k lands
+ * in, and -1 when the routing names no register for it. RS_IP's TEX_PTR
+ * is a pointer into the rasterizer's input packet in floats, so the set
+ * it names is TEX_PTR / 4 -- the corpus reads 0 and 4.
  */
 #define R300_US_RS_COLS   2
 
 typedef struct R300UsRs {
-    int tex_reg;                        /* register for the coordinate, -1 */
+    int tex_reg[R300_TEXCOORDS];        /* register per coordinate set, -1 */
     int col_reg[R300_US_RS_COLS];       /* registers for the colours, -1 */
     uint8_t col_pkt[R300_US_RS_COLS];   /* RS_IP COL_PTR of each */
     uint8_t col_fmt[R300_US_RS_COLS];   /* RS_IP COL_FMT of each */
