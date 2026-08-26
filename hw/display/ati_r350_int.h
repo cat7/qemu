@@ -28,6 +28,7 @@
 
 #include "hw/pci/pci_device.h"
 #include "hw/display/edid.h"
+#include "qemu/bitmap.h"
 #include "hw/i2c/bitbang_i2c.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -131,6 +132,47 @@ typedef enum ATIR350GlFallback {
 } ATIR350GlFallback;
 
 /*
+ * Which coherency hook gave the resident render target back. The rules
+ * are stated at "GL-OWNED RENDER TARGET" in ati_r350_3d.c; this counts
+ * how often each of them actually fires and how many pixels it moved,
+ * because "the target is not staying resident" is a symptom whose cure
+ * depends entirely on WHICH rule is ending it. Read the tally from
+ * `gl-stats`.
+ */
+typedef enum ATIR350GlRel {
+    R350_GLR_SCANOUT,       /* the display refresh, and the cursor's timer */
+    R350_GLR_RING,          /* the end of a command-processor ring run */
+    R350_GLR_IB,            /* the end of an indirect buffer */
+    R350_GLR_FIFO,          /* a CP FIFO push through the register aperture */
+    R350_GLR_READ,          /* a named-range reader, ati_r350_gl_sync() */
+    R350_GLR_2D,            /* the 2D scaler, and host-data pushes */
+    R350_GLR_TARGET,        /* a draw bound a different colour buffer */
+    R350_GLR_FALLBACK,      /* a draw the offload handed back */
+    R350_GLR_BACKEND,       /* the backend declined, mid-draw */
+    R350_GLR_RESET,         /* reset, unrealize */
+    R350_GLR_MAX
+} ATIR350GlRel;
+
+/*
+ * How long a DECODED TEXTURE may live. The default states the rule the
+ * decode actually depends on -- see r300_gl_tex_current() -- and the
+ * other two exist to measure it:
+ *
+ *   burst   the M3 lifetime: every release drops the whole cache. Safe,
+ *           and on Flurry it left a 0.6% hit rate. Kept as the A/B arm.
+ *   dirty   the default: an entry lives while the VRAM it was decoded
+ *           from is unwritten, which is what correctness requires.
+ *   never   deliberately WRONG -- entries are never invalidated at all.
+ *           It exists so the guard can be shown to bite: a gl=verify
+ *           run in this mode must FAIL. Never a shipping configuration.
+ */
+typedef enum ATIR350GlTexLife {
+    R350_TEXLIFE_DIRTY,
+    R350_TEXLIFE_BURST,
+    R350_TEXLIFE_NEVER,
+} ATIR350GlTexLife;
+
+/*
  * A blended draw whose own primitives overlap is rendered in several
  * ordered passes rather than handed back to the software rasterizer
  * (milestone M3; see r300_gl_passes()). These bound the partition: a
@@ -149,6 +191,15 @@ typedef enum ATIR350GlFallback {
  */
 #define R300_GL_TEXCACHE     R350_GL_TEXSLOTS
 #define R300_GL_TEXCACHE_MAX (256 * 1024)
+
+/*
+ * The guard on a cached entry (see r300_gl_tex_current()) walks the
+ * host pages its VRAM range covers. A texture spanning more pages than
+ * this is decoded into the scratch buffer and not cached, so that the
+ * walk stays a bounded cost per draw -- 4 MB at a 4 KB page, where the
+ * cache's own texel limit is a quarter of that.
+ */
+#define R300_GL_DIRTY_PAGES  1024
 
 typedef struct ATIR350PM4Parser {
     uint32_t remaining;      /* data dwords still expected */
@@ -546,11 +597,16 @@ struct ATIR350State {
     int gl_dx0, gl_dy0, gl_dx1, gl_dy1; /* drawn: the GPU copy is NEWER */
     uint64_t gl_flushes;                /* fetches back into VRAM */
     uint64_t gl_flush_px, gl_seed_px;   /* ... and pixels moved each way */
+    uint64_t gl_rel[R350_GLR_MAX];      /* which hook ended a residency */
+    uint64_t gl_rel_px[R350_GLR_MAX];   /* ... and what it cost to */
     /*
-     * Decoded textures, keyed on everything the decode depends on. They
-     * live exactly as long as the resident target does and for the same
-     * reason -- see the coherency block -- so a burst of draws sharing a
-     * texture decodes it once instead of once each.
+     * Decoded textures, keyed on everything the decode depends on.
+     *
+     * An entry is valid while the VRAM range it was decoded from is
+     * UNWRITTEN -- that, and not the render target's residency, is what
+     * the decode depends on. `epoch` is the dirty-bitmap generation the
+     * entry was last known clean in; see r300_gl_tex_current() for the
+     * rule and its two enforcement points.
      */
     struct {
         uint32_t off, len, pitch;
@@ -560,10 +616,17 @@ struct ATIR350State {
         uint8_t *rgba;
         size_t sz;
         uint64_t used;
+        uint64_t epoch;             /* the bitmap generation it is clean in */
+        unsigned npg;               /* host pages the range spans */
         bool live;                  /* the decoded bytes are current */
         bool up;                    /* ... and the backend has them too */
     } gl_tex[R300_GL_TEXCACHE];
     uint64_t gl_tex_seq, gl_tex_hit, gl_tex_miss;
+    uint64_t gl_tex_stale;      /* entries the dirty guard killed */
+    uint64_t gl_epoch;          /* bumped whenever the VGA bitmap is cleared */
+    unsigned gl_pgbits;         /* qemu_target_page_bits(), resolved once */
+    ATIR350GlTexLife gl_texlife;
+    char *gl_texlife_path;
     bool gl_tex_any;            /* any entry live: the hot hooks test this */
 
     /*
@@ -698,9 +761,19 @@ const char *ati_r350_gl_fb_name(ATIR350GlFallback why);
  * is hot enough to care: it costs one predictable branch when no target
  * is resident, which is always the case with the default gl=off.
  */
-void ati_r350_gl_release(ATIR350State *s);
+void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why);
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len);
 void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len);
+const char *ati_r350_gl_rel_name(ATIR350GlRel why);
+
+/*
+ * The display refresh has just snapshotted and CLEARED the VGA dirty
+ * bitmap, which is the one thing the decoded-texture cache reads to
+ * know whether the guest CPU wrote over a texture. Hand the snapshot
+ * over before it is discarded: entries whose range it marks are killed,
+ * and the rest are carried into the new generation.
+ */
+void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap);
 
 /* something is about to READ this range of VRAM */
 static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,

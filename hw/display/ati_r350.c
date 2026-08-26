@@ -19,6 +19,7 @@
 #include "qom/object.h"
 #include "hw/i2c/i2c.h"
 
+#include "exec/target_page.h"
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
 #include "ati_r350_gl.h"
@@ -643,6 +644,13 @@ static DirtyBitmapSnapshot *ati_r350_take_dirty(ATIR350State *s)
             s->fb_block_pending[i] = true;
         }
     }
+    /*
+     * The clear above is the only thing that resets DIRTY_MEMORY_VGA,
+     * and the decoded-texture cache reads those bits to know whether
+     * the guest CPU wrote over a texture. Hand the snapshot over before
+     * it is discarded -- it is the sole record of what was set.
+     */
+    ati_r350_gl_epoch(s, snap);
     return snap;
 }
 
@@ -664,7 +672,7 @@ static bool ati_r350_update_display(void *opaque)
      * at all. Releasing later would let a frame the GPU rendered sit
      * unnoticed until something else dirtied the same page.
      */
-    ati_r350_gl_release(s);
+    ati_r350_gl_release(s, R350_GLR_SCANOUT);
     snap = ati_r350_take_dirty(s);
     ati_r350_get_mode(s, &mode);
     valid = ati_r350_mode_valid(s, &mode);
@@ -2587,7 +2595,7 @@ static void ati_r350_pm4_run(ATIR350State *s)
      * and its loads through the frame-buffer BAR cannot be trapped. See
      * "GL-OWNED RENDER TARGET" in ati_r350_3d.c.
      */
-    ati_r350_gl_release(s);
+    ati_r350_gl_release(s, R350_GLR_RING);
 }
 
 /*
@@ -3070,7 +3078,7 @@ static void ati_r350_pm4_parse(ATIR350State *s,
 static void ati_r350_pm4_fifo_push(ATIR350State *s, uint32_t val)
 {
     ati_r350_pm4_parse(s, &s->pm4_fifo, val);
-    ati_r350_gl_release(s);
+    ati_r350_gl_release(s, R350_GLR_FIFO);
 }
 
 /*
@@ -3123,7 +3131,7 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
         trace_ati_r350_pm4_ib_dword(i, val);
         ati_r350_pm4_parse(s, &parser, val);
     }
-    ati_r350_gl_release(s);
+    ati_r350_gl_release(s, R350_GLR_IB);
 }
 
 /*
@@ -3301,7 +3309,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
 
     if (s->gl_ctx) {
         /* the surface descriptors are about to go: resolve it first */
-        ati_r350_gl_release(s);
+        ati_r350_gl_release(s, R350_GLR_RESET);
         s->gl_tex_w = s->gl_tex_h = 0;
     }
     memset(s->regs, 0, sizeof(s->regs));
@@ -3793,6 +3801,22 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         }
         trace_ati_r350_gl_open(ati_r350_gl_describe(s->gl_ctx));
     }
+    s->gl_pgbits = qemu_target_page_bits();
+    s->gl_texlife = R350_TEXLIFE_DIRTY;
+    if (s->gl_texlife_path && s->gl_texlife_path[0]) {
+        if (!strcmp(s->gl_texlife_path, "burst")) {
+            s->gl_texlife = R350_TEXLIFE_BURST;
+        } else if (!strcmp(s->gl_texlife_path, "never")) {
+            s->gl_texlife = R350_TEXLIFE_NEVER;
+            warn_report("ati-radeon9800: gl-texlife=never never invalidates "
+                        "a decoded texture. It is a control for proving the "
+                        "invalidation guard fires, not a usable setting.");
+        } else if (strcmp(s->gl_texlife_path, "dirty")) {
+            error_setg(errp, "gl-texlife must be one of dirty, burst, never "
+                       "(got \"%s\")", s->gl_texlife_path);
+            return;
+        }
+    }
 
     memory_region_init_io(&s->mmio, obj, &ati_r350_mmio_ops, s,
                           "ati-r350-mmio", ATI_R350_MMIO_SIZE);
@@ -3937,7 +3961,7 @@ static void ati_r350_exit(PCIDevice *dev)
         fclose(s->cap_fp);
         s->cap_fp = NULL;
     }
-    ati_r350_gl_release(s);
+    ati_r350_gl_release(s, R350_GLR_RESET);
     for (i = 0; i < R300_GL_TEXCACHE; i++) {
         g_free(s->gl_tex[i].rgba);
     }
@@ -4000,6 +4024,14 @@ static const Property ati_r350_properties[] = {
      * anything at all.
      */
     DEFINE_PROP_BOOL("pvs-glsl", ATIR350State, pvs_glsl, false),
+    /*
+     * How long a decoded texture may live: "dirty" (the default and the
+     * rule the decode depends on), "burst" (the M3 lifetime, kept as
+     * the A/B arm), or "never" -- which is DELIBERATELY WRONG and
+     * exists only so the guard can be shown to bite. See the texture
+     * cache lifetime block in ati_r350_3d.c.
+     */
+    DEFINE_PROP_STRING("gl-texlife", ATIR350State, gl_texlife_path),
     DEFINE_EDID_PROPERTIES(ATIR350State, edid_info),
 };
 
@@ -4165,12 +4197,29 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
     g_string_append_printf(out, "\nresident target: %" PRIu64 " flushes, %"
                            PRIu64 " px out, %" PRIu64 " px in"
                            "\ntexture cache: %" PRIu64 " hits, %" PRIu64
-                           " decodes (%.1f%%)",
+                           " decodes (%.1f%%), %" PRIu64 " stale, life %s",
                            s->gl_flushes, s->gl_flush_px, s->gl_seed_px,
                            s->gl_tex_hit, s->gl_tex_miss,
                            s->gl_tex_hit + s->gl_tex_miss
                            ? 100.0 * s->gl_tex_hit /
-                             (s->gl_tex_hit + s->gl_tex_miss) : 0.0);
+                             (s->gl_tex_hit + s->gl_tex_miss) : 0.0,
+                           s->gl_tex_stale,
+                           s->gl_texlife == R350_TEXLIFE_BURST ? "burst"
+                           : s->gl_texlife == R350_TEXLIFE_NEVER
+                             ? "never (CONTROL: invalidation OFF)" : "dirty");
+    /*
+     * WHICH hook ended each residency. "the target is not staying
+     * resident" is a symptom whose cure depends entirely on which rule
+     * is ending it, and this is the only thing that says.
+     */
+    for (k = 0; k < R350_GLR_MAX; k++) {
+        if (s->gl_rel[k]) {
+            g_string_append_printf(out, "\n  released by %s: %" PRIu64
+                                   ", %" PRIu64 " px",
+                                   ati_r350_gl_rel_name(k), s->gl_rel[k],
+                                   s->gl_rel_px[k]);
+        }
+    }
     if (s->gl_addblend) {
         /*
          * Blended draws GL's own blender rendered in a single pass

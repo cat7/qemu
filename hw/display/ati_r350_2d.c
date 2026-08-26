@@ -588,7 +588,7 @@ static void ati_r350_2d_scale_run(ATIR350State *s,
     int src_bpp, x, y;
 
     /* the scaler reads VRAM directly, around ati_r350_2d_read_pixel() */
-    ati_r350_gl_release(s);
+    ati_r350_gl_release(s, R350_GLR_2D);
     vram = memory_region_get_ram_ptr(&s->vram);
     trace_ati_r350_scale(op->dst_x, op->dst_y, op->w, op->h, op->src_off,
                             op->src_pitch, op->x_inc, op->y_inc, op->dt);
@@ -872,7 +872,7 @@ bool ati_r350_host_data_flush(ATIR350State *s)
         return false;
     }
     /* CPU-pushed pixels land in VRAM behind the 3D engine's back */
-    ati_r350_gl_release(s);
+    ati_r350_gl_release(s, R350_GLR_2D);
 
     bypp = bpp / 8;
     dst_stride = s->dst_pitch * bpp; /* pitch is in 8-pixel units */

@@ -21,6 +21,8 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include "hw/pci/pci_device.h"
+#include "system/physmem.h"
+#include "exec/target_page.h"
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
 #include "ati_r350_gl.h"
@@ -2111,11 +2113,6 @@ static void r300_gl_discard(ATIR350State *s)
     s->gl_vx0 = s->gl_vx1 = s->gl_vy0 = s->gl_vy1 = 0;
 }
 
-/*
- * Decoded textures die with the target, and for the same reason: the
- * moments at which residency ends are exactly the moments at which
- * something outside the 3D engine may have changed VRAM.
- */
 static void r300_gl_texdrop(ATIR350State *s)
 {
     unsigned k;
@@ -2127,24 +2124,196 @@ static void r300_gl_texdrop(ATIR350State *s)
     s->gl_tex_any = false;
 }
 
-void ati_r350_gl_release(ATIR350State *s)
+static const char *const r300_gl_rel_names[R350_GLR_MAX] = {
+    [R350_GLR_SCANOUT]  = "scanout",
+    [R350_GLR_RING]     = "ring end",
+    [R350_GLR_IB]       = "indirect buffer end",
+    [R350_GLR_FIFO]     = "CP FIFO push",
+    [R350_GLR_READ]     = "ranged read",
+    [R350_GLR_2D]       = "2D engine",
+    [R350_GLR_TARGET]   = "target changed",
+    [R350_GLR_FALLBACK] = "draw fell back",
+    [R350_GLR_BACKEND]  = "backend declined",
+    [R350_GLR_RESET]    = "reset",
+};
+
+const char *ati_r350_gl_rel_name(ATIR350GlRel why)
 {
-    r300_gl_texdrop(s);
+    return why < R350_GLR_MAX && r300_gl_rel_names[why]
+           ? r300_gl_rel_names[why] : "?";
+}
+
+/*
+ * TEXTURE CACHE LIFETIME -- the rule, and why it is no longer the
+ * target's.
+ *
+ * M3 tied a decoded texture's life to the resident render target's:
+ * both died at every release, on the argument that those are the
+ * moments something outside the 3D engine may have touched VRAM. That
+ * is SUFFICIENT but far stronger than necessary, and it is expensive:
+ * on Flurry.saver the target is released about once per draw, so the
+ * cache read 34 hits against 5990 decodes -- 0.6% -- and
+ * r300_gl_decode_tex() took 41% of the vCPU's executing time.
+ *
+ * What a decoded entry actually depends on is its SOURCE BYTES: it is
+ * valid exactly while VRAM in [off, off+len) is unwritten. Every writer
+ * is therefore an enforcement point, and each one already exists or is
+ * added here:
+ *
+ *   the 2D engine, host-data     ati_r350_gl_dirty() -> gl_wrote()
+ *   pushes, CP write-backs,      kills every overlapping entry
+ *   the MM_DATA window
+ *
+ *   a 3D draw rendering into     r300_gl_bind()'s loop, same test
+ *   a cached range
+ *
+ *   the GUEST CPU through the    THE DIRTY BITMAP. Its stores are
+ *   frame-buffer BAR             ordinary host stores with no callback,
+ *                                but they set DIRTY_MEMORY_VGA, which
+ *                                is the same mechanism the scanout has
+ *                                always relied on to notice them.
+ *
+ *   reset, unrealize             r300_gl_texdrop()
+ *
+ * READING THE BITMAP WITHOUT DISTURBING IT, AND THE ONE-BIT PROBLEM.
+ * The scanout owns that bitmap: it snapshots and CLEARS the whole of
+ * VRAM on every refresh, and it decides both what to redraw and where
+ * the framebuffer is from what it finds. So this guard never clears a
+ * bit and never claims a range -- it only reads.
+ *
+ * Reading alone is enough only because of how an entry is ADMITTED. A
+ * dirty bit does not say WHEN the page was written, so a page that is
+ * already dirty when the texture is decoded can never afterwards be
+ * distinguished from one written a moment later: the bit is set either
+ * way. A baseline of "dirty at decode time" would therefore be a
+ * permanent blind spot over exactly those pages. So an entry is
+ * admitted to the cache ONLY when every page of its source range reads
+ * clean, and from then on ANY set bit is a write that happened since.
+ *
+ *   admission          every page clean, or the texture is decoded into
+ *                      the scratch this time and not cached
+ *   between refreshes  r300_gl_tex_current() re-reads the live flags
+ *   at a refresh       ati_r350_gl_epoch() is handed the snapshot the
+ *                      clear produced -- the only record of what was
+ *                      set -- applies the same test to every live entry
+ *                      before it is discarded, and carries the
+ *                      survivors into the next generation
+ *
+ * An entry whose generation is not the current one was not carried, so
+ * it is killed. Between them the two checks see every write, at page
+ * granularity rounded outwards, so the guard errs towards killing.
+ *
+ * THE PRICE of admission, stated: a texture cannot enter the cache
+ * until the bitmap has been cleared since it was last written -- one
+ * display refresh after its upload, 16 ms on a live display. It is
+ * decoded normally in the meantime.
+ *
+ * The device's own writes set the same bits and so also kill entries.
+ * That is conservative rather than wrong: a flush or a blit into a
+ * texture's range really does stale it.
+ *
+ * THE CONTROL. `gl-texlife=never` switches off EVERY one of the
+ * enforcement points above -- the dirty guard, the writer hook's kill
+ * and the render-into-a-cached-range kill alike -- so that "the cache
+ * is invalidated correctly" is a claim something can disprove. A
+ * gl=verify run in that mode must FAIL, and offline the replay harness
+ * must diverge, which is what makes this rule a measurement rather
+ * than an argument.
+ */
+static unsigned r300_gl_pages(ATIR350State *s, uint32_t off, uint32_t len)
+{
+    unsigned bits = s->gl_pgbits;
+
+    return (unsigned)((((uint64_t)off + len + ((1u << bits) - 1)) >> bits) -
+                      (off >> bits));
+}
+
+/* is any page of this VRAM range marked written? */
+static bool r300_gl_range_dirty(ATIR350State *s, uint32_t off, unsigned npg)
+{
+    ram_addr_t base = memory_region_get_ram_addr(&s->vram) +
+                      (off & ~(ram_addr_t)((1u << s->gl_pgbits) - 1));
+    unsigned i;
+
+    for (i = 0; i < npg; i++) {
+        if (physical_memory_get_dirty_flag(base +
+                                           ((ram_addr_t)i << s->gl_pgbits),
+                                           DIRTY_MEMORY_VGA)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool r300_gl_tex_current(ATIR350State *s, unsigned k)
+{
+    if (s->gl_texlife != R350_TEXLIFE_DIRTY) {
+        /* burst: dropped at release instead. never: the control. */
+        return true;
+    }
+    return s->gl_tex[k].epoch == s->gl_epoch &&
+           !r300_gl_range_dirty(s, s->gl_tex[k].off, s->gl_tex[k].npg);
+}
+
+void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap)
+{
+    bool any = false;
+    unsigned k, i;
+
+    s->gl_epoch++;
+    if (s->gl_texlife != R350_TEXLIFE_DIRTY) {
+        return;
+    }
+    for (k = 0; k < R300_GL_TEXCACHE; k++) {
+        uint32_t p0;
+        bool stale = false;
+
+        if (!s->gl_tex[k].live) {
+            continue;
+        }
+        p0 = s->gl_tex[k].off & ~((1u << s->gl_pgbits) - 1);
+        for (i = 0; i < s->gl_tex[k].npg && !stale; i++) {
+            stale = memory_region_snapshot_get_dirty(&s->vram, snap,
+                        p0 + ((uint64_t)i << s->gl_pgbits),
+                        (uint64_t)1 << s->gl_pgbits);
+        }
+        if (stale) {
+            s->gl_tex[k].live = false;
+            s->gl_tex[k].up = false;
+            s->gl_tex_stale++;
+        } else {
+            s->gl_tex[k].epoch = s->gl_epoch;
+            any = true;
+        }
+    }
+    s->gl_tex_any = any;
+}
+
+void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
+{
+    uint64_t px;
+
+    if (s->gl_texlife == R350_TEXLIFE_BURST) {
+        r300_gl_texdrop(s);
+    }
     if (!s->gl_res) {
         return;
     }
+    px = s->gl_flush_px;
     r300_gl_flush(s);
     r300_gl_discard(s);
     s->gl_res = false;
+    s->gl_rel[why]++;
+    s->gl_rel_px[why] += s->gl_flush_px - px;
 }
 
 /*
  * A READER of this range: it must see VRAM as the engine left it, so a
  * resident target overlapping it is flushed and given back. Decoded
- * textures are deliberately NOT dropped -- reading a texture is what
- * the cache exists for, and dropping it here made every draw invalidate
- * the very entry it had just filled (measured live: 0 hits in 3732
- * decodes over a Chess session).
+ * textures are NOT dropped -- reading a texture is what the cache
+ * exists for, and dropping it here made every draw invalidate the very
+ * entry it had just filled (measured live: 0 hits in 3732 decodes over
+ * a Chess session).
  */
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
 {
@@ -2153,7 +2322,7 @@ void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
     if (!r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
         return;
     }
-    ati_r350_gl_release(s);
+    ati_r350_gl_release(s, R350_GLR_READ);
 }
 
 /* a WRITER of this range: whatever was decoded from it is now stale */
@@ -2161,7 +2330,8 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
 {
     unsigned k;
 
-    for (k = 0; k < R300_GL_TEXCACHE; k++) {
+    for (k = 0; s->gl_texlife != R350_TEXLIFE_NEVER &&
+                k < R300_GL_TEXCACHE; k++) {
         if (s->gl_tex[k].live && off < s->gl_tex[k].off + s->gl_tex[k].len &&
             off + len > s->gl_tex[k].off) {
             s->gl_tex[k].live = false;
@@ -2190,13 +2360,14 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
     if (s->gl_res && (s->gl_res_off != d->dst_off ||
                       s->gl_res_pitch != d->dst_pitch ||
                       s->gl_res_xr != xr)) {
-        ati_r350_gl_release(s);         /* a different target entirely */
+        /* a different target entirely */
+        ati_r350_gl_release(s, R350_GLR_TARGET);
     }
     if (x1 > s->gl_tex_w || y1 > s->gl_tex_h) {
         r300_gl_flush(s);               /* the grow below discards it */
     }
     if (!ati_r350_gl_target(s->gl_ctx, x1, y1, &lost)) {
-        ati_r350_gl_release(s);
+        ati_r350_gl_release(s, R350_GLR_BACKEND);
         return false;
     }
     if (lost) {
@@ -2204,7 +2375,8 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
         s->gl_tex_h = MAX(y1, s->gl_tex_h);
         r300_gl_discard(s);
     }
-    for (i = 0; i < R300_GL_TEXCACHE; i++) {
+    for (i = 0; s->gl_texlife != R350_TEXLIFE_NEVER &&
+                i < R300_GL_TEXCACHE; i++) {
         /* rendering into a range some cached texture came from */
         if (s->gl_tex[i].live &&
             d->dst_off + (uint32_t)y0 * d->dst_pitch <
@@ -2262,7 +2434,7 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
             }
             if (!ati_r350_gl_seed(s->gl_ctx, strip[k].x0, strip[k].y0,
                                   sw, sh, base, d->dst_pitch, xr)) {
-                ati_r350_gl_release(s);
+                ati_r350_gl_release(s, R350_GLR_BACKEND);
                 return false;
             }
             s->gl_seed_px += (uint64_t)sw * sh;
@@ -2812,16 +2984,36 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     *fresh = 1;
 
     len = (uint32_t)d->tex_h * d->tex_pitch;
+    /*
+     * Not cacheable, so decoded into the scratch: too big to keep, no
+     * range to invalidate on, or -- new with the dirty guard -- a range
+     * spanning more pages than a baseline has room to describe.
+     */
     if ((size_t)d->tex_w * d->tex_h > R300_GL_TEXCACHE_MAX ||
         !d->tex_pitch || !len ||
         !ati_r350_mc_to_vram(s, d->tex_off, &off) ||
         (uint64_t)off + len > ATI_R350_VRAM_SIZE ||
+        r300_gl_pages(s, off, len) > R300_GL_DIRTY_PAGES ||
         !r300_cap_xor(s, off, len, &xr)) {
         s->gl_tex_miss++;
         r300_gl_decode_tex(s, d, s->gl_texbuf);
         return s->gl_texbuf;
     }
     for (k = 0; k < R300_GL_TEXCACHE; k++) {
+        /*
+         * The dirty guard is applied to the entry this draw is about to
+         * USE, and only to that one -- an entry nobody matches cannot
+         * be read stale, and walking every entry's pages on every draw
+         * would cost more than the decode it saves. A stale match is
+         * killed here and falls through to the decode below, with its
+         * now-free slot the natural victim.
+         */
+        if (r300_gl_tex_same(s, k, d, off, len, xr) &&
+            !r300_gl_tex_current(s, k)) {
+            s->gl_tex[k].live = false;
+            s->gl_tex[k].up = false;
+            s->gl_tex_stale++;
+        }
         if (r300_gl_tex_same(s, k, d, off, len, xr)) {
             s->gl_tex[k].used = ++s->gl_tex_seq;
             s->gl_tex_hit++;
@@ -2860,9 +3052,19 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
         s->gl_tex[victim].sel[k] = d->tex_sel[k];
     }
     s->gl_tex[victim].used = ++s->gl_tex_seq;
-    s->gl_tex[victim].live = true;
+    s->gl_tex[victim].epoch = s->gl_epoch;
+    s->gl_tex[victim].npg = r300_gl_pages(s, off, len);
+    /*
+     * ADMISSION: only a range whose every page reads clean can be
+     * guarded, because a bit already set cannot afterwards be told from
+     * one set later. An entry that fails here is used for this draw and
+     * then dropped, and the next decode after a refresh admits it.
+     */
+    s->gl_tex[victim].live = s->gl_texlife != R350_TEXLIFE_DIRTY ||
+                             !r300_gl_range_dirty(s, off,
+                                                  s->gl_tex[victim].npg);
     s->gl_tex[victim].up = true;
-    s->gl_tex_any = true;
+    s->gl_tex_any |= s->gl_tex[victim].live;
     *slot = victim;
     *fresh = 1;
     return s->gl_tex[victim].rgba;
@@ -3164,7 +3366,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
         r300_gl_rd_rect(d, xr, x0, y0, w, h, s->gl_before);
     }
     if (!ati_r350_gl_draw(s->gl_ctx, &req)) {
-        ati_r350_gl_release(s);
+        ati_r350_gl_release(s, R350_GLR_BACKEND);
         return r300_gl_fallback(s, R350_GLF_BACKEND, prim, nvtx);
     }
     s->gl_drawn++;
@@ -3256,18 +3458,18 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
             }
         }
         if (d->resolve) {
-            ati_r350_gl_release(s);
+            ati_r350_gl_release(s, R350_GLR_FALLBACK);
         }
     }
     if (s->cap_fp && s->cap_arm && nvtx) {
-        ati_r350_gl_release(s);
+        ati_r350_gl_release(s, R350_GLR_FALLBACK);
         r300_cap_draw(s, d, vb, nvtx, prim);
     } else if (s->gl_ctx && nvtx &&
                r300_gl_prims(s, d, vb, nvtx, prim)) {
         /* the backend rendered it (and, under verify, so did we) */
     } else {
         /* the software rasterizer writes VRAM the GPU copy shadows */
-        ati_r350_gl_release(s);
+        ati_r350_gl_release(s, R350_GLR_FALLBACK);
         r300_raster_prims(s, d, vb, nvtx, prim);
     }
 }
