@@ -525,6 +525,7 @@ struct ATIR350State {
     unsigned gl_order[R300_GL_TRI_MAX];
     unsigned gl_pass_first[R300_GL_PASS_MAX + 1];
     float gl_bbox[R300_GL_TRI_MAX][4];
+    uint64_t gl_addblend;       /* draws GL's own blender ordered */
     uint64_t gl_multipass;      /* draws that needed more than one pass */
     uint64_t gl_passes;         /* ... and how many passes in total */
     /*

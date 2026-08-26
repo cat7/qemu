@@ -2444,6 +2444,67 @@ static bool r300_tris_overlap(const R300Vtx * const a[3],
 }
 
 /*
+ * ...and the draw that needs none of it, because GL's own blender can
+ * keep the device's order for free.
+ *
+ * THE PREDICATE, stated exactly: for colour and for alpha alike, the
+ * combine function is ADD, the DESTINATION factor is ONE, and the
+ * SOURCE factor does not read the destination. The blend is then
+ *
+ *      dst' = clamp(dst + f(src))
+ *
+ * and two things follow that nothing else here enjoys. The destination
+ * term is the destination unchanged, so a per-primitive quantisation
+ * needs no read: the device's byte is already an integer and the
+ * fragment shader can hand GL floor(255*f(src)) to add to it, which is
+ * the device's truncating pack, once per primitive, in primitive order.
+ * And no factor looks at the destination, so no snapshot of it is
+ * needed -- the seed and the between-pass copy both disappear.
+ *
+ * That is what makes the ordered partition unnecessary for this family
+ * rather than merely cheaper. Flurry.saver's ribbons are the family:
+ * every one of the 1899 draws M3 measured as `self-overlapping blend
+ * prim 13` fallbacks blends additively, each a quad list of up to 456
+ * self-crossing triangles that the partition either spread over 24.83
+ * passes or refused outright past 64. The SAT machinery stays for
+ * everything whose destination term is not the destination -- an
+ * ordinary SRC_ALPHA/ONE_MINUS_SRC_ALPHA composite cannot use this,
+ * because there the destination is scaled before it is added and the
+ * scaled value is not on the byte grid.
+ *
+ * Codes are r300_blend_f()'s own; both encodings of each factor are
+ * listed because the register uses both.
+ */
+static bool r300_blend_reads_dst(unsigned code)
+{
+    switch (code) {
+    case 9: case 36:                    /* DST_COLOR */
+    case 10: case 37:
+    case 7: case 40:                    /* DST_ALPHA */
+    case 8: case 41:
+    case 11: case 42:                   /* SRC_ALPHA_SATURATE: min(sa,1-da) */
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool r300_gl_addblend(const R300DrawState *d)
+{
+    /* r300_blend_comb(): everything outside 2..7 is ADD */
+    if ((d->comb_fcn >= 2 && d->comb_fcn <= 7) ||
+        (d->a_comb_fcn >= 2 && d->a_comb_fcn <= 7)) {
+        return false;
+    }
+    if ((d->dst_factor != 2 && d->dst_factor != 33) ||
+        (d->a_dst_factor != 2 && d->a_dst_factor != 33)) {
+        return false;
+    }
+    return !r300_blend_reads_dst(d->src_factor) &&
+           !r300_blend_reads_dst(d->a_src_factor);
+}
+
+/*
  * Assign each triangle the earliest pass that keeps the device's order:
  * one later than the last earlier triangle it overlaps, or pass 0 if it
  * overlaps none. That is correct by construction in both directions --
@@ -2875,14 +2936,24 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
         return r300_gl_fallback(s, R350_GLF_CLIPRULE, prim, nvtx);
     }
     if (d->blend && d->blend_read && ntri > 1) {
-        if (ntri > R300_GL_TRI_MAX) {
+        npass = ntri > R300_GL_TRI_MAX
+                ? 0 : r300_gl_passes(s, gvb, idx, ntri);
+        /*
+         * The partition is asked FIRST, and a draw it puts in a single
+         * pass keeps the shader blend, which reproduces the device bit
+         * for bit. Only a draw that needed several passes -- or that the
+         * partition refused outright -- is handed to GL's own blender,
+         * because only there is there anything to win. That makes the
+         * blast radius exactly "the draws that were slow or unrenderable
+         * before" and leaves every draw that was already exact alone.
+         */
+        if (npass != 1 && r300_gl_addblend(d)) {
+            req.add_blend = 1;
+            npass = 1;
+            s->gl_addblend++;
+        } else if (!npass) {
             return r300_gl_fallback(s, R350_GLF_SELFBLEND, prim, nvtx);
-        }
-        npass = r300_gl_passes(s, gvb, idx, ntri);
-        if (!npass) {
-            return r300_gl_fallback(s, R350_GLF_SELFBLEND, prim, nvtx);
-        }
-        if (npass > 1) {
+        } else if (npass > 1) {
             r300_gl_order(s, ntri, npass);
             s->gl_multipass++;
             s->gl_passes += npass;
@@ -3104,7 +3175,7 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
             ati_r350_gl_release(s);
         }
     }
-    if (s->cap_fp && nvtx) {
+    if (s->cap_fp && s->cap_arm && nvtx) {
         ati_r350_gl_release(s);
         r300_cap_draw(s, d, vb, nvtx, prim);
     } else if (s->gl_ctx && nvtx &&

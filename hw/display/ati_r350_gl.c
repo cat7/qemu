@@ -71,9 +71,30 @@
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
 
+/*
+ * One draw program and its uniform locations, resolved once at link
+ * time. There are two, built from the same source with one #define
+ * between them: `main` computes the blend itself and writes bytes into
+ * the integer colour buffer, `add` writes only the source term as a
+ * float and lets GL's blender add it. A uniform a variant does not use
+ * resolves to -1, and glUniform on -1 is defined to do nothing, so both
+ * are fed by the same code below.
+ */
+typedef struct R350GlProg {
+    GLuint prog;
+    GLint u_rect, u_org, u_texsize, u_clamp, u_textured;
+    GLint u_alphatest, u_affunc, u_afref, u_discard;
+    GLint u_blend, u_blendread, u_cfac, u_afac, u_konst;
+} R350GlProg;
+
 struct R350GlCtx {
     CGLContextObj ctx;
-    GLuint prog, vao, vbo, fbo, cbuf, dst;
+    R350GlProg main, add;
+    /* the two format conversions the add-blend path needs, and their VAO */
+    GLuint ui2n, n2ui, vao_blit;
+    GLuint vao, vbo, fbo, cbuf, dst;
+    /* the normalized colour buffer GL's own blender can write into */
+    GLuint acc;
     /* uploaded textures by caller slot, plus the scratch at the end */
     GLuint tex[R350_GL_TEXSLOTS + 1];
     int tex_w[R350_GL_TEXSLOTS + 1], tex_h[R350_GL_TEXSLOTS + 1];
@@ -84,10 +105,6 @@ struct R350GlCtx {
     uint8_t *stage;
     size_t stage_sz;
     char desc[128];
-    /* uniform locations, resolved once at link time */
-    GLint u_rect, u_org, u_texsize, u_clamp, u_textured;
-    GLint u_alphatest, u_affunc, u_afref, u_discard;
-    GLint u_blend, u_blendread, u_cfac, u_afac, u_konst;
 };
 
 static const char *vs_src =
@@ -132,9 +149,26 @@ static const char *vs_src =
 "    f_inv = a_inv;\n"
 "}\n";
 
-static const char *fs_src =
+/*
+ * The two fragment-shader prologues. Everything after them is one
+ * source; `R350_ADD` picks the variant. The integer output is the
+ * device's truncating pack written literally; the float one is a source
+ * term for GL's blender, biased so that its round-to-nearest lands on
+ * the byte the device would have truncated to (see the add-blend
+ * comment in ati_r350_gl_draw()).
+ */
+static const char *fs_head_main =
 "#version 330 core\n"
 "#extension GL_ARB_gpu_shader5 : require\n"
+"out uvec4 o_col;\n";
+
+static const char *fs_head_add =
+"#version 330 core\n"
+"#extension GL_ARB_gpu_shader5 : require\n"
+"#define R350_ADD 1\n"
+"out vec4 o_col;\n";
+
+static const char *fs_src =
 "flat in vec2 f_p0;\n"
 "flat in vec2 f_p1;\n"
 "flat in vec2 f_p2;\n"
@@ -145,7 +179,6 @@ static const char *fs_src =
 "flat in vec2 f_t1;\n"
 "flat in vec2 f_t2;\n"
 "flat in float f_inv;\n"
-"out uvec4 o_col;\n"
 "uniform usampler2D u_tex;\n"
 "uniform usampler2D u_dst;\n"
 "uniform float u_n255[256];\n"
@@ -265,6 +298,25 @@ static const char *fs_src =
 "        else if (u_discard == 6) kill = a1 && z1;\n"
 "        if (kill) discard;\n"
 "    }\n"
+"#ifdef R350_ADD\n"
+/*
+ * The source term alone, in the software rasterizer's own expression --
+ * the destination arguments are zero because the caller only routes a
+ * draw here when no factor can look at them. GL adds the result to the
+ * destination byte, so the byte is quantised once per primitive exactly
+ * as the device quantises it.
+ */
+"    precise float sr = c.r * bf(u_cfac.x, c.r, c.a, 0.0, 0.0,\n"
+"                                u_konst.r, u_konst.a);\n"
+"    precise float sg = c.g * bf(u_cfac.x, c.g, c.a, 0.0, 0.0,\n"
+"                                u_konst.g, u_konst.a);\n"
+"    precise float sb = c.b * bf(u_cfac.x, c.b, c.a, 0.0, 0.0,\n"
+"                                u_konst.b, u_konst.a);\n"
+"    precise float sa = c.a * bf(u_afac.x, c.a, c.a, 0.0, 0.0,\n"
+"                                u_konst.a, u_konst.a);\n"
+"    vec4 t = clamp(vec4(sr, sg, sb, sa), 0.0, 1.0);\n"
+"    o_col = (floor(t * 255.0) + 0.25) / 255.0;\n"
+"#else\n"
 "    if (u_blend != 0) {\n"
 "        uvec4 du = texelFetch(u_dst, ivec2(gl_FragCoord.xy), 0);\n"
 "        vec4 d = u_blendread != 0\n"
@@ -291,14 +343,58 @@ static const char *fs_src =
  * normalized round trip in between.
  */
 "    o_col = uvec4(floor(clamp(c, 0.0, 1.0) * 255.0));\n"
+"#endif\n"
 "}\n";
 
-static GLuint gl_compile(GLenum type, const char *src, const char **err)
+/*
+ * The add-blend path's two format conversions, and the full-viewport
+ * triangle both are drawn with. The colour buffer is GL_RGBA8UI, which
+ * GL's blender is not allowed to touch at all, so a draw that wants the
+ * blender works in a normalized copy: bytes out, bytes back.
+ *
+ * Both directions are exact and that is the whole point of the biases.
+ * Out: byte k becomes (k + 0.25)/255, which the normalized attachment
+ * stores as k again. Back: the sampled float is k/255 to within an ULP,
+ * and +0.5 before the floor turns it into k. Nothing outside the drawn
+ * primitives can move, which is what keeps the OUTSIDE class a hard
+ * zero for these draws as for every other.
+ */
+static const char *vs_blit_src =
+"#version 330 core\n"
+"void main()\n"
+"{\n"
+"    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+"    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"}\n";
+
+static const char *fs_ui2n_src =
+"#version 330 core\n"
+"out vec4 o_col;\n"
+"uniform usampler2D u_src;\n"
+"void main()\n"
+"{\n"
+"    uvec4 v = texelFetch(u_src, ivec2(gl_FragCoord.xy), 0);\n"
+"    o_col = (vec4(v) + 0.25) / 255.0;\n"
+"}\n";
+
+static const char *fs_n2ui_src =
+"#version 330 core\n"
+"out uvec4 o_col;\n"
+"uniform sampler2D u_src;\n"
+"void main()\n"
+"{\n"
+"    vec4 v = texelFetch(u_src, ivec2(gl_FragCoord.xy), 0);\n"
+"    o_col = uvec4(floor(v * 255.0 + 0.5));\n"
+"}\n";
+
+static GLuint gl_compile(GLenum type, const char *head, const char *src,
+                         const char **err)
 {
+    const char *parts[2] = { head ? head : "", src };
     GLuint sh = glCreateShader(type);
     GLint ok = 0;
 
-    glShaderSource(sh, 1, &src, NULL);
+    glShaderSource(sh, head ? 2 : 1, head ? parts : &src, NULL);
     glCompileShader(sh);
     glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -307,6 +403,65 @@ static GLuint gl_compile(GLenum type, const char *src, const char **err)
         return 0;
     }
     return sh;
+}
+
+static GLuint gl_link(const char *vsrc, const char *fhead, const char *fsrc,
+                      const char **err)
+{
+    GLuint vs = gl_compile(GL_VERTEX_SHADER, NULL, vsrc, err);
+    GLuint fs = vs ? gl_compile(GL_FRAGMENT_SHADER, fhead, fsrc, err) : 0;
+    GLuint prog;
+    GLint ok = 0;
+
+    if (!vs || !fs) {
+        if (vs) {
+            glDeleteShader(vs);
+        }
+        return 0;
+    }
+    prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        glDeleteProgram(prog);
+        *err = "GLSL program would not link";
+        return 0;
+    }
+    return prog;
+}
+
+/* the draw programs differ in one #define; their uniforms are the same */
+static void gl_prog_locs(R350GlProg *p)
+{
+    unsigned k;
+    float n255[256];
+
+    glUseProgram(p->prog);
+    glUniform1i(glGetUniformLocation(p->prog, "u_tex"), 0);
+    glUniform1i(glGetUniformLocation(p->prog, "u_dst"), 1);
+    for (k = 0; k < 256; k++) {
+        n255[k] = k / 255.0f;
+    }
+    glUniform1fv(glGetUniformLocation(p->prog, "u_n255"), 256, n255);
+
+    p->u_rect = glGetUniformLocation(p->prog, "u_rect");
+    p->u_org = glGetUniformLocation(p->prog, "u_org");
+    p->u_texsize = glGetUniformLocation(p->prog, "u_texsize");
+    p->u_clamp = glGetUniformLocation(p->prog, "u_clamp");
+    p->u_textured = glGetUniformLocation(p->prog, "u_textured");
+    p->u_alphatest = glGetUniformLocation(p->prog, "u_alphatest");
+    p->u_affunc = glGetUniformLocation(p->prog, "u_affunc");
+    p->u_afref = glGetUniformLocation(p->prog, "u_afref");
+    p->u_discard = glGetUniformLocation(p->prog, "u_discard");
+    p->u_blend = glGetUniformLocation(p->prog, "u_blend");
+    p->u_blendread = glGetUniformLocation(p->prog, "u_blendread");
+    p->u_cfac = glGetUniformLocation(p->prog, "u_cfac");
+    p->u_afac = glGetUniformLocation(p->prog, "u_afac");
+    p->u_konst = glGetUniformLocation(p->prog, "u_konst");
 }
 
 R350GlCtx *ati_r350_gl_open(const char **err)
@@ -321,9 +476,7 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     };
     CGLPixelFormatObj pix = NULL;
     R350GlCtx *g;
-    GLuint vs, fs;
-    GLint npix = 0, ok = 0;
-    float n255[256];
+    GLint npix = 0;
     unsigned k;
 
     *err = NULL;
@@ -341,26 +494,22 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     CGLDestroyPixelFormat(pix);
     CGLSetCurrentContext(g->ctx);
 
-    vs = gl_compile(GL_VERTEX_SHADER, vs_src, err);
-    fs = vs ? gl_compile(GL_FRAGMENT_SHADER, fs_src, err) : 0;
-    if (!vs || !fs) {
+    g->main.prog = gl_link(vs_src, fs_head_main, fs_src, err);
+    g->add.prog = g->main.prog
+                  ? gl_link(vs_src, fs_head_add, fs_src, err) : 0;
+    g->ui2n = g->add.prog
+              ? gl_link(vs_blit_src, NULL, fs_ui2n_src, err) : 0;
+    g->n2ui = g->ui2n ? gl_link(vs_blit_src, NULL, fs_n2ui_src, err) : 0;
+    if (!g->n2ui) {
         ati_r350_gl_close(g);
         return NULL;
     }
-    g->prog = glCreateProgram();
-    glAttachShader(g->prog, vs);
-    glAttachShader(g->prog, fs);
-    glLinkProgram(g->prog);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    glGetProgramiv(g->prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        ati_r350_gl_close(g);
-        *err = "GLSL program would not link";
-        return NULL;
-    }
-    glUseProgram(g->prog);
+    glUseProgram(g->ui2n);
+    glUniform1i(glGetUniformLocation(g->ui2n, "u_src"), 2);
+    glUseProgram(g->n2ui);
+    glUniform1i(glGetUniformLocation(g->n2ui, "u_src"), 2);
 
+    glGenVertexArrays(1, &g->vao_blit);
     glGenVertexArrays(1, &g->vao);
     glBindVertexArray(g->vao);
     glGenBuffers(1, &g->vbo);
@@ -369,6 +518,7 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     glGenTextures(R350_GL_TEXSLOTS + 1, g->tex);
     glGenTextures(1, &g->white);
     glGenTextures(1, &g->dst);
+    glGenTextures(1, &g->acc);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     {
@@ -390,27 +540,8 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
 
-    glUniform1i(glGetUniformLocation(g->prog, "u_tex"), 0);
-    glUniform1i(glGetUniformLocation(g->prog, "u_dst"), 1);
-    for (k = 0; k < 256; k++) {
-        n255[k] = k / 255.0f;
-    }
-    glUniform1fv(glGetUniformLocation(g->prog, "u_n255"), 256, n255);
-
-    g->u_rect = glGetUniformLocation(g->prog, "u_rect");
-    g->u_org = glGetUniformLocation(g->prog, "u_org");
-    g->u_texsize = glGetUniformLocation(g->prog, "u_texsize");
-    g->u_clamp = glGetUniformLocation(g->prog, "u_clamp");
-    g->u_textured = glGetUniformLocation(g->prog, "u_textured");
-    g->u_alphatest = glGetUniformLocation(g->prog, "u_alphatest");
-    g->u_affunc = glGetUniformLocation(g->prog, "u_affunc");
-    g->u_afref = glGetUniformLocation(g->prog, "u_afref");
-    g->u_discard = glGetUniformLocation(g->prog, "u_discard");
-    g->u_blend = glGetUniformLocation(g->prog, "u_blend");
-    g->u_blendread = glGetUniformLocation(g->prog, "u_blendread");
-    g->u_cfac = glGetUniformLocation(g->prog, "u_cfac");
-    g->u_afac = glGetUniformLocation(g->prog, "u_afac");
-    g->u_konst = glGetUniformLocation(g->prog, "u_konst");
+    gl_prog_locs(&g->add);
+    gl_prog_locs(&g->main);         /* leaves the main program current */
 
     {
         static const struct { GLint loc, n, off; } at[] = {
@@ -449,13 +580,18 @@ void ati_r350_gl_close(R350GlCtx *g)
     if (g->ctx) {
         CGLSetCurrentContext(g->ctx);
         glDeleteTextures(1, &g->dst);
+        glDeleteTextures(1, &g->acc);
         glDeleteTextures(R350_GL_TEXSLOTS + 1, g->tex);
         glDeleteTextures(1, &g->white);
         glDeleteTextures(1, &g->cbuf);
         glDeleteFramebuffers(1, &g->fbo);
         glDeleteBuffers(1, &g->vbo);
         glDeleteVertexArrays(1, &g->vao);
-        glDeleteProgram(g->prog);
+        glDeleteVertexArrays(1, &g->vao_blit);
+        glDeleteProgram(g->main.prog);
+        glDeleteProgram(g->add.prog);
+        glDeleteProgram(g->ui2n);
+        glDeleteProgram(g->n2ui);
         CGLSetCurrentContext(NULL);
         CGLDestroyContext(g->ctx);
     }
@@ -531,6 +667,17 @@ bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, w, h, 0, GL_RGBA_INTEGER,
+                 GL_UNSIGNED_BYTE, NULL);
+    /*
+     * The normalized twin the add-blend path renders into. It holds
+     * nothing between draws -- each such draw copies the colour buffer
+     * into it and copies the result back -- so growing it loses nothing.
+     */
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, g->acc);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
                  GL_UNSIGNED_BYTE, NULL);
     glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -608,6 +755,7 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
 
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 {
+    const R350GlProg *p;
     int sx0, sy0, sx1, sy1;
 
     if (!g || r->w <= 0 || r->h <= 0 || !r->nvert ||
@@ -622,6 +770,8 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      */
     CGLSetCurrentContext(g->ctx);
 
+    p = r->add_blend ? &g->add : &g->main;
+    glUseProgram(p->prog);
     glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                            GL_TEXTURE_2D, g->cbuf, 0);
@@ -643,7 +793,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      * uploaded them from the host for every draw, which the bench
      * measures at 1.44 ms full screen against 0.074 ms for the copy.
      */
-    if (r->blend && r->blend_read) {
+    if (r->blend && r->blend_read && !r->add_blend) {
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, g->dst);
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, r->x0, r->y0,
@@ -686,20 +836,20 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
                  (GLsizeiptr)sizeof(float) * R350_GL_VSTRIDE * r->nvert,
                  r->verts, GL_STREAM_DRAW);
 
-    glUniform4f(g->u_rect, 0.0f, 0.0f, (float)r->surf_w, (float)r->surf_h);
-    glUniform2f(g->u_org, 0.0f, 0.0f);
-    glUniform2i(g->u_texsize, r->tex_w, r->tex_h);
-    glUniform2i(g->u_clamp, r->clamp_s, r->clamp_t);
-    glUniform1i(g->u_textured, r->textured);
-    glUniform1i(g->u_alphatest, r->alpha_test);
-    glUniform1i(g->u_affunc, r->af_func);
-    glUniform1f(g->u_afref, r->af_ref);
-    glUniform1i(g->u_discard, r->discard);
-    glUniform1i(g->u_blend, r->blend);
-    glUniform1i(g->u_blendread, r->blend_read);
-    glUniform3i(g->u_cfac, r->src_factor, r->dst_factor, r->comb_fcn);
-    glUniform3i(g->u_afac, r->a_src_factor, r->a_dst_factor, r->a_comb_fcn);
-    glUniform4f(g->u_konst, r->k_r, r->k_g, r->k_b, r->k_a);
+    glUniform4f(p->u_rect, 0.0f, 0.0f, (float)r->surf_w, (float)r->surf_h);
+    glUniform2f(p->u_org, 0.0f, 0.0f);
+    glUniform2i(p->u_texsize, r->tex_w, r->tex_h);
+    glUniform2i(p->u_clamp, r->clamp_s, r->clamp_t);
+    glUniform1i(p->u_textured, r->textured);
+    glUniform1i(p->u_alphatest, r->alpha_test);
+    glUniform1i(p->u_affunc, r->af_func);
+    glUniform1f(p->u_afref, r->af_ref);
+    glUniform1i(p->u_discard, r->discard);
+    glUniform1i(p->u_blend, r->blend);
+    glUniform1i(p->u_blendread, r->blend_read);
+    glUniform3i(p->u_cfac, r->src_factor, r->dst_factor, r->comb_fcn);
+    glUniform3i(p->u_afac, r->a_src_factor, r->a_dst_factor, r->a_comb_fcn);
+    glUniform4f(p->u_konst, r->k_r, r->k_g, r->k_b, r->k_a);
 
     /*
      * Scissor, the one cliprect it absorbed, AND the draw's rectangle.
@@ -724,19 +874,66 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      * GPU, which is the whole point: the software rasterizer's ordering
      * is reproduced without the draw going back to it.
      */
-    if (r->npass > 1) {
-        unsigned p;
+    if (r->add_blend) {
+        /*
+         * dst' = dst + f(src), in ONE pass, with GL's own blender doing
+         * the adding and keeping primitive order while it does. The
+         * blender cannot touch an integer attachment at all, so the
+         * draw runs in the normalized twin: copy the colour buffer in,
+         * blend, copy the result back. Both copies are exact (see the
+         * conversion shaders) and both are GPU-side.
+         *
+         * The quantisation is what makes this a REPRODUCTION of the
+         * device rather than an approximation of it. The device packs
+         * every primitive with a truncation, so a pixel a ribbon
+         * crosses twice is truncated twice; the shader hands GL
+         * floor(255*f(src)) and GL adds it to a byte, which is the same
+         * chain, one integer step per primitive.
+         */
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, g->acc, 0);
+        glUseProgram(g->ui2n);
+        glBindVertexArray(g->vao_blit);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, g->cbuf);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
 
-        for (p = 0; p < r->npass; p++) {
-            if (p) {
+        glUseProgram(p->prog);
+        glBindVertexArray(g->vao);
+        glColorMask(!!(r->wmask & 0x00ff0000), !!(r->wmask & 0x0000ff00),
+                    !!(r->wmask & 0x000000ff), !!(r->wmask & 0xff000000));
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFunc(GL_ONE, GL_ONE);
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
+        glDisable(GL_BLEND);
+
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, g->cbuf, 0);
+        glUseProgram(g->n2ui);
+        glBindVertexArray(g->vao_blit);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, g->acc);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glUseProgram(g->main.prog);
+        glBindVertexArray(g->vao);
+        glActiveTexture(GL_TEXTURE0);
+    } else if (r->npass > 1) {
+        unsigned k;
+
+        for (k = 0; k < r->npass; k++) {
+            if (k) {
                 glActiveTexture(GL_TEXTURE1);
                 glBindTexture(GL_TEXTURE_2D, g->dst);
                 glCopyTexSubImage2D(GL_TEXTURE_2D, 0, r->x0, r->y0,
                                     r->x0, r->y0, r->w, r->h);
                 glActiveTexture(GL_TEXTURE0);
             }
-            glDrawArrays(GL_TRIANGLES, (GLint)r->pass[p],
-                         (GLsizei)(r->pass[p + 1] - r->pass[p]));
+            glDrawArrays(GL_TRIANGLES, (GLint)r->pass[k],
+                         (GLsizei)(r->pass[k + 1] - r->pass[k]));
         }
     } else {
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);

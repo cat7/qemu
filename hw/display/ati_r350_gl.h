@@ -122,6 +122,25 @@ typedef struct R350GlReq {
     float k_r, k_g, k_b, k_a;
 
     /*
+     * Hand this draw's blend to GL's OWN blender instead of computing it
+     * in the fragment shader, and render every primitive in one pass
+     * however much they overlap each other.
+     *
+     * The caller sets it only when the blend is
+     *     dst' = dst + f(src)
+     * -- destination factor ONE, combine ADD, and a source factor that
+     * does not read the destination, for colour and alpha alike. Under
+     * that shape the destination term is the destination unchanged, so
+     * a per-primitive quantisation can be reproduced exactly without
+     * ever reading it: the shader emits floor(255*f(src)) and GL's
+     * blender adds it to a byte that is already an integer. `pass` and
+     * `npass` are then not used and no snapshot of the destination is
+     * needed or taken. See the r300_gl_addblend() comment in
+     * ati_r350_3d.c for the predicate and why it is exactly this shape.
+     */
+    int add_blend;
+
+    /*
      * Where to leave a packed RGBA8 copy of the drawn rectangle, or
      * NULL. Only gl=verify wants one: the target is resident, so the
      * ordinary path leaves the pixels on the GPU and fetches them when

@@ -4106,6 +4106,17 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                            s->gl_tex_hit + s->gl_tex_miss
                            ? 100.0 * s->gl_tex_hit /
                              (s->gl_tex_hit + s->gl_tex_miss) : 0.0);
+    if (s->gl_addblend) {
+        /*
+         * Blended draws GL's own blender rendered in a single pass
+         * because their destination term was the destination itself.
+         * These are the ones the ordered partition used to spread over
+         * many passes or refuse; if this counter is high and the
+         * ordered average below is low, the lever is doing its job.
+         */
+        g_string_append_printf(out, "\nadd-blend draws %" PRIu64,
+                               s->gl_addblend);
+    }
     if (s->gl_multipass) {
         /*
          * How much work the self-overlap ordering is doing. A blended
