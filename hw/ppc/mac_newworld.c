@@ -704,7 +704,8 @@ static void core99_nvram_seed_if_blank(uint8_t *data, uint32_t size)
 }
 
 static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
-                                     const uint8_t *mac, const uint8_t *guid)
+                                     const uint8_t *mac, const uint8_t *guid,
+                                     uint32_t l2clock)
 {
     const uint32_t COPY = 0x2000;
     /*
@@ -787,13 +788,22 @@ static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
      * PowerMac3,4 publishes plus a zeroed /diagnostics/post-results, so Mac OS
      * never shows the "problem with cache memory" alert. Independent of the
      * gmac/fwguid grafts above.
+     *
+     * The l2-cache node's own clock-frequency is not a constant: L2CR
+     * 0xb9000000 has L2CLK (bits 27:25) = 0b100 = divide-by-2, so the
+     * backside cache runs at half the core clock and the property has to
+     * follow whatever the machine's CPU clock is. The donor PowerMac3,4's
+     * 233MHz is exactly 466.67/2; raise the core and this must move with
+     * it or the grafted node contradicts the l2cr beside it.
      */
+    g_autofree char *l2clk = g_strdup_printf(
+        "h# %x encode-int \" clock-frequency\" property ", l2clock);
     g_autofree char *bootcmd = g_strconcat("boot-command=", gmac, fwguid,
         agp_enable,
         "dev /cpus/PowerPC,G4@0 "
         "h# b9000000 encode-int \" l2cr\" property "
-        "new-device \" l2-cache\" device-name \" cache\" device-type "
-        "h# de86254 encode-int \" clock-frequency\" property "
+        "new-device \" l2-cache\" device-name \" cache\" device-type ",
+        l2clk,
         "0 0 encode-bytes \" cache-unified\" property "
         "h# 40 encode-int \" d-cache-line-size\" property "
         "h# 40 encode-int \" i-cache-line-size\" property "
@@ -956,7 +966,7 @@ static void core99_report_boot_device(MacIONVRAMState *nvr)
  * each other, not because real hardware ties them together.
  */
 static void core99_nvram_graft(MacIONVRAMState *nvr, bool inject_gmac,
-                               bool is_pm34)
+                               bool is_pm34, uint32_t l2clock)
 {
     Object *o = object_resolve_path_type("", "sungem", NULL);
     g_autofree char *macstr = o ? object_property_get_str(o, "mac", NULL)
@@ -983,7 +993,7 @@ static void core99_nvram_graft(MacIONVRAMState *nvr, bool inject_gmac,
     core99_nvram_seed_if_blank(nvr->data, nvr->size);
     core99_nvram_set_bootcmd(nvr->data, nvr->size,
                              (inject_gmac && have_mac) ? mac : NULL,
-                             is_pm34 ? guid : NULL);
+                             is_pm34 ? guid : NULL, l2clock);
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -1625,7 +1635,8 @@ static void ppc_core99_init(MachineState *machine)
      */
     if (rom_is_flash) {
         core99_nvram_graft(nvr, true,
-                          core99_machine->model == CORE99_MODEL_PM34);
+                          core99_machine->model == CORE99_MODEL_PM34,
+                          core99_clockfreq(core99_machine->model) / 2);
     }
     core99_report_boot_device(nvr);
     /* No PCI init: the BIOS will do it */

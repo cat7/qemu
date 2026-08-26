@@ -50,9 +50,27 @@
  * quite the nominal 33.33/466.67/133.33MHz round numbers -- but the exact
  * timebase = bus/4 relationship holds, as on every 60x-bus PowerPC, and
  * guests derive one frequency from the other, so keep the set consistent.
+ *
+ * DELIBERATE DEPARTURE FROM THE DONOR MACHINE, 2026-08-26: the CPU clock is
+ * raised from the donor's 3.5x/466MHz to 7x/932MHz -- the ratio a real
+ * PowerMac3,5 "Quicksilver" runs on the same 133MHz bus. Mac OS X 10.5's
+ * installer refuses any machine below 867MHz, and 6.5x (the next ratio down
+ * in the ROM's own PLL table) lands at 865.54MHz, 1.5MHz short. Nothing else
+ * moves: the timebase stays bus/4, so every timing-derived guest behaviour
+ * (the Ticks rate, VBL, the ADB/CUDA timers) is untouched by construction.
+ *
+ * The value is 933,333,331 and not the arithmetic 133,160,004 x 7 =
+ * 932,120,028, because that is what the ROM itself publishes -- MEASURED,
+ * not assumed: with PLL_CFG = 7x in place, a 10.4 guest reads back
+ * hw.cpufrequency 933,333,331 beside hw.busfrequency 133,160,004, and
+ * System Profiler says "CPU Speed: 933 MHz". The ROM rounds the product to
+ * the nominal clock, which is exactly the pairing the donor machine's own
+ * device tree shows (nominal 466,666,665 against a measured 133,160,004 that
+ * multiplies out to 466,060,014). Keeping the constant at the ROM's number
+ * is what makes an OpenBIOS boot agree with a real-ROM one.
  */
 #define PM34_TBFREQ    33290001UL
-#define PM34_CLOCKFREQ 466666665UL
+#define PM34_CLOCKFREQ 933333331UL   /* nominal 7 x PM34_BUSFREQ */
 #define PM34_BUSFREQ   133160004UL
 
 #define PM34_SPD_NUM_DIMMS 3
@@ -78,14 +96,34 @@ void pm34_cpu_defaults(PowerPCCPU *cpu)
      * The Apple ROM derives the CPU clock itself: it measures the bus
      * clock against a timer and multiplies by the PLL ratio it reads
      * from HID1[0:3] (PLL_CFG). QEMU's 74xx resets HID1 to 0, whose
-     * decode made Open Firmware report a 1.2GHz processor. A 466MHz
-     * Digital Audio runs 3.5x on a 133MHz bus, and MPC7400EC Table 14
-     * gives PLL_CFG 0b1110 for 3.5x -- with this in place OF computes
-     * ~465MHz on its own. Set the default too: SPRs snap back to
-     * their registered defaults on every machine reset.
+     * decode made Open Firmware report a 1.2GHz processor. So this
+     * register, not PM34_CLOCKFREQ, is what a real-ROM boot reports --
+     * the two must be set together or the machine contradicts itself.
+     *
+     * The ROM's decode table is not a guess: it sits at ROM offset
+     * 0xc738 (mirrored at 0x84738) as sixteen bytes of ratio-times-two,
+     * indexed by PLL_CFG, and reads
+     *
+     *   0000 9.0x  0001 7.5x  0010 7.0x  0011  --   0100 2.0x
+     *   0101 6.5x  0110 2.5x  0111 4.5x  1000 3.0x  1001 5.5x
+     *   1010 4.0x  1011 5.0x  1100 8.0x  1101 6.0x  1110 3.5x
+     *   1111  --
+     *
+     * i.e. the MPC7400EC Table 14 encoding, and it is self-confirming
+     * at both ends: entry 0b1110 = 3.5x is the 466MHz this machine used
+     * to report, and entry 0b0000 = 9.0x x 133.16MHz = 1198MHz is
+     * exactly the "1.2GHz" an unset HID1 produced.
+     *
+     * 0b0010 = 7.0x is the Quicksilver ratio and the lowest entry above
+     * Mac OS X 10.5's 867MHz installer gate (6.5x = 865.54MHz misses it
+     * by 1.5MHz). Measured live: the ROM then publishes 933,333,331 Hz,
+     * which is what PM34_CLOCKFREQ carries.
+     *
+     * Set the default too: SPRs snap back to their registered defaults
+     * on every machine reset.
      */
-    cpu->env.spr_cb[SPR_HID1].default_value = 0xE0000000;
-    cpu->env.spr[SPR_HID1] = 0xE0000000;
+    cpu->env.spr_cb[SPR_HID1].default_value = 0x20000000;
+    cpu->env.spr[SPR_HID1] = 0x20000000;
 }
 
 /*
