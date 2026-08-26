@@ -178,4 +178,37 @@ void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps);
 /* one constant vector as the program addresses it, cmax applied */
 void r300_pvs_const(const R300PvsProgram *p, unsigned off, float v[4]);
 
+/*
+ * What a translated program needs from whoever runs it, and -- when the
+ * translation was refused -- which construct refused it.
+ */
+typedef struct R300PvsGlsl {
+    unsigned nconst;            /* PVSK[] entries the shader indexes */
+    uint32_t in_mask;           /* PVSA[] registers it reads */
+    uint32_t out_mask;          /* PVSo[] registers it writes */
+    R300PvsGaps gaps;           /* why it was refused, if it was */
+} R300PvsGlsl;
+
+/*
+ * Translate the program to a GLSL 3.30 function
+ *
+ *     void pvs_main();
+ *
+ * reading `uniform vec4 PVSA[16]` (the input registers) and
+ * `uniform vec4 PVSK[n]` (the constant file, PVS_CONST_BASE_OFFSET and
+ * PVS_MAX_CONST_ADDR already applied, so PVSK[k] is what
+ * r300_pvs_const(p, k, ...) returns), and writing `vec4 PVSo[16]`. The
+ * caller declares all three and calls pvs_main() from its own main().
+ *
+ * Returns false, without writing a usable shader, for any construct the
+ * interpreter would report as a gap -- so a program the translator cannot
+ * express is one the caller falls back on rather than renders wrong.
+ * `info` may be NULL.
+ */
+bool r300_pvs_glsl(const R300PvsProgram *p, char *buf, size_t cap,
+                   R300PvsGlsl *info);
+
+/* fill `k[n][4]` with the constant file the translated shader expects */
+void r300_pvs_glsl_consts(const R300PvsProgram *p, float *k, unsigned n);
+
 #endif /* ATI_R350_PVS_H */
