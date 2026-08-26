@@ -372,3 +372,4 @@ ati_r350_3d_gl_verify(uint32_t prim, uint32_t px, uint32_t diff, uint32_t maxd, 
 ati_r350_gl_open(const char *desc) "R300 gl backend: %s"
 ati_r350_fs_program(uint32_t afirst, uint32_t nalu, uint32_t tfirst, uint32_t ntex, uint32_t nregs, int texdst, int col0, int col1, int ok) "R300 fs program alu %u+%u tex %u+%u regs=%u texdst=%d col=(%d,%d) ok=%d"
 ati_r350_us_glsl(uint32_t afirst, uint32_t nalu, int ok, uint32_t bytes, int slot) "R300 us->glsl alu %u+%u ok=%d bytes=%u slot=%d"
+ati_r350_us_refused(uint32_t cfg, uint32_t ca3, uint32_t outfmt, uint32_t rsic, uint32_t rsi0, uint32_t rsi1, uint32_t ip0, uint32_t ip1, uint32_t tex0, uint32_t tex1) "R300 fs refused cfg=0x%08x ca3=0x%08x outfmt=0x%08x rs_cnt=0x%08x rs_inst=0x%08x,0x%08x rs_ip=0x%08x,0x%08x tex_inst=0x%08x,0x%08x"

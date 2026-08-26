@@ -230,11 +230,21 @@ typedef struct R300UsArgFast {
     float lit;
 } R300UsArgFast;
 
-/* constructs met that this model does not implement */
+/*
+ * Constructs met that this model does not implement.
+ *
+ * The output gap is TWO gaps deliberately. US_OUT_FMT_0 carries a pixel
+ * format and a four-way component select, and a single report that named
+ * only the format was actively misleading: a guest asking for a
+ * supported format with an unsupported select was reported as
+ * "unimplemented fragment output format 0x0", which names a format the
+ * model has always run. Whichever half refuses is now the half that is
+ * named.
+ */
 typedef struct R300UsGaps {
-    uint8_t rgb_op, a_op, tex_op, indirect, rs_route, out_fmt;
+    uint8_t rgb_op, a_op, tex_op, indirect, rs_route, out_fmt, out_sel;
     bool has_rgb_op, has_a_op, has_tex_op;
-    bool has_indirect, has_rs_route, has_out_fmt;
+    bool has_indirect, has_rs_route, has_out_fmt, has_out_sel;
 } R300UsGaps;
 
 typedef struct R300UsProgram {

@@ -88,6 +88,14 @@ static void us_gap_out_fmt(R300UsGaps *g, uint8_t v)
     }
 }
 
+static void us_gap_out_sel(R300UsGaps *g, uint8_t v)
+{
+    if (g && !g->has_out_sel) {
+        g->has_out_sel = true;
+        g->out_sel = v;
+    }
+}
+
 static void us_decode_alu(R300UsAlu *a, uint32_t rgb_addr, uint32_t rgb_inst,
                           uint32_t a_addr, uint32_t a_inst)
 {
@@ -532,17 +540,24 @@ void r300_us_analyse(R300UsProgram *p,
      * permute, so it is named rather than silently ignored. A program
      * that writes no output at all never reaches the target and its
      * format is not consulted.
+     *
+     * The two halves are reported SEPARATELY. Reporting the format for a
+     * refusal the select caused named a format this model runs, which
+     * cost a reader of the gap list a wrong conclusion.
      */
     if (p->writes_out) {
         unsigned fmt = us_out_fmt0 & R300_US_OUT_FMT_MASK;
         unsigned sel = (us_out_fmt0 >> R300_US_OUT_SEL_SHIFT(0)) & 0xff;
 
-        if ((fmt != R300_US_OUT_FMT_C4_8 && fmt != R300_US_OUT_FMT_C4_10) ||
-            sel != ((R300_US_OUT_SEL_BLUE << 0) |
+        if (fmt != R300_US_OUT_FMT_C4_8 && fmt != R300_US_OUT_FMT_C4_10) {
+            us_gap_out_fmt(&p->gaps, fmt);
+            p->expressible = false;
+        }
+        if (sel != ((R300_US_OUT_SEL_BLUE << 0) |
                     (R300_US_OUT_SEL_GREEN << 2) |
                     (R300_US_OUT_SEL_RED << 4) |
                     (R300_US_OUT_SEL_ALPHA << 6))) {
-            us_gap_out_fmt(&p->gaps, fmt);
+            us_gap_out_sel(&p->gaps, sel);
             p->expressible = false;
         }
     }

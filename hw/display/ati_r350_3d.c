@@ -1361,6 +1361,33 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
             if (g->has_out_fmt) {
                 ati_r350_note_gap(s, R350_GAP_FS_OUT_FMT, g->out_fmt);
             }
+            if (g->has_out_sel) {
+                ati_r350_note_gap(s, R350_GAP_FS_OUT_SEL, g->out_sel);
+            }
+            /*
+             * The words that describe the refused program, so a gap
+             * found in a live guest can be specified offline instead of
+             * guessed at. A gap name says WHICH construct; only the
+             * encoding says what it asks for.
+             *
+             * The texture instructions are read at the RELOCATED slot.
+             * US_CODE_OFFSET exists so a driver can move a program
+             * rather than rewrite it, and slot 0 is very often not the
+             * one in force -- printing it would describe some other
+             * program entirely.
+             */
+            unsigned t0 = (R300_US_TEX_INST_0 >> 2) + p->tex_first;
+
+            trace_ati_r350_us_refused(regs[R300_US_CONFIG >> 2],
+                                      regs[(R300_US_CODE_ADDR_0 >> 2) + 3],
+                                      regs[R300_US_OUT_FMT_0 >> 2],
+                                      regs[R300_RS_INST_COUNT >> 2],
+                                      regs[R300_RS_INST_0 >> 2],
+                                      regs[(R300_RS_INST_0 >> 2) + 1],
+                                      regs[R300_RS_IP_0 >> 2],
+                                      regs[(R300_RS_IP_0 >> 2) + 1],
+                                      p->ntex > 0 ? regs[t0] : 0,
+                                      p->ntex > 1 ? regs[t0 + 1] : 0);
         }
         trace_ati_r350_fs_program(p->alu_first, p->nalu, p->tex_first,
                                   p->ntex, p->nregs_used, p->tex_dst,
