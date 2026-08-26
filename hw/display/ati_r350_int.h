@@ -623,6 +623,16 @@ struct ATIR350State {
     } gl_tex[R300_GL_TEXCACHE];
     uint64_t gl_tex_seq, gl_tex_hit, gl_tex_miss;
     uint64_t gl_tex_stale;      /* entries the dirty guard killed */
+    /*
+     * Why the other lookups missed. A hit rate is only actionable with
+     * these beside it: an entry refused admission, one a writer killed,
+     * one a draw rendered over and one the LRU evicted are four
+     * different problems.
+     */
+    uint64_t gl_tex_noadmit;    /* range was dirty: cannot be guarded */
+    uint64_t gl_tex_wrote;      /* a writer hook killed it */
+    uint64_t gl_tex_over;       /* a draw rendered into its range */
+    uint64_t gl_tex_evict;      /* the LRU gave its slot away */
     uint64_t gl_epoch;          /* bumped whenever the VGA bitmap is cleared */
     unsigned gl_pgbits;         /* qemu_target_page_bits(), resolved once */
     ATIR350GlTexLife gl_texlife;
@@ -774,6 +784,15 @@ const char *ati_r350_gl_rel_name(ATIR350GlRel why);
  * and the rest are carried into the new generation.
  */
 void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap);
+
+/*
+ * Take responsibility for the VGA dirty bits over a VRAM range the
+ * decoded-texture cache wants to guard, feeding the scanout's own
+ * accumulator first so nothing it uses is lost. False when the range
+ * may not be claimed. Implemented in ati_r350.c, beside the scanout
+ * code whose bits these are.
+ */
+bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len);
 
 /* something is about to READ this range of VRAM */
 static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,

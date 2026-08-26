@@ -2334,6 +2334,7 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
                 k < R300_GL_TEXCACHE; k++) {
         if (s->gl_tex[k].live && off < s->gl_tex[k].off + s->gl_tex[k].len &&
             off + len > s->gl_tex[k].off) {
+            s->gl_tex_wrote++;
             s->gl_tex[k].live = false;
             s->gl_tex[k].up = false;
         }
@@ -2382,6 +2383,7 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
             d->dst_off + (uint32_t)y0 * d->dst_pitch <
             s->gl_tex[i].off + s->gl_tex[i].len &&
             d->dst_off + (uint32_t)y1 * d->dst_pitch > s->gl_tex[i].off) {
+            s->gl_tex_over++;
             s->gl_tex[i].live = false;
             s->gl_tex[i].up = false;
         }
@@ -3060,9 +3062,12 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
      * one set later. An entry that fails here is used for this draw and
      * then dropped, and the next decode after a refresh admits it.
      */
+    s->gl_tex_evict += s->gl_tex[victim].live;
     s->gl_tex[victim].live = s->gl_texlife != R350_TEXLIFE_DIRTY ||
                              !r300_gl_range_dirty(s, off,
-                                                  s->gl_tex[victim].npg);
+                                                  s->gl_tex[victim].npg) ||
+                             ati_r350_gl_admit(s, off, len);
+    s->gl_tex_noadmit += !s->gl_tex[victim].live;
     s->gl_tex[victim].up = true;
     s->gl_tex_any |= s->gl_tex[victim].live;
     *slot = victim;

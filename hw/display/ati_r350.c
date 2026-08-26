@@ -20,6 +20,7 @@
 #include "hw/i2c/i2c.h"
 
 #include "exec/target_page.h"
+#include "system/physmem.h"
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
 #include "ati_r350_gl.h"
@@ -652,6 +653,55 @@ static DirtyBitmapSnapshot *ati_r350_take_dirty(ATIR350State *s)
      */
     ati_r350_gl_epoch(s, snap);
     return snap;
+}
+
+/*
+ * ADMITTING A TEXTURE RANGE to the decoded-texture cache: take
+ * responsibility for the VGA dirty bits over it, so that from here on
+ * any set bit is a write that happened since. See "TEXTURE CACHE
+ * LIFETIME" in ati_r350_3d.c for why admission has to be a clean slate
+ * rather than a recorded baseline.
+ *
+ * Those bits belong to the scanout, and it has exactly two consumers of
+ * them. The framebuffer-region redraw test reads only the DISPLAYED
+ * range, so a range overlapping it is refused outright -- rounded
+ * outwards by a page, because the clear below is page-granular. The
+ * framebuffer-GUESS heuristic reads the whole of VRAM through
+ * fb_block_pending[], and that is fed here with exactly what it would
+ * have seen. Nothing else looks, so nothing is lost.
+ *
+ * Returns false when the range may not be claimed, and the caller then
+ * decodes without caching.
+ */
+bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len)
+{
+    int nblocks = ATI_R350_VRAM_SIZE / ATI_R350_FB_SCAN_BLOCK;
+    uint64_t pg = qemu_target_page_size();
+    uint64_t lo = off & ~(pg - 1);
+    uint64_t hi = (off + len + pg - 1) & ~(pg - 1);
+    uint64_t fb_len = (uint64_t)s->mode.pitch * s->mode.height;
+    ram_addr_t base;
+    uint64_t a;
+    int i;
+
+    if (hi > ATI_R350_VRAM_SIZE) {
+        return false;
+    }
+    if (fb_len && lo < (uint64_t)s->mode.fb_offset + fb_len &&
+        hi > s->mode.fb_offset) {
+        return false;               /* those bits decide the redraw */
+    }
+    base = memory_region_get_ram_addr(&s->vram);
+    for (a = lo; a < hi; a += pg) {
+        if (physical_memory_get_dirty_flag(base + a, DIRTY_MEMORY_VGA)) {
+            i = a / ATI_R350_FB_SCAN_BLOCK;
+            if (i < nblocks) {
+                s->fb_block_pending[i] = true;
+            }
+        }
+    }
+    memory_region_reset_dirty(&s->vram, lo, hi - lo, DIRTY_MEMORY_VGA);
+    return true;
 }
 
 static void ati_r350_cursor_update(ATIR350State *s);
@@ -4197,16 +4247,20 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
     g_string_append_printf(out, "\nresident target: %" PRIu64 " flushes, %"
                            PRIu64 " px out, %" PRIu64 " px in"
                            "\ntexture cache: %" PRIu64 " hits, %" PRIu64
-                           " decodes (%.1f%%), %" PRIu64 " stale, life %s",
+                           " decodes (%.1f%%), life %s"
+                           "\n  missed by: %" PRIu64 " not admitted (range "
+                           "dirty), %" PRIu64 " stale, %" PRIu64 " written, %"
+                           PRIu64 " drawn over, %" PRIu64 " evicted",
                            s->gl_flushes, s->gl_flush_px, s->gl_seed_px,
                            s->gl_tex_hit, s->gl_tex_miss,
                            s->gl_tex_hit + s->gl_tex_miss
                            ? 100.0 * s->gl_tex_hit /
                              (s->gl_tex_hit + s->gl_tex_miss) : 0.0,
-                           s->gl_tex_stale,
                            s->gl_texlife == R350_TEXLIFE_BURST ? "burst"
                            : s->gl_texlife == R350_TEXLIFE_NEVER
-                             ? "never (CONTROL: invalidation OFF)" : "dirty");
+                             ? "never (CONTROL: invalidation OFF)" : "dirty",
+                           s->gl_tex_noadmit, s->gl_tex_stale,
+                           s->gl_tex_wrote, s->gl_tex_over, s->gl_tex_evict);
     /*
      * WHICH hook ended each residency. "the target is not staying
      * resident" is a symptom whose cure depends entirely on which rule

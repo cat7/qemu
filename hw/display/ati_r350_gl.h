@@ -56,8 +56,14 @@
  * How many uploaded textures the backend keeps, plus one: slot
  * R350_GL_TEXSLOTS is a scratch the caller uses for a texture it is not
  * tracking, and it is uploaded every time. See R350GlReq.tex_slot.
+ *
+ * MEASURED, not guessed: at 8 a live Flurry session reported 620 of its
+ * 2546 decodes as entries the LRU had evicted -- the second largest
+ * miss class after the ones a writer killed. The device-side cache
+ * bounds each entry at R300_GL_TEXCACHE_MAX texels, so this many slots
+ * is a bounded worst case rather than an open-ended allocation.
  */
-#define R350_GL_TEXSLOTS 8
+#define R350_GL_TEXSLOTS 32
 
 typedef struct R350GlReq {
     /*
