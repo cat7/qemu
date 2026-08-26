@@ -2060,6 +2060,7 @@ static void r300_gl_texdrop(ATIR350State *s)
 
     for (k = 0; k < R300_GL_TEXCACHE; k++) {
         s->gl_tex[k].live = false;
+        s->gl_tex[k].up = false;
     }
     s->gl_tex_any = false;
 }
@@ -2084,6 +2085,7 @@ void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
         if (s->gl_tex[k].live && off < s->gl_tex[k].off + s->gl_tex[k].len &&
             off + len > s->gl_tex[k].off) {
             s->gl_tex[k].live = false;
+            s->gl_tex[k].up = false;
         }
     }
     if (!r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
@@ -2132,6 +2134,7 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
             s->gl_tex[i].off + s->gl_tex[i].len &&
             d->dst_off + (uint32_t)y1 * d->dst_pitch > s->gl_tex[i].off) {
             s->gl_tex[i].live = false;
+            s->gl_tex[i].up = false;
         }
     }
     s->gl_res = true;
@@ -2577,11 +2580,15 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
  * to a uniformly swapped range of VRAM is decoded into the scratch
  * buffer and not cached -- there would be no range to invalidate it on.
  */
-static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d)
+static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
+                                      unsigned *slot, int *fresh)
 {
     uint32_t off, len;
     unsigned k, victim = 0, xr = 0;
     size_t need = (size_t)d->tex_w * d->tex_h * 4;
+
+    *slot = R350_GL_TEXSLOTS;           /* the scratch: uploaded every time */
+    *fresh = 1;
 
     len = (uint32_t)d->tex_h * d->tex_pitch;
     if ((size_t)d->tex_w * d->tex_h > R300_GL_TEXCACHE_MAX ||
@@ -2597,6 +2604,14 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d)
         if (r300_gl_tex_same(s, k, d, off, len, xr)) {
             s->gl_tex[k].used = ++s->gl_tex_seq;
             s->gl_tex_hit++;
+            *slot = k;
+            /*
+             * The backend still holds it uploaded unless the slot was
+             * given to a different texture since; `up` is what says so,
+             * and it is cleared wherever an entry is.
+             */
+            *fresh = !s->gl_tex[k].up;
+            s->gl_tex[k].up = true;
             return s->gl_tex[k].rgba;
         }
         if (!s->gl_tex[k].live) {
@@ -2625,7 +2640,10 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d)
     }
     s->gl_tex[victim].used = ++s->gl_tex_seq;
     s->gl_tex[victim].live = true;
+    s->gl_tex[victim].up = true;
     s->gl_tex_any = true;
+    *slot = victim;
+    *fresh = 1;
     return s->gl_tex[victim].rgba;
 }
 
@@ -2747,7 +2765,8 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     const R300Vtx *gvb = vb;
     R350GlReq req = { 0 };
     const uint8_t *texbuf = NULL;
-    unsigned ntri = 0, npass = 1, i, xr = 0;
+    unsigned ntri = 0, npass = 1, i, xr = 0, texslot = R350_GL_TEXSLOTS;
+    int texfresh = 1;
     int x0, y0, x1, y1, w, h;
     size_t rect_sz, texels = 0;
 
@@ -2865,7 +2884,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
         }
     }
     if (d->textured) {
-        texbuf = r300_gl_texture(s, d);
+        texbuf = r300_gl_texture(s, d, &texslot, &texfresh);
     }
     /*
      * The target becomes resident here, and this is the last point at
@@ -2884,6 +2903,8 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.pass = npass > 1 ? s->gl_pass_first : NULL;
     req.npass = npass;
     req.tex = d->textured ? texbuf : NULL;
+    req.tex_slot = texslot;
+    req.tex_fresh = texfresh;
     req.tex_w = d->tex_w;
     req.tex_h = d->tex_h;
     req.clamp_s = d->clamp_s;

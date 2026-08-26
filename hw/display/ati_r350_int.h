@@ -33,6 +33,7 @@
 #include "qom/object.h"
 #include "ati_r350_pvs.h"
 #include "ati_r350_cap.h"
+#include "ati_r350_gl.h"
 
 #define PCI_VENDOR_ID_ATI              0x1002
 /*
@@ -146,7 +147,7 @@ typedef enum ATIR350GlFallback {
  * frame's window tiles, and bounded so a guest cannot make the device
  * allocate without limit.
  */
-#define R300_GL_TEXCACHE     8
+#define R300_GL_TEXCACHE     R350_GL_TEXSLOTS
 #define R300_GL_TEXCACHE_MAX (256 * 1024)
 
 typedef struct ATIR350PM4Parser {
@@ -555,7 +556,8 @@ struct ATIR350State {
         uint8_t *rgba;
         size_t sz;
         uint64_t used;
-        bool live;
+        bool live;                  /* the decoded bytes are current */
+        bool up;                    /* ... and the backend has them too */
     } gl_tex[R300_GL_TEXCACHE];
     uint64_t gl_tex_seq, gl_tex_hit, gl_tex_miss;
     bool gl_tex_any;            /* any entry live: the hot hooks test this */

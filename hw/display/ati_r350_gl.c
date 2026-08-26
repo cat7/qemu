@@ -73,7 +73,11 @@
 
 struct R350GlCtx {
     CGLContextObj ctx;
-    GLuint prog, vao, vbo, fbo, cbuf, tex, dst;
+    GLuint prog, vao, vbo, fbo, cbuf, dst;
+    /* uploaded textures by caller slot, plus the scratch at the end */
+    GLuint tex[R350_GL_TEXSLOTS + 1];
+    int tex_w[R350_GL_TEXSLOTS + 1], tex_h[R350_GL_TEXSLOTS + 1];
+    GLuint white;                   /* the 1x1 an untextured draw samples */
     /* the resident target's size; a request smaller than it reuses it */
     int fb_w, fb_h;
     /* staging for the two swapper orders GL cannot produce directly */
@@ -362,10 +366,26 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     glGenBuffers(1, &g->vbo);
     glGenFramebuffers(1, &g->fbo);
     glGenTextures(1, &g->cbuf);
-    glGenTextures(1, &g->tex);
+    glGenTextures(R350_GL_TEXSLOTS + 1, g->tex);
+    glGenTextures(1, &g->white);
     glGenTextures(1, &g->dst);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    {
+        /*
+         * What an untextured draw samples. Specified once: giving a
+         * texture new storage is a synchronisation point, and doing it
+         * per draw cost 1.4 ms of caller time for every three draws.
+         */
+        static const uint8_t white[4] = { 255, 255, 255, 255 };
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g->white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, 1, 1, 0,
+                     GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, white);
+    }
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
@@ -429,7 +449,8 @@ void ati_r350_gl_close(R350GlCtx *g)
     if (g->ctx) {
         CGLSetCurrentContext(g->ctx);
         glDeleteTextures(1, &g->dst);
-        glDeleteTextures(1, &g->tex);
+        glDeleteTextures(R350_GL_TEXSLOTS + 1, g->tex);
+        glDeleteTextures(1, &g->white);
         glDeleteTextures(1, &g->cbuf);
         glDeleteFramebuffers(1, &g->fbo);
         glDeleteBuffers(1, &g->vbo);
@@ -587,7 +608,6 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
 
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 {
-    static const uint8_t white[4] = { 255, 255, 255, 255 };
     int sx0, sy0, sx1, sy1;
 
     if (!g || r->w <= 0 || r->h <= 0 || !r->nvert ||
@@ -631,15 +651,34 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     }
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g->tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    if (r->textured && r->tex) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->tex_w, r->tex_h, 0,
-                     GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, r->tex);
+    if (r->textured && r->tex_slot <= R350_GL_TEXSLOTS) {
+        unsigned sl = r->tex_slot;
+
+        glBindTexture(GL_TEXTURE_2D, g->tex[sl]);
+        if (r->tex_fresh && r->tex) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            if (g->tex_w[sl] == r->tex_w && g->tex_h[sl] == r->tex_h) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->tex_w, r->tex_h,
+                                GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, r->tex);
+            } else {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->tex_w,
+                             r->tex_h, 0, GL_RGBA_INTEGER,
+                             GL_UNSIGNED_BYTE, r->tex);
+                g->tex_w[sl] = r->tex_w;
+                g->tex_h[sl] = r->tex_h;
+            }
+        } else if (g->tex_w[sl] != r->tex_w || g->tex_h[sl] != r->tex_h) {
+            /*
+             * The caller said the slot was current and it is not. That
+             * can only be a bookkeeping error, and rendering from the
+             * wrong texture is the silent kind of wrong, so refuse.
+             */
+            return false;
+        }
     } else {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, 1, 1, 0,
-                     GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, white);
+        /* specified once at open: re-specifying it per draw is a stall */
+        glBindTexture(GL_TEXTURE_2D, g->white);
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, g->vbo);

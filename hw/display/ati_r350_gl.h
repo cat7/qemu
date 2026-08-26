@@ -52,6 +52,13 @@
  */
 #define R350_GL_VSTRIDE 33
 
+/*
+ * How many uploaded textures the backend keeps, plus one: slot
+ * R350_GL_TEXSLOTS is a scratch the caller uses for a texture it is not
+ * tracking, and it is uploaded every time. See R350GlReq.tex_slot.
+ */
+#define R350_GL_TEXSLOTS 8
+
 typedef struct R350GlReq {
     /*
      * Every coordinate below is a coordinate IN THE RESIDENT TARGET,
@@ -86,7 +93,19 @@ typedef struct R350GlReq {
     const unsigned *pass;
     unsigned npass;
 
-    const uint8_t *tex;         /* RGBA8, tex_w x tex_h; NULL if untextured */
+    /*
+     * The texture, RGBA8, and WHICH of the backend's texture objects it
+     * belongs in. The caller already decides when a decoded texture is
+     * still current -- it owns the VRAM ranges the answer depends on --
+     * so it names a slot and says whether the bytes are new. A slot
+     * whose bytes are unchanged is bound and not re-uploaded, which on
+     * this host is 0.93 ms of caller time per full-screen draw.
+     * `tex` may be NULL when tex_fresh is false. A slot of exactly
+     * R350_GL_TEXSLOTS is the scratch, which is always uploaded.
+     */
+    const uint8_t *tex;
+    unsigned tex_slot;          /* <= R350_GL_TEXSLOTS; the last is scratch */
+    int tex_fresh;              /* upload `tex` into that slot first */
     int tex_w, tex_h;
     int clamp_s, clamp_t;       /* TX_FILTER0 clamp modes; <= 1 is repeat */
     int textured;
