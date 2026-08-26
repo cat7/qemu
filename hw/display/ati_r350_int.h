@@ -476,6 +476,8 @@ struct ATIR350State {
      */
     char *cap_path;
     FILE *cap_fp;
+    bool cap_arm;               /* record at all: a settable QOM property */
+    int draw_xr;                /* swapper xor the LAST redraw used */
     uint32_t cap_max;           /* records to take before closing the file */
     uint32_t cap_max_px;        /* skip a draw whose rectangle exceeds this */
     uint32_t cap_index;         /* records written so far */

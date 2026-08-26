@@ -852,6 +852,7 @@ static bool ati_r350_update_display(void *opaque)
                                     ldl_le_p(vp + o30 + 12));
     }
     ds = qemu_console_surface(s->con);
+    s->draw_xr = (int)ati_r350_vram_xor(s, mode.fb_offset);
     switch (mode.pix_width) {
     case R350_PIX_WIDTH_8BPP:
         ati_r350_draw_8bpp(s, ds, &mode);
@@ -1767,11 +1768,16 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_PALETTE_INDEX:
         s->dac_wr_index = val & 0xff;
         s->dac_rd_index = (val >> 16) & 0xff;
+        trace_ati_r350_palette("PALETTE_INDEX", s->dac_wr_index, val, 0, 0, 0);
         break;
     case R350_PALETTE_DATA:
         s->palette[s->dac_wr_index][0] = (val >> 16) & 0xff;  /* R */
         s->palette[s->dac_wr_index][1] = (val >> 8) & 0xff;   /* G */
         s->palette[s->dac_wr_index][2] = val & 0xff;          /* B */
+        trace_ati_r350_palette("PALETTE_DATA", s->dac_wr_index, val,
+                               s->palette[s->dac_wr_index][0],
+                               s->palette[s->dac_wr_index][1],
+                               s->palette[s->dac_wr_index][2]);
         s->force_redraw = true;
         s->dac_wr_index++;
         break;
@@ -1931,6 +1937,10 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         s->palette[s->dac_wr_index][0] = (val >> 22) & 0xff;
         s->palette[s->dac_wr_index][1] = (val >> 12) & 0xff;
         s->palette[s->dac_wr_index][2] = (val >> 2) & 0xff;
+        trace_ati_r350_palette("PALETTE_30_DATA", s->dac_wr_index, val,
+                               s->palette[s->dac_wr_index][0],
+                               s->palette[s->dac_wr_index][1],
+                               s->palette[s->dac_wr_index][2]);
         s->force_redraw = true;
         s->dac_wr_index++;
         break;
@@ -3298,6 +3308,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     memset(s->plls, 0, sizeof(s->plls));
     memset(s->palette, 0, sizeof(s->palette));
     s->swap_valid = false;          /* the surface registers just went */
+    s->draw_xr = -1;                /* nothing has been drawn with any */
     s->dac_wr_index = 0;
     s->dac_rd_index = 0;
     s->i2c_offset = 0;
@@ -4211,6 +4222,8 @@ static char *ati_r350_get_scanout(Object *obj, Error **errp)
         "crtc: %ux%u bpp=%u pitch=%u fb_offset=0x%x valid_seen=%d\n"
         "crtc_offset_reg: 0x%x  crtc_pitch_reg: 0x%x  display_dis: %d\n"
         "auto_fb: valid=%d %ux%u bpp=%u fb_offset=0x%x\n"
+        "swapper: xr now %u for fb_offset (SURFACE_CNTL=0x%08x), "
+        "xr at last redraw %d, force_redraw=%d\n"
         "activity: %d/%d blocks live, longest run %d blocks at 0x%x",
         s->auto_fb_overriding ? "activity heuristic (CRTC overridden)"
                               : "CRTC registers",
@@ -4222,10 +4235,73 @@ static char *ati_r350_get_scanout(Object *obj, Error **errp)
         (s->regs[R350_CRTC_EXT_CNTL >> 2] & R350_CRTC_DISPLAY_DIS) != 0,
         s->auto_fb_valid, s->auto_fb_mode.width, s->auto_fb_mode.height,
         s->auto_fb_mode.bpp, s->auto_fb_mode.fb_offset,
+        ati_r350_vram_xor(s, s->mode.fb_offset),
+        s->regs[R350_SURFACE_CNTL >> 2], s->draw_xr, s->force_redraw,
         active, nblocks, best,
         best_start < 0 ? 0 : best_start * ATI_R350_FB_SCAN_BLOCK);
 
     return g_string_free(out, FALSE);
+}
+
+/*
+ * `palette` property: the 256-entry DAC LUT as the scanout is reading
+ * it right now. In every depth this device drives, that RAM is a
+ * per-channel GAMMA table rather than a colour map -- 32bpp indexes it
+ * with each of the pixel's own three bytes -- so a screen whose colours
+ * are wrong while VRAM is right is a question about these 768 numbers
+ * and nothing else. Reading them beats inferring a curve from three
+ * sampled pixels, which is how the 10.3 purple screen was first
+ * described.
+ *
+ * Printed as "idx r g b" for the entries that are not the identity,
+ * plus a count, so an identity ramp is one short line.
+ */
+static char *ati_r350_get_palette(Object *obj, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+    GString *out = g_string_new(NULL);
+    unsigned i, n = 0;
+
+    for (i = 0; i < 256; i++) {
+        if (s->palette[i][0] != i || s->palette[i][1] != i ||
+            s->palette[i][2] != i) {
+            n++;
+        }
+    }
+    g_string_append_printf(out, "%u of 256 entries differ from the identity",
+                           n);
+    for (i = 0; i < 256; i += 16) {
+        g_string_append_printf(out, "\n[%3u] %3u %3u %3u", i,
+                               s->palette[i][0], s->palette[i][1],
+                               s->palette[i][2]);
+    }
+    return g_string_free(out, FALSE);
+}
+
+/*
+ * Whether the draw capture is recording. A settable property rather
+ * than a -device one because it has to be turned on at a MOMENT: a boot
+ * to the desktop spends a thousand records before the application under
+ * study draws anything, so a corpus of one app is taken by arming this
+ * from the monitor right before launching it --
+ *   qom-set /machine/peripheral-anon/device[N] draw-capture-arm true
+ * It defaults to on so that every capture recipe recorded before it
+ * existed still means what it said; `draw-capture-arm=off` on the
+ * -device line is what defers a capture to the monitor.
+ */
+static bool ati_r350_get_cap_arm(Object *obj, Error **errp)
+{
+    return ATI_R350(obj)->cap_arm;
+}
+
+static void ati_r350_set_cap_arm(Object *obj, bool value, Error **errp)
+{
+    ATI_R350(obj)->cap_arm = value;
+}
+
+static void ati_r350_instance_init(Object *obj)
+{
+    ATI_R350(obj)->cap_arm = true;
 }
 
 static void ati_r350_class_init(ObjectClass *klass, const void *data)
@@ -4234,10 +4310,15 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
+    object_class_property_add_bool(klass, "draw-capture-arm",
+                                   ati_r350_get_cap_arm,
+                                   ati_r350_set_cap_arm);
     object_class_property_add_str(klass, "gaps", ati_r350_get_gaps, NULL);
     object_class_property_add_str(klass, "scanout", ati_r350_get_scanout,
                                   NULL);
     object_class_property_add_str(klass, "gl-stats", ati_r350_get_gl, NULL);
+    object_class_property_add_str(klass, "palette", ati_r350_get_palette,
+                                  NULL);
 
     k->class_id  = PCI_CLASS_DISPLAY_VGA;
     k->vendor_id = PCI_VENDOR_ID_ATI;
@@ -4267,6 +4348,7 @@ static const TypeInfo ati_r350_type_info = {
     .name           = TYPE_ATI_R350,
     .parent         = TYPE_PCI_DEVICE,
     .instance_size  = sizeof(ATIR350State),
+    .instance_init  = ati_r350_instance_init,
     .class_init     = ati_r350_class_init,
     .interfaces     = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
