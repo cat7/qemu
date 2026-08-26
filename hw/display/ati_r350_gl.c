@@ -73,7 +73,7 @@
 
 /*
  * One draw program and its uniform locations, resolved once at link
- * time. There are two, built from the same source with one #define
+ * time. Two variants are built from the same source with one #define
  * between them: `main` computes the blend itself and writes bytes into
  * the integer colour buffer, `add` writes only the source term as a
  * float and lets GL's blender add it. A uniform a variant does not use
@@ -85,11 +85,31 @@ typedef struct R350GlProg {
     GLint u_rect, u_org, u_texsize, u_clamp, u_textured;
     GLint u_alphatest, u_affunc, u_afref, u_discard;
     GLint u_blend, u_blendread, u_cfac, u_afac, u_konst;
+    GLint u_usk;
 } R350GlProg;
+
+/*
+ * One guest fragment program, linked. There is no single draw shader any
+ * more: milestone M5 splices the translated `us_main()` into the source
+ * below, so a program is per US program per blend variant. The corpus
+ * five captures hold contains ten distinct programs, and a guest changes
+ * program far less often than it draws, so a small direct-mapped cache
+ * keyed on the translation's signature keeps the link count at the
+ * number of programs rather than the number of draws.
+ */
+#define R350_GL_PROGSLOTS 16
+
+typedef struct R350GlProgSlot {
+    uint64_t key;               /* 0 = empty */
+    bool add;                   /* which blend variant this is */
+    R350GlProg p;
+} R350GlProgSlot;
 
 struct R350GlCtx {
     CGLContextObj ctx;
-    R350GlProg main, add;
+    R350GlProgSlot prog[R350_GL_PROGSLOTS];
+    unsigned prog_next;         /* round-robin victim */
+    uint64_t prog_hits, prog_links, prog_failed;
     /* the two format conversions the add-blend path needs, and their VAO */
     GLuint ui2n, n2ui, vao_blit;
     GLuint vao, vbo, fbo, cbuf, dst;
@@ -123,6 +143,9 @@ static const char *vs_src =
 "layout(location = 10) in vec2 a_t1;\n"
 "layout(location = 11) in vec2 a_t2;\n"
 "layout(location = 12) in float a_inv;\n"
+"layout(location = 13) in vec4 a_s0;\n"
+"layout(location = 14) in vec4 a_s1;\n"
+"layout(location = 15) in vec4 a_s2;\n"
 "uniform vec4 u_rect;\n"
 "flat out vec2 f_p0;\n"
 "flat out vec2 f_p1;\n"
@@ -134,6 +157,9 @@ static const char *vs_src =
 "flat out vec2 f_t1;\n"
 "flat out vec2 f_t2;\n"
 "flat out float f_inv;\n"
+"flat out vec4 f_s0;\n"
+"flat out vec4 f_s1;\n"
+"flat out vec4 f_s2;\n"
 "void main()\n"
 "{\n"
 "    float nx = (a_pos.x - u_rect.x) / u_rect.z * 2.0 - 1.0;\n"
@@ -147,6 +173,7 @@ static const char *vs_src =
 "    f_c0 = a_c0; f_c1 = a_c1; f_c2 = a_c2;\n"
 "    f_t0 = a_t0; f_t1 = a_t1; f_t2 = a_t2;\n"
 "    f_inv = a_inv;\n"
+"    f_s0 = a_s0; f_s1 = a_s1; f_s2 = a_s2;\n"
 "}\n";
 
 /*
@@ -160,12 +187,14 @@ static const char *vs_src =
 static const char *fs_head_main =
 "#version 330 core\n"
 "#extension GL_ARB_gpu_shader5 : require\n"
+"uniform vec4 USK[32];\n"
 "out uvec4 o_col;\n";
 
 static const char *fs_head_add =
 "#version 330 core\n"
 "#extension GL_ARB_gpu_shader5 : require\n"
 "#define R350_ADD 1\n"
+"uniform vec4 USK[32];\n"
 "out vec4 o_col;\n";
 
 static const char *fs_src =
@@ -179,6 +208,9 @@ static const char *fs_src =
 "flat in vec2 f_t1;\n"
 "flat in vec2 f_t2;\n"
 "flat in float f_inv;\n"
+"flat in vec4 f_s0;\n"
+"flat in vec4 f_s1;\n"
+"flat in vec4 f_s2;\n"
 "uniform usampler2D u_tex;\n"
 "uniform usampler2D u_dst;\n"
 "uniform float u_n255[256];\n"
@@ -248,6 +280,15 @@ static const char *fs_src =
 "    precise vec2 st = fma(vec2(w2), f_t2,\n"
 "                          fma(vec2(w1), f_t1, w0 * f_t0));\n"
 "    ts = st.x; tt = st.y;\n"
+/*
+ * The fragment program's inputs, in the units it reads them: the texel
+ * as four normalized floats through the same k/255 table the software
+ * path's r300_texel_chan() divides by, and the two interpolated colours
+ * with the rasterizer's own weights. `us_main()` above is the guest's
+ * program, translated; nothing here decides what it computes.
+ */
+"    precise vec4 c1 = fma(vec4(w2), f_s2, fma(vec4(w1), f_s1, w0 * f_s0));\n"
+"    vec4 texel = vec4(1.0);\n"
 "    if (u_textured != 0) {\n"
 "        int tx = int(ts);\n"
 "        int ty = int(tt);\n"
@@ -264,10 +305,13 @@ static const char *fs_src =
 "            ty = clamp(ty, 0, u_texsize.y - 1);\n"
 "        }\n"
 "        uvec4 tu = texelFetch(u_tex, ivec2(tx, ty), 0);\n"
-"        c.a *= u_n255[int(tu.a)];\n"
-"        c.r *= u_n255[int(tu.r)];\n"
-"        c.g *= u_n255[int(tu.g)];\n"
-"        c.b *= u_n255[int(tu.b)];\n"
+"        texel = vec4(u_n255[int(tu.r)], u_n255[int(tu.g)],\n"
+"                     u_n255[int(tu.b)], u_n255[int(tu.a)]);\n"
+"    }\n"
+"    {\n"
+"        vec4 shaded;\n"
+"        us_main(texel, c, c1, shaded);\n"
+"        c = shaded;\n"
 "    }\n"
 /*
  * GL core profile has no alpha test; DISCARD_SRC_PIXELS has no GL
@@ -387,14 +431,22 @@ static const char *fs_n2ui_src =
 "    o_col = uvec4(floor(v * 255.0 + 0.5));\n"
 "}\n";
 
-static GLuint gl_compile(GLenum type, const char *head, const char *src,
-                         const char **err)
+static GLuint gl_compile(GLenum type, const char *head, const char *mid,
+                         const char *src, const char **err)
 {
-    const char *parts[2] = { head ? head : "", src };
+    const char *parts[3];
     GLuint sh = glCreateShader(type);
     GLint ok = 0;
+    GLsizei n = 0;
 
-    glShaderSource(sh, head ? 2 : 1, head ? parts : &src, NULL);
+    if (head) {
+        parts[n++] = head;
+    }
+    if (mid) {
+        parts[n++] = mid;
+    }
+    parts[n++] = src;
+    glShaderSource(sh, n, parts, NULL);
     glCompileShader(sh);
     glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -405,11 +457,12 @@ static GLuint gl_compile(GLenum type, const char *head, const char *src,
     return sh;
 }
 
-static GLuint gl_link(const char *vsrc, const char *fhead, const char *fsrc,
-                      const char **err)
+static GLuint gl_link(const char *vsrc, const char *fhead, const char *fmid,
+                      const char *fsrc, const char **err)
 {
-    GLuint vs = gl_compile(GL_VERTEX_SHADER, NULL, vsrc, err);
-    GLuint fs = vs ? gl_compile(GL_FRAGMENT_SHADER, fhead, fsrc, err) : 0;
+    GLuint vs = gl_compile(GL_VERTEX_SHADER, NULL, NULL, vsrc, err);
+    GLuint fs = vs ? gl_compile(GL_FRAGMENT_SHADER, fhead, fmid, fsrc, err)
+                   : 0;
     GLuint prog;
     GLint ok = 0;
 
@@ -462,6 +515,50 @@ static void gl_prog_locs(R350GlProg *p)
     p->u_cfac = glGetUniformLocation(p->prog, "u_cfac");
     p->u_afac = glGetUniformLocation(p->prog, "u_afac");
     p->u_konst = glGetUniformLocation(p->prog, "u_konst");
+    p->u_usk = glGetUniformLocation(p->prog, "USK");
+}
+
+/*
+ * The linked program for one guest fragment program and one blend
+ * variant. A miss links; a hit is the ordinary case, because a guest
+ * changes fragment program far less often than it draws.
+ *
+ * A program that will not compile is a REFUSAL, not a fallback to some
+ * other shading: the caller renders that draw on the software path,
+ * where the interpreter computes the same thing this text does. So a
+ * failed link costs correctness nothing and is counted.
+ */
+static R350GlProg *gl_prog_for(R350GlCtx *g, const R350GlReq *r, bool add)
+{
+    const char *err = NULL;
+    R350GlProgSlot *sl;
+    unsigned k;
+    GLuint prog;
+
+    for (k = 0; k < R350_GL_PROGSLOTS; k++) {
+        if (g->prog[k].key == r->us_key && g->prog[k].add == add) {
+            g->prog_hits++;
+            return g->prog[k].p.prog ? &g->prog[k].p : NULL;
+        }
+    }
+    prog = gl_link(vs_src, add ? fs_head_add : fs_head_main,
+                   r->us_glsl, fs_src, &err);
+    sl = &g->prog[g->prog_next];
+    g->prog_next = (g->prog_next + 1) % R350_GL_PROGSLOTS;
+    if (sl->p.prog) {
+        glDeleteProgram(sl->p.prog);
+    }
+    memset(sl, 0, sizeof(*sl));
+    sl->key = r->us_key;
+    sl->add = add;
+    sl->p.prog = prog;
+    if (!prog) {
+        g->prog_failed++;
+        return NULL;
+    }
+    g->prog_links++;
+    gl_prog_locs(&sl->p);
+    return &sl->p;
 }
 
 R350GlCtx *ati_r350_gl_open(const char **err)
@@ -494,12 +591,9 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     CGLDestroyPixelFormat(pix);
     CGLSetCurrentContext(g->ctx);
 
-    g->main.prog = gl_link(vs_src, fs_head_main, fs_src, err);
-    g->add.prog = g->main.prog
-                  ? gl_link(vs_src, fs_head_add, fs_src, err) : 0;
-    g->ui2n = g->add.prog
-              ? gl_link(vs_blit_src, NULL, fs_ui2n_src, err) : 0;
-    g->n2ui = g->ui2n ? gl_link(vs_blit_src, NULL, fs_n2ui_src, err) : 0;
+    g->ui2n = gl_link(vs_blit_src, NULL, NULL, fs_ui2n_src, err);
+    g->n2ui = g->ui2n ? gl_link(vs_blit_src, NULL, NULL, fs_n2ui_src, err)
+                      : 0;
     if (!g->n2ui) {
         ati_r350_gl_close(g);
         return NULL;
@@ -540,9 +634,6 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
 
-    gl_prog_locs(&g->add);
-    gl_prog_locs(&g->main);         /* leaves the main program current */
-
     {
         static const struct { GLint loc, n, off; } at[] = {
             { 0, 2, 0 }, { 1, 4, 2 }, { 2, 2, 6 },
@@ -550,6 +641,7 @@ R350GlCtx *ati_r350_gl_open(const char **err)
             { 6, 4, 14 }, { 7, 4, 18 }, { 8, 4, 22 },
             { 9, 2, 26 }, { 10, 2, 28 }, { 11, 2, 30 },
             { 12, 1, 32 },
+            { 13, 4, 33 }, { 14, 4, 37 }, { 15, 4, 41 },
         };
 
         glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
@@ -578,6 +670,8 @@ void ati_r350_gl_close(R350GlCtx *g)
         return;
     }
     if (g->ctx) {
+        unsigned k;
+
         CGLSetCurrentContext(g->ctx);
         glDeleteTextures(1, &g->dst);
         glDeleteTextures(1, &g->acc);
@@ -588,8 +682,11 @@ void ati_r350_gl_close(R350GlCtx *g)
         glDeleteBuffers(1, &g->vbo);
         glDeleteVertexArrays(1, &g->vao);
         glDeleteVertexArrays(1, &g->vao_blit);
-        glDeleteProgram(g->main.prog);
-        glDeleteProgram(g->add.prog);
+        for (k = 0; k < R350_GL_PROGSLOTS; k++) {
+            if (g->prog[k].p.prog) {
+                glDeleteProgram(g->prog[k].p.prog);
+            }
+        }
         glDeleteProgram(g->ui2n);
         glDeleteProgram(g->n2ui);
         CGLSetCurrentContext(NULL);
@@ -602,6 +699,19 @@ void ati_r350_gl_close(R350GlCtx *g)
 const char *ati_r350_gl_describe(R350GlCtx *g)
 {
     return g ? g->desc : "none";
+}
+
+/*
+ * The shader cache, for `gl-stats`. A link count near the draw count
+ * means the caller's key is changing when the program is not, which is
+ * a real cost: relinking a GLSL program mid-frame is a pipeline stall.
+ */
+void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
+                            uint64_t *failed)
+{
+    *hits = g ? g->prog_hits : 0;
+    *links = g ? g->prog_links : 0;
+    *failed = g ? g->prog_failed : 0;
 }
 
 /*
@@ -770,8 +880,14 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      */
     CGLSetCurrentContext(g->ctx);
 
-    p = r->add_blend ? &g->add : &g->main;
+    p = gl_prog_for(g, r, r->add_blend);
+    if (!p) {
+        return false;      /* the program would not compile: fall back */
+    }
     glUseProgram(p->prog);
+    if (p->u_usk >= 0 && r->us_konst) {
+        glUniform4fv(p->u_usk, R350_GL_USK, r->us_konst);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                            GL_TEXTURE_2D, g->cbuf, 0);
@@ -918,7 +1034,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDrawArrays(GL_TRIANGLES, 0, 3);
 
-        glUseProgram(g->main.prog);
+        glUseProgram(p->prog);
         glBindVertexArray(g->vao);
         glActiveTexture(GL_TEXTURE0);
     } else if (r->npass > 1) {
@@ -987,6 +1103,12 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req)
 const char *ati_r350_gl_describe(R350GlCtx *g)
 {
     return "none";
+}
+
+void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
+                            uint64_t *failed)
+{
+    *hits = *links = *failed = 0;
 }
 
 #endif /* CONFIG_DARWIN */

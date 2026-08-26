@@ -33,6 +33,7 @@
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "ati_r350_pvs.h"
+#include "ati_r350_us.h"
 #include "ati_r350_cap.h"
 #include "ati_r350_gl.h"
 
@@ -93,6 +94,12 @@ typedef enum ATIR350GapKind {
     R350_GAP_TEX_SWIZZLE,    /* TX_FORMAT1 component select not modelled */
     R350_GAP_AOS_ARRAYS,     /* more vertex arrays bound than we fetch */
     R350_GAP_VTE_FMT,        /* VAP_VTE_CNTL vertex format bit not modelled */
+    R350_GAP_FS_RGB_OP,      /* US colour-side opcode not implemented */
+    R350_GAP_FS_ALPHA_OP,    /* US alpha-side opcode not implemented */
+    R350_GAP_FS_TEX_OP,      /* US texture instruction not implemented */
+    R350_GAP_FS_INDIRECT,    /* US_CONFIG names an indirection level */
+    R350_GAP_FS_RS_ROUTE,    /* rasterizer routes something we do not emit */
+    R350_GAP_FS_OUT_FMT,     /* US_OUT_FMT_0 component select not modelled */
     R350_GAP_MAX
 } ATIR350GapKind;
 
@@ -128,6 +135,7 @@ typedef enum ATIR350GlFallback {
     R350_GLF_SELFBLEND,     /* self-overlapping blend needing too many passes */
     R350_GLF_SURFACE,       /* target too large, or it would not resize */
     R350_GLF_BACKEND,       /* the backend itself declined the request */
+    R350_GLF_FSPROG,        /* fragment program the translator refused */
     R350_GLF_MAX
 } ATIR350GlFallback;
 
@@ -721,6 +729,31 @@ struct ATIR350State {
     uint64_t pvs_tr_by_reason[3];       /* vector op, math op, dst file */
     uint32_t pvs_tr_last_bytes, pvs_tr_last_nconst;
     uint32_t pvs_tr_last_in, pvs_tr_last_out;
+
+    /*
+     * Phase 2, milestone M5: the fragment program in force, decoded once
+     * per draw out of the US register banks. It lives here rather than in
+     * the per-draw state because it is three kilobytes of decoded
+     * instruction and because the GL backend keys its shader cache on it.
+     * `us_sig` is the signature of the control words and instruction
+     * dwords the decode was made from, so a thousand draws of one program
+     * cost one decode.
+     */
+    R300UsProgram us_prog;
+    uint64_t us_sig;
+    uint64_t us_draws, us_refused;
+    /*
+     * The same program as GLSL, for the host-GPU backend, translated
+     * whenever the decode is. `us_glsl_key` is what the backend caches
+     * the linked shader under and is never zero for a usable program.
+     * The constants are flattened per draw because they change without
+     * the program changing.
+     */
+    char us_glsl[16 * 1024];
+    bool us_glsl_ok;
+    uint64_t us_glsl_key;
+    uint64_t us_glsl_ok_n, us_glsl_refused_n;
+    float us_konst_flat[R300_US_CONSTS * 4];
 
     /*
      * Staging buffer for an in-flight R300 3D_DRAW_IMMD_2 payload

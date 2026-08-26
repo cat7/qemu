@@ -1017,6 +1017,43 @@
 #define R300_RB3D_AARESOLVE_PITCH     0x4e84
 #define R300_RB3D_AARESOLVE_CTL       0x4e88
 #define R300_AARESOLVE_MODE           (1u << 0)
+/*
+ * The universal shader's control words and its six instruction banks.
+ * The banks are RAM holding many programs at once; US_CONFIG says how
+ * many indirection levels are live, US_CODE_ADDR_n where each level's
+ * ALU and texture segments start and how long they are, and
+ * US_CODE_OFFSET a relocation added to both starts so the guest can
+ * rewrite the store without a pipeline flush. Resolving all four is
+ * what turns "a hundred instruction slots have been written" into the
+ * two instructions a given draw actually is.
+ */
+#define R300_US_CONFIG                0x4600
+#define R300_US_PIXSIZE               0x4604
+#define R300_US_CODE_OFFSET           0x4608
+#define R300_US_CODE_ADDR_0           0x4610
+#define R300_US_TEX_INST_0            0x4620
+#define R300_US_OUT_FMT_0             0x46a4
+#define R300_US_ALU_RGB_ADDR_0        0x46c0
+#define R300_US_ALU_ALPHA_ADDR_0      0x47c0
+#define R300_US_ALU_RGB_INST_0        0x48c0
+#define R300_US_ALU_ALPHA_INST_0      0x49c0
+/*
+ * The rasterizer's interpolator routing: RS_INST_n says which frame
+ * register each interpolated quantity is dropped into and RS_IP_n where
+ * in the vertex stage's output packet it comes from. Chess.app's board
+ * is the only thing in the corpus that issues two of them -- the second
+ * carries the specular colour its fragment program adds.
+ */
+#define R300_RS_COUNT                 0x4300
+#define R300_RS_INST_COUNT            0x4304
+#define R300_RS_IP_0                  0x4310
+#define R300_RS_INST_0                0x4330
+/*
+ * US_ALU_CONST, four dwords per vector in R, G, B, A order, stored as
+ * 24-bit floats (IEEE with the low mantissa byte dropped). Vector 0 is
+ * what the driver's solid-fill shader hands the desktop backdrop, which
+ * is why it also carries the name the model has used for it all along.
+ */
 #define R300_PFS_PARAM_0_X            0x4c00
 #define R300_GA_POINT_S0              0x4200
 #define R300_GA_POINT_T0              0x4204

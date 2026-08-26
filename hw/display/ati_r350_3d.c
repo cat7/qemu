@@ -31,6 +31,13 @@
 typedef struct R300Vtx {
     float x, y, z, w;
     float r, g, b, a;
+    /*
+     * The second interpolated colour. The rasterizer routes up to four,
+     * and a fragment program that names two is what Chess.app's board is:
+     * `MAD OUT.rgb = texel, colour0, colour1` -- diffuse times the wood
+     * plus a specular term this model had no second colour to carry.
+     */
+    float r1, g1, b1, a1;
     float s, t;
 } R300Vtx;
 
@@ -44,6 +51,16 @@ typedef struct R300DrawState {
     bool vs_run;            /* consume it: it is uploaded and not bypassed */
     bool vs_color;          /* take the per-vertex colour from its output */
     unsigned vs_color_out;  /* which output register that colour is */
+    bool vs_color2;         /* the program emits a second colour as well */
+    unsigned vs_color2_out;
+    /*
+     * The fragment program in force. It lives in the device rather than
+     * here so that the GL backend can key its shader cache on it, and it
+     * is NULL only when the control registers describe nothing.
+     */
+    const R300UsProgram *fs;
+    bool fs_run;            /* this model can execute it */
+    bool fs_col1;           /* it names a second interpolated colour */
     bool vs_texcoord;       /* take the texture coordinate from its output */
     unsigned vs_tex_out;    /* which output register that coordinate is */
     unsigned attr_size[R300_AOS_MAX];  /* dwords per vertex, per input reg */
@@ -424,6 +441,42 @@ static inline bool r300_edge_accept(float w, bool top_left)
     return w > 0.0f || (w == 0.0f && top_left);
 }
 
+/*
+ * The pixel stack frame the fragment program starts from: the
+ * rasterizer's own outputs, dropped into the registers RS_INST named.
+ * Registers it does not name read zero, which is what the hardware's
+ * frame holds and what the GLSL translation declares.
+ *
+ * This is the whole of the interface between the two stages. What used
+ * to sit here instead was `colour *= texel` for every textured draw --
+ * right for two of the ten programs the guests in this project's corpus
+ * upload and wrong for the rest.
+ */
+static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
+                                 const float *tex, const float col[2][4])
+{
+    const R300UsProgram *p = d->fs;
+    unsigned n;
+
+    for (n = 0; n < p->nregs_used; n++) {
+        f->r[n][0] = f->r[n][1] = f->r[n][2] = f->r[n][3] = 0.0f;
+    }
+    f->out[0] = f->out[1] = f->out[2] = f->out[3] = 0.0f;
+    if (tex && p->tex_dst >= 0) {
+        float *r = f->r[p->tex_dst];
+
+        r[0] = tex[0]; r[1] = tex[1]; r[2] = tex[2]; r[3] = tex[3];
+    }
+    for (n = 0; n < R300_US_RS_COLS; n++) {
+        if (p->rs.col_reg[n] >= 0) {
+            const float *c = col[p->rs.col_pkt[n]];
+            float *r = f->r[p->rs.col_reg[n]];
+
+            r[0] = c[0]; r[1] = c[1]; r[2] = c[2]; r[3] = c[3];
+        }
+    }
+}
+
 static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                             const R300Vtx *v0, const R300Vtx *v1,
                             const R300Vtx *v2)
@@ -585,15 +638,49 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             cg = w0 * v0->g + w1 * v1->g + w2 * v2->g;
             cb = w0 * v0->b + w1 * v1->b + w2 * v2->b;
             ca = w0 * v0->a + w1 * v1->a + w2 * v2->a;
-            if (d->textured) {
-                float ts = w0 * v0->s + w1 * v1->s + w2 * v2->s;
-                float tt = w0 * v0->t + w1 * v1->t + w2 * v2->t;
-                uint32_t texel = r300_sample_tex(s, d, (int)ts, (int)tt);
+            if (d->fs_run) {
+                R300UsRegs f;
+                float tex[4], col[2][4];
+                bool textured = d->textured && d->fs->tex_dst >= 0;
 
-                ca *= r300_texel_chan(d, texel, 0);
-                cr *= r300_texel_chan(d, texel, 1);
-                cg *= r300_texel_chan(d, texel, 2);
-                cb *= r300_texel_chan(d, texel, 3);
+                if (textured) {
+                    float ts = w0 * v0->s + w1 * v1->s + w2 * v2->s;
+                    float tt = w0 * v0->t + w1 * v1->t + w2 * v2->t;
+                    uint32_t texel = r300_sample_tex(s, d, (int)ts, (int)tt);
+
+                    tex[0] = r300_texel_chan(d, texel, 1);
+                    tex[1] = r300_texel_chan(d, texel, 2);
+                    tex[2] = r300_texel_chan(d, texel, 3);
+                    tex[3] = r300_texel_chan(d, texel, 0);
+                } else {
+                    /*
+                     * A program with a fetch whose texture unit this draw
+                     * does not enable. WHITE, not black: the same 1x1
+                     * white texture the GL backend binds for an
+                     * untextured draw, and the value that leaves a
+                     * modulate program computing its colour operand
+                     * alone rather than blacking the draw out.
+                     */
+                    tex[0] = tex[1] = tex[2] = tex[3] = 1.0f;
+                }
+                col[0][0] = cr;
+                col[0][1] = cg;
+                col[0][2] = cb;
+                col[0][3] = ca;
+                if (d->fs_col1) {
+                    col[1][0] = w0 * v0->r1 + w1 * v1->r1 + w2 * v2->r1;
+                    col[1][1] = w0 * v0->g1 + w1 * v1->g1 + w2 * v2->g1;
+                    col[1][2] = w0 * v0->b1 + w1 * v1->b1 + w2 * v2->b1;
+                    col[1][3] = w0 * v0->a1 + w1 * v1->a1 + w2 * v2->a1;
+                } else {
+                    col[1][0] = col[1][1] = col[1][2] = col[1][3] = 0.0f;
+                }
+                r300_fs_frame(d, &f, tex, col);
+                r300_us_run(d->fs, &f);
+                cr = f.out[0];
+                cg = f.out[1];
+                cb = f.out[2];
+                ca = f.out[3];
             }
             if (d->alpha_test) {
                 bool pass;
@@ -823,6 +910,7 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
     v->g = d->flat_g;
     v->b = d->flat_b;
     v->a = d->flat_a;
+    v->r1 = v->g1 = v->b1 = v->a1 = 0.0f;
     v->s = v->t = 0.0f;
     /*
      * Everything below reads the vertex as one flat block whose first
@@ -1011,6 +1099,24 @@ static void r300_vs_color(R300Vtx *v, const float c[4])
 }
 
 /*
+ * The second colour the vertex stage emits. Chess.app's lighting program
+ * writes its specular term there and its fragment program adds it, which
+ * is the one arithmetic gap milestone M5 set out to close; nothing else
+ * in the corpus emits two.
+ */
+static void r300_vs_color1(R300Vtx *v, const float c[4])
+{
+    if (!isfinite(c[0]) || !isfinite(c[1]) ||
+        !isfinite(c[2]) || !isfinite(c[3])) {
+        return;
+    }
+    v->r1 = c[0];
+    v->g1 = c[1];
+    v->b1 = c[2];
+    v->a1 = c[3];
+}
+
+/*
  * Run the vertex program for this vertex, as far as this model consumes
  * it: the clip-space position, and the colour the rasterizer interpolates.
  *
@@ -1072,6 +1178,9 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
 
     if ((r.out_written & (1u << d->vs_color_out)) && r300_vs_has_color(d)) {
         r300_vs_color(v, r.out[d->vs_color_out]);
+    }
+    if (d->vs_color2 && (r.out_written & (1u << d->vs_color2_out))) {
+        r300_vs_color1(v, r.out[d->vs_color2_out]);
     }
     if (d->vs_texcoord && (r.out_written & (1u << d->vs_tex_out))) {
         r300_vs_texcoord(d, v, r.out[d->vs_tex_out]);
@@ -1146,6 +1255,160 @@ static void r300_pvs_translate(ATIR350State *s, const R300PvsProgram *p)
     trace_ati_r350_pvs_glsl(p->first, p->last, p->cbase, p->cmax, ok,
                             (uint32_t)strlen(body), info.nconst,
                             info.in_mask, info.out_mask);
+}
+
+/*
+ * Milestone M5: resolve the fragment program this draw runs.
+ *
+ * The six US banks are RAM holding every program the guest has ever
+ * uploaded; which slots of them a draw executes is US_CONFIG,
+ * US_CODE_ADDR_3 and the US_CODE_OFFSET relocation, and what those slots
+ * mean for a pixel also needs the rasterizer routing that says which
+ * frame register each interpolated quantity lands in. All of it is
+ * decoded here, once per draw, and the result is what the rasterizer and
+ * the GL backend both shade with.
+ *
+ * A program the interpreter cannot express is COUNTED and the draw
+ * renders its interpolated colour unmodulated -- deliberately not the
+ * old `texel * colour`, which was never anything but a guess at what a
+ * program computes and is what this milestone removes.
+ */
+static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
+{
+    R300UsProgram *p = &s->us_prog;
+    const uint32_t *regs = s->regs;
+    float konst[R300_US_CONSTS][4];
+    uint64_t sig;
+    unsigned i;
+
+    /*
+     * One decode per program, not per draw: the signature is the four
+     * control words, which is what selects the slots. A guest that
+     * rewrites an in-range instruction without touching them would be
+     * missed, so US_CODE_OFFSET -- the register whose whole purpose is
+     * to move a program rather than rewrite it in place -- is in the
+     * signature, and every write into an ALU or texture bank clears it.
+     */
+    sig = 1 | ((uint64_t)regs[R300_US_CONFIG >> 2] << 1) |
+          ((uint64_t)(regs[R300_US_CODE_OFFSET >> 2] & 0xffffff) << 25);
+    if (sig != s->us_sig ||
+        p->nregs != (regs[R300_US_PIXSIZE >> 2] & 0x1f) + 1) {
+        s->us_sig = sig;
+        for (i = 0; i < R300_US_CONSTS; i++) {
+            unsigned k = (R300_PFS_PARAM_0_X >> 2) + i * 4;
+
+            konst[i][0] = r300_f32(regs[k] << 8);
+            konst[i][1] = r300_f32(regs[k + 1] << 8);
+            konst[i][2] = r300_f32(regs[k + 2] << 8);
+            konst[i][3] = r300_f32(regs[k + 3] << 8);
+        }
+        r300_us_analyse(p, regs[R300_US_CONFIG >> 2],
+                        regs[R300_US_CODE_OFFSET >> 2],
+                        &regs[R300_US_CODE_ADDR_0 >> 2],
+                        regs[R300_US_PIXSIZE >> 2],
+                        regs[R300_US_OUT_FMT_0 >> 2],
+                        &regs[R300_US_TEX_INST_0 >> 2],
+                        &regs[R300_US_ALU_RGB_ADDR_0 >> 2],
+                        &regs[R300_US_ALU_RGB_INST_0 >> 2],
+                        &regs[R300_US_ALU_ALPHA_ADDR_0 >> 2],
+                        &regs[R300_US_ALU_ALPHA_INST_0 >> 2],
+                        konst,
+                        regs[R300_RS_INST_COUNT >> 2],
+                        &regs[R300_RS_INST_0 >> 2],
+                        &regs[R300_RS_IP_0 >> 2]);
+        if (!p->expressible) {
+            const R300UsGaps *g = &p->gaps;
+
+            if (g->has_rgb_op) {
+                ati_r350_note_gap(s, R350_GAP_FS_RGB_OP, g->rgb_op);
+            }
+            if (g->has_a_op) {
+                ati_r350_note_gap(s, R350_GAP_FS_ALPHA_OP, g->a_op);
+            }
+            if (g->has_tex_op) {
+                ati_r350_note_gap(s, R350_GAP_FS_TEX_OP, g->tex_op);
+            }
+            if (g->has_indirect) {
+                ati_r350_note_gap(s, R350_GAP_FS_INDIRECT, g->indirect);
+            }
+            if (g->has_rs_route) {
+                ati_r350_note_gap(s, R350_GAP_FS_RS_ROUTE, g->rs_route);
+            }
+            if (g->has_out_fmt) {
+                ati_r350_note_gap(s, R350_GAP_FS_OUT_FMT, g->out_fmt);
+            }
+        }
+        trace_ati_r350_fs_program(p->alu_first, p->nalu, p->tex_first,
+                                  p->ntex, p->nregs_used, p->tex_dst,
+                                  p->rs.col_reg[0], p->rs.col_reg[1],
+                                  p->expressible);
+        /*
+         * The same program for the host GPU. Translated here, with the
+         * decode, so a thousand draws of one program cost one
+         * translation and one shader link -- and so that a program the
+         * translator refuses is refused before any pixel depends on it.
+         */
+        s->us_glsl_ok = r300_us_glsl(p, s->us_glsl, sizeof(s->us_glsl));
+        /*
+         * The key the GL backend caches its linked shader under is a
+         * hash of the TEXT, not of the control words. Those change far
+         * more often than the program does -- US_CODE_OFFSET exists
+         * precisely so the driver can move a program rather than
+         * rewrite it, and a live Chess session relocates one 4720 times
+         * while uploading ten distinct programs. Keyed on the words, a
+         * shader cache would relink on nearly every draw.
+         */
+        if (s->us_glsl_ok) {
+            const char *c = s->us_glsl;
+            uint64_t h = 1469598103934665603ULL;
+
+            while (*c) {
+                h = (h ^ (uint8_t)*c++) * 1099511628211ULL;
+            }
+            s->us_glsl_key = h | 1;
+            s->us_glsl_ok_n++;
+        } else {
+            s->us_glsl_key = 0;
+            s->us_glsl_refused_n++;
+        }
+        trace_ati_r350_us_glsl(p->alu_first, p->nalu, s->us_glsl_ok,
+                               (uint32_t)strlen(s->us_glsl), 0);
+    } else {
+        /* the constants are per-draw even when the program is not */
+        for (i = 0; i < R300_US_CONSTS; i++) {
+            unsigned k = (R300_PFS_PARAM_0_X >> 2) + i * 4;
+
+            p->konst[i][0] = r300_f32(regs[k] << 8);
+            p->konst[i][1] = r300_f32(regs[k + 1] << 8);
+            p->konst[i][2] = r300_f32(regs[k + 2] << 8);
+            p->konst[i][3] = r300_f32(regs[k + 3] << 8);
+        }
+    }
+
+    /* the backend takes the constant file as a flat array, per draw */
+    for (i = 0; i < R300_US_CONSTS; i++) {
+        s->us_konst_flat[i * 4 + 0] = p->konst[i][0];
+        s->us_konst_flat[i * 4 + 1] = p->konst[i][1];
+        s->us_konst_flat[i * 4 + 2] = p->konst[i][2];
+        s->us_konst_flat[i * 4 + 3] = p->konst[i][3];
+    }
+
+    d->fs = p;
+    d->fs_run = p->valid && p->expressible;
+    d->fs_col1 = d->fs_run && p->rs.col_reg[1] >= 0;
+    s->us_draws++;
+    if (p->valid && !p->expressible) {
+        s->us_refused++;
+    }
+    /*
+     * An ALU that writes neither a frame register nor the output fifo
+     * cannot produce a colour, so the draw contributes nothing to the
+     * colour buffer -- the same situation RB3D_COLOR_CHANNEL_MASK == 0
+     * describes above, arrived at from the shader side. Dropping it is
+     * not an optimisation: shading it would paint something the hardware
+     * never paints.
+     */
+    return !d->fs_run || p->writes_out;
 }
 
 /*
@@ -1533,6 +1796,16 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                              d->textured && first_tex < R300_PVS_OUT_REGS &&
                              (d->vs.out_mask & (1u << first_tex));
             d->vs_tex_out = first_tex;
+            /*
+             * The second colour, for the fragment program that adds one.
+             * VAP_OUTPUT_VTX_FMT_0 packs the colours after the position,
+             * so it is simply the next output register, and it exists
+             * only when the vertex stage declares two.
+             */
+            d->vs_color2_out = first_color + 1;
+            d->vs_color2 = d->vs_run && !d->vs.plain_matrix && ncolor >= 2 &&
+                           d->vs_color2_out < R300_PVS_OUT_REGS &&
+                           (d->vs.out_mask & (1u << d->vs_color2_out));
         }
     }
     /*
@@ -1559,6 +1832,9 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->flat_a = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2) + 3] << 8);
     } else {
         d->flat_r = d->flat_g = d->flat_b = d->flat_a = 1.0f;
+    }
+    if (!r300_fs_setup(s, d)) {
+        return false;
     }
     /*
      * What the colour buffer was configured to do with this draw, read
@@ -1939,13 +2215,16 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
     }
 
     /*
-     * The VRAM pointer and the vertex program are the only members of
-     * the state that are not plain data, and nothing below
-     * r300_run_prims() reads either, so a record drops both: the harness
-     * substitutes its own VRAM and never resurrects a program.
+     * The VRAM pointer, the vertex program and the fragment program are
+     * the only members of the state that are not plain data. The harness
+     * substitutes its own VRAM and never resurrects a vertex program --
+     * the positions are already transformed. The FRAGMENT program is a
+     * different matter: since milestone M5 it is what the draw shades
+     * with, so it is written out by value and the pointer is cleared.
      */
     st = *d;
     st.vram = NULL;
+    st.fs = NULL;
     memset(&st.vs, 0, sizeof(st.vs));
 
     before = g_malloc(h.rect_bytes);
@@ -1956,6 +2235,7 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
 
     r300_cap_write(s, &h, sizeof(h));
     r300_cap_write(s, &st, sizeof(st));
+    r300_cap_write(s, &s->us_prog, sizeof(s->us_prog));
     r300_cap_write(s, vb, sizeof(*vb) * nvtx);
     if (h.tex_bytes) {
         r300_cap_write(s, d->vram + tex_off, h.tex_bytes);
@@ -3092,6 +3372,9 @@ static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
     v[28] = t1->s; v[29] = t1->t;
     v[30] = t2->s; v[31] = t2->t;
     v[32] = inv;
+    v[33] = t0->r1; v[34] = t0->g1; v[35] = t0->b1; v[36] = t0->a1;
+    v[37] = t1->r1; v[38] = t1->g1; v[39] = t1->b1; v[40] = t1->a1;
+    v[41] = t2->r1; v[42] = t2->g1; v[43] = t2->b1; v[44] = t2->a1;
 }
 
 /*
@@ -3200,6 +3483,15 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
 
     if (d->resolve) {
         return r300_gl_fallback(s, R350_GLF_RESOLVE, prim, nvtx);
+    }
+    /*
+     * A fragment program the translator refused. The software path runs
+     * the same refusal through the interpreter and paints the
+     * interpolated colour; sending this draw to a shader that computes
+     * something else would be the one thing worse than either.
+     */
+    if (!d->fs_run || !s->us_glsl_ok) {
+        return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
     }
     /*
      * Assemble first: a primitive this path does not know is the
@@ -3366,6 +3658,9 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.k_b = d->k_b; req.k_a = d->k_a;
     /* only verify wants the pixels on the host; see the coherency block */
     req.out = s->gl_mode == R350_GL_VERIFY ? s->gl_out : NULL;
+    req.us_glsl = s->us_glsl;
+    req.us_key = s->us_glsl_key;
+    req.us_konst = s->us_konst_flat;
 
     if (s->gl_mode == R350_GL_VERIFY) {
         r300_gl_rd_rect(d, xr, x0, y0, w, h, s->gl_before);

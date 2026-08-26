@@ -34,7 +34,7 @@ r350_gl_deps = []
 if host_os == 'darwin'
   r350_gl_deps += dependency('appleframeworks', modules: 'OpenGL')
 endif
-system_ss.add(when: 'CONFIG_ATI_R350', if_true: [files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c', 'ati_r350_pvs_glsl.c', 'ati_r350_gl.c'), r350_gl_deps])
+system_ss.add(when: 'CONFIG_ATI_R350', if_true: [files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c', 'ati_r350_pvs_glsl.c', 'ati_r350_us.c', 'ati_r350_us_glsl.c', 'ati_r350_gl.c'), r350_gl_deps])
 
 system_ss.add(when: 'CONFIG_EXYNOS4', if_true: files('exynos4210_fimd.c'))
 system_ss.add(when: 'CONFIG_FRAMEBUFFER', if_true: files('framebuffer.c'))

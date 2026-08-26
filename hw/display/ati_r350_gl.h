@@ -49,8 +49,14 @@
  *   14..25  triangle vertex 0/1/2 colours
  *   26..31  triangle vertex 0/1/2 texture coordinates
  *   32      1.0f / signed area, computed on the HOST
+ *   33..44  triangle vertex 0/1/2 SECOND colours
+ *
+ * The second colour is the one a fragment program can add to the
+ * modulated texel -- Chess.app's specular term -- and it is carried at
+ * the corners like the first so the fragment stage interpolates it with
+ * the same weights.
  */
-#define R350_GL_VSTRIDE 33
+#define R350_GL_VSTRIDE 45
 
 /*
  * How many uploaded textures the backend keeps, plus one: slot
@@ -64,6 +70,9 @@
  * is a bounded worst case rather than an open-ended allocation.
  */
 #define R350_GL_TEXSLOTS 32
+
+/* US_ALU_CONST vectors a translated fragment program may name */
+#define R350_GL_USK 32
 
 typedef struct R350GlReq {
     /*
@@ -158,6 +167,22 @@ typedef struct R350GlReq {
      * something outside the 3D engine needs to look.
      */
     uint8_t *out;
+
+    /*
+     * The fragment program, translated to GLSL by ati_r350_us_glsl.c:
+     * the text of a `void us_main(vec4 tex0, vec4 col0, vec4 col1, out
+     * vec4 outc)` the backend splices into its own fragment shader,
+     * `us_key` a signature the backend caches the linked program under,
+     * and `us_konst` the thirty-two constant vectors the program may
+     * name, uploaded per draw.
+     *
+     * Every draw carries one. The backend does not have a default: the
+     * shading the caller wants is whatever the guest's program says, and
+     * there is no arithmetic here that is not in that text.
+     */
+    const char *us_glsl;
+    uint64_t us_key;
+    const float *us_konst;      /* 32 * 4 floats */
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;
@@ -201,5 +226,9 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req);
 
 /* a one-line description of the backend actually in use, for `qom-get gl` */
 const char *ati_r350_gl_describe(R350GlCtx *g);
+
+/* the fragment-shader cache: hits, links, and programs that would not build */
+void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
+                            uint64_t *failed);
 
 #endif /* ATI_R350_GL_H */

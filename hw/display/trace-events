@@ -370,3 +370,5 @@ ati_r350_3d_gl(uint32_t prim, uint32_t nvtx, int x0, int y0, int x1, int y1, uin
 ati_r350_3d_gl_fallback(const char *why, uint32_t prim, uint32_t nvtx) "R300 gl fallback %s prim=%u nvtx=%u"
 ati_r350_3d_gl_verify(uint32_t prim, uint32_t px, uint32_t diff, uint32_t maxd, int x0, int y0, int x1, int y1) "R300 gl verify prim=%u px=%u differing=%u max=%u rect(%d,%d)-(%d,%d)"
 ati_r350_gl_open(const char *desc) "R300 gl backend: %s"
+ati_r350_fs_program(uint32_t afirst, uint32_t nalu, uint32_t tfirst, uint32_t ntex, uint32_t nregs, int texdst, int col0, int col1, int ok) "R300 fs program alu %u+%u tex %u+%u regs=%u texdst=%d col=(%d,%d) ok=%d"
+ati_r350_us_glsl(uint32_t afirst, uint32_t nalu, int ok, uint32_t bytes, int slot) "R300 us->glsl alu %u+%u ok=%d bytes=%u slot=%d"

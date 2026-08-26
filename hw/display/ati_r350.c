@@ -3802,6 +3802,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         h.state_bytes = ati_r350_cap_state_bytes();
         h.vtx_bytes = ati_r350_cap_vtx_bytes();
         h.vram_bytes = ATI_R350_VRAM_SIZE;
+        h.us_bytes = sizeof(R300UsProgram);
         if (fwrite(&h, 1, sizeof(h), s->cap_fp) != sizeof(h)) {
             error_setg_errno(errp, errno, "cannot write draw-capture file %s",
                              s->cap_path);
@@ -4099,6 +4100,12 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_TEX_SWIZZLE]  = "texture component select",
     [R350_GAP_AOS_ARRAYS]   = "vertex arrays bound",
     [R350_GAP_VTE_FMT]      = "viewport vertex format",
+    [R350_GAP_FS_RGB_OP]    = "fragment colour opcode",
+    [R350_GAP_FS_ALPHA_OP]  = "fragment alpha opcode",
+    [R350_GAP_FS_TEX_OP]    = "fragment texture instruction",
+    [R350_GAP_FS_INDIRECT]  = "fragment indirection level",
+    [R350_GAP_FS_RS_ROUTE]  = "rasterizer attribute routing",
+    [R350_GAP_FS_OUT_FMT]   = "fragment output format",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
@@ -4162,6 +4169,7 @@ static const char *const ati_r350_gl_fb_names[R350_GLF_MAX] = {
     [R350_GLF_SELFBLEND] = "self-overlapping blend",
     [R350_GLF_SURFACE]  = "render target size",
     [R350_GLF_BACKEND]  = "backend declined",
+    [R350_GLF_FSPROG]   = "fragment program refused",
 };
 
 const char *ati_r350_gl_fb_name(ATIR350GlFallback why)
@@ -4198,6 +4206,40 @@ static char *ati_r350_get_pvs(Object *obj, Error **errp)
                            " in 0x%x, out 0x%x", s->pvs_tr_last_bytes,
                            s->pvs_tr_last_nconst, s->pvs_tr_last_in,
                            s->pvs_tr_last_out);
+    return g_string_free(out, FALSE);
+}
+
+/*
+ * `us-stats` property: what the fragment stage actually ran (milestone
+ * M5). Read it from the monitor with
+ *   qom-get /machine/peripheral-anon/device[N] us-stats
+ *
+ * Unlike `pvs-stats` this one is never off: every draw's colour comes
+ * from the guest's own fragment program now, so how many of them the
+ * interpreter could execute and how many the GLSL translator could
+ * express is the coverage measurement for the whole pixel path. A
+ * refusal is also noted as an ordinary gap, so `gaps` names the
+ * construct.
+ */
+static char *ati_r350_get_us(Object *obj, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+    GString *out = g_string_new(NULL);
+    const R300UsProgram *p = &s->us_prog;
+
+    g_string_append_printf(out, "draws %" PRIu64 ", refused %" PRIu64
+                           "\nprogram decodes %" PRIu64
+                           " (translated %" PRIu64 ", refused %" PRIu64 ")",
+                           s->us_draws, s->us_refused,
+                           s->us_glsl_ok_n + s->us_glsl_refused_n,
+                           s->us_glsl_ok_n, s->us_glsl_refused_n);
+    g_string_append_printf(out, "\nlast: %u alu at %u, %u tex at %u, "
+                           "%u regs, texdst %d, colours (%d,%d), "
+                           "%u bytes of GLSL",
+                           p->nalu, p->alu_first, p->ntex, p->tex_first,
+                           p->nregs_used, p->tex_dst, p->rs.col_reg[0],
+                           p->rs.col_reg[1],
+                           (unsigned)strlen(s->us_glsl));
     return g_string_free(out, FALSE);
 }
 
@@ -4273,6 +4315,14 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                    ati_r350_gl_rel_name(k), s->gl_rel[k],
                                    s->gl_rel_px[k]);
         }
+    }
+    {
+        uint64_t ph, pl, pf;
+
+        ati_r350_gl_prog_stats(s->gl_ctx, &ph, &pl, &pf);
+        g_string_append_printf(out, "\nfragment shaders: %" PRIu64
+                               " cache hits, %" PRIu64 " linked, %" PRIu64
+                               " would not build", ph, pl, pf);
     }
     if (s->gl_addblend) {
         /*
@@ -4475,6 +4525,7 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
                                   NULL);
     object_class_property_add_str(klass, "gl-stats", ati_r350_get_gl, NULL);
     object_class_property_add_str(klass, "pvs-stats", ati_r350_get_pvs, NULL);
+    object_class_property_add_str(klass, "us-stats", ati_r350_get_us, NULL);
     object_class_property_add_str(klass, "palette", ati_r350_get_palette,
                                   NULL);
 

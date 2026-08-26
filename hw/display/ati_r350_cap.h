@@ -28,7 +28,7 @@
 #ifndef ATI_R350_CAP_H
 #define ATI_R350_CAP_H
 
-#define R350_CAP_MAGIC      "R350CAP1"
+#define R350_CAP_MAGIC      "R350CAP2"
 #define R350_CAP_REC_MAGIC  0x52334452u         /* "R3DR" */
 
 /* how many recently written textures are remembered for deduplication */
@@ -41,17 +41,23 @@ typedef struct R350CapFileHdr {
     uint32_t state_bytes;       /* sizeof(R300DrawState) */
     uint32_t vtx_bytes;         /* sizeof(R300Vtx) */
     uint32_t vram_bytes;        /* ATI_R350_VRAM_SIZE */
-    uint32_t reserved;
+    uint32_t us_bytes;          /* sizeof(R300UsProgram) */
 } R350CapFileHdr;
 
 /*
  * Payload, in this order, immediately after the record header:
  *
- *   R300DrawState  state         (vram pointer and vertex program cleared)
+ *   R300DrawState  state    (vram pointer, vertex program, fs pointer cleared)
+ *   R300UsProgram  fs            the FRAGMENT program this draw ran
  *   R300Vtx        vb[nvtx]
  *   uint8_t        tex[tex_bytes]        raw VRAM bytes, swapper NOT applied
  *   uint8_t        before[rect_bytes]    raw VRAM bytes of the destination
  *   uint8_t        after[rect_bytes]     the same bytes after the draw
+ *
+ * The fragment program is carried by VALUE because the state holds only
+ * a pointer to it: from milestone M5 the shading a draw performs is the
+ * guest's own program, so a record that did not carry it would not be a
+ * self-contained test case at all.
  *
  * `rect_bytes` is (x1 - x0) * 4 * (y1 - y0): the rows are packed, not
  * at the destination pitch. A record whose texture repeats one already
