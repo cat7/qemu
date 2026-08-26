@@ -872,6 +872,32 @@ static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
     r300_vs_texcoord(d, v, c);
 }
 
+/*
+ * What a draw's first vertex says about its texture coordinate, in both
+ * of the units it could be in: the raw attribute the vertex program
+ * names (s, t and the projective q) against the coordinate this model
+ * ended up sampling with. A guest that hands over NORMALISED
+ * coordinates prints a raw s of about 1.0 and a sampled s of about 1.0
+ * too -- one texel of a whole texture -- while a guest whose attribute
+ * is already in texels prints the two the same and large.
+ */
+static void r300_trace_texcoord(const R300DrawState *d, const uint32_t *dw,
+                                const R300Vtx *v)
+{
+    float c[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+    if (!trace_event_get_state_backends(TRACE_ATI_R350_3D_TEXCOORD)) {
+        return;
+    }
+    if (d->tex_attr >= 0 && (unsigned)d->tex_attr < d->attr_count) {
+        r300_vs_input(d, dw, (unsigned)d->tex_attr, c);
+    }
+    trace_ati_r350_3d_texcoord(d->tex_attr, d->tex_w, d->tex_h,
+                               (int32_t)(c[0] * 1000), (int32_t)(c[1] * 1000),
+                               (int32_t)(c[3] * 1000),
+                               (int32_t)(v->s * 1000), (int32_t)(v->t * 1000));
+}
+
 static void r300_vs_color(R300Vtx *v, const float c[4])
 {
     if (!isfinite(c[0]) || !isfinite(c[1]) ||
@@ -1603,6 +1629,9 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
             float clip[4];
 
             r300_load_vtx(&d, vd, vsize, vsize, &vb[i]);
+            if (i == 0 && d.textured) {
+                r300_trace_texcoord(&d, vd, &vb[i]);
+            }
             if (d.vs_run && r300_vs_vtx(s, &d, vd, &vb[i], clip)) {
                 r300_xform_vtx(&d, &vb[i], clip);
             } else {
@@ -1759,6 +1788,9 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
             }
             r300_load_vtx(&d, dw, vsize, size[0], &vb[i]);
             r300_attr_texcoord(&d, dw, size[0], &vb[i]);
+            if (i == 0 && d.textured) {
+                r300_trace_texcoord(&d, dw, &vb[i]);
+            }
             if (d.vs_run) {
                 float clip[4];
 
