@@ -3992,6 +3992,14 @@ static const Property ati_r350_properties[] = {
      * "on", or "verify". See ati_r350_gl.h.
      */
     DEFINE_PROP_STRING("gl", ATIR350State, gl_path),
+    /*
+     * Diagnostic only (milestone M4): translate each vertex program the
+     * guest uploads to GLSL and count whether the translator could
+     * express it, readable as the "pvs-stats" property. Off by default,
+     * and with it off r300_pvs_translate() returns before doing
+     * anything at all.
+     */
+    DEFINE_PROP_BOOL("pvs-glsl", ATIR350State, pvs_glsl, false),
     DEFINE_EDID_PROPERTIES(ATIR350State, edid_info),
 };
 
@@ -4077,6 +4085,38 @@ static const char *const ati_r350_gl_fb_names[R350_GLF_MAX] = {
 const char *ati_r350_gl_fb_name(ATIR350GlFallback why)
 {
     return why < R350_GLF_MAX ? ati_r350_gl_fb_names[why] : "?";
+}
+
+/*
+ * `pvs-stats` property: how much of what the guest actually uploads the
+ * PVS-to-GLSL translation can express (milestone M4). Read it from the
+ * monitor with
+ *   qom-get /machine/peripheral-anon/device[N] pvs-stats
+ *
+ * It counts PROGRAMS, not draws -- a program is translated once, when
+ * the control registers first name its instruction range. A refusal is
+ * also noted as an ordinary gap, so `gaps` names the opcode too.
+ */
+static char *ati_r350_get_pvs(Object *obj, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+    GString *out = g_string_new(NULL);
+
+    if (!s->pvs_glsl) {
+        g_string_append(out, "off");
+        return g_string_free(out, FALSE);
+    }
+    g_string_append_printf(out, "programs %" PRIu64 " translated, %" PRIu64
+                           " refused (vector op %" PRIu64 ", math op %"
+                           PRIu64 ", dst file %" PRIu64 ")",
+                           s->pvs_tr_ok, s->pvs_tr_refused,
+                           s->pvs_tr_by_reason[0], s->pvs_tr_by_reason[1],
+                           s->pvs_tr_by_reason[2]);
+    g_string_append_printf(out, "\nlast: %u bytes of GLSL, %u constants,"
+                           " in 0x%x, out 0x%x", s->pvs_tr_last_bytes,
+                           s->pvs_tr_last_nconst, s->pvs_tr_last_in,
+                           s->pvs_tr_last_out);
+    return g_string_free(out, FALSE);
 }
 
 /*
@@ -4331,6 +4371,7 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_str(klass, "scanout", ati_r350_get_scanout,
                                   NULL);
     object_class_property_add_str(klass, "gl-stats", ati_r350_get_gl, NULL);
+    object_class_property_add_str(klass, "pvs-stats", ati_r350_get_pvs, NULL);
     object_class_property_add_str(klass, "palette", ati_r350_get_palette,
                                   NULL);
 

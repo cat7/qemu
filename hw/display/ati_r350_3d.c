@@ -1086,6 +1086,67 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
 }
 
 /*
+ * Milestone M4's live coverage measurement, and nothing else: hand this
+ * program to the GLSL translator and record whether it could express it.
+ *
+ * It is NOT on any pixel's path. The offline three-way harness
+ * (doc/radeon9800/pvs-offline-test) proves the translation COMPUTES what
+ * the interpreter computes, over the seven programs one application
+ * uploads; what no corpus can answer is how much of what real guests
+ * upload it COVERS, and that is a question only a running desktop asks.
+ * So the answer is counted here, behind a property that is off by
+ * default -- with it off this function returns before touching anything,
+ * which is the whole of its no-op proof.
+ *
+ * A program is translated once per program, not once per draw: the
+ * signature is the instruction range and constant base the control
+ * registers name, and Chess's thousand board draws all carry one.
+ */
+static void r300_pvs_translate(ATIR350State *s, const R300PvsProgram *p)
+{
+    static char body[192 * 1024];
+    R300PvsGlsl info;
+    uint64_t sig;
+    bool ok;
+
+    if (!s->pvs_glsl || !p->valid) {
+        return;
+    }
+    sig = 1 | ((uint64_t)p->first << 1) | ((uint64_t)p->last << 12) |
+          ((uint64_t)p->cbase << 24) | ((uint64_t)p->cmax << 32);
+    if (sig == s->pvs_tr_sig) {
+        return;
+    }
+    s->pvs_tr_sig = sig;
+
+    ok = r300_pvs_glsl(p, body, sizeof(body), &info);
+    if (ok) {
+        s->pvs_tr_ok++;
+        s->pvs_tr_last_bytes = strlen(body);
+        s->pvs_tr_last_nconst = info.nconst;
+        s->pvs_tr_last_in = info.in_mask;
+        s->pvs_tr_last_out = info.out_mask;
+    } else {
+        s->pvs_tr_refused++;
+        if (info.gaps.has_vec_op) {
+            s->pvs_tr_by_reason[0]++;
+            ati_r350_note_gap(s, R350_GAP_VS_VECTOR_OP, info.gaps.vec_op);
+        }
+        if (info.gaps.has_math_op) {
+            s->pvs_tr_by_reason[1]++;
+            ati_r350_note_gap(s, R350_GAP_VS_MATH_OP, info.gaps.math_op);
+        }
+        if (info.gaps.has_dst_file) {
+            s->pvs_tr_by_reason[2]++;
+            ati_r350_note_gap(s, R350_GAP_VS_DST_FILE, info.gaps.dst_file);
+        }
+    }
+    trace_ati_r350_pvs_glsl(p->first, p->last, p->cbase, p->cmax, ok,
+                            (uint32_t)strlen(body), info.nconst,
+                            info.in_mask, info.out_mask);
+}
+
+/*
  * 3D_DRAW_IMMD_2: dw[0] is VAP_VF_CNTL (primitive type, walk mode,
  * vertex count), the rest is vertex data laid out VAP_VTX_SIZE dwords
  * per vertex.
@@ -1390,6 +1451,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                              s->regs[R300_VAP_PVS_CODE_CNTL_0 >> 2],
                              s->regs[R300_VAP_PVS_CONST_CNTL >> 2],
                              first_tex);
+            r300_pvs_translate(s, &d->vs);
             cb = d->vs.valid ? d->vs.cbase * 4 : 0;
             if (cb + 16 > ARRAY_SIZE(s->pvs_const)) {
                 cb = 0;

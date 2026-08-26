@@ -360,6 +360,7 @@ ati_r350_3d_skip(uint32_t vf, uint32_t vsize, uint32_t info) "R300 draw skipped 
 ati_r350_3d_vbuf_vtx(int32_t x, int32_t y, int32_t s, int32_t t) "R300 vbuf last-vtx x=%d y=%d s=%d t=%d (x1000)"
 ati_r350_3d_rect(uint32_t dst, int x0, int y0, int x1, int y1, int s0, int t0, int s1, int t1) "R300 draw -> dst=0x%x rect(%d,%d)-(%d,%d) tex(%d,%d)-(%d,%d)"
 ati_r350_3d_texcoord(int attr, uint32_t tw, uint32_t th, int32_t rs, int32_t rt, int32_t rq, int32_t vs, int32_t vt) "R300 texcoord attr=%d tex=%ux%u raw=(%d,%d) q=%d sampled=(%d,%d) (x1000)"
+ati_r350_pvs_glsl(uint32_t first, uint32_t last, uint32_t cbase, uint32_t cmax, int ok, uint32_t bytes, uint32_t nconst, uint32_t in_mask, uint32_t out_mask) "R300 pvs->glsl inst %u..%u cbase=%u cmax=%u ok=%d bytes=%u consts=%u in=0x%x out=0x%x"
 ati_r350_3d_cb(uint32_t dst, uint32_t pitch, uint32_t wmask, int resolve, uint32_t src, uint32_t src_pitch) "R300 cb dst=0x%x pitch=%u wmask=0x%08x resolve=%d from=0x%x pitch=%u"
 ati_r350_3d_vbuf_aos(uint32_t vf, uint32_t nvtx, uint32_t cnt, uint32_t ctl, uint32_t addr0, uint32_t addr1) "R300 vbuf vf_cntl=0x%08x nvtx=%u AOS_CNT=0x%08x CTL=0x%08x ADDR0=0x%08x ADDR1=0x%08x"
 ati_r350_3d_vbuf_aos_src(uint32_t idx, uint32_t size, uint32_t stride, uint32_t addr, const char *win, uint64_t target) "R300 vbuf aos%u size=%u stride=%u card=0x%08x -> %s 0x%" PRIx64

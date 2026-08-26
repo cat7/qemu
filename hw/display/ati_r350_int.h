@@ -630,6 +630,26 @@ struct ATIR350State {
     uint32_t pvs_code_dwords;
 
     /*
+     * Phase 2, milestone M4: how much of what real guests upload the
+     * GLSL translation in ati_r350_pvs_glsl.c can express. Armed by the
+     * "pvs-glsl" property and otherwise never entered, because the
+     * translation is not on any pixel's path -- the offline three-way
+     * harness measures what it COMPUTES, and this measures what it
+     * COVERS, which no corpus of seven programs can answer.
+     *
+     * A program is translated once, when the control registers first
+     * name it: `pvs_tr_sig` is the range and constant base the last
+     * attempt was made for, so a thousand draws of one program cost one
+     * translation.
+     */
+    bool pvs_glsl;
+    uint64_t pvs_tr_sig;
+    uint64_t pvs_tr_ok, pvs_tr_refused;
+    uint64_t pvs_tr_by_reason[3];       /* vector op, math op, dst file */
+    uint32_t pvs_tr_last_bytes, pvs_tr_last_nconst;
+    uint32_t pvs_tr_last_in, pvs_tr_last_out;
+
+    /*
      * Staging buffer for an in-flight R300 3D_DRAW_IMMD_2 payload
      * (VAP_VF_CNTL + inline vertices). Scratch state only: a packet
      * split across a migration is lost, like the 2D host-data
