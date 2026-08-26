@@ -729,29 +729,29 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                  * source values that could not change the destination
                  * under the configured blend, before it costs a read.
                  */
-                bool a0 = ca == 0.0f, a1 = ca == 1.0f;
-                bool c0 = cr == 0.0f && cg == 0.0f && cb == 0.0f;
-                bool c1 = cr == 1.0f && cg == 1.0f && cb == 1.0f;
+                bool a_zero = ca == 0.0f, a_one = ca == 1.0f;
+                bool rgb_black = cr == 0.0f && cg == 0.0f && cb == 0.0f;
+                bool rgb_white = cr == 1.0f && cg == 1.0f && cb == 1.0f;
                 bool kill;
 
                 switch (d->discard) {
                 case 1:
-                    kill = a0;
+                    kill = a_zero;
                     break;
                 case 2:
-                    kill = c0;
+                    kill = rgb_black;
                     break;
                 case 3:
-                    kill = a0 && c0;
+                    kill = a_zero && rgb_black;
                     break;
                 case 4:
-                    kill = a1;
+                    kill = a_one;
                     break;
                 case 5:
-                    kill = c1;
+                    kill = rgb_white;
                     break;
                 case 6:
-                    kill = a1 && c1;
+                    kill = a_one && rgb_white;
                     break;
                 default:
                     kill = false;
