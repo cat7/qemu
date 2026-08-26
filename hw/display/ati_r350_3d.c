@@ -2465,12 +2465,35 @@ static bool r300_tris_overlap(const R300Vtx * const a[3],
  * rather than merely cheaper. Flurry.saver's ribbons are the family:
  * every one of the 1899 draws M3 measured as `self-overlapping blend
  * prim 13` fallbacks blends additively, each a quad list of up to 456
- * self-crossing triangles that the partition either spread over 24.83
- * passes or refused outright past 64. The SAT machinery stays for
- * everything whose destination term is not the destination -- an
- * ordinary SRC_ALPHA/ONE_MINUS_SRC_ALPHA composite cannot use this,
- * because there the destination is scaled before it is added and the
- * scaled value is not on the byte grid.
+ * self-crossing triangles that the partition either spread over many
+ * passes or refused outright. The SAT machinery stays for everything
+ * whose destination term is not the destination -- an ordinary
+ * SRC_ALPHA/ONE_MINUS_SRC_ALPHA composite cannot use this, because
+ * there the destination is scaled before it is added and the scaled
+ * value is not on the byte grid.
+ *
+ * IT IS NOT EXACT, AND THAT IS WHY IT IS BEHIND gl=fast RATHER THAN ON
+ * BY DEFAULT. Measured on a Flurry corpus of 94 replayable draws
+ * (doc/radeon9800/flurry-glcap-2026-08-26.bin.gz) against the software
+ * rasterizer, and live with gl=verify:
+ *
+ *   ordered passes, limit raised so nothing is refused
+ *       INTERIOR 99.9314% at delta 0, EDGE 0.0001%, ribbon max delta 4
+ *   this path
+ *       INTERIOR 99.3857% at delta 0, EDGE 1.1854%, ribbon max delta 45
+ *   live gl=verify over a Flurry session
+ *       VALUE 99.9628% -> 98.8267% at delta 0, COVER 0.1022%
+ *
+ * What it buys is 22.93 fps against 13.19, with the self-overlap
+ * fallback count going 665 -> 0 (1899 -> 0 against the milestone's own
+ * pass limit) and the vCPU at 71.5% of a core. The residue is a
+ * per-primitive rounding decomposition that accumulates over a pixel's
+ * overlap depth: the device computes trunc((t + D/255)*255) and this
+ * path computes D + trunc(255*t), and the two disagree wherever 255*t
+ * lands within a few ULPs of an integer -- which for a ribbon crossing
+ * itself thirty times is thirty chances to differ by one. On screen the
+ * two are indistinguishable; in numbers they are not, so the choice is
+ * the user's and `on` stays exact.
  *
  * Codes are r300_blend_f()'s own; both encodings of each factor are
  * listed because the register uses both.
@@ -2943,11 +2966,10 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
          * pass keeps the shader blend, which reproduces the device bit
          * for bit. Only a draw that needed several passes -- or that the
          * partition refused outright -- is handed to GL's own blender,
-         * because only there is there anything to win. That makes the
-         * blast radius exactly "the draws that were slow or unrenderable
-         * before" and leaves every draw that was already exact alone.
+         * and only under gl=fast, because the hand-off is a measured
+         * trade of accuracy for frame rate rather than a free win.
          */
-        if (npass != 1 && r300_gl_addblend(d)) {
+        if (s->gl_fast && npass != 1 && r300_gl_addblend(d)) {
             req.add_blend = 1;
             npass = 1;
             s->gl_addblend++;

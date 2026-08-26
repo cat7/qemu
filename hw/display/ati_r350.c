@@ -3768,8 +3768,21 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
             s->gl_mode = R350_GL_ON;
         } else if (!strcmp(s->gl_path, "verify")) {
             s->gl_mode = R350_GL_VERIFY;
+        } else if (!strcmp(s->gl_path, "fast")) {
+            /*
+             * `on` plus the additive one-pass blend. Its own comment in
+             * r300_gl_addblend() has the measurements; the short of it
+             * is Flurry.saver at 22.93 fps instead of 13.19, with
+             * gl=verify's VALUE class falling from 99.9998% at delta 0
+             * to 98.83% on that workload. It is deliberately not the
+             * default: `on` renders what it renders exactly or hands it
+             * back, and this mode trades that for frame rate.
+             */
+            s->gl_mode = R350_GL_ON;
+            s->gl_fast = true;
         } else {
-            error_setg(errp, "gl must be one of off, on, verify (got \"%s\")",
+            error_setg(errp,
+                       "gl must be one of off, on, fast, verify (got \"%s\")",
                        s->gl_path);
             return;
         }
@@ -4097,7 +4110,8 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
     }
     g_string_append_printf(out, "mode %s\nbackend %s\ndrawn %" PRIu64
                            "\nfallback %" PRIu64 " (%.2f%% offloaded)",
-                           s->gl_mode == R350_GL_VERIFY ? "verify" : "on",
+                           s->gl_mode == R350_GL_VERIFY ? "verify"
+                           : s->gl_fast ? "fast" : "on",
                            ati_r350_gl_describe(s->gl_ctx), s->gl_drawn, fb,
                            s->gl_drawn + fb
                            ? 100.0 * s->gl_drawn / (s->gl_drawn + fb) : 0.0);

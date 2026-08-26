@@ -139,7 +139,7 @@ typedef enum ATIR350GlFallback {
  * silently shaping what the offload covers.
  */
 #define R300_GL_TRI_MAX     512
-#define R300_GL_PASS_MAX    64
+#define R300_GL_PASS_MAX    128
 
 /*
  * How many decoded textures are kept, and the largest one kept. Eight
@@ -527,6 +527,7 @@ struct ATIR350State {
     unsigned gl_order[R300_GL_TRI_MAX];
     unsigned gl_pass_first[R300_GL_PASS_MAX + 1];
     float gl_bbox[R300_GL_TRI_MAX][4];
+    bool gl_fast;               /* gl=fast: allow the additive one-pass blend */
     uint64_t gl_addblend;       /* draws GL's own blender ordered */
     uint64_t gl_multipass;      /* draws that needed more than one pass */
     uint64_t gl_passes;         /* ... and how many passes in total */

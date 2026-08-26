@@ -137,6 +137,11 @@ typedef struct R350GlReq {
      * `npass` are then not used and no snapshot of the destination is
      * needed or taken. See the r300_gl_addblend() comment in
      * ati_r350_3d.c for the predicate and why it is exactly this shape.
+     *
+     * It is not exact -- the per-primitive rounding decomposition
+     * differs from the device's and accumulates over a pixel's overlap
+     * depth -- so the caller only sets it under `gl=fast`. The numbers
+     * are in that same comment.
      */
     int add_blend;
 
