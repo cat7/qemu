@@ -2049,8 +2049,24 @@ static void r300_gl_discard(ATIR350State *s)
     s->gl_vx0 = s->gl_vx1 = s->gl_vy0 = s->gl_vy1 = 0;
 }
 
+/*
+ * Decoded textures die with the target, and for the same reason: the
+ * moments at which residency ends are exactly the moments at which
+ * something outside the 3D engine may have changed VRAM.
+ */
+static void r300_gl_texdrop(ATIR350State *s)
+{
+    unsigned k;
+
+    for (k = 0; k < R300_GL_TEXCACHE; k++) {
+        s->gl_tex[k].live = false;
+    }
+    s->gl_tex_any = false;
+}
+
 void ati_r350_gl_release(ATIR350State *s)
 {
+    r300_gl_texdrop(s);
     if (!s->gl_res) {
         return;
     }
@@ -2062,7 +2078,14 @@ void ati_r350_gl_release(ATIR350State *s)
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
 {
     uint32_t lo, hi;
+    unsigned k;
 
+    for (k = 0; k < R300_GL_TEXCACHE; k++) {
+        if (s->gl_tex[k].live && off < s->gl_tex[k].off + s->gl_tex[k].len &&
+            off + len > s->gl_tex[k].off) {
+            s->gl_tex[k].live = false;
+        }
+    }
     if (!r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
         return;
     }
@@ -2079,6 +2102,7 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
                          unsigned xr, int x0, int y0, int x1, int y1)
 {
     bool lost = false;
+    unsigned i;
     int ux0, uy0, ux1, uy1;
 
     if (x1 > R300_GL_SURF_MAX || y1 > R300_GL_SURF_MAX) {
@@ -2100,6 +2124,15 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
         s->gl_tex_w = MAX(x1, s->gl_tex_w);
         s->gl_tex_h = MAX(y1, s->gl_tex_h);
         r300_gl_discard(s);
+    }
+    for (i = 0; i < R300_GL_TEXCACHE; i++) {
+        /* rendering into a range some cached texture came from */
+        if (s->gl_tex[i].live &&
+            d->dst_off + (uint32_t)y0 * d->dst_pitch <
+            s->gl_tex[i].off + s->gl_tex[i].len &&
+            d->dst_off + (uint32_t)y1 * d->dst_pitch > s->gl_tex[i].off) {
+            s->gl_tex[i].live = false;
+        }
     }
     s->gl_res = true;
     s->gl_res_off = d->dst_off;
@@ -2486,13 +2519,18 @@ static void r300_gl_rd_rect(const R300DrawState *d, unsigned xr,
  * Both paths therefore share the sampler exactly, and what gl=verify
  * measures is the rasterization, not the texture unit.
  *
- * There is no texture cache here on purpose. A cache needs an
- * invalidation hook that covers the CPU aperture, which stores into a
- * plain RAM alias this device cannot observe; getting that right is
- * milestone M3's work, and a wrong cache would be a silent-wrongness
- * bug of exactly the kind this project keeps finding. So the cost of
- * decoding per draw is paid, and bounded by falling back on anything
- * larger than R300_GL_TEX_MAX texels.
+ * The decoded result is CACHED (milestone M3). The cache key is every
+ * piece of state the decode reads -- the resolved VRAM offset, the
+ * width, height and pitch, the bytes per texel, the format code, all
+ * four component selects and the aperture swapper's xor -- so a hit is
+ * a hit on the same bytes decoded the same way, not on an address. What
+ * makes it safe is that an entry lives exactly as long as the resident
+ * render target does and dies at the same moments, which is the same
+ * argument written out at "GL-OWNED RENDER TARGET" above: inside a
+ * command-processor burst nothing else can touch VRAM without saying
+ * so, and a burst is where the repetition is. A texture in system
+ * memory rather than VRAM is not cached at all, because there is no
+ * range to invalidate on.
  */
 #define R300_GL_TEX_MAX (1024 * 1024)
 
@@ -2512,6 +2550,83 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
             p[3] = (uint8_t)(r300_texel_chan(d, texel, 0) * 255.0f + 0.5f);
         }
     }
+}
+
+/* everything the decode above depends on, and nothing else */
+static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
+                             const R300DrawState *d, uint32_t off,
+                             uint32_t len, unsigned xr)
+{
+    return s->gl_tex[k].live &&
+           s->gl_tex[k].off == off && s->gl_tex[k].len == len &&
+           s->gl_tex[k].pitch == d->tex_pitch &&
+           s->gl_tex[k].bpp == d->tex_bpp &&
+           s->gl_tex[k].code == d->tex_code &&
+           s->gl_tex[k].w == d->tex_w && s->gl_tex[k].h == d->tex_h &&
+           s->gl_tex[k].xr == xr &&
+           s->gl_tex[k].sel[0] == d->tex_sel[0] &&
+           s->gl_tex[k].sel[1] == d->tex_sel[1] &&
+           s->gl_tex[k].sel[2] == d->tex_sel[2] &&
+           s->gl_tex[k].sel[3] == d->tex_sel[3];
+}
+
+/*
+ * The decoded texture for this draw: from the cache when the same bytes
+ * were decoded the same way inside this burst, and decoded into the
+ * least recently used entry otherwise. A texture that does not resolve
+ * to a uniformly swapped range of VRAM is decoded into the scratch
+ * buffer and not cached -- there would be no range to invalidate it on.
+ */
+static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d)
+{
+    uint32_t off, len;
+    unsigned k, victim = 0, xr = 0;
+    size_t need = (size_t)d->tex_w * d->tex_h * 4;
+
+    len = (uint32_t)d->tex_h * d->tex_pitch;
+    if ((size_t)d->tex_w * d->tex_h > R300_GL_TEXCACHE_MAX ||
+        !d->tex_pitch || !len ||
+        !ati_r350_mc_to_vram(s, d->tex_off, &off) ||
+        (uint64_t)off + len > ATI_R350_VRAM_SIZE ||
+        !r300_cap_xor(s, off, len, &xr)) {
+        s->gl_tex_miss++;
+        r300_gl_decode_tex(s, d, s->gl_texbuf);
+        return s->gl_texbuf;
+    }
+    for (k = 0; k < R300_GL_TEXCACHE; k++) {
+        if (r300_gl_tex_same(s, k, d, off, len, xr)) {
+            s->gl_tex[k].used = ++s->gl_tex_seq;
+            s->gl_tex_hit++;
+            return s->gl_tex[k].rgba;
+        }
+        if (!s->gl_tex[k].live) {
+            victim = k;
+        } else if (s->gl_tex[victim].live &&
+                   s->gl_tex[k].used < s->gl_tex[victim].used) {
+            victim = k;
+        }
+    }
+    s->gl_tex_miss++;
+    if (need > s->gl_tex[victim].sz) {
+        s->gl_tex[victim].rgba = g_realloc(s->gl_tex[victim].rgba, need);
+        s->gl_tex[victim].sz = need;
+    }
+    r300_gl_decode_tex(s, d, s->gl_tex[victim].rgba);
+    s->gl_tex[victim].off = off;
+    s->gl_tex[victim].len = len;
+    s->gl_tex[victim].pitch = d->tex_pitch;
+    s->gl_tex[victim].bpp = d->tex_bpp;
+    s->gl_tex[victim].code = d->tex_code;
+    s->gl_tex[victim].w = d->tex_w;
+    s->gl_tex[victim].h = d->tex_h;
+    s->gl_tex[victim].xr = xr;
+    for (k = 0; k < 4; k++) {
+        s->gl_tex[victim].sel[k] = d->tex_sel[k];
+    }
+    s->gl_tex[victim].used = ++s->gl_tex_seq;
+    s->gl_tex[victim].live = true;
+    s->gl_tex_any = true;
+    return s->gl_tex[victim].rgba;
 }
 
 /* one vertex of the expanded triangle list, carrying its whole triangle */
@@ -2631,6 +2746,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     g_autofree unsigned *idx = NULL;
     const R300Vtx *gvb = vb;
     R350GlReq req = { 0 };
+    const uint8_t *texbuf = NULL;
     unsigned ntri = 0, npass = 1, i, xr = 0;
     int x0, y0, x1, y1, w, h;
     size_t rect_sz, texels = 0;
@@ -2749,7 +2865,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
         }
     }
     if (d->textured) {
-        r300_gl_decode_tex(s, d, s->gl_texbuf);
+        texbuf = r300_gl_texture(s, d);
     }
     /*
      * The target becomes resident here, and this is the last point at
@@ -2767,7 +2883,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.nvert = ntri * 3;
     req.pass = npass > 1 ? s->gl_pass_first : NULL;
     req.npass = npass;
-    req.tex = d->textured ? s->gl_texbuf : NULL;
+    req.tex = d->textured ? texbuf : NULL;
     req.tex_w = d->tex_w;
     req.tex_h = d->tex_h;
     req.clamp_s = d->clamp_s;

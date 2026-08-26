@@ -140,6 +140,15 @@ typedef enum ATIR350GlFallback {
 #define R300_GL_TRI_MAX     512
 #define R300_GL_PASS_MAX    8
 
+/*
+ * How many decoded textures are kept, and the largest one kept. Eight
+ * entries of at most a megabyte of RGBA each: enough for a compositor
+ * frame's window tiles, and bounded so a guest cannot make the device
+ * allocate without limit.
+ */
+#define R300_GL_TEXCACHE     8
+#define R300_GL_TEXCACHE_MAX (256 * 1024)
+
 typedef struct ATIR350PM4Parser {
     uint32_t remaining;      /* data dwords still expected */
     uint32_t type;           /* packet type of the in-flight packet */
@@ -532,6 +541,24 @@ struct ATIR350State {
     int gl_dx0, gl_dy0, gl_dx1, gl_dy1; /* drawn: the GPU copy is NEWER */
     uint64_t gl_flushes;                /* fetches back into VRAM */
     uint64_t gl_flush_px, gl_seed_px;   /* ... and pixels moved each way */
+    /*
+     * Decoded textures, keyed on everything the decode depends on. They
+     * live exactly as long as the resident target does and for the same
+     * reason -- see the coherency block -- so a burst of draws sharing a
+     * texture decodes it once instead of once each.
+     */
+    struct {
+        uint32_t off, len, pitch;
+        unsigned bpp, code, xr;
+        unsigned sel[4];
+        int w, h;
+        uint8_t *rgba;
+        size_t sz;
+        uint64_t used;
+        bool live;
+    } gl_tex[R300_GL_TEXCACHE];
+    uint64_t gl_tex_seq, gl_tex_hit, gl_tex_miss;
+    bool gl_tex_any;            /* any entry live: the hot hooks test this */
 
     /*
      * Hardware cursor (CUR_* registers). hw_cursor_on tracks whether the
@@ -651,7 +678,7 @@ void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len);
 static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
                                      uint32_t len)
 {
-    if (unlikely(s->gl_res)) {
+    if (unlikely(s->gl_res || s->gl_tex_any)) {
         ati_r350_gl_sync(s, off, len);
     }
 }

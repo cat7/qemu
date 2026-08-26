@@ -3903,6 +3903,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
 static void ati_r350_exit(PCIDevice *dev)
 {
     ATIR350State *s = ATI_R350(dev);
+    unsigned i;
 
     timer_free(s->vblank_timer);
     timer_free(s->vblank_end_timer);
@@ -3913,6 +3914,9 @@ static void ati_r350_exit(PCIDevice *dev)
         s->cap_fp = NULL;
     }
     ati_r350_gl_release(s);
+    for (i = 0; i < R300_GL_TEXCACHE; i++) {
+        g_free(s->gl_tex[i].rgba);
+    }
     ati_r350_gl_close(s->gl_ctx);
     s->gl_ctx = NULL;
     g_free(s->gl_before);
@@ -4094,8 +4098,14 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
      * is not working.
      */
     g_string_append_printf(out, "\nresident target: %" PRIu64 " flushes, %"
-                           PRIu64 " px out, %" PRIu64 " px in",
-                           s->gl_flushes, s->gl_flush_px, s->gl_seed_px);
+                           PRIu64 " px out, %" PRIu64 " px in"
+                           "\ntexture cache: %" PRIu64 " hits, %" PRIu64
+                           " decodes (%.1f%%)",
+                           s->gl_flushes, s->gl_flush_px, s->gl_seed_px,
+                           s->gl_tex_hit, s->gl_tex_miss,
+                           s->gl_tex_hit + s->gl_tex_miss
+                           ? 100.0 * s->gl_tex_hit /
+                             (s->gl_tex_hit + s->gl_tex_miss) : 0.0);
     if (s->gl_multipass) {
         /*
          * How much work the self-overlap ordering is doing. A blended
