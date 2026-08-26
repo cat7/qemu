@@ -146,11 +146,14 @@ typedef struct R300DrawState {
  * The GL backend's contract states its own texture-unit and coordinate-
  * set counts rather than including this file's headers -- it is meant to
  * be replaceable without the draw path noticing. That independence is
- * only safe if the two agree, so it is checked here rather than trusted.
- * The capture format repeats the unit count for the same reason.
+ * only safe if the numbers are checked rather than trusted. The unit
+ * counts must AGREE; the backend's coordinate-set count may be smaller
+ * than the device's, because it only ever receives a draw whose program
+ * reads set 0 (see ati_r350_gl.h), and it must never be larger. The
+ * capture format repeats the unit count for the same reason.
  */
 QEMU_BUILD_BUG_ON(R350_GL_TEXUNITS != R300_TEX_UNITS);
-QEMU_BUILD_BUG_ON(R350_GL_TEXCOORDS != R300_TEXCOORDS);
+QEMU_BUILD_BUG_ON(R350_GL_TEXCOORDS > R300_TEXCOORDS);
 QEMU_BUILD_BUG_ON(R350_CAP_TEX_UNITS != R300_TEX_UNITS);
 
 static inline float r300_f32(uint32_t v)
@@ -1534,6 +1537,29 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
                                       regs[(R300_RS_IP_0 >> 2) + 1],
                                       p->ntex > 0 ? regs[t0] : 0,
                                       p->ntex > 1 ? regs[t0 + 1] : 0);
+            /*
+             * The WHOLE routing table, because two entries of it are
+             * not enough to say what a refusal asks for: an RS_INST
+             * naming IP entry 2 tells you nothing unless you can see
+             * IP 2, and the first cut of this trace printed entries 0
+             * and 1 only. RS_INST_COUNT is what says how many of the
+             * instructions below are live.
+             */
+            trace_ati_r350_us_refused_ip(
+                (regs[R300_RS_INST_COUNT >> 2] & 0xf) + 1,
+                regs[(R300_RS_IP_0 >> 2) + 0], regs[(R300_RS_IP_0 >> 2) + 1],
+                regs[(R300_RS_IP_0 >> 2) + 2], regs[(R300_RS_IP_0 >> 2) + 3],
+                regs[(R300_RS_IP_0 >> 2) + 4], regs[(R300_RS_IP_0 >> 2) + 5],
+                regs[(R300_RS_IP_0 >> 2) + 6], regs[(R300_RS_IP_0 >> 2) + 7]);
+            trace_ati_r350_us_refused_ri(
+                regs[(R300_RS_INST_0 >> 2) + 0],
+                regs[(R300_RS_INST_0 >> 2) + 1],
+                regs[(R300_RS_INST_0 >> 2) + 2],
+                regs[(R300_RS_INST_0 >> 2) + 3],
+                regs[(R300_RS_INST_0 >> 2) + 4],
+                regs[(R300_RS_INST_0 >> 2) + 5],
+                regs[(R300_RS_INST_0 >> 2) + 6],
+                regs[(R300_RS_INST_0 >> 2) + 7]);
         }
         trace_ati_r350_fs_program(p->alu_first, p->nalu, p->tex_first,
                                   p->ntex, p->nregs_used, p->tex_dst,
@@ -1622,9 +1648,23 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
             continue;
         }
         for (k = 0; k < d->ntc; k++) {
-            if (p->rs.tex_reg[k] == t->src && !(tc_named & (1u << k))) {
+            if (p->rs.tex_reg[k] != t->src) {
+                continue;
+            }
+            if (!(tc_named & (1u << k))) {
                 d->tc_unit[k] = t->unit;
                 tc_named |= 1u << k;
+            } else if (d->tex[t->unit].w != d->tex[d->tc_unit[k]].w ||
+                       d->tex[t->unit].h != d->tex[d->tc_unit[k]].h) {
+                /*
+                 * A second unit sampling the SAME coordinate set out of
+                 * a DIFFERENTLY sized texture. The set is carried in the
+                 * texels of the first unit that named it, so the second
+                 * one is sampled at the wrong scale -- say so rather
+                 * than render it quietly. Two units of the same size
+                 * sharing a set is exact and is not reported.
+                 */
+                ati_r350_note_gap(s, R350_GAP_TEXCOORD_SCALE, t->unit);
             }
         }
     }
@@ -2080,6 +2120,35 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                            d->vs_color2_out < R300_PVS_OUT_REGS &&
                            (d->vs.out_mask & (1u << d->vs_color2_out));
         }
+    }
+    /*
+     * Where each coordinate SET comes from, for the one question a live
+     * multitexturing guest can answer and no corpus can: the rasterizer
+     * routes a set, but something has to PRODUCE it, and a set nobody
+     * produces interpolates zeros and samples texel (0,0) for every
+     * pixel -- which looks exactly like a flat white panel.
+     */
+    if (trace_event_get_state_backends(TRACE_ATI_R350_3D_TEXSETS)) {
+        uint32_t vsm = 0, atm = 0, un = 0, en = 0, fetched = 0;
+
+        for (i = 0; i < d->ntc && i < 8; i++) {
+            vsm |= d->vs_texcoord[i] ? (1u << i) : 0;
+            atm |= d->tex_attr[i] >= 0 ? (1u << i) : 0;
+            un |= (d->tc_unit[i] & 0xf) << (i * 4);
+        }
+        for (i = 0; i < R300_TEX_UNITS; i++) {
+            en |= d->tex[i].en ? (1u << i) : 0;
+        }
+        for (i = 0; d->fs && i < d->fs->ntex; i++) {
+            if (d->fs->tex[i].op == R300_US_TEXOP_LD ||
+                d->fs->tex[i].op == R300_US_TEXOP_PROJ) {
+                fetched |= 1u << (d->fs->tex[i].unit & 7);
+            }
+        }
+        trace_ati_r350_3d_texsets(d->ntc, d->vs_tex_out[0], d->vs.out_mask,
+                                  vsm, atm, un,
+                                  s->regs[R300_VAP_OUTPUT_VTX_FMT_1 >> 2],
+                                  s->regs[R300_TX_ENABLE >> 2], en, fetched);
     }
     /*
      * A draw whose program this model will not execute -- the bounds name
@@ -3676,11 +3745,16 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     return s->gl_tex[victim].rgba;
 }
 
-/* one vertex of the expanded triangle list, carrying its whole triangle */
+/*
+ * One vertex of the expanded triangle list, in the backend's layout.
+ * Only R350_GL_TEXCOORDS sets are carried, which is one: the caller
+ * offloads a draw only when the translator could express its program,
+ * and that shape reads coordinate set 0 and nothing else.
+ */
 static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
                         const R300Vtx *t1, const R300Vtx *t2, float inv)
 {
-    const unsigned C = R300_TEXCOORDS;
+    const unsigned C = R350_GL_TEXCOORDS;
     unsigned k;
 
     v[0] = me->x; v[1] = me->y;

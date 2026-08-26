@@ -29,19 +29,27 @@
  * is interpolated per-vertex data that any number of units may sample
  * with.
  *
- * Both numbers are chosen from measurement plus one hard constraint.
- * Mac OS X 10.5's compositor fetches from units 0, 1 and 2 and routes
- * two coordinate sets (RS_IP TEX_PTR 0 and 4) -- that is the whole of
- * what the Leopard corpus shows. Units cost draw state only, so there is
- * headroom; COORDINATE SETS cost a vertex ATTRIBUTE in the GL backend,
- * and GL 3.3 core guarantees only sixteen of those, which the layout in
- * ati_r350_gl.h already fills exactly at two sets. A third set is
- * therefore not a constant change on its own -- it needs the dead
- * per-vertex `a_st` attribute reclaimed first -- and until a guest is
- * seen to want one it is reported as a gap rather than approximated.
+ * Both numbers are read off a live Mac OS X 10.5 desktop rather than
+ * chosen. Its compositor fetches from units 0, 1 and 2, and its RS_IP
+ * table is the full eight-entry identity -- TEX_PTR 0, 4, 8, 12, 16,
+ * 20, 24, 28, so IP entry k is coordinate set k -- with RS_INST_COUNT
+ * naming up to seven live instructions and fragment programs whose LD
+ * instructions read the registers sets 3, 4, 5 and 6 land in. That is a
+ * multi-tap filter, not a driver writing a table it does not use, and
+ * eight is also the number the hardware has: RS_IP is eight entries
+ * deep.
+ *
+ * The first attempt at this row set the count to TWO, from the two
+ * TEX_PTR values a truncated refusal trace happened to print, and a
+ * live boot then reported `rasterizer attribute routing 0x1` 49 times
+ * with the menus still blank. Widening the trace to the whole table is
+ * what produced the number above. Units cost draw state only; a
+ * coordinate set costs per-vertex memory, and the rasterizer
+ * interpolates only the sets a draw's own routing names, so a
+ * single-texture draw pays for none of them.
  */
 #define R300_TEX_UNITS          8
-#define R300_TEXCOORDS         2
+#define R300_TEXCOORDS          8
 
 /* instruction RAM, and the pixel stack frame the instructions address */
 #define R300_US_ALU_SLOTS       64

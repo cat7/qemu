@@ -36,16 +36,25 @@
 
 /*
  * Interpolated texture coordinate SETS a request carries, and texture
- * UNITS it can bind. A set is per-vertex data, a unit is bound texture
- * state, and a fragment program may sample any unit with any set.
+ * UNITS it can bind.
  *
- * Two sets is not an arbitrary number: the layout below spends one
- * vertex ATTRIBUTE on each corner's coordinates, GL 3.3 core guarantees
- * only sixteen attributes, and at two sets this layout uses exactly
- * sixteen. A third would have to reclaim one first. The device asserts
- * that these two agree with its own R300_TEXCOORDS and R300_TEX_UNITS.
+ * ONE coordinate set, and that is a consequence rather than a limit.
+ * The caller only offloads a draw whose fragment program the translator
+ * could express, and that shape is a single fetch from unit 0 addressed
+ * by coordinate SET 0 -- anything else needs a fetch inside the program,
+ * which this contract's `us_main()` cannot perform. So a request can
+ * never carry a second set, and the vertex layout below does not spend
+ * a GL attribute on one; the sixteen GL 3.3 core guarantees are exactly
+ * filled as it stands. The device's own R300_TEXCOORDS is eight,
+ * because its software rasterizer really does interpolate that many for
+ * Mac OS X 10.5.
+ *
+ * The unit count is the device's, and asserted equal to it: a request
+ * names a texture per unit even though today's translated programs read
+ * only unit 0, so that a backend growing multi-unit sampling does not
+ * need the contract changed underneath it.
  */
-#define R350_GL_TEXCOORDS 2
+#define R350_GL_TEXCOORDS 1
 #define R350_GL_TEXUNITS  8
 
 /*

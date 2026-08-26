@@ -132,16 +132,16 @@ static const char *vs_src =
 "#extension GL_ARB_gpu_shader5 : require\n"
 "layout(location = 0) in vec2 a_pos;\n"
 "layout(location = 1) in vec4 a_col;\n"
-"layout(location = 2) in vec4 a_st;\n"
+"layout(location = 2) in vec2 a_st;\n"
 "layout(location = 3) in vec2 a_p0;\n"
 "layout(location = 4) in vec2 a_p1;\n"
 "layout(location = 5) in vec2 a_p2;\n"
 "layout(location = 6) in vec4 a_c0;\n"
 "layout(location = 7) in vec4 a_c1;\n"
 "layout(location = 8) in vec4 a_c2;\n"
-"layout(location = 9) in vec4 a_t0;\n"
-"layout(location = 10) in vec4 a_t1;\n"
-"layout(location = 11) in vec4 a_t2;\n"
+"layout(location = 9) in vec2 a_t0;\n"
+"layout(location = 10) in vec2 a_t1;\n"
+"layout(location = 11) in vec2 a_t2;\n"
 "layout(location = 12) in float a_inv;\n"
 "layout(location = 13) in vec4 a_s0;\n"
 "layout(location = 14) in vec4 a_s1;\n"
@@ -153,9 +153,9 @@ static const char *vs_src =
 "flat out vec4 f_c0;\n"
 "flat out vec4 f_c1;\n"
 "flat out vec4 f_c2;\n"
-"flat out vec4 f_t0;\n"
-"flat out vec4 f_t1;\n"
-"flat out vec4 f_t2;\n"
+"flat out vec2 f_t0;\n"
+"flat out vec2 f_t1;\n"
+"flat out vec2 f_t2;\n"
 "flat out float f_inv;\n"
 "flat out vec4 f_s0;\n"
 "flat out vec4 f_s1;\n"
@@ -204,9 +204,9 @@ static const char *fs_src =
 "flat in vec4 f_c0;\n"
 "flat in vec4 f_c1;\n"
 "flat in vec4 f_c2;\n"
-"flat in vec4 f_t0;\n"
-"flat in vec4 f_t1;\n"
-"flat in vec4 f_t2;\n"
+"flat in vec2 f_t0;\n"
+"flat in vec2 f_t1;\n"
+"flat in vec2 f_t2;\n"
 "flat in float f_inv;\n"
 "flat in vec4 f_s0;\n"
 "flat in vec4 f_s1;\n"
@@ -278,13 +278,11 @@ static const char *fs_src =
 "    precise float w2 = 1.0 - w0 - w1;\n"
 "    c = fma(vec4(w2), f_c2, fma(vec4(w1), f_c1, w0 * f_c0));\n"
 /*
- * Coordinate set 0. Component for component this is the expression the
- * single-coordinate shader computed, so widening the attribute did not
- * move a pixel; the further sets are interpolated the same way where
- * the program names them.
+ * Coordinate set 0, the only one a request carries -- a translated
+ * program reads no other. See the coordinate-set note in ati_r350_gl.h.
  */
-"    precise vec2 st = fma(vec2(w2), f_t2.xy,\n"
-"                          fma(vec2(w1), f_t1.xy, w0 * f_t0.xy));\n"
+"    precise vec2 st = fma(vec2(w2), f_t2,\n"
+"                          fma(vec2(w1), f_t1, w0 * f_t0));\n"
 "    ts = st.x; tt = st.y;\n"
 /*
  * The fragment program's inputs, in the units it reads them: the texel

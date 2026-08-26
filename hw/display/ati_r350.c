@@ -4106,6 +4106,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_FS_INDIRECT]  = "fragment indirection level",
     [R350_GAP_FS_RS_ROUTE]  = "rasterizer attribute routing",
     [R350_GAP_FS_OUT_FMT]   = "fragment output format",
+    [R350_GAP_TEXCOORD_SCALE] = "texture coordinate scale shared",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)

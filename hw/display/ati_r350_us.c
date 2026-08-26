@@ -135,8 +135,20 @@ static void us_decode_alu(R300UsAlu *a, uint32_t rgb_addr, uint32_t rgb_inst,
  * The rasterizer routing. RS_INST_n names an entry of the RS_IP table
  * for its texture address and another for its colour; RS_IP says where
  * in the rasterizer's input packet each of them comes from. This model
- * emits one coordinate and two colours, so COL_PTR 0 and 1 are the two
- * colour outputs and anything above them is refused.
+ * emits R300_TEXCOORDS coordinate sets and two colours, so COL_PTR 0
+ * and 1 are the two colour outputs and anything above them is refused.
+ *
+ * TEX_PTR is a pointer into that packet in FLOATS and a coordinate set
+ * occupies four of them, so the set an instruction routes is TEX_PTR/4.
+ * Mac OS X 10.5's compositor writes the whole eight-entry identity table
+ * -- TEX_PTR 0, 4, 8, 12, 16, 20, 24, 28 -- and RS_INST_COUNT says how
+ * many of the instructions above it are live; a multi-tap filter really
+ * does read six or seven of them. All of that used to be refused as
+ * `rasterizer attribute routing 0x1`.
+ *
+ * A TEX_PTR that is not a multiple of four would be a partial or
+ * misaligned route into the packet, which this model does not build, so
+ * it stays a gap rather than being rounded to a set.
  */
 static void us_decode_rs(R300UsRs *rs, R300UsGaps *gaps,
                          uint32_t rs_inst_count, const uint32_t *rs_inst,
@@ -161,16 +173,23 @@ static void us_decode_rs(R300UsRs *rs, R300UsGaps *gaps,
         unsigned id;
 
         if ((v >> R300_RS_INST_TEX_CN_SHIFT) & 0x7) {
+            unsigned ptr, set;
+
             id = v & R300_RS_INST_TEX_ID_MASK;
-            if (id >= R300_US_RS_IPS ||
-                (rs_ip[id] & R300_RS_IP_TEX_PTR_MASK) != 0) {
-                /* a second interpolated coordinate: not emitted here */
+            if (id >= R300_US_RS_IPS) {
                 us_gap_rs(gaps, 1);
-            } else if (rs->tex_reg[0] >= 0) {
+                continue;
+            }
+            ptr = rs_ip[id] & R300_RS_IP_TEX_PTR_MASK;
+            set = ptr / 4;
+            if (ptr % 4 || set >= R300_TEXCOORDS) {
+                /* a coordinate set past the ones the vertex stage emits */
+                us_gap_rs(gaps, 1);
+            } else if (rs->tex_reg[set] >= 0) {
                 us_gap_rs(gaps, 2);
             } else {
-                rs->tex_reg[0] = (v >> R300_RS_INST_TEX_ADDR_SHIFT) &
-                                 R300_RS_INST_TEX_ADDR_MASK;
+                rs->tex_reg[set] = (v >> R300_RS_INST_TEX_ADDR_SHIFT) &
+                                   R300_RS_INST_TEX_ADDR_MASK;
             }
         }
         if ((v >> R300_RS_INST_COL_CN_SHIFT) & 0x7) {
@@ -398,7 +417,7 @@ void r300_us_analyse(R300UsProgram *p,
     unsigned aoff = us_code_offset & R300_US_CO_ALU_OFFSET_MASK;
     unsigned toff = (us_code_offset >> R300_US_CO_TEX_OFFSET_SHIFT) &
                     R300_US_CO_TEX_OFFSET_MASK;
-    unsigned nfetch = 0;
+    unsigned nfetch = 0, first_unit = 0, first_src = 0;
     unsigned i, lv;
 
     memset(p, 0, sizeof(*p));
@@ -497,21 +516,28 @@ void r300_us_analyse(R300UsProgram *p,
                 /*
                  * The fetch itself happens in the executor, which reads
                  * the coordinate out of the frame register the
-                 * instruction names -- so a second fetch, or one at a
-                 * later level, needs nothing special here. Only a unit
-                 * this model does not bind is a gap. `tex_dst` records
-                 * the first unit-0 fetch for the specialised path and
-                 * the GL translator, both of which take a texel that was
-                 * sampled for them.
+                 * instruction names and samples the unit TEX_ID names --
+                 * so a second fetch, a second unit, or one at a later
+                 * level needs nothing special here. Only a unit this
+                 * model does not bind is a gap.
+                 *
+                 * `tex_dst` and `first_*` record the FIRST fetch, for
+                 * the specialised path and the GL translator: both are
+                 * handed a texel that was sampled for them in front of
+                 * the program, so both are restricted below to a
+                 * program whose one fetch is unit 0 addressed by
+                 * coordinate set 0.
                  */
-                if (t->unit != 0) {
-                    us_gap_tex_op(&p->gaps, 0x10 | t->unit);
+                if (t->unit >= R300_TEX_UNITS) {
+                    us_gap_tex_op(&p->gaps, 0x10 | (t->unit & 0xf));
                     p->expressible = false;
                 } else {
-                    nfetch++;
-                    if (p->tex_dst < 0) {
+                    if (!nfetch) {
+                        first_unit = t->unit;
+                        first_src = t->src;
                         p->tex_dst = t->dst;
                     }
+                    nfetch++;
                 }
                 break;
             default:
@@ -539,12 +565,22 @@ void r300_us_analyse(R300UsProgram *p,
             }
         }
     }
-    p->gl_simple = p->nlevels == 1 && nfetch <= 1 && !p->has_kill;
-
     us_decode_rs(&p->rs, &p->gaps, rs_inst_count, rs_inst, rs_ip);
     if (p->gaps.has_rs_route) {
         p->expressible = false;
     }
+    /*
+     * The shape the GL backend's shader and the specialised executor can
+     * express: ONE level, at most one fetch, from unit 0, addressed by
+     * coordinate set 0, and no TEXKILL. Both are handed a finished texel
+     * that the caller sampled with set 0's coordinate out of unit 0's
+     * texture, so anything else has to run the interpreter -- which
+     * performs its own fetches and gets it right.
+     */
+    p->gl_simple = p->nlevels == 1 && nfetch <= 1 && !p->has_kill &&
+                   (!nfetch || (first_unit == 0 &&
+                                p->rs.tex_reg[0] >= 0 &&
+                                first_src == (unsigned)p->rs.tex_reg[0]));
 
     /*
      * How much of the pixel stack frame has to be initialised per pixel.
