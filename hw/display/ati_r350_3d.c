@@ -841,30 +841,39 @@ static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
 }
 
 /*
- * The texture coordinate of a vertex whose flat block holds none.
+ * The texture coordinate a vertex really carries.
  *
- * r300_load_vtx() reads the coordinate at a fixed place -- the dwords
- * after a four-dword position -- and gives up when the position
- * attribute is narrower than that, because then those dwords belong to
- * some other attribute. `tex_attr` is the way out where the vertex
- * program names the attribute the coordinate really lives in: an
- * output the program only FORWARDS is that attribute's own value, so
- * it can be read straight from the vertex without running the
- * interpreter, and it arrives normalised, exactly as it would out of
- * the program (which is why it goes through r300_vs_texcoord()).
+ * r300_load_vtx() reads one at a fixed place -- the dwords after a
+ * four-dword position -- and takes it as it finds it, in TEXELS.
+ * `tex_attr` is the better answer wherever the vertex program names
+ * the attribute the coordinate lives in: an output the program only
+ * FORWARDS is that attribute's own value, so it can be read straight
+ * from the vertex without running the interpreter, and it arrives
+ * NORMALISED, exactly as it would out of the program -- which is why
+ * it goes through r300_vs_texcoord(), the same scaling by the bound
+ * texture's size that the interpreter's own coordinates get.
  *
- * Flurry.saver is the case this buys: three bound arrays holding a
- * two-dword screen position, an RGBA colour and a two-dword
- * coordinate. Every one of its content draws sampled texel (0,0) for
- * every pixel of the screen.
+ * The positional reading stays for the draws whose program COMPUTES a
+ * coordinate instead of forwarding one (out_src = -1, so tex_attr
+ * stays -1): Mac OS X's compositor multiplies by a texture matrix that
+ * is exactly diag(1/w, 1/h, 1, 1), which makes the attribute it
+ * transforms already a texel count. Those are 881 of the 881 textured
+ * draws in the desktop drag capture, and none of them reaches here.
+ *
+ * The savers built on Core Image are what this buys. Beach, Cosmos,
+ * Forest, Nature Patterns, Paper Shadow and Abstract all paint their
+ * image as a stack of full-width bands, one 512x8 or 1024x8 strip
+ * texture each, with s running 0..1 across the band and t a single
+ * eighth-step -- normalised. Read as texels that is texel (0,0) for
+ * every pixel of a band, so each band came out one flat colour and the
+ * picture became horizontal stripes.
  */
 static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
-                               unsigned pos, R300Vtx *v)
+                               R300Vtx *v)
 {
     float c[4];
 
-    if (pos >= 4 || d->tex_attr < 0 ||
-        (unsigned)d->tex_attr >= d->attr_count ||
+    if (d->tex_attr < 0 || (unsigned)d->tex_attr >= d->attr_count ||
         d->attr_size[d->tex_attr] < 2) {
         return;
     }
@@ -1304,8 +1313,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
             d->vs_run = d->vs.valid;
             d->vs_color_out = first_color;
             /*
-             * Where the coordinate lives in the vertex, for the vertices
-             * whose flat block does not hold one -- see
+             * Where the coordinate lives in the vertex -- see
              * r300_attr_texcoord(). Only a FORWARDED output names an
              * attribute; the compositor's blit program multiplies its
              * coordinate by a texture matrix instead, so out_src is -1
@@ -1629,6 +1637,7 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
             float clip[4];
 
             r300_load_vtx(&d, vd, vsize, vsize, &vb[i]);
+            r300_attr_texcoord(&d, vd, &vb[i]);
             if (i == 0 && d.textured) {
                 r300_trace_texcoord(&d, vd, &vb[i]);
             }
@@ -1787,7 +1796,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                 }
             }
             r300_load_vtx(&d, dw, vsize, size[0], &vb[i]);
-            r300_attr_texcoord(&d, dw, size[0], &vb[i]);
+            r300_attr_texcoord(&d, dw, &vb[i]);
             if (i == 0 && d.textured) {
                 r300_trace_texcoord(&d, dw, &vb[i]);
             }
