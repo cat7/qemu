@@ -35,6 +35,25 @@
  * GL's blender rounds to nearest, which M1 measured as 311371 of 638826
  * pixels differing by exactly 1/255 -- half of every blended surface.
  *
+ * Milestone M3 made the colour buffer an INTEGER (GL_RGBA8UI) texture
+ * and the fragment output a uvec4. Three things follow, and all three
+ * are why it was done:
+ *
+ *   - the destination the blend samples is refreshed with
+ *     glCopyTexSubImage2D, which is legal only between matching format
+ *     classes and which this host runs at 0.074 ms for a whole 1024x768
+ *     surface. That is what lets a self-overlapping blended draw be
+ *     ORDERED on the GPU rather than handed back to the software
+ *     rasterizer -- this host has neither ARB_ nor NV_texture_barrier
+ *     (measured, doc/radeon9800/glbench).
+ *   - it is also what lets the render target STAY on the GPU across
+ *     draws, so the destination is neither uploaded nor read back per
+ *     draw. In the same bench a 1024x768 readback taken away from a
+ *     draw costs 0.402 ms against the 2.8 ms it costs immediately
+ *     after one.
+ *   - the truncating pack stops round-tripping through a normalized
+ *     format: the shader writes the byte the device would have written.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -114,7 +133,7 @@ static const char *fs_src =
 "flat in vec2 f_t1;\n"
 "flat in vec2 f_t2;\n"
 "flat in float f_inv;\n"
-"precise out vec4 o_col;\n"
+"out uvec4 o_col;\n"
 "uniform usampler2D u_tex;\n"
 "uniform usampler2D u_dst;\n"
 "uniform float u_n255[256];\n"
@@ -255,10 +274,11 @@ static const char *fs_src =
 "        c.r = nr; c.g = ng; c.b = nb;\n"
 "    }\n"
 /*
- * The device packs with a truncation, not a round; reproduce it exactly
- * and the unorm8 conversion below is then a no-op.
+ * The device packs with a truncation, not a round. Writing the byte
+ * straight out of an integer attachment is that pack, with no
+ * normalized round trip in between.
  */
-"    o_col = floor(clamp(c, 0.0, 1.0) * 255.0) / 255.0;\n"
+"    o_col = uvec4(floor(clamp(c, 0.0, 1.0) * 255.0));\n"
 "}\n";
 
 static GLuint gl_compile(GLenum type, const char *src, const char **err)
@@ -440,12 +460,20 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     if (g->fb_w != r->w || g->fb_h != r->h) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r->w, r->h, 0, GL_RGBA,
-                     GL_UNSIGNED_BYTE, r->before);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->w, r->h, 0,
+                     GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, r->before);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g->dst);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->w, r->h, 0,
+                     GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, NULL);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g->cbuf);
         g->fb_w = r->w;
         g->fb_h = r->h;
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->w, r->h, GL_RGBA,
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->w, r->h, GL_RGBA_INTEGER,
                         GL_UNSIGNED_BYTE, r->before);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
@@ -458,18 +486,16 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     glViewport(0, 0, r->w, r->h);
 
     /*
-     * The same bytes again as an integer texture: the blend reads the
-     * destination through the sampler rather than through GL's blender,
-     * so that the device's truncating pack can be reproduced exactly.
-     * A record's quad never overlaps itself, so reading the buffer it is
-     * also writing is well defined here.
+     * The blend samples the destination through an integer sampler
+     * rather than through GL's blender, so that the device's truncating
+     * pack is reproduced exactly. The bytes come from the colour buffer
+     * itself, copied on the GPU -- M2 uploaded the same rectangle a
+     * second time from the host, which the bench measures at 1.44 ms per
+     * full-screen draw against 0.074 ms for the copy.
      */
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, g->dst);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->w, r->h, 0,
-                 GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, r->before);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, r->w, r->h);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g->tex);
@@ -515,8 +541,31 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     glColorMask(!!(r->wmask & 0x00ff0000), !!(r->wmask & 0x0000ff00),
                 !!(r->wmask & 0x000000ff), !!(r->wmask & 0xff000000));
 
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
-    glReadPixels(0, 0, r->w, r->h, GL_RGBA, GL_UNSIGNED_BYTE, r->out);
+    /*
+     * One pass in the ordinary case. A draw whose own primitives overlap
+     * while blending gets several, and the destination the blend samples
+     * is refreshed from the colour buffer between them -- entirely on the
+     * GPU, which is the whole point: the software rasterizer's ordering
+     * is reproduced without the draw going back to it.
+     */
+    if (r->npass > 1) {
+        unsigned p;
+
+        for (p = 0; p < r->npass; p++) {
+            if (p) {
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, g->dst);
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                    r->w, r->h);
+                glActiveTexture(GL_TEXTURE0);
+            }
+            glDrawArrays(GL_TRIANGLES, (GLint)r->pass[p],
+                         (GLsizei)(r->pass[p + 1] - r->pass[p]));
+        }
+    } else {
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
+    }
+    glReadPixels(0, 0, r->w, r->h, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, r->out);
 
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_SCISSOR_TEST);

@@ -4057,6 +4057,18 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                            ati_r350_gl_describe(s->gl_ctx), s->gl_drawn, fb,
                            s->gl_drawn + fb
                            ? 100.0 * s->gl_drawn / (s->gl_drawn + fb) : 0.0);
+    if (s->gl_multipass) {
+        /*
+         * How much work the self-overlap ordering is doing. A blended
+         * draw whose primitives cross itself is rendered in this many
+         * ordered passes rather than falling back; if the average
+         * climbs, the partition is the thing to look at.
+         */
+        g_string_append_printf(out, "\nordered draws %" PRIu64
+                               " in %" PRIu64 " passes (%.2f average)",
+                               s->gl_multipass, s->gl_passes,
+                               (double)s->gl_passes / s->gl_multipass);
+    }
     for (k = 0; k < R350_GLF_MAX; k++) {
         for (i = 0; i < R350_GAP_SLOTS; i++) {
             if (s->gl_fb[k][i]) {

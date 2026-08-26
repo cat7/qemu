@@ -49,6 +49,21 @@ typedef struct R350GlReq {
     const float *verts;         /* R350_GL_VSTRIDE floats per vertex */
     unsigned nvert;             /* 3 * triangle count */
 
+    /*
+     * The vertices are ordered into PASSES. A blended draw whose own
+     * primitives overlap cannot be rendered in one go -- the shader
+     * blends against a snapshot of the destination, while the device
+     * paints primitives in order and each blends against what the last
+     * one left. So the caller partitions the triangles so that no two in
+     * a pass overlap and any overlapping pair lands in the device's own
+     * order, and the backend refreshes the blend's source between
+     * passes. `pass[k]` is the first vertex of pass k and there are
+     * npass + 1 entries, the last being nvert. A single pass (the
+     * ordinary case) may leave both NULL and 0.
+     */
+    const unsigned *pass;
+    unsigned npass;
+
     const uint8_t *tex;         /* RGBA8, tex_w x tex_h; NULL if untextured */
     int tex_w, tex_h;
     int clamp_s, clamp_t;       /* TX_FILTER0 clamp modes; <= 1 is repeat */

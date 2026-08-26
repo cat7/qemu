@@ -2032,30 +2032,37 @@ static unsigned r300_gl_rect_list(const R300Vtx *vb, unsigned nvtx,
 /*
  * Does this draw blend against pixels it has already written itself?
  *
- * The backend renders a whole draw in one pass and its shader reads the
- * destination it is blending against as a texture, seeded once from
- * VRAM. That reproduces the software rasterizer's arithmetic exactly --
- * truncating pack included -- but only while no two primitives of the
- * draw cover the same pixel. The software rasterizer paints them in
- * order and each blends against what the previous one left; a single
- * pass blends both against the ORIGINAL. Flurry.saver's additive
- * ribbons cross themselves inside one draw and differ by up to 229/255
- * because of it, measured by gl=verify.
+ * The backend's shader reads the destination it is blending against as
+ * a texture, seeded once. That reproduces the software rasterizer's
+ * arithmetic exactly -- truncating pack included -- but only while no
+ * two primitives of the draw cover the same pixel. The software
+ * rasterizer paints them in order and each blends against what the
+ * previous one left; a single pass blends both against the ORIGINAL.
+ * Flurry.saver's additive ribbons cross themselves inside one draw and
+ * differ by up to 229/255 because of it, measured by gl=verify.
  *
- * So the draws that do it fall back. The test is exact rather than a
- * bounding box, because a bounding box would also reject Chess's board
- * -- 1048 blended quad-strip draws that the offline harness measures
- * as correct through GL to a maximum channel delta of 1. Two triangles
- * are separated when some edge normal projects them to intervals that
- * do not overlap in a positive length, so a shared edge (the two
- * halves of a quad, or two quads of a strip) reads as disjoint, which
- * is what makes an ordinary mesh keep the fast path.
+ * M2 made those draws fall back to the software rasterizer, which cost
+ * the offload most of its speed: the same binary without the fallback
+ * measured 14.96 fps against 10.23 -- and rendered Flurry wrong. M3
+ * wins that back by ORDERING them instead. The triangles are
+ * partitioned into passes such that no two in a pass overlap and any
+ * overlapping pair lands in the device's own order, and the backend
+ * refreshes the blend's source between passes with a GPU-side copy.
+ * The result is the software path's ordering, computed on the GPU.
  *
- * Unblended draws need none of this: a later primitive simply
- * overwrites an earlier one, and GL processes primitives in the order
- * they were submitted.
+ * The test is exact rather than a bounding box, because a bounding box
+ * would put every quad of Chess's board in its own pass -- 1048 blended
+ * quad-strip draws the offline harness measures as correct through GL
+ * to a maximum channel delta of 1. Two triangles are separated when
+ * some edge normal projects them to intervals that do not overlap in a
+ * positive length, so a shared edge (the two halves of a quad, or two
+ * quads of a strip) reads as disjoint, which is what keeps an ordinary
+ * mesh in a single pass.
+ *
+ * Unblended draws need none of this, and neither do blended ones whose
+ * READ_ENABLE is clear: GL updates the framebuffer in primitive order,
+ * so a later primitive simply overwrites an earlier one.
  */
-#define R300_GL_TRI_MAX 192
 
 /*
  * The separating-axis test, one axis. Two convex shapes are disjoint
@@ -2102,28 +2109,79 @@ static bool r300_tris_overlap(const R300Vtx * const a[3],
     return true;
 }
 
-static bool r300_gl_self_overlap(const R300Vtx *vb, const unsigned *idx,
-                                 unsigned ntri)
+/*
+ * Assign each triangle the earliest pass that keeps the device's order:
+ * one later than the last earlier triangle it overlaps, or pass 0 if it
+ * overlaps none. That is correct by construction in both directions --
+ * two triangles in the same pass never cover a common pixel, and an
+ * overlapping pair is always drawn earlier-first with the later one
+ * blending against a destination that already holds the earlier one.
+ *
+ * The inner loop runs backwards and skips any triangle already in a
+ * pass no later than the one this triangle has reached, because such a
+ * triangle cannot push it further; and a bounding-box test screens the
+ * exact one. A mesh therefore costs one bounding-box comparison per
+ * pair and stays in a single pass.
+ *
+ * Returns the number of passes, or 0 when the draw needs more than
+ * R300_GL_PASS_MAX -- the caller falls back and counts it.
+ */
+static unsigned r300_gl_passes(ATIR350State *s, const R300Vtx *vb,
+                               const unsigned *idx, unsigned ntri)
 {
-    unsigned i, j;
+    unsigned i, j, n = 1;
 
-    if (ntri > R300_GL_TRI_MAX) {
-        return true;                /* too many to check: refuse, safely */
-    }
     for (i = 0; i < ntri; i++) {
         const R300Vtx *a[3] = { &vb[idx[i * 3]], &vb[idx[i * 3 + 1]],
                                 &vb[idx[i * 3 + 2]] };
+        float *bb = s->gl_bbox[i];
 
-        for (j = i + 1; j < ntri; j++) {
-            const R300Vtx *b[3] = { &vb[idx[j * 3]], &vb[idx[j * 3 + 1]],
-                                    &vb[idx[j * 3 + 2]] };
+        bb[0] = MIN(a[0]->x, MIN(a[1]->x, a[2]->x));
+        bb[1] = MIN(a[0]->y, MIN(a[1]->y, a[2]->y));
+        bb[2] = MAX(a[0]->x, MAX(a[1]->x, a[2]->x));
+        bb[3] = MAX(a[0]->y, MAX(a[1]->y, a[2]->y));
+        s->gl_pass[i] = 0;
+        for (j = i; j-- > 0;) {
+            const float *cb = s->gl_bbox[j];
+            const R300Vtx *b[3];
 
-            if (r300_tris_overlap(a, b)) {
-                return true;
+            if (s->gl_pass[j] < s->gl_pass[i]) {
+                continue;
+            }
+            if (bb[2] <= cb[0] || cb[2] <= bb[0] ||
+                bb[3] <= cb[1] || cb[3] <= bb[1]) {
+                continue;
+            }
+            b[0] = &vb[idx[j * 3]];
+            b[1] = &vb[idx[j * 3 + 1]];
+            b[2] = &vb[idx[j * 3 + 2]];
+            if (!r300_tris_overlap(a, b)) {
+                continue;
+            }
+            if (s->gl_pass[j] + 1u >= R300_GL_PASS_MAX) {
+                return 0;
+            }
+            s->gl_pass[i] = s->gl_pass[j] + 1;
+        }
+        n = MAX(n, s->gl_pass[i] + 1u);
+    }
+    return n;
+}
+
+/* the triangles in pass order, and where in the vertex array each begins */
+static void r300_gl_order(ATIR350State *s, unsigned ntri, unsigned npass)
+{
+    unsigned p, i, n = 0;
+
+    for (p = 0; p < npass; p++) {
+        s->gl_pass_first[p] = n * 3;
+        for (i = 0; i < ntri; i++) {
+            if (s->gl_pass[i] == p) {
+                s->gl_order[n++] = i;
             }
         }
     }
-    return false;
+    s->gl_pass_first[npass] = n * 3;
 }
 
 /*
@@ -2374,7 +2432,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     g_autofree unsigned *idx = NULL;
     const R300Vtx *gvb = vb;
     R350GlReq req = { 0 };
-    unsigned ntri = 0, i, xr = 0;
+    unsigned ntri = 0, npass = 1, i, xr = 0;
     int x0, y0, x1, y1, w, h;
     size_t rect_sz, texels = 0;
 
@@ -2405,8 +2463,19 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if (!r300_gl_clip(d, &req.sx0, &req.sy0, &req.sx1, &req.sy1)) {
         return r300_gl_fallback(s, R350_GLF_CLIPRULE, prim, nvtx);
     }
-    if (d->blend && ntri > 1 && r300_gl_self_overlap(gvb, idx, ntri)) {
-        return r300_gl_fallback(s, R350_GLF_SELFBLEND, prim, nvtx);
+    if (d->blend && d->blend_read && ntri > 1) {
+        if (ntri > R300_GL_TRI_MAX) {
+            return r300_gl_fallback(s, R350_GLF_SELFBLEND, prim, nvtx);
+        }
+        npass = r300_gl_passes(s, gvb, idx, ntri);
+        if (!npass) {
+            return r300_gl_fallback(s, R350_GLF_SELFBLEND, prim, nvtx);
+        }
+        if (npass > 1) {
+            r300_gl_order(s, ntri, npass);
+            s->gl_multipass++;
+            s->gl_passes += npass;
+        }
     }
     /*
      * The rectangle, and the swapper over it, from the same two helpers
@@ -2466,13 +2535,19 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
         s->gl_verts = g_realloc(s->gl_verts, s->gl_verts_sz);
     }
 
-    for (i = 0; i < ntri * 3; i++) {
-        const R300Vtx *t0 = &gvb[idx[i - i % 3 + 0]];
-        const R300Vtx *t1 = &gvb[idx[i - i % 3 + 1]];
-        const R300Vtx *t2 = &gvb[idx[i - i % 3 + 2]];
+    for (i = 0; i < ntri; i++) {
+        /* pass order when there is one, submission order otherwise */
+        unsigned src = (npass > 1 ? s->gl_order[i] : i) * 3;
+        const R300Vtx *t0 = &gvb[idx[src + 0]];
+        const R300Vtx *t1 = &gvb[idx[src + 1]];
+        const R300Vtx *t2 = &gvb[idx[src + 2]];
+        float inv = 1.0f / r300_edge(t0, t1, t2->x, t2->y);
+        unsigned k;
 
-        r300_gl_vtx(s->gl_verts + (size_t)i * R350_GL_VSTRIDE, &gvb[idx[i]],
-                    t0, t1, t2, 1.0f / r300_edge(t0, t1, t2->x, t2->y));
+        for (k = 0; k < 3; k++) {
+            r300_gl_vtx(s->gl_verts + (size_t)(i * 3 + k) * R350_GL_VSTRIDE,
+                        &gvb[idx[src + k]], t0, t1, t2, inv);
+        }
     }
     if (d->textured) {
         r300_gl_decode_tex(s, d, s->gl_texbuf);
@@ -2482,6 +2557,8 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.x0 = x0; req.y0 = y0; req.w = w; req.h = h;
     req.verts = s->gl_verts;
     req.nvert = ntri * 3;
+    req.pass = npass > 1 ? s->gl_pass_first : NULL;
+    req.npass = npass;
     req.tex = d->textured ? s->gl_texbuf : NULL;
     req.tex_w = d->tex_w;
     req.tex_h = d->tex_h;

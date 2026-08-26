@@ -123,10 +123,21 @@ typedef enum ATIR350GlFallback {
     R350_GLF_XOR,           /* aperture swapper not uniform over the rect */
     R350_GLF_CLIPRULE,      /* a genuine 4-rect cliprect truth table */
     R350_GLF_TEXTURE,       /* texture too large to decode per draw */
-    R350_GLF_SELFBLEND,     /* blended draw whose own primitives overlap */
+    R350_GLF_SELFBLEND,     /* self-overlapping blend needing too many passes */
     R350_GLF_BACKEND,       /* the backend itself declined the request */
     R350_GLF_MAX
 } ATIR350GlFallback;
+
+/*
+ * A blended draw whose own primitives overlap is rendered in several
+ * ordered passes rather than handed back to the software rasterizer
+ * (milestone M3; see r300_gl_passes()). These bound the partition: a
+ * draw needing more triangles or more passes than this falls back and
+ * is counted, so the limits are visible in `gl-stats` rather than
+ * silently shaping what the offload covers.
+ */
+#define R300_GL_TRI_MAX     512
+#define R300_GL_PASS_MAX    8
 
 typedef struct ATIR350PM4Parser {
     uint32_t remaining;      /* data dwords still expected */
@@ -493,6 +504,18 @@ struct ATIR350State {
     size_t gl_rect_sz, gl_texbuf_sz;
     float *gl_verts;
     size_t gl_verts_sz;
+    /*
+     * The self-overlap partition's working set, sized once rather than
+     * allocated per draw: which pass each triangle landed in, the
+     * triangles in pass order, where each pass begins in the vertex
+     * array, and the bounding boxes the pairwise test screens with.
+     */
+    uint8_t gl_pass[R300_GL_TRI_MAX];
+    unsigned gl_order[R300_GL_TRI_MAX];
+    unsigned gl_pass_first[R300_GL_PASS_MAX + 1];
+    float gl_bbox[R300_GL_TRI_MAX][4];
+    uint64_t gl_multipass;      /* draws that needed more than one pass */
+    uint64_t gl_passes;         /* ... and how many passes in total */
 
     /*
      * Hardware cursor (CUR_* registers). hw_cursor_on tracks whether the
