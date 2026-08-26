@@ -2076,9 +2076,27 @@ void ati_r350_gl_release(ATIR350State *s)
     s->gl_res = false;
 }
 
+/*
+ * A READER of this range: it must see VRAM as the engine left it, so a
+ * resident target overlapping it is flushed and given back. Decoded
+ * textures are deliberately NOT dropped -- reading a texture is what
+ * the cache exists for, and dropping it here made every draw invalidate
+ * the very entry it had just filled (measured live: 0 hits in 3732
+ * decodes over a Chess session).
+ */
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
 {
     uint32_t lo, hi;
+
+    if (!r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
+        return;
+    }
+    ati_r350_gl_release(s);
+}
+
+/* a WRITER of this range: whatever was decoded from it is now stale */
+void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
+{
     unsigned k;
 
     for (k = 0; k < R300_GL_TEXCACHE; k++) {
@@ -2088,10 +2106,7 @@ void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
             s->gl_tex[k].up = false;
         }
     }
-    if (!r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
-        return;
-    }
-    ati_r350_gl_release(s);
+    ati_r350_gl_sync(s, off, len);
 }
 
 /*

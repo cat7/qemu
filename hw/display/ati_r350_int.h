@@ -676,12 +676,23 @@ const char *ati_r350_gl_fb_name(ATIR350GlFallback why);
  */
 void ati_r350_gl_release(ATIR350State *s);
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len);
+void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len);
 
+/* something is about to READ this range of VRAM */
 static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
                                      uint32_t len)
 {
-    if (unlikely(s->gl_res || s->gl_tex_any)) {
+    if (unlikely(s->gl_res)) {
         ati_r350_gl_sync(s, off, len);
+    }
+}
+
+/* ... and about to WRITE it, which also stales anything decoded from it */
+static inline void ati_r350_gl_dirty(ATIR350State *s, uint32_t off,
+                                     uint32_t len)
+{
+    if (unlikely(s->gl_res || s->gl_tex_any)) {
+        ati_r350_gl_wrote(s, off, len);
     }
 }
 

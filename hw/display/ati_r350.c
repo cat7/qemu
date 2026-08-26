@@ -1647,7 +1647,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
             uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
             if (off + 4 <= ATI_R350_VRAM_SIZE) {
-                ati_r350_gl_touch(s, off, 4);
+                ati_r350_gl_dirty(s, off, 4);
                 stl_le_p(vram + off, val);
                 memory_region_set_dirty(&s->vram, off, 4);
             }
@@ -2468,7 +2468,7 @@ static void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
         if (off + 4 <= ATI_R350_VRAM_SIZE) {
-            ati_r350_gl_touch(s, off, 4);
+            ati_r350_gl_dirty(s, off, 4);
             stl_le_p(vram + off, val);
             memory_region_set_dirty(&s->vram, off, 4);
         }

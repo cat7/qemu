@@ -777,12 +777,27 @@ void ati_r350_2d_blt(ATIR350State *s)
      * The 2D engine reads and writes VRAM through its own per-pixel
      * path, and a blit's source or destination is regularly the surface
      * the 3D engine has been rendering into -- a texture upload, a
-     * window's backing store, the framebuffer itself. Give the target
-     * back rather than reasoning per blit about which is which: see
-     * "GL-OWNED RENDER TARGET" in ati_r350_3d.c. `gl-stats` counts the
-     * flushes, so if this turns out to be the expensive hook it says so.
+     * window's backing store, the framebuffer itself. Name both ranges
+     * rather than releasing unconditionally: the compositor interleaves
+     * blits with 3D draws constantly, and giving the target back for
+     * every one of them was most of the flushes `gl-stats` reported.
+     * Both ranges are computed generously -- from the surface origin to
+     * the last row the blit can reach -- because too wide only costs a
+     * flush, while too narrow is the silent kind of wrong.
      */
-    ati_r350_gl_release(s);
+    if (unlikely(s->gl_res || s->gl_tex_any)) {
+        int bpp = ati_r350_bpp_from_dp_datatype(s);
+        uint32_t ds = s->dst_pitch_bytes ? s->dst_pitch : s->dst_pitch * bpp;
+        uint32_t ss = s->src_pitch_bytes ? s->src_pitch : s->src_pitch * bpp;
+
+        ati_r350_gl_dirty(s, s->dst_offset,
+                          (s->dst_y + s->dst_height + 1) * ds);
+        if (src_source != R350_DP_SRC_HOST &&
+            src_source != R350_DP_SRC_HOST_BYTEALIGN) {
+            ati_r350_gl_touch(s, s->src_offset,
+                              (s->src_y + s->dst_height + 1) * ss);
+        }
+    }
 
     trace_ati_r350_2d_blt((s->src_x << 16) | s->src_y,
                              (s->dst_x << 16) | s->dst_y,
