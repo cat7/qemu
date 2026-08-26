@@ -21,6 +21,7 @@
 
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
+#include "ati_r350_gl.h"
 #include "trace.h"
 
 
@@ -3714,6 +3715,34 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         }
     }
 
+    /*
+     * Host-GPU offload (phase 2, milestone M2). `gl=off` -- the default
+     * -- opens nothing, and the draw path then tests one NULL pointer
+     * and rasterizes exactly as it always did. `on` renders what the
+     * backend can through it and falls back per draw for the rest;
+     * `verify` runs both paths and diffs them, with the software result
+     * still the one that lands in VRAM.
+     */
+    if (s->gl_path && s->gl_path[0] && strcmp(s->gl_path, "off")) {
+        const char *why = NULL;
+
+        if (!strcmp(s->gl_path, "on")) {
+            s->gl_mode = R350_GL_ON;
+        } else if (!strcmp(s->gl_path, "verify")) {
+            s->gl_mode = R350_GL_VERIFY;
+        } else {
+            error_setg(errp, "gl must be one of off, on, verify (got \"%s\")",
+                       s->gl_path);
+            return;
+        }
+        s->gl_ctx = ati_r350_gl_open(&why);
+        if (!s->gl_ctx) {
+            error_setg(errp, "gl=%s: %s", s->gl_path, why);
+            return;
+        }
+        trace_ati_r350_gl_open(ati_r350_gl_describe(s->gl_ctx));
+    }
+
     memory_region_init_io(&s->mmio, obj, &ati_r350_mmio_ops, s,
                           "ati-r350-mmio", ATI_R350_MMIO_SIZE);
     /*
@@ -3856,6 +3885,13 @@ static void ati_r350_exit(PCIDevice *dev)
         fclose(s->cap_fp);
         s->cap_fp = NULL;
     }
+    ati_r350_gl_close(s->gl_ctx);
+    s->gl_ctx = NULL;
+    g_free(s->gl_before);
+    g_free(s->gl_out);
+    g_free(s->gl_sw);
+    g_free(s->gl_texbuf);
+    g_free(s->gl_verts);
 }
 
 static const VMStateDescription vmstate_ati_r350 = {
@@ -3895,6 +3931,11 @@ static const Property ati_r350_properties[] = {
     DEFINE_PROP_UINT32("draw-capture-max", ATIR350State, cap_max, 256),
     DEFINE_PROP_UINT32("draw-capture-max-px", ATIR350State, cap_max_px,
                        256 * 256),
+    /*
+     * Host-GPU offload: "off" (the default, and a provable no-op),
+     * "on", or "verify". See ati_r350_gl.h.
+     */
+    DEFINE_PROP_STRING("gl", ATIR350State, gl_path),
     DEFINE_EDID_PROPERTIES(ATIR350State, edid_info),
 };
 
@@ -3959,6 +4000,99 @@ static char *ati_r350_get_gaps(Object *obj, Error **errp)
     }
     if (!out->len) {
         g_string_append(out, "none");
+    }
+    return g_string_free(out, FALSE);
+}
+
+static const char *const ati_r350_gl_fb_names[R350_GLF_MAX] = {
+    [R350_GLF_PRIM]     = "primitive",
+    [R350_GLF_RESOLVE]  = "aa resolve",
+    [R350_GLF_RECT]     = "destination rect",
+    [R350_GLF_ALIGN]    = "destination alignment",
+    [R350_GLF_VRAMEND]  = "rectangle past VRAM",
+    [R350_GLF_XOR]      = "non-uniform swapper",
+    [R350_GLF_CLIPRULE] = "cliprect truth table",
+    [R350_GLF_TEXTURE]  = "texture size",
+    [R350_GLF_SELFBLEND] = "self-overlapping blend",
+    [R350_GLF_BACKEND]  = "backend declined",
+};
+
+const char *ati_r350_gl_fb_name(ATIR350GlFallback why)
+{
+    return why < R350_GLF_MAX ? ati_r350_gl_fb_names[why] : "?";
+}
+
+/*
+ * `gl-stats` property: how much of this session the host-GPU offload actually
+ * carried, and -- under gl=verify -- how far its pixels were from the
+ * software rasterizer's. Read it from the monitor with
+ *   qom-get /machine/peripheral-anon/device[N] gl-stats
+ *
+ * The fallback tally is the coverage measurement: a draw family the
+ * backend cannot render is named with its primitive type and counted,
+ * so "the offload is on" is a number rather than an impression. The
+ * verify histogram is the live analogue of the offline M1 harness --
+ * the acceptance there is a maximum channel delta of 1 with at least
+ * 99.9% of pixels at delta 0.
+ */
+static char *ati_r350_get_gl(Object *obj, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+    GString *out = g_string_new(NULL);
+    uint64_t fb = 0;
+    unsigned k, i;
+
+    if (!s->gl_ctx) {
+        g_string_append(out, "off");
+        return g_string_free(out, FALSE);
+    }
+    for (k = 0; k < R350_GLF_MAX; k++) {
+        for (i = 0; i < R350_GAP_SLOTS; i++) {
+            fb += s->gl_fb[k][i];
+        }
+    }
+    g_string_append_printf(out, "mode %s\nbackend %s\ndrawn %" PRIu64
+                           "\nfallback %" PRIu64 " (%.2f%% offloaded)",
+                           s->gl_mode == R350_GL_VERIFY ? "verify" : "on",
+                           ati_r350_gl_describe(s->gl_ctx), s->gl_drawn, fb,
+                           s->gl_drawn + fb
+                           ? 100.0 * s->gl_drawn / (s->gl_drawn + fb) : 0.0);
+    for (k = 0; k < R350_GLF_MAX; k++) {
+        for (i = 0; i < R350_GAP_SLOTS; i++) {
+            if (s->gl_fb[k][i]) {
+                g_string_append_printf(out, "\n  %s prim %u: %" PRIu64,
+                                       ati_r350_gl_fb_names[k], i,
+                                       s->gl_fb[k][i]);
+            }
+        }
+    }
+    if (s->gl_v_draws) {
+        uint64_t vpx = s->gl_v_hist[0] + s->gl_v_hist[1] +
+                       s->gl_v_hist[2] + s->gl_v_hist[3];
+
+        g_string_append_printf(out,
+                               "\nverify %" PRIu64 " draws, %" PRIu64
+                               " px, max delta %u, %" PRIu64
+                               " draws with any delta > 1"
+                               "\n  VALUE %" PRIu64 " px: d0 %" PRIu64
+                               " d1 %" PRIu64 " d2-4 %" PRIu64
+                               " d>4 %" PRIu64 " = %.4f%% at delta 0, "
+                               "max delta %u"
+                               "\n  COVER %" PRIu64 " px, %" PRIu64
+                               " differing = %.4f%% of the compared area"
+                               "\n  of the value-class disagreements above "
+                               "1/255, %" PRIu64 " are in a multi-triangle "
+                               "draw (a shared-edge tie the offline "
+                               "classifier scores as EDGE)",
+                               s->gl_v_draws, s->gl_v_px, s->gl_v_max,
+                               s->gl_v_bad,
+                               vpx, s->gl_v_hist[0], s->gl_v_hist[1],
+                               s->gl_v_hist[2], s->gl_v_hist[3],
+                               vpx ? 100.0 * s->gl_v_hist[0] / vpx : 0.0,
+                               s->gl_v_vmax,
+                               s->gl_v_cover_px, s->gl_v_cover,
+                               100.0 * s->gl_v_cover / s->gl_v_px,
+                               s->gl_v_mesh);
     }
     return g_string_free(out, FALSE);
 }
@@ -4031,6 +4165,7 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_str(klass, "gaps", ati_r350_get_gaps, NULL);
     object_class_property_add_str(klass, "scanout", ati_r350_get_scanout,
                                   NULL);
+    object_class_property_add_str(klass, "gl-stats", ati_r350_get_gl, NULL);
 
     k->class_id  = PCI_CLASS_DISPLAY_VGA;
     k->vendor_id = PCI_VENDOR_ID_ATI;

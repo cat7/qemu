@@ -23,6 +23,7 @@
 #include "hw/pci/pci_device.h"
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
+#include "ati_r350_gl.h"
 #include "trace.h"
 
 typedef struct R300Vtx {
@@ -1542,35 +1543,6 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
 {
     unsigned i;
 
-    /*
-     * Where this draw actually lands, straight from the transformed
-     * vertices. Offline replay of a command stream has to reconstruct
-     * this and can get it wrong -- reading it from the engine is the
-     * ground truth to check such a reconstruction against.
-     */
-    if (trace_event_get_state_backends(TRACE_ATI_R350_3D_RECT) && nvtx) {
-        float x0 = vb[0].x, y0 = vb[0].y, x1 = x0, y1 = y0;
-        float s0 = vb[0].s, t0 = vb[0].t, s1 = s0, t1 = t0;
-
-        for (i = 1; i < nvtx; i++) {
-            x0 = MIN(x0, vb[i].x); x1 = MAX(x1, vb[i].x);
-            y0 = MIN(y0, vb[i].y); y1 = MAX(y1, vb[i].y);
-            s0 = MIN(s0, vb[i].s); s1 = MAX(s1, vb[i].s);
-            t0 = MIN(t0, vb[i].t); t1 = MAX(t1, vb[i].t);
-        }
-        if (prim == 1) {
-            /* a point sprite covers RE_POINTSIZE around its centre */
-            uint32_t psize = s->regs[R300_RE_POINTSIZE >> 2];
-            float hw = ((psize >> 16) & 0xffff) / 12.0f;
-            float hh = (psize & 0xffff) / 12.0f;
-
-            x0 -= hw; x1 += hw;
-            y0 -= hh; y1 += hh;
-        }
-        trace_ati_r350_3d_rect(d->dst_off, (int)x0, (int)y0, (int)x1, (int)y1,
-                               (int)s0, (int)t0, (int)s1, (int)t1);
-    }
-
     switch (prim) {
     case 1:     /* point list -- WindowServer's screen composites are
                  * point SPRITES: RE_POINTSIZE gives the width/height
@@ -1949,11 +1921,661 @@ uint32_t ati_r350_cap_vtx_bytes(void)
     return sizeof(R300Vtx);
 }
 
+/*
+ * Host-GPU offload (phase 2, milestone M2).
+ *
+ * Everything below runs only when the "gl" property opened a backend,
+ * and the draw path tests nothing but s->gl_ctx, so a device left at
+ * the default `gl=off` reaches r300_raster_prims() through exactly the
+ * branch it always did.
+ *
+ * The shape is deliberately the same as the M1 replay harness, because
+ * that is what was measured: this builds the same self-contained
+ * request out of live device state that a capture record carried on
+ * disk, hands it to the backend, and puts the rectangle back into VRAM
+ * for the existing scanout to display. Anything the backend cannot
+ * render falls back to the software rasterizer PER DRAW and is counted
+ * -- a correct hybrid frame beats a complete GL frame that is wrong.
+ */
+static bool r300_gl_fallback(ATIR350State *s, ATIR350GlFallback why,
+                             unsigned prim, unsigned nvtx)
+{
+    s->gl_fb[why][prim & (R350_GAP_SLOTS - 1)]++;
+    trace_ati_r350_3d_gl_fallback(ati_r350_gl_fb_name(why), prim, nvtx);
+    return false;
+}
+
+/*
+ * The triangles r300_raster_prims() assembles, as an index list. Kept
+ * beside that switch and in the same order on purpose: if the two ever
+ * disagree the offload draws different geometry from the oracle, which
+ * is the one divergence gl=verify could not attribute.
+ *
+ * Point lists, line lists, strips and loops are deliberately absent.
+ * A point SPRITE is a whole per-vertex quad expansion driven by
+ * registers the request does not carry, and a line is expanded across
+ * its direction; both are milestone M3 work at the earliest. They fall
+ * back and are counted.
+ */
+static unsigned r300_gl_tris(unsigned prim, unsigned nvtx, unsigned *idx,
+                             unsigned max)
+{
+    unsigned n = 0, i;
+
+#define R300_GL_EMIT(a, b, c)                           \
+    do {                                                \
+        if (n + 3 > max) {                              \
+            return n / 3;                               \
+        }                                               \
+        idx[n++] = (a); idx[n++] = (b); idx[n++] = (c); \
+    } while (0)
+
+    switch (prim) {
+    case 4: case 7:
+        for (i = 0; i + 3 <= nvtx; i += 3) {
+            R300_GL_EMIT(i, i + 1, i + 2);
+        }
+        break;
+    case 5: case 15:
+        for (i = 2; i < nvtx; i++) {
+            R300_GL_EMIT(0, i - 1, i);
+        }
+        break;
+    case 6:
+        for (i = 2; i < nvtx; i++) {
+            R300_GL_EMIT(i - 2, i - 1, i);
+        }
+        break;
+    case 13:
+        for (i = 0; i + 4 <= nvtx; i += 4) {
+            R300_GL_EMIT(i, i + 1, i + 2);
+            R300_GL_EMIT(i, i + 2, i + 3);
+        }
+        break;
+    case 14:
+        for (i = 2; i + 2 <= nvtx; i += 2) {
+            R300_GL_EMIT(i - 2, i - 1, i + 1);
+            R300_GL_EMIT(i - 2, i + 1, i);
+        }
+        break;
+    default:
+        return 0;
+    }
+#undef R300_GL_EMIT
+    return n / 3;
+}
+
+/*
+ * A rectangle-list draw implies a fourth corner that is not in the
+ * vertex buffer, so it cannot be expressed as an index list over vb[].
+ * The vertices are synthesised into a private array instead, which is
+ * why prim 8 is handled separately rather than inside r300_gl_tris().
+ */
+static unsigned r300_gl_rect_list(const R300Vtx *vb, unsigned nvtx,
+                                  R300Vtx *out, unsigned max)
+{
+    unsigned n = 0, i;
+
+    for (i = 0; i + 3 <= nvtx && n + 6 <= max; i += 3) {
+        R300Vtx v3 = vb[i + 2];
+
+        v3.x = vb[i + 1].x + vb[i + 2].x - vb[i].x;
+        v3.y = vb[i + 1].y + vb[i + 2].y - vb[i].y;
+        v3.s = vb[i + 1].s + vb[i + 2].s - vb[i].s;
+        v3.t = vb[i + 1].t + vb[i + 2].t - vb[i].t;
+        out[n++] = vb[i]; out[n++] = vb[i + 1]; out[n++] = vb[i + 2];
+        out[n++] = vb[i + 1]; out[n++] = v3; out[n++] = vb[i + 2];
+    }
+    return n / 3;
+}
+
+/*
+ * Does this draw blend against pixels it has already written itself?
+ *
+ * The backend renders a whole draw in one pass and its shader reads the
+ * destination it is blending against as a texture, seeded once from
+ * VRAM. That reproduces the software rasterizer's arithmetic exactly --
+ * truncating pack included -- but only while no two primitives of the
+ * draw cover the same pixel. The software rasterizer paints them in
+ * order and each blends against what the previous one left; a single
+ * pass blends both against the ORIGINAL. Flurry.saver's additive
+ * ribbons cross themselves inside one draw and differ by up to 229/255
+ * because of it, measured by gl=verify.
+ *
+ * So the draws that do it fall back. The test is exact rather than a
+ * bounding box, because a bounding box would also reject Chess's board
+ * -- 1048 blended quad-strip draws that the offline harness measures
+ * as correct through GL to a maximum channel delta of 1. Two triangles
+ * are separated when some edge normal projects them to intervals that
+ * do not overlap in a positive length, so a shared edge (the two
+ * halves of a quad, or two quads of a strip) reads as disjoint, which
+ * is what makes an ordinary mesh keep the fast path.
+ *
+ * Unblended draws need none of this: a later primitive simply
+ * overwrites an earlier one, and GL processes primitives in the order
+ * they were submitted.
+ */
+#define R300_GL_TRI_MAX 192
+
+/*
+ * The separating-axis test, one axis. Two convex shapes are disjoint
+ * exactly when some axis projects them to intervals that do not
+ * overlap, and for two triangles it is enough to try the six edge
+ * normals. "Do not overlap" is taken as touching-counts-as-disjoint, so
+ * a shared edge separates -- which is what a mesh is made of.
+ */
+static bool r300_axis_sep(float nx, float ny, const R300Vtx * const a[3],
+                          const R300Vtx * const b[3])
+{
+    float alo, ahi, blo, bhi;
+    unsigned i;
+
+    if (nx == 0.0f && ny == 0.0f) {
+        return false;               /* a degenerate edge separates nothing */
+    }
+    alo = ahi = nx * a[0]->x + ny * a[0]->y;
+    blo = bhi = nx * b[0]->x + ny * b[0]->y;
+    for (i = 1; i < 3; i++) {
+        float va = nx * a[i]->x + ny * a[i]->y;
+        float vb = nx * b[i]->x + ny * b[i]->y;
+
+        alo = MIN(alo, va); ahi = MAX(ahi, va);
+        blo = MIN(blo, vb); bhi = MAX(bhi, vb);
+    }
+    return ahi <= blo || bhi <= alo;
+}
+
+static bool r300_tris_overlap(const R300Vtx * const a[3],
+                              const R300Vtx * const b[3])
+{
+    unsigned i;
+
+    for (i = 0; i < 3; i++) {
+        const R300Vtx *p = a[i], *q = a[(i + 1) % 3];
+        const R300Vtx *r = b[i], *t = b[(i + 1) % 3];
+
+        if (r300_axis_sep(-(q->y - p->y), q->x - p->x, a, b) ||
+            r300_axis_sep(-(t->y - r->y), t->x - r->x, a, b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool r300_gl_self_overlap(const R300Vtx *vb, const unsigned *idx,
+                                 unsigned ntri)
+{
+    unsigned i, j;
+
+    if (ntri > R300_GL_TRI_MAX) {
+        return true;                /* too many to check: refuse, safely */
+    }
+    for (i = 0; i < ntri; i++) {
+        const R300Vtx *a[3] = { &vb[idx[i * 3]], &vb[idx[i * 3 + 1]],
+                                &vb[idx[i * 3 + 2]] };
+
+        for (j = i + 1; j < ntri; j++) {
+            const R300Vtx *b[3] = { &vb[idx[j * 3]], &vb[idx[j * 3 + 1]],
+                                    &vb[idx[j * 3 + 2]] };
+
+            if (r300_tris_overlap(a, b)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * RE_CLIPRECT_CNTL is a 16-entry truth table indexed by which of the
+ * four clip rectangles contain the pixel, and in general it has no GL
+ * equivalent. The compositor does not use it in general, though: it
+ * clips each window-content draw with ONE rectangle, and "scissor AND
+ * one rect" is still a rectangle, which glScissor expresses exactly.
+ * The no-clip rule and the four single-rect rules fold in; a genuine
+ * truth table falls back rather than being approximated.
+ */
+static bool r300_gl_clip(const R300DrawState *d, int *ex0, int *ey0,
+                         int *ex1, int *ey1)
+{
+    int r = -1;
+
+    switch (d->clip_rule) {
+    case 0xffff:
+        break;
+    case 0xaaaa:
+        r = 0;
+        break;
+    case 0xcccc:
+        r = 1;
+        break;
+    case 0xf0f0:
+        r = 2;
+        break;
+    case 0xff00:
+        r = 3;
+        break;
+    default:
+        return false;
+    }
+    *ex0 = MAX(d->sc_x0, 0);
+    *ey0 = MAX(d->sc_y0, 0);
+    *ex1 = MIN(d->sc_x1 + 1, 8191);     /* the scissor's edges are inclusive */
+    *ey1 = MIN(d->sc_y1 + 1, 8191);
+    if (r >= 0) {
+        /* a cliprect's bottom-right is exclusive */
+        *ex0 = MAX(*ex0, d->cr[r][0]);
+        *ey0 = MAX(*ey0, d->cr[r][1]);
+        *ex1 = MIN(*ex1, d->cr[r][2]);
+        *ey1 = MIN(*ey1, d->cr[r][3]);
+    }
+    return true;
+}
+
+/*
+ * The destination rectangle, as RGBA8 the way GL wants it. The swapper
+ * is a byte-lane permutation inside an aligned dword and the record's
+ * xor is uniform over the region, so a row reads exactly as
+ * r300_ld32() reads it -- lane j of the dword is byte (j ^ xr).
+ */
+static void r300_gl_rd_rect(const R300DrawState *d, unsigned xr,
+                            int x0, int y0, int w, int h, uint8_t *rgba)
+{
+    int x, y;
+
+    for (y = 0; y < h; y++) {
+        const uint8_t *p = d->vram + d->dst_off +
+                           (uint32_t)(y0 + y) * d->dst_pitch +
+                           (uint32_t)x0 * 4;
+        uint8_t *o = rgba + (size_t)y * w * 4;
+
+        for (x = 0; x < w; x++, p += 4, o += 4) {
+            o[0] = p[2 ^ xr];           /* R */
+            o[1] = p[1 ^ xr];           /* G */
+            o[2] = p[0 ^ xr];           /* B */
+            o[3] = p[3 ^ xr];           /* A */
+        }
+    }
+}
+
+static void r300_gl_wr_rect(ATIR350State *s, const R300DrawState *d,
+                            unsigned xr, int x0, int y0, int w, int h,
+                            const uint8_t *rgba)
+{
+    int x, y;
+
+    for (y = 0; y < h; y++) {
+        uint32_t addr = d->dst_off + (uint32_t)(y0 + y) * d->dst_pitch +
+                        (uint32_t)x0 * 4;
+        uint8_t *p = d->vram + addr;
+        const uint8_t *i = rgba + (size_t)y * w * 4;
+        uint64_t lo = addr & ~7ull;
+        uint64_t hi = (addr + (uint32_t)w * 4 + 7) & ~7ull;
+
+        for (x = 0; x < w; x++, p += 4, i += 4) {
+            p[2 ^ xr] = i[0];
+            p[1 ^ xr] = i[1];
+            p[0 ^ xr] = i[2];
+            p[3 ^ xr] = i[3];
+        }
+        memory_region_set_dirty(&s->vram, lo, hi - lo);
+    }
+}
+
+/*
+ * The texture, decoded by the device's OWN r300_sample_tex() and
+ * r300_texel_chan(): format decode, bytes per texel, the aperture
+ * swapper and the four-way TX_FORMAT1 component select all included.
+ * Both paths therefore share the sampler exactly, and what gl=verify
+ * measures is the rasterization, not the texture unit.
+ *
+ * There is no texture cache here on purpose. A cache needs an
+ * invalidation hook that covers the CPU aperture, which stores into a
+ * plain RAM alias this device cannot observe; getting that right is
+ * milestone M3's work, and a wrong cache would be a silent-wrongness
+ * bug of exactly the kind this project keeps finding. So the cost of
+ * decoding per draw is paid, and bounded by falling back on anything
+ * larger than R300_GL_TEX_MAX texels.
+ */
+#define R300_GL_TEX_MAX (1024 * 1024)
+
+static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
+                               uint8_t *rgba)
+{
+    int tx, ty;
+
+    for (ty = 0; ty < d->tex_h; ty++) {
+        for (tx = 0; tx < d->tex_w; tx++) {
+            uint32_t texel = r300_sample_tex(s, d, tx, ty);
+            uint8_t *p = rgba + ((size_t)ty * d->tex_w + tx) * 4;
+
+            p[0] = (uint8_t)(r300_texel_chan(d, texel, 1) * 255.0f + 0.5f);
+            p[1] = (uint8_t)(r300_texel_chan(d, texel, 2) * 255.0f + 0.5f);
+            p[2] = (uint8_t)(r300_texel_chan(d, texel, 3) * 255.0f + 0.5f);
+            p[3] = (uint8_t)(r300_texel_chan(d, texel, 0) * 255.0f + 0.5f);
+        }
+    }
+}
+
+/* one vertex of the expanded triangle list, carrying its whole triangle */
+static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
+                        const R300Vtx *t1, const R300Vtx *t2, float inv)
+{
+    v[0] = me->x; v[1] = me->y;
+    v[2] = me->r; v[3] = me->g; v[4] = me->b; v[5] = me->a;
+    v[6] = me->s; v[7] = me->t;
+    v[8] = t0->x;  v[9] = t0->y;
+    v[10] = t1->x; v[11] = t1->y;
+    v[12] = t2->x; v[13] = t2->y;
+    v[14] = t0->r; v[15] = t0->g; v[16] = t0->b; v[17] = t0->a;
+    v[18] = t1->r; v[19] = t1->g; v[20] = t1->b; v[21] = t1->a;
+    v[22] = t2->r; v[23] = t2->g; v[24] = t2->b; v[25] = t2->a;
+    v[26] = t0->s; v[27] = t0->t;
+    v[28] = t1->s; v[29] = t1->t;
+    v[30] = t2->s; v[31] = t2->t;
+    v[32] = inv;
+}
+
+/*
+ * gl=verify's scoring, over one rectangle.
+ *
+ * The offline M1 harness scores a draw by replaying the rasterizer's
+ * own acceptance test to decide which pixels are INTERIOR and which are
+ * EDGE, because the two classes have very different criteria: an
+ * interior pixel is arithmetic and must agree to 1/255, an edge pixel
+ * is a coverage tie that GL and a software fill rule are allowed to
+ * resolve differently. Doing that here would mean rasterizing a third
+ * time.
+ *
+ * It is not necessary. The record already holds the destination BEFORE
+ * the draw, so "did this path write this pixel" is readable from the
+ * data: a pixel where exactly one of the two paths changed the
+ * destination is a COVERAGE disagreement -- the edge class by
+ * definition -- and a pixel both of them changed (or neither) is a
+ * VALUE disagreement, the interior class. No rasterization, and the
+ * classification is the one the criteria are actually about.
+ *
+ * Conservative in the safe direction: a path that writes a pixel the
+ * value it already held reads as "did not write", which can only move a
+ * pixel out of the coverage class and into the stricter one.
+ *
+ * One class of tie this cannot see, and it is counted separately rather
+ * than left to be argued about. Inside a MESH -- a strip, a fan, or a
+ * quad list of more than one quad -- two adjacent triangles share an
+ * edge, and a pixel exactly on it is awarded to one of them by the fill
+ * rule. Both paths write such a pixel, so the coverage test above puts
+ * it in the value class, but the two triangles can carry completely
+ * different texture coordinates (Chess's board samples a different part
+ * of its wood texture per square), so the disagreement is full-range.
+ * `gl_v_mesh` is how many of the value-class disagreements come from a
+ * draw with more than two triangles; the offline harness, which
+ * replays the acceptance test and can see the tie, classifies exactly
+ * those as EDGE.
+ */
+static void r300_gl_verify(ATIR350State *s, const R300DrawState *d,
+                           unsigned prim, unsigned ntri, unsigned xr,
+                           int x0, int y0, int w, int h)
+{
+    size_t npx = (size_t)w * h, i;
+    unsigned maxd = 0;
+    uint64_t diff = 0;
+
+    r300_gl_rd_rect(d, xr, x0, y0, w, h, s->gl_sw);
+    for (i = 0; i < npx; i++) {
+        const uint8_t *g = s->gl_out + i * 4;
+        const uint8_t *o = s->gl_sw + i * 4;
+        const uint8_t *b = s->gl_before + i * 4;
+        unsigned dmax = 0, c;
+        bool gw = false, ow = false;
+
+        for (c = 0; c < 4; c++) {
+            unsigned k = g[c] > o[c] ? g[c] - o[c] : o[c] - g[c];
+
+            dmax = MAX(dmax, k);
+            gw |= g[c] != b[c];
+            ow |= o[c] != b[c];
+        }
+        maxd = MAX(maxd, dmax);
+        diff += dmax != 0;
+        if (gw != ow) {
+            /* one path covered this pixel and the other did not */
+            s->gl_v_cover_px++;
+            if (dmax) {
+                s->gl_v_cover++;
+            }
+            continue;
+        }
+        s->gl_v_hist[dmax == 0 ? 0 : dmax == 1 ? 1 : dmax <= 4 ? 2 : 3]++;
+        s->gl_v_vmax = MAX(s->gl_v_vmax, dmax);
+        if (dmax > 1 && ntri > 2) {
+            s->gl_v_mesh++;
+        }
+    }
+    s->gl_v_px += npx;
+    s->gl_v_draws++;
+    s->gl_v_max = MAX(s->gl_v_max, maxd);
+    if (maxd > 1) {
+        s->gl_v_bad++;
+    }
+    trace_ati_r350_3d_gl_verify(prim, (uint32_t)npx, (uint32_t)diff, maxd,
+                                x0, y0, x0 + w, y0 + h);
+}
+
+/*
+ * Returns true when the backend rendered the draw and the caller must
+ * not rasterize it again. In gl=verify the software rasterizer HAS been
+ * run by the time this returns true -- its result is what stays in
+ * VRAM, and the GL result is only compared against it.
+ */
+static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
+                          const R300Vtx *vb, unsigned nvtx, unsigned prim)
+{
+    g_autofree R300Vtx *rect_vb = NULL;
+    g_autofree unsigned *idx = NULL;
+    const R300Vtx *gvb = vb;
+    R350GlReq req = { 0 };
+    unsigned ntri = 0, i, xr = 0;
+    int x0, y0, x1, y1, w, h;
+    size_t rect_sz, texels = 0;
+
+    if (d->resolve) {
+        return r300_gl_fallback(s, R350_GLF_RESOLVE, prim, nvtx);
+    }
+    /*
+     * Assemble first: a primitive this path does not know is the
+     * commonest fallback and the cheapest one to detect. `vb`/`nvtx`
+     * stay the draw as the guest issued it -- only `gvb`/`idx` are the
+     * expansion GL is handed.
+     */
+    if (prim == 8) {
+        rect_vb = g_new(R300Vtx, (size_t)nvtx * 2 + 6);
+        ntri = r300_gl_rect_list(vb, nvtx, rect_vb, nvtx * 2 + 6);
+        idx = g_new(unsigned, (size_t)ntri * 3 + 3);
+        for (i = 0; i < ntri * 3; i++) {
+            idx[i] = i;
+        }
+        gvb = rect_vb;
+    } else {
+        idx = g_new(unsigned, (size_t)nvtx * 3 + 3);
+        ntri = r300_gl_tris(prim, nvtx, idx, nvtx * 3 + 3);
+    }
+    if (!ntri) {
+        return r300_gl_fallback(s, R350_GLF_PRIM, prim, nvtx);
+    }
+    if (!r300_gl_clip(d, &req.sx0, &req.sy0, &req.sx1, &req.sy1)) {
+        return r300_gl_fallback(s, R350_GLF_CLIPRULE, prim, nvtx);
+    }
+    if (d->blend && ntri > 1 && r300_gl_self_overlap(gvb, idx, ntri)) {
+        return r300_gl_fallback(s, R350_GLF_SELFBLEND, prim, nvtx);
+    }
+    /*
+     * The rectangle, and the swapper over it, from the same two helpers
+     * the draw capture uses -- the bounding box widened by a pixel and
+     * clipped exactly the way r300_raster_tri() clips its scan.
+     */
+    if ((d->dst_off | d->dst_pitch) & 3) {
+        return r300_gl_fallback(s, R350_GLF_ALIGN, prim, nvtx);
+    }
+    if (!r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1)) {
+        /*
+         * Empty after the scissor, off-screen, or not a finite
+         * rectangle at all. The software path paints nothing for these
+         * either, so this is the one fallback that costs nothing.
+         */
+        return r300_gl_fallback(s, R350_GLF_RECT, prim, nvtx);
+    }
+    w = x1 - x0;
+    h = y1 - y0;
+    /*
+     * r300_cap_rect() trims rows off the bottom to keep a rectangle
+     * inside VRAM. A capture may be short; an offload may not lose
+     * pixels the software path would have drawn, so a rectangle that
+     * comes anywhere near the end of VRAM is refused outright rather
+     * than silently rendered short.
+     */
+    if ((uint64_t)d->dst_off + (uint64_t)y1 * d->dst_pitch +
+        (uint64_t)x1 * 4 > ATI_R350_VRAM_SIZE) {
+        return r300_gl_fallback(s, R350_GLF_VRAMEND, prim, nvtx);
+    }
+    if (!r300_cap_xor(s, d->dst_off + (uint32_t)y0 * d->dst_pitch,
+                      (uint32_t)(y1 - 1 - y0) * d->dst_pitch +
+                      (uint32_t)x1 * 4, &xr)) {
+        return r300_gl_fallback(s, R350_GLF_XOR, prim, nvtx);
+    }
+    if (d->textured) {
+        texels = (size_t)d->tex_w * d->tex_h;
+        if (!texels || texels > R300_GL_TEX_MAX) {
+            return r300_gl_fallback(s, R350_GLF_TEXTURE, prim, nvtx);
+        }
+    }
+
+    /* scratch, grown on demand and reused for the life of the device */
+    rect_sz = (size_t)w * h * 4;
+    if (rect_sz > s->gl_rect_sz) {
+        s->gl_before = g_realloc(s->gl_before, rect_sz);
+        s->gl_out = g_realloc(s->gl_out, rect_sz);
+        s->gl_sw = g_realloc(s->gl_sw, rect_sz);
+        s->gl_rect_sz = rect_sz;
+    }
+    if (texels * 4 > s->gl_texbuf_sz) {
+        s->gl_texbuf = g_realloc(s->gl_texbuf, texels * 4);
+        s->gl_texbuf_sz = texels * 4;
+    }
+    if ((size_t)ntri * 3 * R350_GL_VSTRIDE * sizeof(float) > s->gl_verts_sz) {
+        s->gl_verts_sz = (size_t)ntri * 3 * R350_GL_VSTRIDE * sizeof(float);
+        s->gl_verts = g_realloc(s->gl_verts, s->gl_verts_sz);
+    }
+
+    for (i = 0; i < ntri * 3; i++) {
+        const R300Vtx *t0 = &gvb[idx[i - i % 3 + 0]];
+        const R300Vtx *t1 = &gvb[idx[i - i % 3 + 1]];
+        const R300Vtx *t2 = &gvb[idx[i - i % 3 + 2]];
+
+        r300_gl_vtx(s->gl_verts + (size_t)i * R350_GL_VSTRIDE, &gvb[idx[i]],
+                    t0, t1, t2, 1.0f / r300_edge(t0, t1, t2->x, t2->y));
+    }
+    if (d->textured) {
+        r300_gl_decode_tex(s, d, s->gl_texbuf);
+    }
+    r300_gl_rd_rect(d, xr, x0, y0, w, h, s->gl_before);
+
+    req.x0 = x0; req.y0 = y0; req.w = w; req.h = h;
+    req.verts = s->gl_verts;
+    req.nvert = ntri * 3;
+    req.tex = d->textured ? s->gl_texbuf : NULL;
+    req.tex_w = d->tex_w;
+    req.tex_h = d->tex_h;
+    req.clamp_s = d->clamp_s;
+    req.clamp_t = d->clamp_t;
+    req.textured = d->textured;
+    req.wmask = d->wmask;
+    req.alpha_test = d->alpha_test;
+    req.af_func = d->af_func;
+    req.af_ref = d->af_ref;
+    req.discard = d->discard;
+    req.blend = d->blend;
+    req.blend_read = d->blend_read;
+    req.src_factor = d->src_factor;
+    req.dst_factor = d->dst_factor;
+    req.comb_fcn = d->comb_fcn;
+    req.a_src_factor = d->a_src_factor;
+    req.a_dst_factor = d->a_dst_factor;
+    req.a_comb_fcn = d->a_comb_fcn;
+    req.k_r = d->k_r; req.k_g = d->k_g;
+    req.k_b = d->k_b; req.k_a = d->k_a;
+    req.before = s->gl_before;
+    req.out = s->gl_out;
+
+    if (!ati_r350_gl_draw(s->gl_ctx, &req)) {
+        return r300_gl_fallback(s, R350_GLF_BACKEND, prim, nvtx);
+    }
+    s->gl_drawn++;
+    trace_ati_r350_3d_gl(prim, nvtx, x0, y0, x1, y1, ntri);
+
+    if (s->gl_mode == R350_GL_VERIFY) {
+        /*
+         * Both paths ran; the software one is what lands. The offload is
+         * being measured here, not trusted, so VRAM must come out of a
+         * verify session byte-identical to a gl=off session.
+         */
+        r300_raster_prims(s, d, vb, nvtx, prim);
+        r300_gl_verify(s, d, prim, ntri, xr, x0, y0, w, h);
+        return true;
+    }
+    r300_gl_wr_rect(s, d, xr, x0, y0, w, h, s->gl_out);
+    return true;
+}
+
+/*
+ * Where this draw actually lands, straight from the transformed
+ * vertices. Offline replay of a command stream has to reconstruct this
+ * and can get it wrong -- reading it from the engine is the ground
+ * truth to check such a reconstruction against.
+ *
+ * Emitted from r300_run_prims() rather than from the rasterizer, which
+ * is where it used to live: once a draw can be rendered by the GL
+ * backend instead, a trace inside the software path silently stops
+ * describing most of a frame. It reported 243 of Chess's 1648 board
+ * draws under gl=on before it was moved -- exactly the fallbacks -- and
+ * the standing rect baselines are measured with it.
+ */
+static void r300_trace_rect(ATIR350State *s, const R300DrawState *d,
+                            const R300Vtx *vb, unsigned nvtx, unsigned prim)
+{
+    float x0 = vb[0].x, y0 = vb[0].y, x1 = x0, y1 = y0;
+    float s0 = vb[0].s, t0 = vb[0].t, s1 = s0, t1 = t0;
+    unsigned i;
+
+    for (i = 1; i < nvtx; i++) {
+        x0 = MIN(x0, vb[i].x); x1 = MAX(x1, vb[i].x);
+        y0 = MIN(y0, vb[i].y); y1 = MAX(y1, vb[i].y);
+        s0 = MIN(s0, vb[i].s); s1 = MAX(s1, vb[i].s);
+        t0 = MIN(t0, vb[i].t); t1 = MAX(t1, vb[i].t);
+    }
+    if (prim == 1) {
+        /* a point sprite covers RE_POINTSIZE around its centre */
+        uint32_t psize = s->regs[R300_RE_POINTSIZE >> 2];
+        float hw = ((psize >> 16) & 0xffff) / 12.0f;
+        float hh = (psize & 0xffff) / 12.0f;
+
+        x0 -= hw; x1 += hw;
+        y0 -= hh; y1 += hh;
+    }
+    trace_ati_r350_3d_rect(d->dst_off, (int)x0, (int)y0, (int)x1, (int)y1,
+                           (int)s0, (int)t0, (int)s1, (int)t1);
+}
+
 static void r300_run_prims(ATIR350State *s, R300DrawState *d,
                            const R300Vtx *vb, unsigned nvtx, unsigned prim)
 {
+    if (nvtx && trace_event_get_state_backends(TRACE_ATI_R350_3D_RECT)) {
+        r300_trace_rect(s, d, vb, nvtx, prim);
+    }
     if (s->cap_fp && nvtx) {
         r300_cap_draw(s, d, vb, nvtx, prim);
+    } else if (s->gl_ctx && nvtx &&
+               r300_gl_prims(s, d, vb, nvtx, prim)) {
+        /* the backend rendered it (and, under verify, so did we) */
     } else {
         r300_raster_prims(s, d, vb, nvtx, prim);
     }

@@ -96,6 +96,38 @@ typedef enum ATIR350GapKind {
 
 #define R350_GAP_SLOTS 256
 
+/*
+ * How the "gl" property is set: whether the host-GPU backend renders a
+ * draw, and whether the software rasterizer runs alongside it as a
+ * check. `off` is the default and is a provable no-op -- the draw path
+ * tests one NULL pointer and calls exactly what it called before.
+ */
+typedef enum ATIR350GlMode {
+    R350_GL_OFF = 0,
+    R350_GL_ON,             /* GL renders what it can; the rest falls back */
+    R350_GL_VERIFY          /* both run, they are diffed, software wins */
+} ATIR350GlMode;
+
+/*
+ * Why a draw the GL backend was offered went to the software rasterizer
+ * instead. Counted per primitive type, the same shape as the gap
+ * tracker, so `qom-get <device> gl` says how much of a session the
+ * offload actually covered rather than leaving it to be inferred.
+ */
+typedef enum ATIR350GlFallback {
+    R350_GLF_PRIM,          /* point sprites, lines: not assembled here */
+    R350_GLF_RESOLVE,       /* AA resolve: the colour buffer is the source */
+    R350_GLF_RECT,          /* no drawable destination rectangle */
+    R350_GLF_ALIGN,         /* destination offset or pitch not dword-aligned */
+    R350_GLF_VRAMEND,       /* rectangle runs off the end of VRAM */
+    R350_GLF_XOR,           /* aperture swapper not uniform over the rect */
+    R350_GLF_CLIPRULE,      /* a genuine 4-rect cliprect truth table */
+    R350_GLF_TEXTURE,       /* texture too large to decode per draw */
+    R350_GLF_SELFBLEND,     /* blended draw whose own primitives overlap */
+    R350_GLF_BACKEND,       /* the backend itself declined the request */
+    R350_GLF_MAX
+} ATIR350GlFallback;
+
 typedef struct ATIR350PM4Parser {
     uint32_t remaining;      /* data dwords still expected */
     uint32_t type;           /* packet type of the in-flight packet */
@@ -432,6 +464,37 @@ struct ATIR350State {
     unsigned cap_tex_n;
 
     /*
+     * Host-GPU offload (phase 2, milestone M2). `gl_path` is the "gl"
+     * property as given; `gl_mode` is it parsed, and `gl_ctx` is NULL
+     * unless a backend was actually opened -- that pointer is the only
+     * thing the draw path tests, so a device left at the default is
+     * untouched by any of this. See ati_r350_gl.h for the backend
+     * interface and ati_r350_gl.c for the GL implementation of it.
+     */
+    char *gl_path;
+    ATIR350GlMode gl_mode;
+    struct R350GlCtx *gl_ctx;
+    uint64_t gl_drawn;          /* draws the backend rendered */
+    uint64_t gl_fb[R350_GLF_MAX][R350_GAP_SLOTS];   /* fallbacks, by prim */
+    /* gl=verify: the per-pixel agreement between the two paths */
+    uint64_t gl_v_px, gl_v_hist[4];     /* delta 0, 1, 2-4, above 4 */
+    uint64_t gl_v_draws, gl_v_bad;      /* draws compared / with delta > 1 */
+    uint64_t gl_v_cover_px, gl_v_cover;  /* coverage-class pixels / differing */
+    uint64_t gl_v_mesh;         /* ... of those, from a multi-triangle draw */
+    unsigned gl_v_max, gl_v_vmax;
+    /*
+     * Scratch for one request, grown on demand and never shrunk: a draw
+     * needs the destination rectangle twice over in RGBA, the decoded
+     * texture, and the expanded triangle list. Milestone M3 hands these
+     * to a queue instead, which is why they are sized per request rather
+     * than allocated inside the backend.
+     */
+    uint8_t *gl_before, *gl_out, *gl_sw, *gl_texbuf;
+    size_t gl_rect_sz, gl_texbuf_sz;
+    float *gl_verts;
+    size_t gl_verts_sz;
+
+    /*
      * Hardware cursor (CUR_* registers). hw_cursor_on tracks whether the
      * guest's own cursor is live, so the host-driven fallback pointer
      * stands aside rather than fighting it for the console cursor.
@@ -522,6 +585,9 @@ void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx);
 /* sizes of the private draw-capture payload structs (ati_r350_cap.h) */
 uint32_t ati_r350_cap_state_bytes(void);
 uint32_t ati_r350_cap_vtx_bytes(void);
+
+/* why a draw went to the software rasterizer instead of the GL backend */
+const char *ati_r350_gl_fb_name(ATIR350GlFallback why);
 
 /* ati_r350_3d.c */
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
