@@ -387,13 +387,46 @@ static void r300_span_clip(float a, float k, float lim, int *lo, int *hi)
     }
 }
 
+/*
+ * The fill convention, as a predicate on one edge.
+ *
+ * A quad is two triangles sharing a diagonal, and a pixel that lands
+ * exactly on that diagonal must be shaded by exactly one of them --
+ * shade it twice and a blended draw blends it twice, which is a seam;
+ * shade it neither and the quad has a crack down the middle. The rule
+ * every rasterizer uses is top-left: of the two triangles the shared
+ * edge belongs to the one for which it is a top or a left edge, and
+ * they cannot both say yes because they traverse it in opposite
+ * directions.
+ *
+ * `dx`/`dy` are the edge's direction, `flip` is set when the triangle's
+ * signed area is negative so that the direction is expressed in the
+ * winding the acceptance test is written for (interior on the left, y
+ * increasing downwards). In that frame an edge is LEFT when it points
+ * up the screen and TOP when it is horizontal and points right.
+ */
+static inline bool r300_top_left(float dx, float dy, bool flip)
+{
+    if (flip) {
+        dx = -dx;
+        dy = -dy;
+    }
+    return dy < 0.0f || (dy == 0.0f && dx > 0.0f);
+}
+
+static inline bool r300_edge_accept(float w, bool top_left)
+{
+    return w > 0.0f || (w == 0.0f && top_left);
+}
+
 static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                             const R300Vtx *v0, const R300Vtx *v1,
                             const R300Vtx *v2)
 {
     float area = r300_edge(v0, v1, v2->x, v2->y);
-    float inv, dx0, dy0, dx1, dy1;
+    float inv, dx0, dy0, dx1, dy1, dx2, dy2;
     float a0, b0, c0, a1, b1, c1;
+    bool flip, tl0, tl1, tl2;
     int x0, y0, x1, y1, x, y;
 
     if (area == 0.0f) {
@@ -423,6 +456,12 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     dy0 = v2->y - v1->y;
     dx1 = v0->x - v2->x;
     dy1 = v0->y - v2->y;
+    dx2 = v1->x - v0->x;
+    dy2 = v1->y - v0->y;
+    flip = area < 0.0f;
+    tl0 = r300_top_left(dx0, dy0, flip);
+    tl1 = r300_top_left(dx1, dy1, flip);
+    tl2 = r300_top_left(dx2, dy2, flip);
     a0 = -dy0 * inv;
     b0 = dx0 * inv;
     c0 = (dy0 * v1->x - dx0 * v1->y) * inv;
@@ -443,7 +482,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
 
     for (y = y0; y < y1; y++) {
         float py = y + 0.5f;
-        float ry0 = py - v1->y, ry1 = py - v2->y;
+        float ry0 = py - v1->y, ry1 = py - v2->y, ry2 = py - v0->y;
         /* w0 and w1 along this row, as w = a*x + k */
         float k0 = b0 * py + c0 + 0.5f * a0;
         float k1 = b1 * py + c1 + 0.5f * a1;
@@ -461,18 +500,39 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
          */
         r300_span_clip(a0, k0, 0.0f, &sx0, &sx1);
         r300_span_clip(a1, k1, 0.0f, &sx0, &sx1);
+        /*
+         * The third bound stays at the old -0.001 slack even though the
+         * acceptance test no longer has any: a looser bound is a
+         * superset of the accepted range, which is all a loop bound has
+         * to be, and tightening it would only re-derive a limit the
+         * exact test applies anyway.
+         */
         r300_span_clip(-(a0 + a1), -(k0 + k1), -1.001f, &sx0, &sx1);
 
         for (x = sx0; x <= sx1; x++) {
             float px = x + 0.5f;
             float w0 = (dx0 * ry0 - dy0 * (px - v1->x)) * inv;
             float w1 = (dx1 * ry1 - dy1 * (px - v2->x)) * inv;
+            float w2e = (dx2 * ry2 - dy2 * (px - v0->x)) * inv;
             float w2 = 1.0f - w0 - w1;
             float cr, cg, cb, ca;
             uint32_t addr;
             uint32_t out;
 
-            if (w0 < 0.0f || w1 < 0.0f || w2 < -0.001f) {
+            /*
+             * The third weight is tested from its own edge expression
+             * and interpolated from 1 - w0 - w1. They agree in exact
+             * arithmetic, but only the edge form produces the exact
+             * zero a tie is made of: the subtraction's cancellation
+             * leaves a rounding residue instead, which is a tie the
+             * fill rule can no longer see. Interpolation keeps the
+             * subtraction so that every accepted pixel shades exactly
+             * as it did before -- this changes WHICH pixels are
+             * accepted, and nothing about what they come out as.
+             */
+            if (!r300_edge_accept(w0, tl0) ||
+                !r300_edge_accept(w1, tl1) ||
+                !r300_edge_accept(w2e, tl2)) {
                 continue;
             }
             if (d->clip_rule != 0xffff) {
