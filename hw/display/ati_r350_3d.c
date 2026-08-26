@@ -442,6 +442,45 @@ static inline bool r300_edge_accept(float w, bool top_left)
 }
 
 /*
+ * How the fragment executor samples a texture.
+ *
+ * The interpreter is device-state-free by design, so the fetch reaches
+ * it as a callback; this is the device's end of it. The coordinate
+ * arrives in TEXEL units with the projection already applied -- both are
+ * settled upstream by r300_attr_texcoord() and the vertex program's own
+ * texture-coordinate output -- which is why LD and PROJ do the same
+ * thing here, exactly as they did when the fetch sat in front of the
+ * program instead of inside it.
+ *
+ * A unit this draw does not bind reads WHITE, not black: the same 1x1
+ * white texture the GL backend binds for an untextured draw, and the
+ * value that leaves a modulate program computing its colour operand
+ * alone rather than blacking the draw out.
+ */
+typedef struct R300SampleCtx {
+    ATIR350State *s;
+    const R300DrawState *d;
+} R300SampleCtx;
+
+static void r300_us_sample(void *ctx, unsigned unit, bool proj,
+                           const float coord[4], float texel[4])
+{
+    R300SampleCtx *c = ctx;
+    const R300DrawState *d = c->d;
+    uint32_t t;
+
+    if (unit != 0 || !d->textured) {
+        texel[0] = texel[1] = texel[2] = texel[3] = 1.0f;
+        return;
+    }
+    t = r300_sample_tex(c->s, d, (int)coord[0], (int)coord[1]);
+    texel[0] = r300_texel_chan(d, t, 1);
+    texel[1] = r300_texel_chan(d, t, 2);
+    texel[2] = r300_texel_chan(d, t, 3);
+    texel[3] = r300_texel_chan(d, t, 0);
+}
+
+/*
  * The pixel stack frame the fragment program starts from: the
  * rasterizer's own outputs, dropped into the registers RS_INST named.
  * Registers it does not name read zero, which is what the hardware's
@@ -453,7 +492,7 @@ static inline bool r300_edge_accept(float w, bool top_left)
  * upload and wrong for the rest.
  */
 static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
-                                 const float *tex, const float col[2][4])
+                                 float ts, float tt, const float col[2][4])
 {
     const R300UsProgram *p = d->fs;
     unsigned n;
@@ -462,10 +501,20 @@ static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
         f->r[n][0] = f->r[n][1] = f->r[n][2] = f->r[n][3] = 0.0f;
     }
     f->out[0] = f->out[1] = f->out[2] = f->out[3] = 0.0f;
-    if (tex && p->tex_dst >= 0) {
-        float *r = f->r[p->tex_dst];
+    f->kill = false;
+    /*
+     * The interpolated texture COORDINATE, not a texel: since the
+     * executor performs the texture instructions itself, what the
+     * rasterizer owes the frame is what RS_INST routes into it. Verified
+     * against the whole offline corpus -- 29 of 29 LD/PROJ fetches name
+     * exactly this register as their source -- so for every program that
+     * predates indirection levels the executor samples the same texel
+     * the caller used to hand over.
+     */
+    if (p->rs.tex_reg >= 0) {
+        float *r = f->r[p->rs.tex_reg];
 
-        r[0] = tex[0]; r[1] = tex[1]; r[2] = tex[2]; r[3] = tex[3];
+        r[0] = ts; r[1] = tt; r[2] = 0.0f; r[3] = 1.0f;
     }
     for (n = 0; n < R300_US_RS_COLS; n++) {
         if (p->rs.col_reg[n] >= 0) {
@@ -640,27 +689,27 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             ca = w0 * v0->a + w1 * v1->a + w2 * v2->a;
             if (d->fs_run) {
                 float tex[4], col[2][4], fsout[4];
-                bool textured = d->textured && d->fs->tex_dst >= 0;
+                float ts = w0 * v0->s + w1 * v1->s + w2 * v2->s;
+                float tt = w0 * v0->t + w1 * v1->t + w2 * v2->t;
 
-                if (textured) {
-                    float ts = w0 * v0->s + w1 * v1->s + w2 * v2->s;
-                    float tt = w0 * v0->t + w1 * v1->t + w2 * v2->t;
-                    uint32_t texel = r300_sample_tex(s, d, (int)ts, (int)tt);
-
-                    tex[0] = r300_texel_chan(d, texel, 1);
-                    tex[1] = r300_texel_chan(d, texel, 2);
-                    tex[2] = r300_texel_chan(d, texel, 3);
-                    tex[3] = r300_texel_chan(d, texel, 0);
-                } else {
+                if (d->fs->fast) {
                     /*
-                     * A program with a fetch whose texture unit this draw
-                     * does not enable. WHITE, not black: the same 1x1
-                     * white texture the GL backend binds for an
-                     * untextured draw, and the value that leaves a
-                     * modulate program computing its colour operand
-                     * alone rather than blacking the draw out.
+                     * The specialised path is handed a finished texel,
+                     * so its one fetch is done for it here -- the same
+                     * sampler the executor would have called, hoisted
+                     * out of a program that cannot need a second one.
                      */
-                    tex[0] = tex[1] = tex[2] = tex[3] = 1.0f;
+                    if (d->textured && d->fs->tex_dst >= 0) {
+                        uint32_t texel = r300_sample_tex(s, d, (int)ts,
+                                                         (int)tt);
+
+                        tex[0] = r300_texel_chan(d, texel, 1);
+                        tex[1] = r300_texel_chan(d, texel, 2);
+                        tex[2] = r300_texel_chan(d, texel, 3);
+                        tex[3] = r300_texel_chan(d, texel, 0);
+                    } else {
+                        tex[0] = tex[1] = tex[2] = tex[3] = 1.0f;
+                    }
                 }
                 col[0][0] = cr;
                 col[0][1] = cg;
@@ -692,10 +741,14 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                      */
                     r300_us_run_fast(d->fs, tex, col[0], col[1], fsout);
                 } else {
+                    R300SampleCtx sc = { s, d };
                     R300UsRegs f;
 
-                    r300_fs_frame(d, &f, tex, col);
-                    r300_us_run(d->fs, &f);
+                    r300_fs_frame(d, &f, ts, tt, col);
+                    r300_us_run(d->fs, &f, r300_us_sample, &sc);
+                    if (f.kill) {
+                        continue;       /* TEXKILL */
+                    }
                     fsout[0] = f.out[0];
                     fsout[1] = f.out[1];
                     fsout[2] = f.out[2];

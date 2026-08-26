@@ -323,8 +323,13 @@ static void us_try_fast(R300UsProgram *p)
      * A non-identity output select is the interpreter's job. Putting it
      * in the specialised executor costs a per-pixel branch in every
      * guest for a construct only one of them uses; see `out_permuted`.
+     *
+     * `gl_simple` is required for the same reason it gates the
+     * translator: the specialised executor is handed a texel the caller
+     * sampled, so it cannot run a program whose fetch depends on an
+     * earlier level, fetches more than once, or kills the fragment.
      */
-    if (p->out_permuted) {
+    if (p->out_permuted || !p->gl_simple) {
         return;
     }
 
@@ -391,8 +396,8 @@ void r300_us_analyse(R300UsProgram *p,
     unsigned aoff = us_code_offset & R300_US_CO_ALU_OFFSET_MASK;
     unsigned toff = (us_code_offset >> R300_US_CO_TEX_OFFSET_SHIFT) &
                     R300_US_CO_TEX_OFFSET_MASK;
-    uint32_t ca = us_code_addr[3];
-    unsigned i;
+    unsigned nfetch = 0;
+    unsigned i, lv;
 
     memset(p, 0, sizeof(*p));
     p->tex_dst = -1;
@@ -400,32 +405,62 @@ void r300_us_analyse(R300UsProgram *p,
     p->rs.col_reg[0] = p->rs.col_reg[1] = -1;
 
     /*
-     * Only level 3, the level a DX7-style single-pass program occupies,
-     * is modelled: a lower level's texture fetch is addressed by an
-     * earlier level's ALU result, which needs the fetch inside the
-     * interpreter rather than in front of it. Every draw in every
-     * capture this project holds reads NLEVEL 0 (20867 of 20867), so
-     * this refuses nothing that has ever been seen.
+     * US_CONFIG.NLEVEL names the live indirection levels, counting DOWN
+     * from level 3 (R3xx/R5xx reference, US_CONFIG): 0 = level 3 only,
+     * the DX7-style single pass; 1 = levels 2 and 3, DX8-style bump
+     * mapping; 2 = levels 1 to 3; 3 = all four. They execute in
+     * ascending order, so an earlier level's ALU result is what a later
+     * level's texture fetch can be addressed by.
      */
-    if (nlevel != 0) {
+    if (nlevel >= R300_US_LEVELS) {
+        /*
+         * NLEVEL is three bits and only 0-3 are defined; 4-7 are
+         * reserved. Refusing them is not pedantry -- `3 - nlevel` is
+         * how a level indexes US_CODE_ADDR, and it underflows here.
+         */
         us_gap_indirect(&p->gaps, nlevel);
         return;
     }
-
-    p->alu_first = (ca & R300_US_CA_ALU_START_MASK) + aoff;
-    p->nalu = ((ca >> R300_US_CA_ALU_SIZE_SHIFT) & R300_US_CA_ALU_SIZE_MASK)
-              + 1;
-    p->tex_first = ((ca >> R300_US_CA_TEX_START_SHIFT) &
-                    R300_US_CA_TEX_START_MASK) + toff;
-    p->ntex = (us_config & R300_US_CFG_FIRST_TEX) ?
-              (((ca >> R300_US_CA_TEX_SIZE_SHIFT) &
-                R300_US_CA_TEX_SIZE_MASK) + 1) : 0;
+    p->nlevels = nlevel + 1;
     p->nregs = (us_pixsize & 0x1f) + 1;
 
-    if (p->alu_first + p->nalu > R300_US_ALU_SLOTS ||
-        p->tex_first + p->ntex > R300_US_TEX_SLOTS) {
-        return;                 /* not valid: the range leaves the RAM */
+    for (lv = 0; lv < p->nlevels; lv++) {
+        uint32_t ca = us_code_addr[3 - nlevel + lv];
+        R300UsLevel *L = &p->level[lv];
+        unsigned astart = (ca & R300_US_CA_ALU_START_MASK) + aoff;
+        unsigned asize = ((ca >> R300_US_CA_ALU_SIZE_SHIFT) &
+                          R300_US_CA_ALU_SIZE_MASK) + 1;
+        unsigned tstart = ((ca >> R300_US_CA_TEX_START_SHIFT) &
+                           R300_US_CA_TEX_START_MASK) + toff;
+        unsigned tsize = ((ca >> R300_US_CA_TEX_SIZE_SHIFT) &
+                          R300_US_CA_TEX_SIZE_MASK) + 1;
+
+        /*
+         * FIRST_TEX gates the texture code of the FIRST valid level, and
+         * only that one -- the register's own wording. For NLEVEL 0 the
+         * first valid level IS level 3, which is why this reads the same
+         * as the single-level code it replaces.
+         */
+        if (lv == 0 && !(us_config & R300_US_CFG_FIRST_TEX)) {
+            tsize = 0;
+        }
+        if (astart + asize > R300_US_ALU_SLOTS ||
+            tstart + tsize > R300_US_TEX_SLOTS ||
+            p->nalu + asize > R300_US_ALU_SLOTS ||
+            p->ntex + tsize > R300_US_TEX_SLOTS) {
+            return;             /* not valid: a range leaves the RAM */
+        }
+        L->alu_slot = astart;
+        L->tex_slot = tstart;
+        L->alu_at = p->nalu;
+        L->nalu = asize;
+        L->tex_at = p->ntex;
+        L->ntex = tsize;
+        p->nalu += asize;
+        p->ntex += tsize;
     }
+    p->alu_first = p->level[0].alu_slot;
+    p->tex_first = p->level[0].tex_slot;
     p->valid = true;
     p->expressible = true;
 
@@ -436,57 +471,71 @@ void r300_us_analyse(R300UsProgram *p,
         p->konst[i][3] = konst[i][3];
     }
 
-    for (i = 0; i < p->ntex; i++) {
-        uint32_t v = tex_inst[p->tex_first + i];
-        R300UsTex *t = &p->tex[i];
+    for (lv = 0; lv < p->nlevels; lv++) {
+        const R300UsLevel *L = &p->level[lv];
 
-        t->op = (v >> R300_US_TEX_INST_SHIFT) & R300_US_TEX_INST_MASK;
-        t->src = v & R300_US_TEX_SRC_MASK;
-        t->dst = (v >> R300_US_TEX_DST_SHIFT) & R300_US_TEX_DST_MASK;
-        t->unit = (v >> R300_US_TEX_ID_SHIFT) & R300_US_TEX_ID_MASK;
-        switch (t->op) {
-        case R300_US_TEXOP_NOP:
-            break;
-        case R300_US_TEXOP_LD:
-        case R300_US_TEXOP_PROJ:
-            /*
-             * Where the texel lands. How the coordinate reaches the
-             * sampler is settled upstream -- r300_attr_texcoord() and
-             * the vertex program's own texture-coordinate output already
-             * deliver s and t in texel units, projection applied -- so
-             * LD and PROJ differ here only in a name.
-             */
-            if (t->unit != 0 || p->tex_dst >= 0) {
-                us_gap_tex_op(&p->gaps, 0x10 | t->unit);
+        for (i = 0; i < L->ntex; i++) {
+            uint32_t v = tex_inst[L->tex_slot + i];
+            R300UsTex *t = &p->tex[L->tex_at + i];
+
+            t->op = (v >> R300_US_TEX_INST_SHIFT) & R300_US_TEX_INST_MASK;
+            t->src = v & R300_US_TEX_SRC_MASK;
+            t->dst = (v >> R300_US_TEX_DST_SHIFT) & R300_US_TEX_DST_MASK;
+            t->unit = (v >> R300_US_TEX_ID_SHIFT) & R300_US_TEX_ID_MASK;
+            switch (t->op) {
+            case R300_US_TEXOP_NOP:
+                break;
+            case R300_US_TEXOP_TEXKILL:
+                p->has_kill = true;
+                break;
+            case R300_US_TEXOP_LD:
+            case R300_US_TEXOP_PROJ:
+                /*
+                 * The fetch itself happens in the executor, which reads
+                 * the coordinate out of the frame register the
+                 * instruction names -- so a second fetch, or one at a
+                 * later level, needs nothing special here. Only a unit
+                 * this model does not bind is a gap. `tex_dst` records
+                 * the first unit-0 fetch for the specialised path and
+                 * the GL translator, both of which take a texel that was
+                 * sampled for them.
+                 */
+                if (t->unit != 0) {
+                    us_gap_tex_op(&p->gaps, 0x10 | t->unit);
+                    p->expressible = false;
+                } else {
+                    nfetch++;
+                    if (p->tex_dst < 0) {
+                        p->tex_dst = t->dst;
+                    }
+                }
+                break;
+            default:
+                us_gap_tex_op(&p->gaps, t->op);
                 p->expressible = false;
-            } else {
-                p->tex_dst = t->dst;
+                break;
             }
-            break;
-        default:
-            us_gap_tex_op(&p->gaps, t->op);
-            p->expressible = false;
-            break;
+        }
+
+        for (i = 0; i < L->nalu; i++) {
+            R300UsAlu *a = &p->alu[L->alu_at + i];
+            unsigned k = L->alu_slot + i;
+
+            us_decode_alu(a, rgb_addr[k], rgb_inst[k], a_addr[k], a_inst[k]);
+            if (!us_rgb_op_known(a->rgb_op)) {
+                us_gap_rgb_op(&p->gaps, a->rgb_op);
+                p->expressible = false;
+            }
+            if (!us_a_op_known(a->a_op)) {
+                us_gap_a_op(&p->gaps, a->a_op);
+                p->expressible = false;
+            }
+            if (a->rgb_omask || a->a_omask) {
+                p->writes_out = true;
+            }
         }
     }
-
-    for (i = 0; i < p->nalu; i++) {
-        unsigned k = p->alu_first + i;
-
-        us_decode_alu(&p->alu[i], rgb_addr[k], rgb_inst[k],
-                      a_addr[k], a_inst[k]);
-        if (!us_rgb_op_known(p->alu[i].rgb_op)) {
-            us_gap_rgb_op(&p->gaps, p->alu[i].rgb_op);
-            p->expressible = false;
-        }
-        if (!us_a_op_known(p->alu[i].a_op)) {
-            us_gap_a_op(&p->gaps, p->alu[i].a_op);
-            p->expressible = false;
-        }
-        if (p->alu[i].rgb_omask || p->alu[i].a_omask) {
-            p->writes_out = true;
-        }
-    }
+    p->gl_simple = p->nlevels == 1 && nfetch <= 1 && !p->has_kill;
 
     us_decode_rs(&p->rs, &p->gaps, rs_inst_count, rs_inst, rs_ip);
     if (p->gaps.has_rs_route) {
@@ -520,8 +569,23 @@ void r300_us_analyse(R300UsProgram *p,
             p->nregs_used = a->a_dst + 1u;
         }
     }
-    if (p->tex_dst >= 0 && (unsigned)p->tex_dst + 1u > p->nregs_used) {
-        p->nregs_used = p->tex_dst + 1u;
+    for (i = 0; i < p->ntex; i++) {
+        const R300UsTex *t = &p->tex[i];
+
+        if (t->op == R300_US_TEXOP_NOP) {
+            continue;
+        }
+        if (t->src + 1u > p->nregs_used) {
+            p->nregs_used = t->src + 1u;
+        }
+        if (t->op != R300_US_TEXOP_TEXKILL && t->dst + 1u > p->nregs_used) {
+            p->nregs_used = t->dst + 1u;
+        }
+    }
+    /* the register the rasterizer drops the interpolated coordinate in */
+    if (p->rs.tex_reg >= 0 &&
+        (unsigned)p->rs.tex_reg + 1u > p->nregs_used) {
+        p->nregs_used = p->rs.tex_reg + 1u;
     }
     for (i = 0; i < R300_US_RS_COLS; i++) {
         if (p->rs.col_reg[i] >= 0 &&
@@ -748,156 +812,206 @@ static float us_srcp_a(const R300UsSrc s[3], uint8_t op)
     }
 }
 
-void r300_us_run(const R300UsProgram *p, R300UsRegs *g)
+/*
+ * One ALU slot, both banks. Lifted out of r300_us_run() when the
+ * executor grew an outer loop over indirection levels: the arithmetic
+ * is unchanged line for line, and keeping it at one indentation level
+ * is what makes that checkable by eye.
+ */
+static void us_run_alu(const R300UsProgram *p, R300UsRegs *g,
+                       const R300UsAlu *a)
 {
-    unsigned i, n;
+    R300UsSrc s[3];
+    float srcp[3], srcp_a;
+    float A[3], B[3], C[3], res[3];
+    float aA, aB, aC, ares;
+    float dot;
+    unsigned n;
 
-    for (i = 0; i < p->nalu; i++) {
-        const R300UsAlu *a = &p->alu[i];
-        R300UsSrc s[3];
-        float srcp[3], srcp_a;
-        float A[3], B[3], C[3], res[3];
-        float aA, aB, aC, ares;
-        float dot;
+    for (n = 0; n < 3; n++) {
+        const float *rv = a->rgb_src_const[n] ? p->konst[a->rgb_src[n]]
+                                              : g->r[a->rgb_src[n]];
+        const float *av = a->a_src_const[n] ? p->konst[a->a_src[n]]
+                                            : g->r[a->a_src[n]];
 
+        s[n].rgb[0] = rv[0];
+        s[n].rgb[1] = rv[1];
+        s[n].rgb[2] = rv[2];
+        s[n].a = av[3];
+    }
+    us_srcp_rgb(srcp, s, a->rgb_srcp_op);
+    srcp_a = us_srcp_a(s, a->a_srcp_op);
+
+    us_arg_rgb(A, s, srcp, srcp_a, a->rgb_sel[0], a->rgb_mod[0]);
+    us_arg_rgb(B, s, srcp, srcp_a, a->rgb_sel[1], a->rgb_mod[1]);
+    us_arg_rgb(C, s, srcp, srcp_a, a->rgb_sel[2], a->rgb_mod[2]);
+    aA = us_arg_a(s, srcp, srcp_a, a->a_sel[0], a->a_mod[0]);
+    aB = us_arg_a(s, srcp, srcp_a, a->a_sel[1], a->a_mod[1]);
+    aC = us_arg_a(s, srcp, srcp_a, a->a_sel[2], a->a_mod[2]);
+
+    /*
+     * The dot products are shared between the banks: the RGB side's
+     * DP4 takes its fourth term from the alpha arguments, and the
+     * alpha side's DP reads the result the RGB side computed. Both
+     * are evaluated here so either bank can name it.
+     */
+    dot = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
+
+    switch (a->rgb_op) {
+    case R300_US_RGB_DP3:
+        res[0] = res[1] = res[2] = dot;
+        break;
+    case R300_US_RGB_DP4:
+        res[0] = res[1] = res[2] = dot + aA * aB;
+        break;
+    case R300_US_RGB_D2A:
+        res[0] = res[1] = res[2] = A[0] * B[0] + A[1] * B[1] + C[2];
+        break;
+    case R300_US_RGB_MIN:
         for (n = 0; n < 3; n++) {
-            const float *rv = a->rgb_src_const[n] ? p->konst[a->rgb_src[n]]
-                                                  : g->r[a->rgb_src[n]];
-            const float *av = a->a_src_const[n] ? p->konst[a->a_src[n]]
-                                                : g->r[a->a_src[n]];
-
-            s[n].rgb[0] = rv[0];
-            s[n].rgb[1] = rv[1];
-            s[n].rgb[2] = rv[2];
-            s[n].a = av[3];
+            res[n] = A[n] < B[n] ? A[n] : B[n];
         }
-        us_srcp_rgb(srcp, s, a->rgb_srcp_op);
-        srcp_a = us_srcp_a(s, a->a_srcp_op);
+        break;
+    case R300_US_RGB_MAX:
+        for (n = 0; n < 3; n++) {
+            res[n] = A[n] > B[n] ? A[n] : B[n];
+        }
+        break;
+    case R300_US_RGB_CND:
+        for (n = 0; n < 3; n++) {
+            res[n] = C[n] > 0.5f ? A[n] : B[n];
+        }
+        break;
+    case R300_US_RGB_CMP:
+        for (n = 0; n < 3; n++) {
+            res[n] = C[n] >= 0.0f ? A[n] : B[n];
+        }
+        break;
+    case R300_US_RGB_FRC:
+        for (n = 0; n < 3; n++) {
+            res[n] = A[n] - floorf(A[n]);
+        }
+        break;
+    case R300_US_RGB_SOP:
+        res[0] = res[1] = res[2] = 0.0f;    /* filled in below */
+        break;
+    default:
+        /*
+         * MAD. Written as one expression so the host compiler
+         * contracts it into a fused multiply-add exactly as it does
+         * everywhere else in this model's pixel path -- the GLSL
+         * translator emits fma() to match, and the offline harness
+         * measures that they agree.
+         */
+        for (n = 0; n < 3; n++) {
+            res[n] = A[n] * B[n] + C[n];
+        }
+        break;
+    }
 
-        us_arg_rgb(A, s, srcp, srcp_a, a->rgb_sel[0], a->rgb_mod[0]);
-        us_arg_rgb(B, s, srcp, srcp_a, a->rgb_sel[1], a->rgb_mod[1]);
-        us_arg_rgb(C, s, srcp, srcp_a, a->rgb_sel[2], a->rgb_mod[2]);
-        aA = us_arg_a(s, srcp, srcp_a, a->a_sel[0], a->a_mod[0]);
-        aB = us_arg_a(s, srcp, srcp_a, a->a_sel[1], a->a_mod[1]);
-        aC = us_arg_a(s, srcp, srcp_a, a->a_sel[2], a->a_mod[2]);
+    switch (a->a_op) {
+    case R300_US_A_DP:
+        ares = dot;
+        break;
+    case R300_US_A_MIN:
+        ares = aA < aB ? aA : aB;
+        break;
+    case R300_US_A_MAX:
+        ares = aA > aB ? aA : aB;
+        break;
+    case R300_US_A_CND:
+        ares = aC > 0.5f ? aA : aB;
+        break;
+    case R300_US_A_CMP:
+        ares = aC >= 0.0f ? aA : aB;
+        break;
+    case R300_US_A_FRC:
+        ares = aA - floorf(aA);
+        break;
+    case R300_US_A_EX2:
+        ares = exp2f(aA);
+        break;
+    case R300_US_A_LN2:
+        ares = aA > 0.0f ? log2f(aA) : -FLT_MAX;
+        break;
+    case R300_US_A_RCP:
+        ares = aA != 0.0f ? 1.0f / aA : FLT_MAX;
+        break;
+    case R300_US_A_RSQ:
+        ares = aA != 0.0f ? 1.0f / sqrtf(fabsf(aA)) : FLT_MAX;
+        break;
+    default:
+        ares = aA * aB + aC;
+        break;
+    }
+    if (a->rgb_op == R300_US_RGB_SOP) {
+        res[0] = res[1] = res[2] = ares;
+    }
+
+    for (n = 0; n < 3; n++) {
+        res[n] = us_clamp01(us_omod(res[n], a->rgb_omod), a->rgb_clamp);
+    }
+    ares = us_clamp01(us_omod(ares, a->a_omod), a->a_clamp);
+
+    for (n = 0; n < 3; n++) {
+        if (a->rgb_wmask & (1u << n)) {
+            g->r[a->rgb_dst][n] = res[n];
+        }
+        if (a->rgb_omask & (1u << n)) {
+            g->out[n] = res[n];
+        }
+    }
+    if (a->a_wmask) {
+        g->r[a->a_dst][3] = ares;
+    }
+    if (a->a_omask) {
+        g->out[3] = ares;
+    }
+}
+
+void r300_us_run(const R300UsProgram *p, R300UsRegs *g,
+                 R300UsSampleFn sample, void *ctx)
+{
+    unsigned i, n, lv;
+
+    for (lv = 0; lv < p->nlevels; lv++) {
+        const R300UsLevel *L = &p->level[lv];
 
         /*
-         * The dot products are shared between the banks: the RGB side's
-         * DP4 takes its fourth term from the alpha arguments, and the
-         * alpha side's DP reads the result the RGB side computed. Both
-         * are evaluated here so either bank can name it.
+         * The level's texture instructions, in program order and BEFORE
+         * its ALU slots. That order is what an indirection level means:
+         * the previous level's ALU has already written the frame, so a
+         * fetch here can be addressed by its result.
          */
-        dot = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
+        for (i = 0; i < L->ntex; i++) {
+            const R300UsTex *t = &p->tex[L->tex_at + i];
 
-        switch (a->rgb_op) {
-        case R300_US_RGB_DP3:
-            res[0] = res[1] = res[2] = dot;
-            break;
-        case R300_US_RGB_DP4:
-            res[0] = res[1] = res[2] = dot + aA * aB;
-            break;
-        case R300_US_RGB_D2A:
-            res[0] = res[1] = res[2] = A[0] * B[0] + A[1] * B[1] + C[2];
-            break;
-        case R300_US_RGB_MIN:
-            for (n = 0; n < 3; n++) {
-                res[n] = A[n] < B[n] ? A[n] : B[n];
+            switch (t->op) {
+            case R300_US_TEXOP_TEXKILL:
+                /*
+                 * "Kill pixel if any component is < 0" -- the register
+                 * reference's own wording, over the four components of
+                 * the frame register the instruction names.
+                 */
+                if (g->r[t->src][0] < 0.0f || g->r[t->src][1] < 0.0f ||
+                    g->r[t->src][2] < 0.0f || g->r[t->src][3] < 0.0f) {
+                    g->kill = true;
+                }
+                break;
+            case R300_US_TEXOP_LD:
+            case R300_US_TEXOP_PROJ:
+                if (sample) {
+                    sample(ctx, t->unit, t->op == R300_US_TEXOP_PROJ,
+                           g->r[t->src], g->r[t->dst]);
+                }
+                break;
+            default:
+                break;
             }
-            break;
-        case R300_US_RGB_MAX:
-            for (n = 0; n < 3; n++) {
-                res[n] = A[n] > B[n] ? A[n] : B[n];
-            }
-            break;
-        case R300_US_RGB_CND:
-            for (n = 0; n < 3; n++) {
-                res[n] = C[n] > 0.5f ? A[n] : B[n];
-            }
-            break;
-        case R300_US_RGB_CMP:
-            for (n = 0; n < 3; n++) {
-                res[n] = C[n] >= 0.0f ? A[n] : B[n];
-            }
-            break;
-        case R300_US_RGB_FRC:
-            for (n = 0; n < 3; n++) {
-                res[n] = A[n] - floorf(A[n]);
-            }
-            break;
-        case R300_US_RGB_SOP:
-            res[0] = res[1] = res[2] = 0.0f;    /* filled in below */
-            break;
-        default:
-            /*
-             * MAD. Written as one expression so the host compiler
-             * contracts it into a fused multiply-add exactly as it does
-             * everywhere else in this model's pixel path -- the GLSL
-             * translator emits fma() to match, and the offline harness
-             * measures that they agree.
-             */
-            for (n = 0; n < 3; n++) {
-                res[n] = A[n] * B[n] + C[n];
-            }
-            break;
         }
 
-        switch (a->a_op) {
-        case R300_US_A_DP:
-            ares = dot;
-            break;
-        case R300_US_A_MIN:
-            ares = aA < aB ? aA : aB;
-            break;
-        case R300_US_A_MAX:
-            ares = aA > aB ? aA : aB;
-            break;
-        case R300_US_A_CND:
-            ares = aC > 0.5f ? aA : aB;
-            break;
-        case R300_US_A_CMP:
-            ares = aC >= 0.0f ? aA : aB;
-            break;
-        case R300_US_A_FRC:
-            ares = aA - floorf(aA);
-            break;
-        case R300_US_A_EX2:
-            ares = exp2f(aA);
-            break;
-        case R300_US_A_LN2:
-            ares = aA > 0.0f ? log2f(aA) : -FLT_MAX;
-            break;
-        case R300_US_A_RCP:
-            ares = aA != 0.0f ? 1.0f / aA : FLT_MAX;
-            break;
-        case R300_US_A_RSQ:
-            ares = aA != 0.0f ? 1.0f / sqrtf(fabsf(aA)) : FLT_MAX;
-            break;
-        default:
-            ares = aA * aB + aC;
-            break;
-        }
-        if (a->rgb_op == R300_US_RGB_SOP) {
-            res[0] = res[1] = res[2] = ares;
-        }
-
-        for (n = 0; n < 3; n++) {
-            res[n] = us_clamp01(us_omod(res[n], a->rgb_omod), a->rgb_clamp);
-        }
-        ares = us_clamp01(us_omod(ares, a->a_omod), a->a_clamp);
-
-        for (n = 0; n < 3; n++) {
-            if (a->rgb_wmask & (1u << n)) {
-                g->r[a->rgb_dst][n] = res[n];
-            }
-            if (a->rgb_omask & (1u << n)) {
-                g->out[n] = res[n];
-            }
-        }
-        if (a->a_wmask) {
-            g->r[a->a_dst][3] = ares;
-        }
-        if (a->a_omask) {
-            g->out[3] = ares;
+        for (i = L->alu_at; i < L->alu_at + L->nalu; i++) {
+            us_run_alu(p, g, &p->alu[i]);
         }
     }
 

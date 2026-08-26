@@ -184,6 +184,38 @@ typedef struct R300UsTex {
 } R300UsTex;
 
 /*
+ * One INDIRECTION LEVEL: a run of texture instructions followed by a run
+ * of ALU instructions. US_CONFIG.NLEVEL says how many are live and
+ * US_CODE_ADDR_n names each one's two ranges.
+ *
+ * Levels exist so that a texture fetch can be addressed by an earlier
+ * level's ALU result -- a dependent read. That is the whole reason the
+ * fetch is performed INSIDE this executor rather than in front of it:
+ * with one level the coordinate is known before the program runs and a
+ * caller could sample for it, and with two it is not.
+ *
+ * `alu_at`/`tex_at` index the program's flat decoded arrays; `alu_slot`
+ * and `tex_slot` are the relocated microcode slots the level came from,
+ * kept for the trace.
+ */
+#define R300_US_LEVELS  4
+
+typedef struct R300UsLevel {
+    uint8_t alu_at, nalu, alu_slot;
+    uint8_t tex_at, ntex, tex_slot;
+} R300UsLevel;
+
+/*
+ * How the executor samples a texture. The interpreter is deliberately
+ * free of device state, so the fetch arrives as a callback: `coord` is
+ * the frame register the texture instruction names -- s, t, r, q in the
+ * units the caller established -- and `texel` receives R, G, B, A.
+ * `proj` distinguishes PROJ from LD.
+ */
+typedef void (*R300UsSampleFn)(void *ctx, unsigned unit, bool proj,
+                               const float coord[4], float texel[4]);
+
+/*
  * Which frame register the rasterizer drops each interpolated quantity
  * into, resolved out of RS_INST/RS_IP. The vertex stage of this model
  * emits one texture coordinate and two colours, so an RS instruction
@@ -263,6 +295,18 @@ typedef struct R300UsProgram {
     unsigned nregs_used;
     R300UsRs rs;
     R300UsGaps gaps;
+    /* the live indirection levels, in execution order (ascending) */
+    R300UsLevel level[R300_US_LEVELS];
+    uint8_t nlevels;
+    bool has_kill;              /* the program contains a TEXKILL */
+    /*
+     * The shape the GL backend's shader can express: ONE level, at most
+     * one fetch, from unit 0, and no TEXKILL. That backend samples the
+     * texture itself and hands `us_main()` a finished texel, so anything
+     * needing a fetch mid-program is refused by the translator and falls
+     * back to the software rasterizer -- which renders it correctly.
+     */
+    bool gl_simple;
     /*
      * The one texture fetch, resolved: which frame register receives the
      * texel, and -1 when the program fetches nothing. A program with more
@@ -343,11 +387,15 @@ void r300_us_analyse(R300UsProgram *p,
                      const uint32_t *rs_ip);
 
 /*
- * Run the ALU half of the program: the caller has already placed the
- * interpolated colours and the fetched texel in `g` per the routing
- * r300_us_analyse() resolved. Leaves the shaded fragment in `g->out`.
+ * Run the program. The caller has placed the interpolated colours, and
+ * the interpolated texture COORDINATE, in `g` per the routing
+ * r300_us_analyse() resolved; the texture instructions are executed here
+ * in program order through `sample`, so a fetch addressed by an earlier
+ * level's result works like any other. Leaves the shaded fragment in
+ * `g->out`, and `g->kill` set if a TEXKILL fired.
  */
-void r300_us_run(const R300UsProgram *p, R300UsRegs *g);
+void r300_us_run(const R300UsProgram *p, R300UsRegs *g,
+                 R300UsSampleFn sample, void *ctx);
 
 /*
  * The same computation for a program `p->fast` accepted, without

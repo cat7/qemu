@@ -217,7 +217,17 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
     UsBuf b = { .p = buf, .cap = cap };
     unsigned i, n;
 
-    if (!p->valid || !p->expressible) {
+    /*
+     * `gl_simple` is the shape this translation can express. The GL
+     * backend samples the texture itself and passes `us_main()` a
+     * finished texel, so a program that fetches mid-flight -- a second
+     * indirection level, a second fetch, a TEXKILL -- has no texel to be
+     * given. Those are REFUSED here rather than approximated, which
+     * makes the draw fall back to the software rasterizer, where the
+     * executor performs the fetches and renders them correctly. The
+     * offload is what is given up, not the picture.
+     */
+    if (!p->valid || !p->expressible || !p->gl_simple) {
         return false;
     }
     us_emit(&b, "void us_main(vec4 tex0, vec4 col0, vec4 col1,\n"
