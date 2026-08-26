@@ -233,18 +233,17 @@ typedef struct R300UsArgFast {
 /*
  * Constructs met that this model does not implement.
  *
- * The output gap is TWO gaps deliberately. US_OUT_FMT_0 carries a pixel
- * format and a four-way component select, and a single report that named
- * only the format was actively misleading: a guest asking for a
- * supported format with an unsupported select was reported as
- * "unimplemented fragment output format 0x0", which names a format the
- * model has always run. Whichever half refuses is now the half that is
- * named.
+ * US_OUT_FMT_0's component SELECT was one of these until it was
+ * implemented as a permutation; only the pixel format can refuse now.
+ * The two were once reported as one, which was actively misleading -- a
+ * guest asking for a supported format with an unsupported select was
+ * reported as "unimplemented fragment output format 0x0", naming a
+ * format the model has always run.
  */
 typedef struct R300UsGaps {
-    uint8_t rgb_op, a_op, tex_op, indirect, rs_route, out_fmt, out_sel;
+    uint8_t rgb_op, a_op, tex_op, indirect, rs_route, out_fmt;
     bool has_rgb_op, has_a_op, has_tex_op;
-    bool has_indirect, has_rs_route, has_out_fmt, has_out_sel;
+    bool has_indirect, has_rs_route, has_out_fmt;
 } R300UsGaps;
 
 typedef struct R300UsProgram {
@@ -273,6 +272,38 @@ typedef struct R300UsProgram {
     int tex_dst;
     /* the program writes at least one output component */
     bool writes_out;
+    /*
+     * US_OUT_FMT_0's component select, resolved into a permutation of
+     * the shaded fragment.
+     *
+     * The output fifo has four components and the select says, for each
+     * of them, which of the shader's R/G/B/A channels it carries. The
+     * destination writer assembles a plain ARGB dword -- which is
+     * exactly the select 0x1b (C0 = Blue, C1 = Green, C2 = Red,
+     * C3 = Alpha) that this project's whole 10.4 and OS 9 corpus reads,
+     * so for those `out_perm` is the identity and `out_permuted` false.
+     *
+     * Mac OS X 10.5's compositor reads 0x39 (C0 = Red, C1 = Green,
+     * C2 = Blue, C3 = Alpha), the same four channels into a destination
+     * whose low component is red: red and blue exchanged. Rather than a
+     * special case for that value, the select is inverted here into
+     * `out[i] := shaded[out_perm[i]]` in the writer's own R,G,B,A order,
+     * which expresses all 256 encodings including the ones that repeat a
+     * channel. That is why there is no gap for a select any more.
+     */
+    uint8_t out_perm[4];
+    /*
+     * out_perm is not the identity. A program with one is deliberately
+     * NOT `fast`: the specialised executor runs once per PIXEL, and a
+     * branch there is a cost every guest pays for a select only Leopard
+     * uses. Measured, three runs against one: 7.35 / 7.51 / 7.48 fps
+     * with the branch in the fast path, 7.70 without it. So the
+     * permutation lives only in the interpreter, the fast executor is
+     * byte-identical to the one that predates the select, and a
+     * permuted program pays the interpreter's price -- which it is
+     * worth, because before this it was not rendered at all.
+     */
+    bool out_permuted;
     /*
      * The specialised path: one MAD per bank over resolved arguments.
      * `fast_rgb_mask` and `fast_a` are the output components it writes.

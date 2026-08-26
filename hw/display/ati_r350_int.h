@@ -100,7 +100,6 @@ typedef enum ATIR350GapKind {
     R350_GAP_FS_INDIRECT,    /* US_CONFIG names an indirection level */
     R350_GAP_FS_RS_ROUTE,    /* rasterizer routes something we do not emit */
     R350_GAP_FS_OUT_FMT,     /* US_OUT_FMT_0 pixel format not modelled */
-    R350_GAP_FS_OUT_SEL,     /* US_OUT_FMT_0 component select not modelled */
     R350_GAP_MAX
 } ATIR350GapKind;
 

@@ -374,6 +374,16 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
         }
         us_emit(&b, "    }\n");
     }
+    /*
+     * US_OUT_FMT_0's component select. A swizzle is the same shuffle of
+     * finished values the two software paths perform at the same point,
+     * so no arithmetic is reordered and the identity emits nothing.
+     */
+    if (p->out_permuted) {
+        us_emit(&b, "    outc = outc.%c%c%c%c;\n",
+                "rgba"[p->out_perm[0]], "rgba"[p->out_perm[1]],
+                "rgba"[p->out_perm[2]], "rgba"[p->out_perm[3]]);
+    }
     us_emit(&b, "}\n");
     return !b.full;
 }

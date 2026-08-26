@@ -1361,9 +1361,6 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
             if (g->has_out_fmt) {
                 ati_r350_note_gap(s, R350_GAP_FS_OUT_FMT, g->out_fmt);
             }
-            if (g->has_out_sel) {
-                ati_r350_note_gap(s, R350_GAP_FS_OUT_SEL, g->out_sel);
-            }
             /*
              * The words that describe the refused program, so a gap
              * found in a live guest can be specified offline instead of

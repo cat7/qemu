@@ -88,14 +88,6 @@ static void us_gap_out_fmt(R300UsGaps *g, uint8_t v)
     }
 }
 
-static void us_gap_out_sel(R300UsGaps *g, uint8_t v)
-{
-    if (g && !g->has_out_sel) {
-        g->has_out_sel = true;
-        g->out_sel = v;
-    }
-}
-
 static void us_decode_alu(R300UsAlu *a, uint32_t rgb_addr, uint32_t rgb_inst,
                           uint32_t a_addr, uint32_t a_inst)
 {
@@ -327,6 +319,15 @@ static void us_try_fast(R300UsProgram *p)
     const R300UsAlu *a = &p->alu[0];
     unsigned n;
 
+    /*
+     * A non-identity output select is the interpreter's job. Putting it
+     * in the specialised executor costs a per-pixel branch in every
+     * guest for a construct only one of them uses; see `out_permuted`.
+     */
+    if (p->out_permuted) {
+        return;
+    }
+
     p->fast = false;
     if (!p->valid || !p->expressible || !p->writes_out || p->nalu != 1) {
         return;
@@ -533,33 +534,43 @@ void r300_us_analyse(R300UsProgram *p,
     }
 
     /*
-     * How the output fifo maps onto the render target's components. The
-     * whole corpus reads 0x1b01 -- C4_10 with C0 = Blue, C1 = Green,
-     * C2 = Red, C3 = Alpha -- which is the plain ARGB the destination
-     * writer already assembles. Anything else would need that writer to
-     * permute, so it is named rather than silently ignored. A program
-     * that writes no output at all never reaches the target and its
-     * format is not consulted.
+     * How the output fifo maps onto the render target's components.
      *
-     * The two halves are reported SEPARATELY. Reporting the format for a
-     * refusal the select caused named a format this model runs, which
-     * cost a reader of the gap list a wrong conclusion.
+     * The FORMAT is still a refusal: C4_8 and C4_10 both deliver four
+     * components the destination writer can store, and the others do
+     * not. A program that writes no output at all never reaches the
+     * target, so neither half is consulted for it.
+     *
+     * The SELECT is not a refusal any more -- it is resolved into a
+     * permutation. See `out_perm` in the header for the derivation; the
+     * short version is that the writer's fixed ARGB assembly IS the
+     * select 0x1b, so inverting the guest's select against it expresses
+     * every encoding and leaves 0x1b costing nothing.
      */
+    p->out_perm[0] = 0;
+    p->out_perm[1] = 1;
+    p->out_perm[2] = 2;
+    p->out_perm[3] = 3;
     if (p->writes_out) {
+        /* which shader channel each of A,R,G,B names, in the writer's order */
+        static const uint8_t chan_to_out[4] = { 3, 0, 1, 2 };
+        /* which writer slot holds output component k */
+        static const uint8_t comp_to_slot[4] = { 2, 1, 0, 3 };
         unsigned fmt = us_out_fmt0 & R300_US_OUT_FMT_MASK;
-        unsigned sel = (us_out_fmt0 >> R300_US_OUT_SEL_SHIFT(0)) & 0xff;
+        unsigned k;
 
         if (fmt != R300_US_OUT_FMT_C4_8 && fmt != R300_US_OUT_FMT_C4_10) {
             us_gap_out_fmt(&p->gaps, fmt);
             p->expressible = false;
         }
-        if (sel != ((R300_US_OUT_SEL_BLUE << 0) |
-                    (R300_US_OUT_SEL_GREEN << 2) |
-                    (R300_US_OUT_SEL_RED << 4) |
-                    (R300_US_OUT_SEL_ALPHA << 6))) {
-            us_gap_out_sel(&p->gaps, sel);
-            p->expressible = false;
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (us_out_fmt0 >> R300_US_OUT_SEL_SHIFT(k)) &
+                           R300_US_OUT_SEL_MASK;
+
+            p->out_perm[comp_to_slot[k]] = chan_to_out[sel];
         }
+        p->out_permuted = p->out_perm[0] != 0 || p->out_perm[1] != 1 ||
+                          p->out_perm[2] != 2 || p->out_perm[3] != 3;
     }
 
     us_try_fast(p);
@@ -887,6 +898,29 @@ void r300_us_run(const R300UsProgram *p, R300UsRegs *g)
         }
         if (a->a_omask) {
             g->out[3] = ares;
+        }
+    }
+
+    /*
+     * US_OUT_FMT_0's component select, applied once at the end. The
+     * output fifo is what the destination writer stores, so the
+     * permutation belongs after the last instruction has written it and
+     * not inside the loop, where an output component is also readable as
+     * a source of a later slot.
+     *
+     * The identity is the guarded case, not an incidental one: every
+     * program in this project's 10.4 and OS 9 corpus reads select 0x1b,
+     * which IS the writer's own order, so the branch is not taken and
+     * nothing moves.
+     */
+    if (p->out_permuted) {
+        float o[4];
+
+        for (n = 0; n < 4; n++) {
+            o[n] = g->out[p->out_perm[n]];
+        }
+        for (n = 0; n < 4; n++) {
+            g->out[n] = o[n];
         }
     }
 }
