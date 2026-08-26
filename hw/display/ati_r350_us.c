@@ -236,6 +236,137 @@ static bool us_a_op_known(uint8_t op)
     }
 }
 
+/*
+ * THE SPECIALISED PATH.
+ *
+ * Every program in this project's corpus is one ALU slot of MAD on both
+ * banks, and running a general interpreter over a thirty-two-register
+ * frame for each pixel cost the software rasterizer 38 % of its frame
+ * rate. So a program of exactly that shape has its six arguments
+ * resolved here, once per draw, into loads from the three things the
+ * rasterizer actually produces -- the texel and two colours -- plus the
+ * constant file.
+ *
+ * The conditions are deliberately narrow and every one of them is a
+ * thing the fast executor does not do: one instruction, MAD on both
+ * banks, no input or output modifier, no clamp, no pre-subtract, and
+ * nothing written to the frame (so no instruction can read what another
+ * wrote). Anything else runs the interpreter, which is still the
+ * specification -- and the offline harness requires the two to agree bit
+ * for bit over the whole corpus.
+ */
+static bool us_arg_fast(const R300UsProgram *p, R300UsArgFast *out,
+                        unsigned reg, bool is_const, unsigned sel,
+                        bool alpha)
+{
+    unsigned k;
+
+    /* the literals, common to both banks */
+    if (alpha ? (sel >= 16 && sel <= 18) : (sel >= 20 && sel <= 22)) {
+        static const float lit[3] = { 0.0f, 1.0f, 0.5f };
+
+        out->src = R300_US_ARG_LIT;
+        out->lit = lit[sel - (alpha ? 16 : 20)];
+        return true;
+    }
+    /* which slot, and which component of it */
+    if (alpha) {
+        if (sel < 9) {
+            out->chan = 1 + (sel % 3);
+        } else if (sel < 12) {
+            out->chan = 4;
+        } else {
+            return false;               /* the pre-subtract */
+        }
+    } else {
+        if (sel < 12) {
+            out->chan = sel % 4;        /* 0 = .rgb, 1..3 = r/g/b */
+        } else if (sel < 15) {
+            out->chan = 4;              /* .aaa */
+        } else {
+            return false;               /* srcp, or a rotate */
+        }
+    }
+    if (is_const) {
+        out->src = R300_US_ARG_CONST;
+        out->ki = reg;
+        return true;
+    }
+    if (p->tex_dst >= 0 && reg == (unsigned)p->tex_dst) {
+        out->src = R300_US_ARG_TEX;
+        return true;
+    }
+    for (k = 0; k < R300_US_RS_COLS; k++) {
+        if (p->rs.col_reg[k] >= 0 && reg == (unsigned)p->rs.col_reg[k]) {
+            out->src = p->rs.col_pkt[k] == 0 ? R300_US_ARG_COL0
+                                             : R300_US_ARG_COL1;
+            return true;
+        }
+    }
+    /*
+     * A register nothing filled. The interpreter reads a cleared frame
+     * and gets zero, so a literal zero is the same answer -- and saying
+     * so here is what keeps the two paths identical rather than merely
+     * close.
+     */
+    out->src = R300_US_ARG_LIT;
+    out->lit = 0.0f;
+    return true;
+}
+
+static void us_try_fast(R300UsProgram *p)
+{
+    const R300UsAlu *a = &p->alu[0];
+    unsigned n;
+
+    p->fast = false;
+    if (!p->valid || !p->expressible || !p->writes_out || p->nalu != 1) {
+        return;
+    }
+    if (a->rgb_op != R300_US_RGB_MAD || a->a_op != R300_US_A_MAD) {
+        return;
+    }
+    if (a->rgb_omod || a->a_omod || a->rgb_clamp || a->a_clamp) {
+        return;
+    }
+    if (a->rgb_wmask || a->a_wmask) {
+        return;                         /* it writes the frame as well */
+    }
+    for (n = 0; n < 3; n++) {
+        if (a->rgb_mod[n] != R300_US_MOD_NOP ||
+            a->a_mod[n] != R300_US_MOD_NOP) {
+            return;
+        }
+    }
+    for (n = 0; n < 3; n++) {
+        unsigned rs = a->rgb_sel[n] < 12 ? a->rgb_sel[n] / 4
+                                         : a->rgb_sel[n] - 12;
+        unsigned as = a->a_sel[n] < 9 ? a->a_sel[n] / 3 : a->a_sel[n] - 9;
+
+        if (a->rgb_sel[n] < 15) {
+            if (!us_arg_fast(p, &p->fast_rgb[n], a->rgb_src[rs],
+                             a->rgb_src_const[rs], a->rgb_sel[n], false)) {
+                return;
+            }
+        } else if (!us_arg_fast(p, &p->fast_rgb[n], 0, false,
+                                a->rgb_sel[n], false)) {
+            return;
+        }
+        if (a->a_sel[n] < 12) {
+            if (!us_arg_fast(p, &p->fast_a[n], a->a_src[as],
+                             a->a_src_const[as], a->a_sel[n], true)) {
+                return;
+            }
+        } else if (!us_arg_fast(p, &p->fast_a[n], 0, false,
+                                a->a_sel[n], true)) {
+            return;
+        }
+    }
+    p->fast_rgb_mask = a->rgb_omask;
+    p->fast_a_out = a->a_omask;
+    p->fast = true;
+}
+
 void r300_us_analyse(R300UsProgram *p,
                      uint32_t us_config, uint32_t us_code_offset,
                      const uint32_t *us_code_addr,
@@ -415,6 +546,8 @@ void r300_us_analyse(R300UsProgram *p,
             p->expressible = false;
         }
     }
+
+    us_try_fast(p);
 }
 
 /* ---------------------------------------------------------------- */

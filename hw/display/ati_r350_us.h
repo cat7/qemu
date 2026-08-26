@@ -200,6 +200,36 @@ typedef struct R300UsRs {
     uint8_t col_fmt[R300_US_RS_COLS];   /* RS_IP COL_FMT of each */
 } R300UsRs;
 
+/*
+ * One argument of the SPECIALISED path, resolved at decode time.
+ *
+ * The whole corpus is one ALU slot of MAD, and running a general
+ * interpreter over a 32-register frame for every pixel cost the software
+ * rasterizer 38 % of its frame rate (9.37 -> 5.85 fps on the Flurry
+ * workload). So a program of that shape is resolved once per draw into
+ * six of these, and the per-pixel work becomes six loads and a
+ * multiply-add -- with no frame to clear and no operand switch.
+ *
+ * It is the same move `plain_matrix` is for the vertex stage, and it is
+ * held to the same standard: the offline harness runs both paths over
+ * every program in the corpus and requires them BIT-IDENTICAL.
+ */
+typedef enum R300UsArgSrc {
+    R300_US_ARG_LIT = 0,        /* a literal 0.0, 1.0 or 0.5 */
+    R300_US_ARG_TEX,            /* the fetched texel */
+    R300_US_ARG_COL0,           /* the first interpolated colour */
+    R300_US_ARG_COL1,           /* the second */
+    R300_US_ARG_CONST,          /* US_ALU_CONST[ki] */
+} R300UsArgSrc;
+
+typedef struct R300UsArgFast {
+    uint8_t src;                /* R300UsArgSrc */
+    uint8_t ki;                 /* constant index, when src is CONST */
+    /* 0 = the vector's own r,g,b; 1..4 = broadcast of r, g, b or a */
+    uint8_t chan;
+    float lit;
+} R300UsArgFast;
+
 /* constructs met that this model does not implement */
 typedef struct R300UsGaps {
     uint8_t rgb_op, a_op, tex_op, indirect, rs_route, out_fmt;
@@ -233,6 +263,14 @@ typedef struct R300UsProgram {
     int tex_dst;
     /* the program writes at least one output component */
     bool writes_out;
+    /*
+     * The specialised path: one MAD per bank over resolved arguments.
+     * `fast_rgb_mask` and `fast_a` are the output components it writes.
+     */
+    bool fast;
+    R300UsArgFast fast_rgb[3], fast_a[3];
+    uint8_t fast_rgb_mask;
+    bool fast_a_out;
 } R300UsProgram;
 
 /* the pixel stack frame an instruction addresses */
@@ -269,6 +307,89 @@ void r300_us_analyse(R300UsProgram *p,
  * r300_us_analyse() resolved. Leaves the shaded fragment in `g->out`.
  */
 void r300_us_run(const R300UsProgram *p, R300UsRegs *g);
+
+/*
+ * The same computation for a program `p->fast` accepted, without
+ * building a frame: `tex`, `col0` and `col1` are four floats each in
+ * R,G,B,A order and `out` receives the shaded fragment. Callers must
+ * check `p->fast` first; the offline harness proves the two agree bit
+ * for bit over every program in the corpus.
+ *
+ * It lives in the header, and is inline, because it runs once per PIXEL:
+ * as an out-of-line call in another translation unit it cost the
+ * software rasterizer a fifth of its frame rate on its own.
+ */
+/*
+ * The specialised executor. One MAD per bank over arguments resolved at
+ * decode time, with no frame to clear and no operand switch: this is
+ * what the software rasterizer runs for every program in the corpus,
+ * and `r300_us_run()` above remains the specification it is checked
+ * against.
+ */
+static inline void us_fetch3(float out[3], const R300UsArgFast *a,
+                             const R300UsProgram *p, const float *v[4])
+{
+    const float *s;
+
+    if (a->src == R300_US_ARG_LIT) {
+        out[0] = out[1] = out[2] = a->lit;
+        return;
+    }
+    s = a->src == R300_US_ARG_CONST ? p->konst[a->ki] : v[a->src];
+    if (a->chan == 0) {
+        out[0] = s[0];
+        out[1] = s[1];
+        out[2] = s[2];
+    } else {
+        out[0] = out[1] = out[2] = s[a->chan - 1];
+    }
+}
+
+static inline float us_fetch1(const R300UsArgFast *a, const R300UsProgram *p,
+                              const float *v[4])
+{
+    const float *s;
+
+    if (a->src == R300_US_ARG_LIT) {
+        return a->lit;
+    }
+    s = a->src == R300_US_ARG_CONST ? p->konst[a->ki] : v[a->src];
+    return s[a->chan - 1];
+}
+
+static inline void r300_us_run_fast(const R300UsProgram *p,
+                                    const float *tex, const float *col0,
+                                    const float *col1, float out[4])
+{
+    const float *v[4];
+    float A[3], B[3], C[3];
+    unsigned n;
+
+    v[R300_US_ARG_LIT] = NULL;
+    v[R300_US_ARG_TEX] = tex;
+    v[R300_US_ARG_COL0] = col0;
+    v[R300_US_ARG_COL1] = col1;
+
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    us_fetch3(A, &p->fast_rgb[0], p, v);
+    us_fetch3(B, &p->fast_rgb[1], p, v);
+    us_fetch3(C, &p->fast_rgb[2], p, v);
+    for (n = 0; n < 3; n++) {
+        if (p->fast_rgb_mask & (1u << n)) {
+            /*
+             * The interpreter's own expression, so the host compiler
+             * contracts both of them the same way.
+             */
+            out[n] = A[n] * B[n] + C[n];
+        }
+    }
+    if (p->fast_a_out) {
+        out[3] = us_fetch1(&p->fast_a[0], p, v) *
+                 us_fetch1(&p->fast_a[1], p, v) +
+                 us_fetch1(&p->fast_a[2], p, v);
+    }
+}
+
 
 /*
  * Translate the program to a GLSL 3.30 function
