@@ -2043,6 +2043,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                             unsigned vsize)
 {
     uint32_t colorpitch = s->regs[R300_RB3D_COLORPITCH0 >> 2];
+    unsigned first_color = 0, ncolor = 0, first_tex = 0;
+    bool vs_live = false;
     unsigned i;
 
     d->vram = memory_region_get_ram_ptr(&s->vram);
@@ -2107,7 +2109,65 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->dst_off = roff;
         d->dst_pitch = rpitch;
     }
-    d->textured = (s->regs[R300_TX_ENABLE >> 2] & 1) && vsize >= 8;
+    /*
+     * WHAT PROGRAM IS IN FORCE, resolved here rather than after the
+     * texture and fragment stages because the gate immediately below
+     * needs it. The analysis is a pure function of the control
+     * registers and the program RAM -- it reads nothing this function
+     * has computed -- so hoisting it changes nothing about its answer;
+     * everything that DEPENDS on the texture state (which attribute a
+     * coordinate lives in, whether the program's colour is a colour)
+     * still happens further down, where that state exists.
+     */
+    d->xform = false;
+    d->vte_xs = d->vte_xo = d->vte_ys = d->vte_yo = false;
+    d->vs_run = false;
+    d->vs_color = false;
+    for (i = 0; i < R300_TEXCOORDS; i++) {
+        d->vs_texcoord[i] = false;
+        d->vs_tex_out[i] = 0;
+        d->tex_attr[i] = -1;
+    }
+    memset(&d->vs, 0, sizeof(d->vs));
+    if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
+        s->pvs_const_dwords >= 16 &&
+        r300_f32(s->regs[R300_SE_VPORT_XSCALE >> 2]) != 0.0f) {
+        r300_pvs_out_layout(s->regs[R300_VAP_OUTPUT_VTX_FMT_0 >> 2],
+                            &first_color, &ncolor, &first_tex);
+        r300_pvs_analyse(&d->vs, s->pvs_code, s->pvs_code_slot_valid,
+                         R300_PVS_CODE_SLOTS,
+                         s->pvs_const, R300_PVS_CONST_SLOTS,
+                         s->regs[R300_VAP_PVS_CODE_CNTL_0 >> 2],
+                         s->regs[R300_VAP_PVS_CONST_CNTL >> 2],
+                         first_tex);
+        vs_live = true;
+    }
+    /*
+     * A VERTEX EIGHT DWORDS WIDE IS NOT THE ONLY VERTEX THAT CARRIES A
+     * TEXTURE COORDINATE. The width test is here because a coordinate
+     * read POSITIONALLY -- the dwords after a four-dword position --
+     * needs the room; it is not a statement about the guest. Mac OS X
+     * 10.5's layer-backed UIs (the Dock's icons, System Preferences'
+     * labels and its wallpaper thumbnails) send a SEVEN-dword vertex,
+     * FLOAT_4 position, one dword, FLOAT_2 coordinate, and compute the
+     * coordinate in the vertex program -- so the width test refused the
+     * texture outright, no unit was enabled, and the draws painted their
+     * flat constant colour: (0,0,0,0) through a blend, i.e. nothing at
+     * all.
+     *
+     * A program that COMPUTES the first coordinate says the draw is
+     * textured as surely as the vertex width does, and r300_vs_texcoord
+     * below can evaluate it wherever it lives. The census over every
+     * capture this project holds is what makes this safe to widen: of
+     * 20867 Mac OS X 10.4 and OS 9 draws, NOT ONE is textured, under
+     * eight dwords wide and carrying a computed coordinate, so the
+     * relaxation reaches nothing that renders today (scratchpad
+     * texguard.py). It is deliberately NOT widened to a FORWARDED
+     * coordinate: four of Beach.saver's draws would change and there is
+     * no evidence they should.
+     */
+    d->textured = (s->regs[R300_TX_ENABLE >> 2] & 1) &&
+                  (vsize >= 8 || r300_pvs_computes(&d->vs, first_tex));
     /*
      * RB3D_BLENDCNTL (R5xx accel guide): bit 0 is ALPHA_BLEND_ENABLE,
      * SRCBLEND lives in [21:16] and DESTBLEND in [29:24] as 6-bit
@@ -2243,43 +2303,21 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->clip_rule = 0xffff;
     }
 
-    d->xform = false;
-    d->vte_xs = d->vte_xo = d->vte_ys = d->vte_yo = false;
-    d->vs_run = false;
-    d->vs_color = false;
-    for (i = 0; i < R300_TEXCOORDS; i++) {
-        d->vs_texcoord[i] = false;
-        d->vs_tex_out[i] = 0;
-        d->tex_attr[i] = -1;
-    }
-    memset(&d->vs, 0, sizeof(d->vs));
-    if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
-        s->pvs_const_dwords >= 16) {
+    if (vs_live) {
         int k;
         uint32_t vte;
-        float xs = r300_f32(s->regs[R300_SE_VPORT_XSCALE >> 2]);
+        unsigned cb;
 
-        if (xs != 0.0f) {
-            unsigned first_color, ncolor, first_tex, cb;
-
+        {
             /*
-             * What the program in force is, and whether it is the plain
-             * 4x4 matrix the desktop is painted with. Deciding this per
-             * draw from the control registers -- not from how much has
-             * ever been uploaded -- is what makes the result independent
+             * The program in force was resolved above -- deciding it per
+             * draw from the control registers, not from how much has
+             * ever been uploaded, is what makes the result independent
              * of what ran before: an earlier attempt at this took the
              * bounds from a high-water mark of the upload stream, and the
              * same draw then rendered differently according to its
              * history.
              */
-            r300_pvs_out_layout(s->regs[R300_VAP_OUTPUT_VTX_FMT_0 >> 2],
-                                &first_color, &ncolor, &first_tex);
-            r300_pvs_analyse(&d->vs, s->pvs_code, s->pvs_code_slot_valid,
-                             R300_PVS_CODE_SLOTS,
-                             s->pvs_const, R300_PVS_CONST_SLOTS,
-                             s->regs[R300_VAP_PVS_CODE_CNTL_0 >> 2],
-                             s->regs[R300_VAP_PVS_CONST_CNTL >> 2],
-                             first_tex);
             r300_pvs_translate(s, &d->vs);
             cb = d->vs.valid ? d->vs.cbase * 4 : 0;
             if (cb + 16 > ARRAY_SIZE(s->pvs_const)) {
