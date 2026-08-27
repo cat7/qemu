@@ -692,6 +692,25 @@ struct ATIR350State {
     bool host_data_active;
     uint32_t host_data_row, host_data_col, host_data_next;
     uint32_t host_data_acc[4];
+    /*
+     * The drawing context the transfer STARTED with. A host-data transfer
+     * spans many register writes, and its final partial accumulator is
+     * only flushed when the NEXT blit arrives -- by which time the packet
+     * that carries it has already installed its own destination rectangle,
+     * datatype, pitch and scissors. Reading the live registers there wrote
+     * one glyph's tail into the next glyph's cell, and where the stale
+     * column index ran past the new width the unsigned `dst_width - col`
+     * underflowed and painted sixteen pixels across its neighbours.
+     * A transfer owns its context until it ends.
+     */
+    struct {
+        uint32_t dst_x, dst_y, dst_width, dst_height;
+        uint32_t dst_offset, dst_pitch;
+        bool dst_pitch_bytes;
+        uint32_t datatype;
+        uint32_t src_frgd_clr, src_bkgd_clr;
+        int sc_left, sc_top, sc_right, sc_bottom;
+    } hd;
 
     /*
      * Vertex-program RAM as uploaded through VAP_PVS_UPLOAD_ADDRESS/DATA.

@@ -28,9 +28,9 @@
  * ROP3 fallback (all 16 codes) so a ROP this driver actually uses
  * doesn't silently vanish.
  */
-static int ati_r350_bpp_from_dp_datatype(ATIR350State *s)
+static int ati_r350_bpp_from_datatype(uint32_t datatype)
 {
-    switch (s->dp_datatype & 0xf) {
+    switch (datatype & 0xf) {
     case 2:
         return 8;
     case 3:
@@ -43,6 +43,11 @@ static int ati_r350_bpp_from_dp_datatype(ATIR350State *s)
     default:
         return 0;
     }
+}
+
+static int ati_r350_bpp_from_dp_datatype(ATIR350State *s)
+{
+    return ati_r350_bpp_from_datatype(s->dp_datatype);
 }
 
 /*
@@ -822,6 +827,21 @@ void ati_r350_2d_blt(ATIR350State *s)
         s->host_data_next = 0;
         s->host_data_col = 0;
         s->host_data_row = 0;
+        /* the transfer takes a copy of the context it starts with */
+        s->hd.dst_x = s->dst_x;
+        s->hd.dst_y = s->dst_y;
+        s->hd.dst_width = s->dst_width;
+        s->hd.dst_height = s->dst_height;
+        s->hd.dst_offset = s->dst_offset;
+        s->hd.dst_pitch = s->dst_pitch;
+        s->hd.dst_pitch_bytes = s->dst_pitch_bytes;
+        s->hd.datatype = s->dp_datatype;
+        s->hd.src_frgd_clr = s->dp_src_frgd_clr;
+        s->hd.src_bkgd_clr = s->dp_src_bkgd_clr;
+        s->hd.sc_left = s->sc_left;
+        s->hd.sc_top = s->sc_top;
+        s->hd.sc_right = s->sc_right;
+        s->hd.sc_bottom = s->sc_bottom;
         return;
     }
     ati_r350_2d_do_blt(s);
@@ -837,8 +857,8 @@ void ati_r350_2d_blt(ATIR350State *s)
  */
 bool ati_r350_host_data_flush(ATIR350State *s)
 {
-    int bpp = ati_r350_bpp_from_dp_datatype(s);
-    uint32_t src_datatype = s->dp_datatype & R350_DP_SRC_DATATYPE;
+    int bpp = ati_r350_bpp_from_datatype(s->hd.datatype);
+    uint32_t src_datatype = s->hd.datatype & R350_DP_SRC_DATATYPE;
     uint32_t dst_stride;
     /*
      * One accumulator holds 128 bits. As COLOUR data that is at most 16
@@ -895,7 +915,7 @@ bool ati_r350_host_data_flush(ATIR350State *s)
      * filled by 7x22 host-data blits had 36 non-empty rows and every
      * one of them sat at y % 8 == 0, which is this multiply exactly.
      */
-    dst_stride = s->dst_pitch_bytes ? s->dst_pitch : s->dst_pitch * bpp;
+    dst_stride = s->hd.dst_pitch_bytes ? s->hd.dst_pitch : s->hd.dst_pitch * bpp;
     if (!dst_stride) {
         s->host_data_active = false;
         return false;
@@ -911,7 +931,7 @@ bool ati_r350_host_data_flush(ATIR350State *s)
      * then ships bitmap payload verbatim and leaves the conversion to
      * the chip. Without it every host-supplied pixel lands reversed.
      */
-    if ((s->dp_datatype & R350_HOST_BIG_ENDIAN_EN) &&
+    if ((s->hd.datatype & R350_HOST_BIG_ENDIAN_EN) &&
         src_datatype == R350_SRC_COLOR) {
         unsigned w;
 
@@ -942,9 +962,9 @@ bool ati_r350_host_data_flush(ATIR350State *s)
         pix_count = sizeof(acc) / bypp;
         memcpy(pix_buf, acc, sizeof(acc));
     } else {
-        uint32_t byte_pix_order = s->dp_datatype & R350_DP_BYTE_PIX_ORDER;
-        uint32_t fg = s->dp_src_frgd_clr;
-        uint32_t bg = s->dp_src_bkgd_clr;
+        uint32_t byte_pix_order = s->hd.datatype & R350_DP_BYTE_PIX_ORDER;
+        uint32_t fg = s->hd.src_frgd_clr;
+        uint32_t bg = s->hd.src_bkgd_clr;
         unsigned word, byte, bit, pidx = 0;
 
         /* Expand the 128 accumulated monochrome bits to bypp-sized
@@ -997,10 +1017,10 @@ bool ati_r350_host_data_flush(ATIR350State *s)
      * put one to four columns of speckled garbage down the right-hand
      * edge of every icon, button, glyph run and menu.
      */
-    sc_left = s->sc_left;
-    sc_top = s->sc_top;
-    sc_right = s->sc_right;
-    sc_bottom = s->sc_bottom;
+    sc_left = s->hd.sc_left;
+    sc_top = s->hd.sc_top;
+    sc_right = s->hd.sc_right;
+    sc_bottom = s->hd.sc_bottom;
     if (sc_right == 0 && sc_bottom == 0) {
         sc_right = 0x3fff;
         sc_bottom = 0x3fff;
@@ -1009,13 +1029,15 @@ bool ati_r350_host_data_flush(ATIR350State *s)
     row = s->host_data_row;
     col = s->host_data_col;
     idx = 0;
-    while (idx < pix_count && row < s->dst_height) {
-        unsigned n = MIN(pix_count - idx, s->dst_width - col);
+    {
+        unsigned row_in = row, col_in = col, wrote = 0;
+    while (idx < pix_count && row < s->hd.dst_height) {
+        unsigned n = MIN(pix_count - idx, s->hd.dst_width - col);
         unsigned i;
 
         for (i = 0; i < n; i++) {
-            int dx = (int)(s->dst_x + col + i);
-            int dy = (int)(s->dst_y + row);
+            int dx = (int)(s->hd.dst_x + col + i);
+            int dy = (int)(s->hd.dst_y + row);
             uint32_t color;
 
             if (dx < sc_left || dx > sc_right ||
@@ -1025,6 +1047,7 @@ bool ati_r350_host_data_flush(ATIR350State *s)
             if (pix_skip[idx + i]) {
                 continue;       /* mask bit clear: leave the destination */
             }
+            wrote++;
             switch (bypp) {
             case 1:
                 color = pix_buf[(idx + i) * bypp];
@@ -1039,20 +1062,24 @@ bool ati_r350_host_data_flush(ATIR350State *s)
                 color = 0;
                 break;
             }
-            ati_r350_2d_write_pixel(s, s->dst_offset, dst_stride,
-                                       s->dst_x + col + i, s->dst_y + row,
+            ati_r350_2d_write_pixel(s, s->hd.dst_offset, dst_stride,
+                                       s->hd.dst_x + col + i, s->hd.dst_y + row,
                                        bpp, color);
         }
         idx += n;
         col += n;
-        if (col >= s->dst_width) {
+        if (col >= s->hd.dst_width) {
             col = 0;
             row++;
         }
     }
+        trace_ati_r350_hostdata_chunk(s->hd.dst_x, s->hd.dst_y, s->hd.dst_width,
+                                      s->hd.dst_height, pix_count, row_in, col_in,
+                                      wrote, 0, sc_right);
+    }
     s->host_data_row = row;
     s->host_data_col = col;
-    if (s->host_data_row >= s->dst_height) {
+    if (s->host_data_row >= s->hd.dst_height) {
         s->host_data_active = false;
     }
     return s->host_data_active;

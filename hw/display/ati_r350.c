@@ -2245,6 +2245,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         if (!s->host_data_active) {
             break;
         }
+        trace_ati_r350_hostdata_dw(base, val, s->host_data_next);
         s->host_data_acc[s->host_data_next++] = val;
         if (base == R350_HOST_DATA_LAST) {
             ati_r350_host_data_flush(s);

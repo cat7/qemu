@@ -341,6 +341,7 @@ ati_r350_ctx_write(const char *name, uint32_t reg, uint32_t val) "2D context: %s
 ati_r350_vram_peek(int row, uint32_t off, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) "vram row=%d off=0x%x : %08x %08x %08x %08x"
 ati_r350_blt_clip(int x, int y, int w, int h, uint32_t doff, uint32_t dstride, uint32_t fboff, uint32_t dpitch, int mbpp, int bpp) "blt (%d,%d) %dx%d DRAW[off=0x%x stride=%u] DISP[off=0x%x pitch=%u bpp=%d] blt_bpp=%d"
 ati_r350_blt_fill(uint32_t brushfg, uint32_t brushbg, uint32_t srcfg, uint32_t rop, uint32_t dt) "blt fill brush_frgd=0x%08x brush_bkgd=0x%08x src_frgd=0x%08x rop=0x%02x dt=0x%x"
+ati_r350_hostdata_chunk(uint32_t dx, uint32_t dy, uint32_t w, uint32_t h, unsigned pix, unsigned row_in, unsigned col_in, unsigned wrote, unsigned hswap, int scr) "hdchunk dst=(%u,%u) %ux%u pix=%u in=(%u,%u) wrote=%u hswap=%u sc_right=%d"
 ati_r350_brush_clr(uint32_t reg, uint32_t val) "DP_BRUSH_FRGD_CLR reg=0x%03x <- 0x%08x"
 ati_r350_blt_scissor(int dx, int dy, int w, int h, int sl, int st, int sr, int sb) "blt (%d,%d) %dx%d scissor L=%d T=%d R=%d B=%d"
 ati_r350_pixwatch(uint32_t addr, uint32_t color, int bpp) "PIXWATCH addr=0x%x <- 0x%08x bpp=%d"
@@ -376,3 +377,4 @@ ati_r350_3d_texsets(uint32_t ntc, uint32_t first_tex, uint32_t out_mask, uint32_
 ati_r350_us_refused(uint32_t cfg, uint32_t ca3, uint32_t outfmt, uint32_t rsic, uint32_t rsi0, uint32_t rsi1, uint32_t ip0, uint32_t ip1, uint32_t tex0, uint32_t tex1) "R300 fs refused cfg=0x%08x ca3=0x%08x outfmt=0x%08x rs_cnt=0x%08x rs_inst=0x%08x,0x%08x rs_ip=0x%08x,0x%08x tex_inst=0x%08x,0x%08x"
 ati_r350_us_refused_ip(uint32_t n, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g, uint32_t h) "R300 fs refused ninst=%u rs_ip=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x"
 ati_r350_us_refused_ri(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g, uint32_t h) "R300 fs refused rs_inst=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x"
+ati_r350_hostdata_dw(uint32_t reg, uint32_t val, unsigned slot) "hostdata reg=0x%03x val=0x%08x slot=%u"
