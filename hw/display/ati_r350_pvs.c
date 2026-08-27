@@ -451,6 +451,81 @@ static bool r300_pvs_src_is_one(uint32_t dw)
     return true;
 }
 
+/*
+ * One row of a texture-coordinate matrix:
+ *
+ *     out[o].<x|y|z|w> = const[c + row] . in[k]
+ *
+ * read straight through on both operands. The row is the write enable,
+ * which is how the four instructions of a 4x4 are told apart, and it is
+ * the same shape the position matrix is recognised by a few lines below
+ * -- with the constant's index free rather than pinned to the row, since
+ * a texture matrix sits wherever the compiler put it in the file.
+ */
+static bool r300_pvs_texmat_row(const uint32_t *w, unsigned *out,
+                                unsigned *row, unsigned *in, unsigned *cbase)
+{
+    uint32_t op = w[0];
+    unsigned dtype = (op >> R300_PVS_DST_REG_TYPE_SHIFT) &
+                     R300_PVS_DST_REG_TYPE_MASK;
+    unsigned we = (op >> R300_PVS_DST_WE_SHIFT) & R300_PVS_DST_WE_MASK;
+    unsigned k = (w[2] >> R300_PVS_SRC_OFFSET_SHIFT) &
+                 R300_PVS_SRC_OFFSET_MASK;
+    unsigned c = (w[1] >> R300_PVS_SRC_OFFSET_SHIFT) &
+                 R300_PVS_SRC_OFFSET_MASK;
+
+    if ((op & R300_PVS_DST_OPCODE_MASK) != R300_VE_DOT_PRODUCT ||
+        (op & (R300_PVS_DST_MATH_INST | R300_PVS_DST_MACRO_INST |
+               R300_PVS_DST_DUAL_MATH_OP | R300_PVS_DST_PRED_ENABLE |
+               R300_PVS_DST_VE_SAT | R300_PVS_DST_ME_SAT |
+               R300_PVS_DST_ADDR_MODE_0 | R300_PVS_DST_ADDR_MODE_1)) ||
+        (dtype != R300_PVS_DST_REG_OUT &&
+         dtype != R300_PVS_DST_REG_OUT_REPL_X) ||
+        (we != 1 && we != 2 && we != 4 && we != 8) ||
+        k >= R300_PVS_IN_REGS ||
+        !r300_pvs_src_is(w[2], R300_PVS_SRC_REG_INPUT, k) ||
+        !r300_pvs_src_is(w[1], R300_PVS_SRC_REG_CONSTANT, c)) {
+        return false;
+    }
+    *out = (op >> R300_PVS_DST_OFFSET_SHIFT) & R300_PVS_DST_OFFSET_MASK;
+    *row = we == 1 ? 0 : we == 2 ? 1 : we == 4 ? 2 : 3;
+    *in = k;
+    *cbase = c - *row;
+    return true;
+}
+
+bool r300_pvs_texmat(const R300PvsProgram *p, unsigned out,
+                     R300PvsTexMat *tm)
+{
+    unsigned rows = 0, in = 0, cbase = 0, i, r;
+
+    if (!r300_pvs_computes(p, out)) {
+        return false;
+    }
+    for (i = p->first; i <= p->last; i++) {
+        unsigned o, row, k, c;
+
+        if (!r300_pvs_texmat_row(&p->code[i * 4], &o, &row, &k, &c) ||
+            o != out) {
+            continue;
+        }
+        if (rows && (k != in || c != cbase)) {
+            return false;       /* two different matrices on one output */
+        }
+        in = k;
+        cbase = c;
+        rows |= 1u << row;
+    }
+    if (rows != 0xf) {
+        return false;
+    }
+    tm->in = in;
+    for (r = 0; r < 4; r++) {
+        r300_pvs_const(p, cbase + r, tm->m[r]);
+    }
+    return true;
+}
+
 void r300_pvs_analyse(R300PvsProgram *p, const uint32_t *code,
                       const uint32_t *slot_valid, unsigned code_slots,
                       const uint32_t *cnst, unsigned const_slots,
@@ -547,15 +622,31 @@ void r300_pvs_analyse(R300PvsProgram *p, const uint32_t *code,
             continue;               /* a forwarded attribute, recorded above */
         }
         /*
-         * Anything landing on a texture-coordinate output is beside the
-         * point: this model interpolates texture coordinates from the
-         * vertex attributes and does not read them back out of the
-         * program, so such an instruction cannot make the matrix wrong.
+         * An instruction landing on a texture-coordinate output does not
+         * make the POSITION matrix wrong, so it does not decide `plain`
+         * here -- but it is not "beside the point" either, which is what
+         * the comment that used to sit here said. It was checked against
+         * Mac OS X 10.4, whose blit program multiplies its coordinate by
+         * exactly diag(1/w, 1/h, 1, 1) -- the inverse of this model's own
+         * attribute scaling, so ignoring the instruction was free.
+         * Mac OS X 10.5 sends the same shape over a vertex that puts the
+         * coordinate somewhere the fixed positional read does not look,
+         * and there ignoring it costs the whole coordinate. The loop
+         * below decides `plain` for these: a computed coordinate keeps
+         * the fast path only while r300_pvs_texmat() can hand the caller
+         * the matrix to apply.
          */
         if (doff >= first_texcoord) {
             continue;
         }
         plain = false;
+    }
+    for (i = first_texcoord; i < R300_PVS_OUT_REGS; i++) {
+        R300PvsTexMat tm;
+
+        if (r300_pvs_computes(p, i) && !r300_pvs_texmat(p, i, &tm)) {
+            plain = false;
+        }
     }
     p->plain_matrix = plain && matrix_rows == 0xf;
 }

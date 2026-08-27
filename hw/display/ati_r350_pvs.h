@@ -133,11 +133,30 @@ typedef struct R300PvsProgram {
      * consumes -- i.e. it is the 4x4 matrix the fixed path already
      * applies, and running it per vertex would only spend time.
      */
+    /*
+     * Note that a program which COMPUTES a texture-coordinate output --
+     * out_mask set, out_src -1 -- keeps this only while every one of
+     * those outputs is the four dot products r300_pvs_texmat() resolves.
+     * The fast path can apply such a matrix without running the program
+     * and cannot apply anything else, so a program that computes its
+     * coordinate some other way loses the fast path rather than losing
+     * the coordinate.
+     */
     bool plain_matrix;
     /* out[n] is a straight copy of in[out_src[n]], or -1 if it is not */
     int8_t out_src[R300_PVS_OUT_REGS];
     uint32_t out_mask;          /* outputs the program writes at all */
 } R300PvsProgram;
+
+/*
+ * The transform a computed texture-coordinate output applies: the four
+ * dot products of one input register against four consecutive constants,
+ * with the constant file already resolved.
+ */
+typedef struct R300PvsTexMat {
+    unsigned in;                /* the input register it transforms */
+    float m[4][4];              /* row r is the constant it dots with */
+} R300PvsTexMat;
 
 /* opcodes met that this interpreter does not implement */
 typedef struct R300PvsGaps {
@@ -167,6 +186,30 @@ void r300_pvs_analyse(R300PvsProgram *p, const uint32_t *code,
                       const uint32_t *cnst, unsigned const_slots,
                       uint32_t code_cntl, uint32_t const_cntl,
                       unsigned first_texcoord);
+
+/*
+ * Does the program COMPUTE this output rather than forward it or leave
+ * it alone? For a texture-coordinate output that is the difference
+ * between a coordinate the vertex carries and one only the program
+ * knows -- which is also what says a draw is textured however narrow
+ * its vertex is.
+ */
+static inline bool r300_pvs_computes(const R300PvsProgram *p, unsigned out)
+{
+    return p->valid && out < R300_PVS_OUT_REGS &&
+           (p->out_mask & (1u << out)) && p->out_src[out] < 0;
+}
+
+/*
+ * Resolve the matrix a computed texture-coordinate output applies, so a
+ * caller that keeps the plain-matrix fast path can still evaluate the
+ * coordinate. Returns false for an output that is absent, forwarded, or
+ * computed by anything other than four whole dot-product rows -- and
+ * r300_pvs_analyse() has already refused `plain_matrix` for that last
+ * case, so a fast-path caller never meets one.
+ */
+bool r300_pvs_texmat(const R300PvsProgram *p, unsigned out,
+                     R300PvsTexMat *tm);
 
 /*
  * Run the program over the inputs already in `r`, leaving the outputs
