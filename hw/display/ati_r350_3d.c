@@ -169,6 +169,38 @@ static inline float r300_f32(uint32_t v)
     return c.f;
 }
 
+/*
+ * A FRAGMENT-STAGE CONSTANT, out of PFS_PARAM / US_ALU_CONST.
+ *
+ * These are 24-bit floats and they are NOT an IEEE float with the low
+ * mantissa byte dropped, which is what this model read them as for
+ * months. The format is its own: sign at bit 23, a SEVEN-bit exponent
+ * biased 63 at [22:16], and sixteen mantissa bits at [15:0] -- so an
+ * IEEE value is packed by rebiasing the exponent (127 -> 63) and
+ * shifting the mantissa down by seven, and unpacked by undoing both.
+ * Exponent zero is zero.
+ *
+ * The truncation reading is wrong by a factor of 2^(e - 63 - (e' - 127))
+ * that varies with the value, which is why it was invisible: every
+ * constant the 10.4 and OS 9 corpus actually READS is a literal 0.0,
+ * 1.0 or 0.5 taken from the instruction's own source SELECT, never from
+ * this file. Mac OS X 10.5's compositor is the first guest to multiply
+ * by one, and the six it uses in a menu draw decode under this rule to
+ * exactly 1/width and 1/height of the three textures that draw samples
+ * -- six numbers agreeing with six dimensions that come from a
+ * different register block entirely, which is what settled the format.
+ */
+static inline float r300_us_f24(uint32_t v)
+{
+    uint32_t sign = v & (1u << 23);
+    uint32_t exp = (v >> 16) & 0x7f;
+
+    if (!exp) {
+        return sign ? -0.0f : 0.0f;
+    }
+    return r300_f32((sign << 8) | ((exp + 127 - 63) << 23) |
+                    ((v & 0xffff) << 7));
+}
 
 /*
  * Every format this model decodes is handed to r300_texel_chan() in one
@@ -1580,10 +1612,10 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
         for (i = 0; i < R300_US_CONSTS; i++) {
             unsigned k = (R300_PFS_PARAM_0_X >> 2) + i * 4;
 
-            konst[i][0] = r300_f32(regs[k] << 8);
-            konst[i][1] = r300_f32(regs[k + 1] << 8);
-            konst[i][2] = r300_f32(regs[k + 2] << 8);
-            konst[i][3] = r300_f32(regs[k + 3] << 8);
+            konst[i][0] = r300_us_f24(regs[k]);
+            konst[i][1] = r300_us_f24(regs[k + 1]);
+            konst[i][2] = r300_us_f24(regs[k + 2]);
+            konst[i][3] = r300_us_f24(regs[k + 3]);
         }
         r300_us_analyse(p, regs[R300_US_CONFIG >> 2],
                         regs[R300_US_CODE_OFFSET >> 2],
@@ -1708,10 +1740,10 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
         for (i = 0; i < R300_US_CONSTS; i++) {
             unsigned k = (R300_PFS_PARAM_0_X >> 2) + i * 4;
 
-            p->konst[i][0] = r300_f32(regs[k] << 8);
-            p->konst[i][1] = r300_f32(regs[k + 1] << 8);
-            p->konst[i][2] = r300_f32(regs[k + 2] << 8);
-            p->konst[i][3] = r300_f32(regs[k + 3] << 8);
+            p->konst[i][0] = r300_us_f24(regs[k]);
+            p->konst[i][1] = r300_us_f24(regs[k + 1]);
+            p->konst[i][2] = r300_us_f24(regs[k + 2]);
+            p->konst[i][3] = r300_us_f24(regs[k + 3]);
         }
     }
 
@@ -2269,16 +2301,16 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     }
     /*
      * Vertices without a colour attribute take the fragment program's
-     * constant colour: OS X's solid-fill shader outputs PFS_PARAM_0
-     * (stored as 24-bit floats -- IEEE with the low mantissa byte
-     * dropped). The desktop backdrop fill arrives exactly this way, a
-     * colourless full-screen quad with the blue in PFS_PARAM_0.
+     * constant colour: OS X's solid-fill shader outputs PFS_PARAM_0,
+     * read through the same 24-bit float decode as the rest of the
+     * constant file. The desktop backdrop fill arrives exactly this
+     * way, a colourless full-screen quad with the blue in PFS_PARAM_0.
      */
     if (vsize < 12 && !d->textured) {
-        d->flat_r = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2)] << 8);
-        d->flat_g = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2) + 1] << 8);
-        d->flat_b = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2) + 2] << 8);
-        d->flat_a = r300_f32(s->regs[(R300_PFS_PARAM_0_X >> 2) + 3] << 8);
+        d->flat_r = r300_us_f24(s->regs[(R300_PFS_PARAM_0_X >> 2)]);
+        d->flat_g = r300_us_f24(s->regs[(R300_PFS_PARAM_0_X >> 2) + 1]);
+        d->flat_b = r300_us_f24(s->regs[(R300_PFS_PARAM_0_X >> 2) + 2]);
+        d->flat_a = r300_us_f24(s->regs[(R300_PFS_PARAM_0_X >> 2) + 3]);
     } else {
         d->flat_r = d->flat_g = d->flat_b = d->flat_a = 1.0f;
     }
