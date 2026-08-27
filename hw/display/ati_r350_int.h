@@ -710,7 +710,7 @@ struct ATIR350State {
         uint32_t datatype;
         uint32_t src_frgd_clr, src_bkgd_clr;
         int sc_left, sc_top, sc_right, sc_bottom;
-        unsigned host_swap_xor;   /* R350_HOST_SWAP_UNSET until latched */
+        unsigned host_swap_xor;   /* RBBM_GUICNTL.HOST_DATA_SWAP as a XOR */
     } hd;
 
     /*

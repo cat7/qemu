@@ -51,13 +51,14 @@ static int ati_r350_bpp_from_dp_datatype(ATIR350State *s)
 }
 
 /*
- * GUI_HOST_SWAP_CNTL as a byte-lane XOR, in the same encoding
- * ati_r350_vram_xor() returns: 32-bit swap reverses all four lanes,
- * 16-bit swap reverses each pair, half-dword swaps the two halves.
+ * One of this chip's four-code byte-swap fields as a byte-lane XOR, in
+ * the same encoding ati_r350_vram_xor() returns: 32-bit swap reverses
+ * all four lanes, 16-bit swap reverses each pair, half-dword swaps the
+ * two halves.
  */
-static unsigned ati_r350_host_swap_xor(ATIR350State *s)
+static unsigned ati_r350_swap_xor(unsigned code)
 {
-    switch (s->regs[R350_GUI_HOST_SWAP_CNTL >> 2] & R350_GUI_HOST_SWAP_MASK) {
+    switch (code) {
     case 1:
         return 1;
     case 2:
@@ -67,6 +68,20 @@ static unsigned ati_r350_host_swap_xor(ATIR350State *s)
     default:
         return 0;
     }
+}
+
+/* GUI_HOST_SWAP_CNTL: the order a buffer the engine BUS-MASTERS is in. */
+static unsigned ati_r350_host_swap_xor(ATIR350State *s)
+{
+    return ati_r350_swap_xor(s->regs[R350_GUI_HOST_SWAP_CNTL >> 2] &
+                             R350_GUI_HOST_SWAP_MASK);
+}
+
+/* RBBM_GUICNTL.HOST_DATA_SWAP: the order the CPU PUSHES dwords in. */
+static unsigned ati_r350_host_data_swap_xor(ATIR350State *s)
+{
+    return ati_r350_swap_xor(s->regs[R350_RBBM_GUICNTL >> 2] &
+                             R350_HOST_DATA_SWAP_MASK);
 }
 
 static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
@@ -843,16 +858,17 @@ void ati_r350_2d_blt(ATIR350State *s)
         s->hd.sc_right = s->sc_right;
         s->hd.sc_bottom = s->sc_bottom;
         /*
-         * GUI_HOST_SWAP_CNTL is the one piece of context that is NOT
-         * read here. Measured over 150 of Mac OS X 10.5's glyph uploads:
-         * two thirds of them set it AFTER the blit that starts the
-         * transfer and before the first payload dword, so latching it
-         * with the rest reads the previous operation's value. It is
-         * captured LAZILY instead -- at the first flush, which is after
-         * every register write the guest makes for this transfer and
-         * still before any later blit can move it.
+         * ...including the byte order the host is about to push the
+         * payload in. RBBM_GUICNTL.HOST_DATA_SWAP is the register that
+         * carries it -- not GUI_HOST_SWAP_CNTL, which belongs to the
+         * bus-master path -- and it is genuinely part of the transfer's
+         * context: in 22 of 22 host-data blits in one Mac OS X 10.5
+         * System Preferences repaint the guest writes it on the
+         * instruction IMMEDIATELY BEFORE the DP_GUI_MASTER_CNTL that
+         * starts the transfer, so it is latched here with everything
+         * else and cannot be moved by a later operation.
          */
-        s->hd.host_swap_xor = R350_HOST_SWAP_UNSET;
+        s->hd.host_swap_xor = ati_r350_host_data_swap_xor(s);
         return;
     }
     ati_r350_2d_do_blt(s);
@@ -968,28 +984,23 @@ bool ati_r350_host_data_flush(ATIR350State *s)
     }
 
     /*
-     * GUI_HOST_SWAP_CNTL, the OTHER swapper, and the one this path was
-     * missing. It does not describe the pixels -- it describes the byte
-     * order the HOST laid the buffer out in -- so it applies whatever a
-     * pixel is, and the bus-master blit path has consulted it since
-     * `3d74a3da6e` (ati_r350_2d_read_pixel(), the same lane-XOR idiom).
-     * The host-data path read only HOST_BIG_ENDIAN_EN, which Mac OS X
-     * 10.5 leaves CLEAR while asking for the 32-bit swap here: measured
-     * live, every one of its 8-bit glyph uploads runs with DP_DATATYPE
-     * 0x00030f02 (bit 29 clear) and GUI_HOST_SWAP_CNTL 2. Reading the
-     * payload in the wrong order inside each dword turned a glyph into
-     * four-pixel confetti; with the swap applied, 132 of 167 uploads in
-     * one System Preferences repaint become smoother by the normalised
-     * gradient measure and the labels read as words.
+     * RBBM_GUICNTL.HOST_DATA_SWAP, latched with the rest of the
+     * transfer's context. It does not describe the pixels -- it
+     * describes the byte order the HOST pushed the dwords in -- so it
+     * applies whatever a pixel is, and HOST_BIG_ENDIAN_EN (above) is a
+     * separate, independent knob that converts BY PIXEL SIZE and so does
+     * nothing at all at 8bpp. Mac OS X 10.5 leaves it clear and asks for
+     * the 32-bit swap here instead: every one of its 8-bit glyph uploads
+     * runs with DP_DATATYPE 0x00030f02 and RBBM_GUICNTL 2.
      *
-     * Two swappers for one job is exactly the shape the ledger's own
-     * trap describes, so they are kept independent rather than merged:
-     * HOST_BIG_ENDIAN_EN converts BY PIXEL SIZE, this converts BY BYTE
-     * LANE, and a guest that sets both means both.
+     * Reading the payload in the wrong order inside each dword turns a
+     * glyph into four-pixel confetti. Replaying the guest's own pushed
+     * dwords offline settles which order is right with no boot at all
+     * (`texdata-residue2-2026-08-27/atlasrebuild.py`): rebuilt under this
+     * swap, all 151 uploads into the 320x320 atlas come out as legible
+     * words -- "System", "Personal", "Hardware", "Date & Time" -- and
+     * rebuilt under no swap the same bytes are noise.
      */
-    if (s->hd.host_swap_xor == R350_HOST_SWAP_UNSET) {
-        s->hd.host_swap_xor = ati_r350_host_swap_xor(s);
-    }
     if (s->hd.host_swap_xor) {
         unsigned xr = s->hd.host_swap_xor;
         unsigned w;

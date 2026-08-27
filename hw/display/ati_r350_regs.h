@@ -411,8 +411,30 @@
  */
 #define R350_GUI_HOST_SWAP_CNTL      0x15d4
 #define R350_GUI_HOST_SWAP_MASK      0x00000003
-/* sentinel: a host-data transfer has not latched its swap code yet */
-#define R350_HOST_SWAP_UNSET         0xffffffffu
+/*
+ * ...and the OTHER end of the same job: the byte-swap control for data
+ * the CPU PUSHES through HOST_DATA0, which is a different path with its
+ * own register. Same four codes.
+ *
+ * The two are not interchangeable and reading the wrong one is the bug
+ * this constant exists to close. GUI_HOST_SWAP_CNTL is written by the
+ * driver's DMA blit emitter (its own function name says so, above) and
+ * describes a buffer the ENGINE reads; RBBM_GUICNTL.HOST_DATA_SWAP is
+ * written immediately before a host-data blit and describes the dwords
+ * the CPU is about to write. Censused over one Mac OS X 10.5 System
+ * Preferences repaint (`texdata-residue2-2026-08-27/adjacency.py` over
+ * leopard-syspref-pm4-2026-08-27.log.gz), the separation is total:
+ * 22 of 22 RBBM_GUICNTL writes are the instruction immediately before a
+ * host-data DP_GUI_MASTER_CNTL and every one carries 2, while 45 of 45
+ * GUI_HOST_SWAP_CNTL writes precede a bus-master blit and alternate
+ * 0 (32 of them) and 2 (13). Neither register ever precedes the other's
+ * operation. Reading the DMA register on the host-data path therefore
+ * picked up whatever the last surface page-in happened to leave there,
+ * which is why 429 of 1335 glyph flushes were unswapped at random and
+ * only some of System Preferences' headers came out as words.
+ */
+#define R350_RBBM_GUICNTL            0x172c
+#define R350_HOST_DATA_SWAP_MASK     0x00000003
 #define R350_DP_SRC_FRGD_CLR         0x15d8
 #define R350_DP_SRC_BKGD_CLR         0x15dc
 #define R350_SC_LEFT                 0x1640
