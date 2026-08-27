@@ -875,7 +875,27 @@ bool ati_r350_host_data_flush(ATIR350State *s)
     ati_r350_gl_release(s, R350_GLR_2D);
 
     bypp = bpp / 8;
-    dst_stride = s->dst_pitch * bpp; /* pitch is in 8-pixel units */
+    /*
+     * The SAME expression ati_r350_2d_do_blt() uses, and it has to be:
+     * `dst_pitch` is whatever the register that last wrote it said, and
+     * `dst_pitch_bytes` is what remembers which unit that was. Every
+     * writer on this device sets it -- DST_PITCH, DST_PITCH_OFFSET and
+     * both of ati_r350_resolve_gui_context()'s DEFAULT_* fallbacks --
+     * so the pitch here is BYTES, and multiplying it by bpp again put
+     * a host-data blit's rows `bpp` times too far apart.
+     *
+     * The comment this replaces ("pitch is in 8-pixel units") described
+     * the Rage 128 Pro parent, where DST_PITCH really did count eights;
+     * the ordinary blit path was corrected for the Radeon layout and
+     * this one was not. It went unseen because no capture this project
+     * holds of Mac OS X 10.4, OS 9, Chess, Flurry or the eleven savers
+     * contains a single host-data blit -- Mac OS X 10.5 is the first
+     * guest here to build its glyph atlas with one. Measured on a live
+     * 10.5 System Preferences repaint: a 320x320 8-bit alpha atlas
+     * filled by 7x22 host-data blits had 36 non-empty rows and every
+     * one of them sat at y % 8 == 0, which is this multiply exactly.
+     */
+    dst_stride = s->dst_pitch_bytes ? s->dst_pitch : s->dst_pitch * bpp;
     if (!dst_stride) {
         s->host_data_active = false;
         return false;
