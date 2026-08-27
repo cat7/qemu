@@ -1326,6 +1326,105 @@ static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
 }
 
 /*
+ * WHERE EACH COORDINATE SET COMES FROM, decided once per draw.
+ *
+ * `use` marks a set whose vertex program COMPUTES the coordinate with a
+ * matrix this model can apply without running the program -- see
+ * r300_texcoord_src() for the guard that decides it, which is the whole
+ * of the change's blast radius.
+ */
+typedef struct R300TexSrc {
+    R300PvsTexMat tm;
+    bool use;
+} R300TexSrc;
+
+/* the dword r300_load_vtx() takes tc[0] from, or -1 when it takes none */
+static int r300_positional_tc(unsigned vsize, unsigned pos)
+{
+    if (pos < 4) {
+        return -1;
+    }
+    if (vsize >= 12) {
+        return 8;
+    }
+    if (vsize >= 8) {
+        return 4;
+    }
+    return -1;
+}
+
+/*
+ * IS THE COORDINATE THIS MATRIX COMPUTES THE ONE THE VERTEX ALREADY
+ * HANDED OVER? This is the guard, and it exists so that the guests that
+ * render correctly today take not one new instruction.
+ *
+ * r300_load_vtx() reads tc[0] out of a fixed dword and leaves it in
+ * TEXELS. A program whose texture matrix is exactly diag(1/w, 1/h, *, 1)
+ * for the bound texture undoes precisely the scaling r300_vs_texcoord()
+ * would then apply, so if it also reads the input register those very
+ * dwords feed, the two routes are the same number arrived at two ways --
+ * except that one of them is two float operations longer, and would move
+ * pixels by a unit in the last place for no gain.
+ *
+ * Mac OS X 10.4's compositor is that program in 4480 of 4480 computed
+ * coordinates across every capture this project holds (Chess 4256,
+ * Flurry 150, iTunes 74) and so is Mac OS X 10.5's menu in all 20 of
+ * its own; not one of them is touched. 10.5's System Preferences is
+ * where it stops holding: 158 draws put the coordinate somewhere the
+ * fixed read does not look and 650 more are too narrow for it to happen
+ * at all. Census: scratchpad texguard.py over the six captures carrying
+ * `ati_r350_pm4_reg`, which agrees under both readings of an ambiguous
+ * vertex layout.
+ */
+static bool r300_texmat_is_positional(const R300DrawState *d,
+                                      const R300PvsTexMat *tm, unsigned set,
+                                      unsigned vsize, unsigned pos)
+{
+    const R300TexUnit *u = &d->tex[d->tc_unit[set]];
+    int ptc = r300_positional_tc(vsize, pos);
+    unsigned off = 0, r, c;
+
+    if (set || ptc < 0 || tm->in >= d->attr_count ||
+        d->attr_size[tm->in] < 2 || !u->w || !u->h) {
+        return false;
+    }
+    for (c = 0; c < tm->in; c++) {
+        off += d->attr_size[c];
+    }
+    if (off != (unsigned)ptc) {
+        return false;
+    }
+    for (r = 0; r < 4; r++) {
+        for (c = 0; c < 4; c++) {
+            if (r != c && tm->m[r][c] != 0.0f) {
+                return false;
+            }
+        }
+    }
+    return tm->m[0][0] == 1.0f / (float)u->w &&
+           tm->m[1][1] == 1.0f / (float)u->h &&
+           tm->m[3][3] == 1.0f;
+}
+
+static void r300_texcoord_src(const R300DrawState *d, unsigned vsize,
+                              unsigned pos, R300TexSrc *ts)
+{
+    unsigned k;
+
+    for (k = 0; k < R300_TEXCOORDS; k++) {
+        ts[k].use = false;
+        if (k >= d->ntc || !d->textured || d->tex_attr[k] >= 0 ||
+            d->vs_texcoord[k]) {
+            continue;           /* absent, forwarded, or the interpreter's */
+        }
+        if (!r300_pvs_texmat(&d->vs, d->vs_tex_out[k], &ts[k].tm)) {
+            continue;
+        }
+        ts[k].use = !r300_texmat_is_positional(d, &ts[k].tm, k, vsize, pos);
+    }
+}
+
+/*
  * The texture coordinate a vertex really carries.
  *
  * r300_load_vtx() reads one at a fixed place -- the dwords after a
@@ -1354,7 +1453,7 @@ static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
  * picture became horizontal stripes.
  */
 static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
-                               R300Vtx *v)
+                               const R300TexSrc *ts, R300Vtx *v)
 {
     float c[4];
     unsigned k;
@@ -1362,6 +1461,27 @@ static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
     for (k = 0; k < d->ntc; k++) {
         int a = d->tex_attr[k];
 
+        if (ts[k].use) {
+            /*
+             * The program COMPUTES this set and the fast path is still
+             * worth keeping for the position, so apply just the four
+             * texture-coordinate rows here. Written with the constant
+             * first and summed left to right, exactly as the
+             * interpreter's DOT_PRODUCT is, so the two agree to the bit
+             * for any draw that could take either route.
+             */
+            const float (*m)[4] = ts[k].tm.m;
+            float in[4];
+            unsigned r;
+
+            r300_vs_input(d, dw, ts[k].tm.in, in);
+            for (r = 0; r < 4; r++) {
+                c[r] = m[r][0] * in[0] + m[r][1] * in[1] +
+                       m[r][2] * in[2] + m[r][3] * in[3];
+            }
+            r300_vs_texcoord(d, v, k, c);
+            continue;
+        }
         if (a < 0 || (unsigned)a >= d->attr_count ||
             d->attr_size[a] < 2) {
             continue;
@@ -4400,13 +4520,15 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
+        R300TexSrc ts[R300_TEXCOORDS];
 
+        r300_texcoord_src(&d, vsize, vsize, ts);
         for (i = 0; i < nvtx; i++) {
             const uint32_t *vd = &dw[1 + i * vsize];
             float clip[4];
 
             r300_load_vtx(&d, vd, vsize, vsize, &vb[i]);
-            r300_attr_texcoord(&d, vd, &vb[i]);
+            r300_attr_texcoord(&d, vd, ts, &vb[i]);
             if (i == 0 && d.textured) {
                 r300_trace_texcoord(&d, vd, &vb[i]);
             }
@@ -4526,8 +4648,10 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
+        R300TexSrc ts[R300_TEXCOORDS];
         uint32_t dw[16];
 
+        r300_texcoord_src(&d, vsize, size[0], ts);
         for (i = 0; i < nvtx; i++) {
             unsigned n = 0;
 
@@ -4566,7 +4690,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                 }
             }
             r300_load_vtx(&d, dw, vsize, size[0], &vb[i]);
-            r300_attr_texcoord(&d, dw, &vb[i]);
+            r300_attr_texcoord(&d, dw, ts, &vb[i]);
             if (i == 0 && d.textured) {
                 r300_trace_texcoord(&d, dw, &vb[i]);
             }
