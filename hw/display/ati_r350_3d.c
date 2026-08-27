@@ -93,7 +93,14 @@ typedef struct R300DrawState {
      */
     bool vs_texcoord[R300_TEXCOORDS];
     unsigned vs_tex_out[R300_TEXCOORDS];
-    unsigned attr_size[R300_AOS_MAX];  /* dwords per vertex, per input reg */
+    /*
+     * Dwords this vertex carries for each of the vertex program's input
+     * registers, indexed by REGISTER: VAP_PROG_STREAM_CNTL's DST_VEC_LOC
+     * decides which register a stream element lands in, and it is not
+     * always the element's own index. A register no element feeds is
+     * zero and reads the (0,0,0,1) default.
+     */
+    unsigned attr_size[R300_AOS_MAX];
     unsigned attr_count;
     float vp[6];            /* SE_VPORT XSCALE,XOFF,YSCALE,YOFF,ZSCALE,ZOFF */
     bool vte_xs, vte_xo;    /* VAP_VTE_CNTL: apply that scale/offset at all */
@@ -161,6 +168,7 @@ static inline float r300_f32(uint32_t v)
     union { uint32_t u; float f; } c = { .u = v };
     return c.f;
 }
+
 
 /*
  * Every format this model decodes is handed to r300_texel_chan() in one
@@ -1112,16 +1120,115 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
     }
 }
 
+/* dwords one stream element of each VAP_PROG_STREAM_CNTL DATA_TYPE eats */
+static unsigned r300_psc_dwords(unsigned type)
+{
+    static const uint8_t n[16] = {
+        [0] = 1, [1] = 2, [2] = 3, [3] = 4,     /* FLOAT_1 .. FLOAT_4 */
+        [4] = 1, [5] = 1, [6] = 1, [7] = 2,     /* BYTE, D3DCOLOR, SHORT_* */
+        [8] = 1, [9] = 1, [10] = 8, [11] = 1, [12] = 2,
+    };
+
+    return n[type & 0xf];
+}
+
+/*
+ * WHICH INPUT REGISTER EACH VERTEX ELEMENT FEEDS.
+ *
+ * The caller has already worked out how many dwords each element of this
+ * vertex carries -- from the bound arrays for a VBUF draw, four at a time
+ * for an inline IMMD one -- and put them in `size[]` in submission order.
+ * What it cannot know from the vertex alone is which of the vertex
+ * program's SIXTEEN input registers each element is written to, and that
+ * is not always the element's own index: VAP_PROG_STREAM_CNTL's
+ * DST_VEC_LOC says, per element, and Mac OS X 10.5's compositor sends a
+ * two-element vertex whose second element lands in **in[2]**. Its menu
+ * and Dock programs read the texture coordinate from in[2], so with the
+ * identity assumption every coordinate they computed came out of the
+ * (0,0,0,1) default -- a constant, the same texel for every pixel, and a
+ * blank white panel where the menu items should be.
+ *
+ * `size[]` is rebuilt INDEXED BY INPUT REGISTER, with a register no
+ * element feeds left at zero. r300_vs_input() finds an element's dwords
+ * by summing the sizes before it, and that stays exact because the
+ * skipped registers contribute nothing and DST_VEC_LOC ascends.
+ *
+ * THE ROUTING IS ONLY BELIEVED WHEN IT DESCRIBES THE VERTEX WE ACTUALLY
+ * HAVE, and that guard is the whole reason this is safe to add to the
+ * shared vertex path. A previous attempt at reading these registers
+ * regressed the 10.4 desktop to flat blocks, and the census says why:
+ * across five 10.4 captures (20867 draws) the register is a MISFIT for
+ * 1633 of them -- never written, still reading its all-zero reset value,
+ * which decodes as sixteen FLOAT_1 elements all pointing at in[0]. Take
+ * the routing only when the element count and every element's dword
+ * count agree with the vertex, no element skips dwords, and no element
+ * names a register this model does not keep. Under that test the census
+ * changes exactly TWO draws in everything this project has ever
+ * captured, and both of them are Leopard's multi-tap compositor draws.
+ */
+static void r300_stream_route(ATIR350State *s, unsigned *size,
+                              unsigned *count)
+{
+    unsigned loc[R300_AOS_MAX], dw[R300_AOS_MAX];
+    unsigned n = 0, i, last = 0;
+    bool done = false, ident = true;
+
+    for (i = 0; i < 8 && !done; i++) {
+        uint32_t v = s->regs[(R300_VAP_PROG_STREAM_CNTL_0 >> 2) + i];
+        unsigned half;
+
+        for (half = 0; half < 2; half++) {
+            uint32_t w = (v >> (half * 16)) & 0xffff;
+
+            if (n == ARRAY_SIZE(loc)) {
+                return;         /* more elements than this model keeps */
+            }
+            if ((w >> R300_PSC_SKIP_DWORDS_SHIFT) &
+                R300_PSC_SKIP_DWORDS_MASK) {
+                return;         /* a gap inside the vertex, not modelled */
+            }
+            dw[n] = r300_psc_dwords(w & R300_PSC_DATA_TYPE_MASK);
+            loc[n] = (w >> R300_PSC_DST_VEC_LOC_SHIFT) &
+                     R300_PSC_DST_VEC_LOC_MASK;
+            if (loc[n] >= ARRAY_SIZE(loc) || (n && loc[n] <= last)) {
+                return;         /* out of range, or not ascending */
+            }
+            ident = ident && loc[n] == n;
+            last = loc[n];
+            n++;
+            if (w & R300_PSC_LAST_VEC) {
+                done = true;
+                break;
+            }
+        }
+    }
+    if (!done || ident || n != *count) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        if (dw[i] != size[i]) {
+            /* not describing this vertex: keep what the caller derived */
+            return;
+        }
+    }
+    for (i = n; i-- > 0; ) {
+        size[loc[i]] = size[i];
+        if (loc[i] != i) {
+            size[i] = 0;
+        }
+    }
+    *count = last + 1;
+}
+
 /*
  * One of the vertex program's input registers, read out of this vertex.
  *
- * There is no VAP_INPUT_ROUTE decoding here and none is wanted: for an
- * array (VBUF) draw the bound arrays are the layout -- array 0 lands in
- * in[0], array 1 in in[1], and so on -- and an inline (IMMD) vertex has no
- * array boundaries at all, so its dwords fill the input registers four at
- * a time. Components a vertex does not supply keep the (0,0,0,1) default,
- * which is what lets a three-dword model-space position meet a 4x4 matrix
- * and still pick up its translation column.
+ * `attr_size` is indexed by INPUT REGISTER: r300_stream_route() has
+ * already applied VAP_PROG_STREAM_CNTL's DST_VEC_LOC, so a register no
+ * element feeds has size zero and reads its default here. Components a
+ * vertex does not supply keep the (0,0,0,1) default, which is what lets
+ * a three-dword model-space position meet a 4x4 matrix and still pick up
+ * its translation column.
  */
 static void r300_vs_input(const R300DrawState *d, const uint32_t *dw,
                           unsigned idx, float out[4])
@@ -4249,13 +4356,15 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
                            d.textured, d.blend, d.tex[0].off);
 
     /*
-     * Inline vertices have no array boundaries, so the vertex program's
-     * input registers take four dwords each in submission order.
+     * Inline vertices have no array boundaries, so their dwords are
+     * taken four at a time in submission order, and then handed to the
+     * stream routing to be told which input register each of them is.
      */
     for (i = 0; i < ARRAY_SIZE(d.attr_size) && i * 4 < vsize; i++) {
         d.attr_size[i] = MIN(vsize - i * 4, 4u);
     }
     d.attr_count = i;
+    r300_stream_route(s, d.attr_size, &d.attr_count);
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
@@ -4373,7 +4482,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
     trace_ati_r350_3d_draw(prim, nvtx, vsize, d.dst_off, d.dst_pitch,
                            d.textured, d.blend, d.tex[0].off);
 
-    /* one vertex-program input register per bound array, in array order */
+    /* the bound arrays in order, then the stream routing over them */
     d.attr_count = 0;
     for (a = 0; a < narr; a++) {
         d.attr_size[a] = size[a];
@@ -4381,6 +4490,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
             d.attr_count = a + 1;
         }
     }
+    r300_stream_route(s, d.attr_size, &d.attr_count);
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);

@@ -1115,6 +1115,25 @@
 #define R300_VAP_VC_SWAP_32BIT        2
 #define R300_VAP_VC_SWAP_HDW          3
 #define R300_VAP_PVS_BYPASS           0x00000100
+/*
+ * VAP_PROG_STREAM_CNTL_[0-7] -- the programmable stream control words.
+ * Two stream ELEMENTS to a register, low half first, and the walk stops
+ * at the element whose LAST_VEC is set. DST_VEC_LOC is the vertex
+ * program INPUT REGISTER the element is written to, which is not always
+ * the element's own index: Mac OS X 10.5's compositor sends a two-element
+ * vertex whose second element lands in in[2].
+ *
+ * Field positions are R5xx_Accel.txt's, read directly (DATA_TYPE 3:0,
+ * SKIP_DWORDS 7:4, DST_VEC_LOC 12:8, LAST_VEC 13, and the same four
+ * sixteen bits higher for element 1).
+ */
+#define R300_VAP_PROG_STREAM_CNTL_0   0x2150
+#define R300_PSC_DATA_TYPE_MASK       0xf
+#define R300_PSC_SKIP_DWORDS_SHIFT    4
+#define R300_PSC_SKIP_DWORDS_MASK     0xf
+#define R300_PSC_DST_VEC_LOC_SHIFT    8
+#define R300_PSC_DST_VEC_LOC_MASK     0x1f
+#define R300_PSC_LAST_VEC             (1u << 13)
 #define R300_SE_VPORT_XSCALE          0x1d98
 #define R300_SC_SCISSOR0              0x43e0
 #define R300_SC_SCISSOR1              0x43e4
