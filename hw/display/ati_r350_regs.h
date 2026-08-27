@@ -411,6 +411,8 @@
  */
 #define R350_GUI_HOST_SWAP_CNTL      0x15d4
 #define R350_GUI_HOST_SWAP_MASK      0x00000003
+/* sentinel: a host-data transfer has not latched its swap code yet */
+#define R350_HOST_SWAP_UNSET         0xffffffffu
 #define R350_DP_SRC_FRGD_CLR         0x15d8
 #define R350_DP_SRC_BKGD_CLR         0x15dc
 #define R350_SC_LEFT                 0x1640

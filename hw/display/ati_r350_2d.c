@@ -842,6 +842,17 @@ void ati_r350_2d_blt(ATIR350State *s)
         s->hd.sc_top = s->sc_top;
         s->hd.sc_right = s->sc_right;
         s->hd.sc_bottom = s->sc_bottom;
+        /*
+         * GUI_HOST_SWAP_CNTL is the one piece of context that is NOT
+         * read here. Measured over 150 of Mac OS X 10.5's glyph uploads:
+         * two thirds of them set it AFTER the blit that starts the
+         * transfer and before the first payload dword, so latching it
+         * with the rest reads the previous operation's value. It is
+         * captured LAZILY instead -- at the first flush, which is after
+         * every register write the guest makes for this transfer and
+         * still before any later blit can move it.
+         */
+        s->hd.host_swap_xor = R350_HOST_SWAP_UNSET;
         return;
     }
     ati_r350_2d_do_blt(s);
@@ -954,6 +965,43 @@ bool ati_r350_host_data_flush(ATIR350State *s)
         }
     } else {
         memcpy(acc, s->host_data_acc, sizeof(acc));
+    }
+
+    /*
+     * GUI_HOST_SWAP_CNTL, the OTHER swapper, and the one this path was
+     * missing. It does not describe the pixels -- it describes the byte
+     * order the HOST laid the buffer out in -- so it applies whatever a
+     * pixel is, and the bus-master blit path has consulted it since
+     * `3d74a3da6e` (ati_r350_2d_read_pixel(), the same lane-XOR idiom).
+     * The host-data path read only HOST_BIG_ENDIAN_EN, which Mac OS X
+     * 10.5 leaves CLEAR while asking for the 32-bit swap here: measured
+     * live, every one of its 8-bit glyph uploads runs with DP_DATATYPE
+     * 0x00030f02 (bit 29 clear) and GUI_HOST_SWAP_CNTL 2. Reading the
+     * payload in the wrong order inside each dword turned a glyph into
+     * four-pixel confetti; with the swap applied, 132 of 167 uploads in
+     * one System Preferences repaint become smoother by the normalised
+     * gradient measure and the labels read as words.
+     *
+     * Two swappers for one job is exactly the shape the ledger's own
+     * trap describes, so they are kept independent rather than merged:
+     * HOST_BIG_ENDIAN_EN converts BY PIXEL SIZE, this converts BY BYTE
+     * LANE, and a guest that sets both means both.
+     */
+    if (s->hd.host_swap_xor == R350_HOST_SWAP_UNSET) {
+        s->hd.host_swap_xor = ati_r350_host_swap_xor(s);
+    }
+    if (s->hd.host_swap_xor) {
+        unsigned xr = s->hd.host_swap_xor;
+        unsigned w;
+
+        for (w = 0; w < ARRAY_SIZE(acc); w++) {
+            uint32_t v = acc[w];
+
+            acc[w] = ((v >> ((0 ^ xr) * 8)) & 0xff) |
+                     ((v >> ((1 ^ xr) * 8)) & 0xff) << 8 |
+                     ((v >> ((2 ^ xr) * 8)) & 0xff) << 16 |
+                     ((v >> ((3 ^ xr) * 8)) & 0xff) << 24;
+        }
     }
 
     memset(pix_skip, 0, sizeof(pix_skip));
@@ -1075,7 +1123,7 @@ bool ati_r350_host_data_flush(ATIR350State *s)
     }
         trace_ati_r350_hostdata_chunk(s->hd.dst_x, s->hd.dst_y, s->hd.dst_width,
                                       s->hd.dst_height, pix_count, row_in, col_in,
-                                      wrote, 0, sc_right);
+                                      wrote, s->hd.host_swap_xor, sc_right);
     }
     s->host_data_row = row;
     s->host_data_col = col;
