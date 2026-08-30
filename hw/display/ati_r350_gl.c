@@ -11,6 +11,15 @@
  * `#version 300 es`, which desktop GL rejects), so nothing here may
  * depend on it.
  *
+ * There are two hosts with a real backend, darwin (CGL) and Windows
+ * (WGL), and the difference between them is confined to the platform
+ * seam below: a context, and on Windows the loading of the GL entry
+ * points. Everything else in this file is GL 3.3 core and shared. That
+ * independence from CONFIG_OPENGL and from any display backend is what
+ * makes a second leg thirty lines of context creation rather than a
+ * port, and the same reasoning kept GL_NV_texture_barrier out (see the
+ * M3 note below).
+ *
  * The shaders are the ones phase-2 milestone M1 validated offline in
  * doc/radeon9800/gl-replay/ against the software rasterizer, on a
  * corpus of real captured draws: interior pixels 99.9992 % at delta 0
@@ -65,11 +74,529 @@
 #include "qemu/osdep.h"
 #include "ati_r350_gl.h"
 
+#if defined(CONFIG_DARWIN) || defined(_WIN32)
+
+/*
+ * THE PLATFORM SEAM.
+ *
+ * Everything below this block down to the stub at the end of the file is
+ * shared and is plain GL 3.3 core. What differs per host is only the
+ * CONTEXT -- how one is created, made current on the thread that is
+ * calling, and destroyed -- plus, on Windows, where the GL entry points
+ * come from. Each leg defines exactly this much:
+ *
+ *   R350_GL_BACKEND_NAME              what `qom-get gl` calls it
+ *   R350GlPlat                        the context, with a `ctx` member
+ *   r350_gl_plat_open(pl, err)        create one and make it current
+ *   r350_gl_plat_close(pl)            destroy it
+ *   r350_gl_makecurrent(pl)           take it for this thread
+ *   r350_gl_done(pl)                  give it back
+ *
+ * r350_gl_done() is the only member of that list that is not obvious,
+ * and it exists because WGL needs it: see the threading comment in the
+ * win32 leg. On darwin it is nothing at all.
+ */
+
 #ifdef CONFIG_DARWIN
 
 #define GL_SILENCE_DEPRECATION 1
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
+
+#define R350_GL_BACKEND_NAME "CGL offscreen"
+
+typedef struct R350GlPlat {
+    CGLContextObj ctx;
+} R350GlPlat;
+
+static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
+{
+    CGLPixelFormatAttribute attrs[] = {
+        kCGLPFAOpenGLProfile,
+        (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
+        kCGLPFAAccelerated,
+        kCGLPFAColorSize, (CGLPixelFormatAttribute)24,
+        kCGLPFAAlphaSize, (CGLPixelFormatAttribute)8,
+        (CGLPixelFormatAttribute)0
+    };
+    CGLPixelFormatObj pix = NULL;
+    GLint npix = 0;
+
+    if (CGLChoosePixelFormat(attrs, &pix, &npix) || !pix) {
+        *err = "no accelerated offscreen GL 3.3 core pixel format";
+        return false;
+    }
+    if (CGLCreateContext(pix, NULL, &pl->ctx)) {
+        CGLDestroyPixelFormat(pix);
+        *err = "CGLCreateContext failed";
+        return false;
+    }
+    CGLDestroyPixelFormat(pix);
+    CGLSetCurrentContext(pl->ctx);
+    return true;
+}
+
+static void r350_gl_plat_close(R350GlPlat *pl)
+{
+    CGLSetCurrentContext(NULL);
+    CGLDestroyContext(pl->ctx);
+    pl->ctx = NULL;
+}
+
+static inline void r350_gl_makecurrent(R350GlPlat *pl)
+{
+    CGLSetCurrentContext(pl->ctx);
+}
+
+/*
+ * Nothing. A CGL context stays current on the thread that set it, and
+ * CGLSetCurrentContext on a second thread simply takes it over -- so
+ * handing it back between entry points would be work for its own sake.
+ */
+static inline void r350_gl_done(R350GlPlat *pl)
+{
+    (void)pl;
+}
+
+#else /* _WIN32 */
+
+/*
+ * Windows has neither half of what the darwin leg gets for free, so both
+ * are hand rolled here.
+ *
+ * THE CONTEXT is raw WGL on an invisible window. SDL is in the Windows
+ * build and would have been the shorter road, but it solves neither of
+ * the two problems this backend actually has. SDL_GL_MakeCurrent is a
+ * thin wrapper over wglMakeCurrent and inherits its cross-thread rule
+ * word for word, so the hard part below is not made any easier by it.
+ * And SDL_CreateWindow needs SDL's video subsystem, which QEMU's own SDL
+ * display owns: ui/sdl2.c calls SDL_Init(SDL_INIT_VIDEO) in
+ * sdl_display_init() and SDL_QuitSubSystem(SDL_INIT_VIDEO) when it shuts
+ * down, which would take this window away from a running guest, and
+ * under -display gtk/vnc/none it is never initialised at all. SDL is
+ * also an optional dependency (meson.build: `required: get_option(sdl)`,
+ * auto), so binding a device's rendering to it would make gl=fast appear
+ * and disappear with a UI package -- exactly the coupling the header
+ * comment above exists to avoid.
+ *
+ * THE ENTRY POINTS come from wglGetProcAddress, because opengl32.dll
+ * exports GL 1.1 and nothing later. The pointers below are named exactly
+ * like the functions they hold, so the shared code calls them without
+ * knowing they are pointers. No GL header is included at all: the types
+ * and enums a 3.3 core context needs are spelled out, and the build then
+ * depends on nothing but windows.h, which qemu/osdep.h has already
+ * pulled in.
+ */
+
+#define R350_GL_BACKEND_NAME "WGL offscreen"
+
+typedef unsigned int GLenum;
+typedef unsigned char GLboolean;
+typedef int GLint;
+typedef int GLsizei;
+typedef unsigned int GLuint;
+typedef unsigned char GLubyte;
+typedef float GLfloat;
+typedef char GLchar;
+typedef ptrdiff_t GLsizeiptr;
+
+#define GL_FALSE                        0
+#define GL_TRUE                         1
+#define GL_NO_ERROR                     0
+#define GL_ONE                          1
+#define GL_TRIANGLES                    0x0004
+#define GL_CULL_FACE                    0x0B44
+#define GL_DEPTH_TEST                   0x0B71
+#define GL_BLEND                        0x0BE2
+#define GL_SCISSOR_TEST                 0x0C11
+#define GL_UNPACK_ALIGNMENT             0x0CF5
+#define GL_PACK_ALIGNMENT               0x0D05
+#define GL_TEXTURE_2D                   0x0DE1
+#define GL_UNSIGNED_BYTE                0x1401
+#define GL_FLOAT                        0x1406
+#define GL_RGBA                         0x1908
+#define GL_VERSION                      0x1F02
+#define GL_NEAREST                      0x2600
+#define GL_TEXTURE_MAG_FILTER           0x2800
+#define GL_TEXTURE_MIN_FILTER           0x2801
+#define GL_FUNC_ADD                     0x8006
+#define GL_RGBA8                        0x8058
+#define GL_TEXTURE0                     0x84C0
+#define GL_TEXTURE1                     0x84C1
+#define GL_TEXTURE2                     0x84C2
+#define GL_ARRAY_BUFFER                 0x8892
+#define GL_STREAM_DRAW                  0x88E0
+#define GL_FRAGMENT_SHADER              0x8B30
+#define GL_VERTEX_SHADER                0x8B31
+#define GL_COMPILE_STATUS               0x8B81
+#define GL_LINK_STATUS                  0x8B82
+#define GL_SHADING_LANGUAGE_VERSION     0x8B8C
+#define GL_FRAMEBUFFER_COMPLETE         0x8CD5
+#define GL_COLOR_ATTACHMENT0            0x8CE0
+#define GL_FRAMEBUFFER                  0x8D40
+#define GL_RGBA8UI                      0x8D7C
+#define GL_RGBA_INTEGER                 0x8D99
+
+/* GL 1.1: opengl32.dll's own exports */
+static void (APIENTRY *glBindTexture)(GLenum, GLuint);
+static void (APIENTRY *glBlendFunc)(GLenum, GLenum);
+static void (APIENTRY *glColorMask)(GLboolean, GLboolean, GLboolean,
+                                    GLboolean);
+static void (APIENTRY *glCopyTexSubImage2D)(GLenum, GLint, GLint, GLint,
+                                            GLint, GLint, GLsizei, GLsizei);
+static void (APIENTRY *glDeleteTextures)(GLsizei, const GLuint *);
+static void (APIENTRY *glDisable)(GLenum);
+static void (APIENTRY *glDrawArrays)(GLenum, GLint, GLsizei);
+static void (APIENTRY *glEnable)(GLenum);
+static void (APIENTRY *glGenTextures)(GLsizei, GLuint *);
+static GLenum (APIENTRY *glGetError)(void);
+static const GLubyte *(APIENTRY *glGetString)(GLenum);
+static void (APIENTRY *glPixelStorei)(GLenum, GLint);
+static void (APIENTRY *glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum,
+                                     GLenum, void *);
+static void (APIENTRY *glScissor)(GLint, GLint, GLsizei, GLsizei);
+static void (APIENTRY *glTexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei,
+                                     GLint, GLenum, GLenum, const void *);
+static void (APIENTRY *glTexParameteri)(GLenum, GLenum, GLint);
+static void (APIENTRY *glTexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei,
+                                        GLsizei, GLenum, GLenum, const void *);
+static void (APIENTRY *glViewport)(GLint, GLint, GLsizei, GLsizei);
+
+/* GL 1.2 and later: only wglGetProcAddress knows these */
+static void (APIENTRY *glActiveTexture)(GLenum);
+static void (APIENTRY *glAttachShader)(GLuint, GLuint);
+static void (APIENTRY *glBindBuffer)(GLenum, GLuint);
+static void (APIENTRY *glBindFramebuffer)(GLenum, GLuint);
+static void (APIENTRY *glBindVertexArray)(GLuint);
+static void (APIENTRY *glBlendEquation)(GLenum);
+static void (APIENTRY *glBufferData)(GLenum, GLsizeiptr, const void *,
+                                     GLenum);
+static GLenum (APIENTRY *glCheckFramebufferStatus)(GLenum);
+static void (APIENTRY *glCompileShader)(GLuint);
+static GLuint (APIENTRY *glCreateProgram)(void);
+static GLuint (APIENTRY *glCreateShader)(GLenum);
+static void (APIENTRY *glDeleteBuffers)(GLsizei, const GLuint *);
+static void (APIENTRY *glDeleteFramebuffers)(GLsizei, const GLuint *);
+static void (APIENTRY *glDeleteProgram)(GLuint);
+static void (APIENTRY *glDeleteShader)(GLuint);
+static void (APIENTRY *glDeleteVertexArrays)(GLsizei, const GLuint *);
+static void (APIENTRY *glEnableVertexAttribArray)(GLuint);
+static void (APIENTRY *glFramebufferTexture2D)(GLenum, GLenum, GLenum,
+                                               GLuint, GLint);
+static void (APIENTRY *glGenBuffers)(GLsizei, GLuint *);
+static void (APIENTRY *glGenFramebuffers)(GLsizei, GLuint *);
+static void (APIENTRY *glGenVertexArrays)(GLsizei, GLuint *);
+static void (APIENTRY *glGetProgramiv)(GLuint, GLenum, GLint *);
+static void (APIENTRY *glGetShaderiv)(GLuint, GLenum, GLint *);
+static GLint (APIENTRY *glGetUniformLocation)(GLuint, const GLchar *);
+static void (APIENTRY *glLinkProgram)(GLuint);
+static void (APIENTRY *glShaderSource)(GLuint, GLsizei,
+                                       const GLchar *const *, const GLint *);
+static void (APIENTRY *glUniform1f)(GLint, GLfloat);
+static void (APIENTRY *glUniform1fv)(GLint, GLsizei, const GLfloat *);
+static void (APIENTRY *glUniform1i)(GLint, GLint);
+static void (APIENTRY *glUniform2f)(GLint, GLfloat, GLfloat);
+static void (APIENTRY *glUniform2i)(GLint, GLint, GLint);
+static void (APIENTRY *glUniform3i)(GLint, GLint, GLint, GLint);
+static void (APIENTRY *glUniform4f)(GLint, GLfloat, GLfloat, GLfloat,
+                                    GLfloat);
+static void (APIENTRY *glUniform4fv)(GLint, GLsizei, const GLfloat *);
+static void (APIENTRY *glUseProgram)(GLuint);
+static void (APIENTRY *glVertexAttribPointer)(GLuint, GLint, GLenum,
+                                              GLboolean, GLsizei,
+                                              const void *);
+
+typedef void (APIENTRY *R350GlProc)(void);
+
+#define R350_GL_PROC(f) { #f, (R350GlProc *)&f }
+
+static const struct {
+    const char *name;
+    R350GlProc *slot;
+} r350_gl_proctab[] = {
+    R350_GL_PROC(glBindTexture),
+    R350_GL_PROC(glBlendFunc),
+    R350_GL_PROC(glColorMask),
+    R350_GL_PROC(glCopyTexSubImage2D),
+    R350_GL_PROC(glDeleteTextures),
+    R350_GL_PROC(glDisable),
+    R350_GL_PROC(glDrawArrays),
+    R350_GL_PROC(glEnable),
+    R350_GL_PROC(glGenTextures),
+    R350_GL_PROC(glGetError),
+    R350_GL_PROC(glGetString),
+    R350_GL_PROC(glPixelStorei),
+    R350_GL_PROC(glReadPixels),
+    R350_GL_PROC(glScissor),
+    R350_GL_PROC(glTexImage2D),
+    R350_GL_PROC(glTexParameteri),
+    R350_GL_PROC(glTexSubImage2D),
+    R350_GL_PROC(glViewport),
+    R350_GL_PROC(glActiveTexture),
+    R350_GL_PROC(glAttachShader),
+    R350_GL_PROC(glBindBuffer),
+    R350_GL_PROC(glBindFramebuffer),
+    R350_GL_PROC(glBindVertexArray),
+    R350_GL_PROC(glBlendEquation),
+    R350_GL_PROC(glBufferData),
+    R350_GL_PROC(glCheckFramebufferStatus),
+    R350_GL_PROC(glCompileShader),
+    R350_GL_PROC(glCreateProgram),
+    R350_GL_PROC(glCreateShader),
+    R350_GL_PROC(glDeleteBuffers),
+    R350_GL_PROC(glDeleteFramebuffers),
+    R350_GL_PROC(glDeleteProgram),
+    R350_GL_PROC(glDeleteShader),
+    R350_GL_PROC(glDeleteVertexArrays),
+    R350_GL_PROC(glEnableVertexAttribArray),
+    R350_GL_PROC(glFramebufferTexture2D),
+    R350_GL_PROC(glGenBuffers),
+    R350_GL_PROC(glGenFramebuffers),
+    R350_GL_PROC(glGenVertexArrays),
+    R350_GL_PROC(glGetProgramiv),
+    R350_GL_PROC(glGetShaderiv),
+    R350_GL_PROC(glGetUniformLocation),
+    R350_GL_PROC(glLinkProgram),
+    R350_GL_PROC(glShaderSource),
+    R350_GL_PROC(glUniform1f),
+    R350_GL_PROC(glUniform1fv),
+    R350_GL_PROC(glUniform1i),
+    R350_GL_PROC(glUniform2f),
+    R350_GL_PROC(glUniform2i),
+    R350_GL_PROC(glUniform3i),
+    R350_GL_PROC(glUniform4f),
+    R350_GL_PROC(glUniform4fv),
+    R350_GL_PROC(glUseProgram),
+    R350_GL_PROC(glVertexAttribPointer),
+};
+
+/*
+ * wglGetProcAddress answers for entry points newer than 1.1 and, on
+ * several drivers, returns 1, 2, 3 or -1 rather than NULL when it has no
+ * answer; the 1.1 ones are ordinary DLL exports it does not know about.
+ * Both sources are tried for every name, so the table above does not
+ * have to record which era a function belongs to -- one fewer thing to
+ * get wrong on a host this file cannot be tested on.
+ */
+static R350GlProc r350_gl_getproc(HMODULE gl32, const char *name)
+{
+    PROC p = wglGetProcAddress(name);
+    uintptr_t v = (uintptr_t)p;
+
+    if (v <= 3 || v == (uintptr_t)-1) {
+        p = GetProcAddress(gl32, name);
+    }
+    return (R350GlProc)p;
+}
+
+/*
+ * Resolve every entry point the file uses, before any of them is called.
+ * A partial load is refused rather than survived: a missing symbol names
+ * itself in the reason string, which is what the device reports as
+ * `gl=...: <reason>` and is the only diagnosis available on a host
+ * nobody can attach a debugger to.
+ */
+static bool r350_gl_load(const char **err)
+{
+    static char miss[80];
+    HMODULE gl32 = LoadLibraryA("opengl32.dll");
+    unsigned k;
+
+    if (!gl32) {
+        *err = "opengl32.dll could not be loaded";
+        return false;
+    }
+    for (k = 0; k < ARRAY_SIZE(r350_gl_proctab); k++) {
+        R350GlProc fn = r350_gl_getproc(gl32, r350_gl_proctab[k].name);
+
+        if (!fn) {
+            snprintf(miss, sizeof(miss), "host GL is missing %s()",
+                     r350_gl_proctab[k].name);
+            *err = miss;
+            return false;
+        }
+        *r350_gl_proctab[k].slot = fn;
+    }
+    return true;
+}
+
+#define WGL_CONTEXT_MAJOR_VERSION_ARB    0x2091
+#define WGL_CONTEXT_MINOR_VERSION_ARB    0x2092
+#define WGL_CONTEXT_PROFILE_MASK_ARB     0x9126
+#define WGL_CONTEXT_CORE_PROFILE_BIT_ARB 0x00000001
+
+typedef struct R350GlPlat {
+    HWND win;
+    HDC dc;
+    HGLRC ctx;
+} R350GlPlat;
+
+static void r350_gl_plat_close(R350GlPlat *pl)
+{
+    if (pl->ctx) {
+        wglMakeCurrent(NULL, NULL);
+        wglDeleteContext(pl->ctx);
+        pl->ctx = NULL;
+    }
+    if (pl->dc) {
+        ReleaseDC(pl->win, pl->dc);
+        pl->dc = NULL;
+    }
+    if (pl->win) {
+        DestroyWindow(pl->win);
+        pl->win = NULL;
+    }
+}
+
+/*
+ * An invisible 1x1 window, because WGL has no windowless context: a
+ * pixel format belongs to a device context and a device context comes
+ * from a window. Nothing is ever drawn to it -- every draw goes to the
+ * FBO and the caller puts the result back in emulated VRAM -- so it is
+ * never shown and never has a message pumped, neither of which WGL
+ * context creation or rendering depends on.
+ *
+ * Then the two-step every WGL program performs: wglCreateContext makes
+ * only the driver's default context, and the entry point that makes a
+ * core-profile one is itself an extension, so it can be asked for only
+ * through a context that already exists.
+ *
+ * 4.1 core is tried before 3.3 core because the fragment shaders say
+ * `#extension GL_ARB_gpu_shader5 : require` -- `precise` and fma() are
+ * GL 4.0 features that 3.3 hardware exposes as an extension, and the
+ * darwin leg asks for kCGLOGLPVersion_GL4_Core for the same reason. A
+ * driver that gives 3.3 without the extension will fail at the first
+ * shader compile with the file's own "would not compile" message rather
+ * than render something subtly different.
+ */
+static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
+{
+    static const char cls[] = "qemu-ati-r350-gl";
+    static bool cls_done;
+    static const int ver[][2] = { { 4, 1 }, { 3, 3 } };
+    /*
+     * wglCreateContextAttribsARB through a union rather than a cast: a
+     * direct cast from PROC to it changes the function type, which every
+     * compiler warns about (-Wcast-function-type), and this file has to
+     * build warning-clean on a toolchain nobody here can run.
+     */
+    union {
+        PROC any;
+        HGLRC (APIENTRY *mk)(HDC, HGLRC, const int *);
+    } arb = { NULL };
+    PIXELFORMATDESCRIPTOR pfd;
+    HGLRC boot;
+    int fmt;
+    unsigned k;
+
+    if (!cls_done) {
+        WNDCLASSA wc;
+
+        memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = DefWindowProcA;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.lpszClassName = cls;
+        if (!RegisterClassA(&wc) &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            *err = "could not register the offscreen GL window class";
+            return false;
+        }
+        cls_done = true;
+    }
+    pl->win = CreateWindowExA(0, cls, cls, WS_POPUP, 0, 0, 1, 1,
+                              NULL, NULL, GetModuleHandleA(NULL), NULL);
+    if (!pl->win) {
+        *err = "could not create the offscreen GL window";
+        return false;
+    }
+    pl->dc = GetDC(pl->win);
+    if (!pl->dc) {
+        *err = "the offscreen GL window has no device context";
+        goto fail;
+    }
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.nSize = sizeof(pfd);
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 24;
+    pfd.cAlphaBits = 8;
+    fmt = ChoosePixelFormat(pl->dc, &pfd);
+    if (!fmt || !SetPixelFormat(pl->dc, fmt, &pfd)) {
+        *err = "no GL-capable pixel format on this host";
+        goto fail;
+    }
+
+    boot = wglCreateContext(pl->dc);
+    if (!boot) {
+        *err = "wglCreateContext failed";
+        goto fail;
+    }
+    if (wglMakeCurrent(pl->dc, boot)) {
+        arb.any = wglGetProcAddress("wglCreateContextAttribsARB");
+        wglMakeCurrent(NULL, NULL);
+    }
+    wglDeleteContext(boot);
+    if (!arb.mk) {
+        *err = "host GL has no WGL_ARB_create_context, so no 3.3 core "
+               "context can be made";
+        goto fail;
+    }
+
+    for (k = 0; k < ARRAY_SIZE(ver) && !pl->ctx; k++) {
+        const int attr[] = {
+            WGL_CONTEXT_MAJOR_VERSION_ARB, ver[k][0],
+            WGL_CONTEXT_MINOR_VERSION_ARB, ver[k][1],
+            WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+            0
+        };
+
+        pl->ctx = arb.mk(pl->dc, NULL, attr);
+    }
+    if (!pl->ctx) {
+        *err = "host GL offers no 3.3 core profile context";
+        goto fail;
+    }
+    if (!wglMakeCurrent(pl->dc, pl->ctx)) {
+        *err = "the 3.3 core context could not be made current";
+        goto fail;
+    }
+    if (!r350_gl_load(err)) {
+        goto fail;
+    }
+    return true;
+
+fail:
+    r350_gl_plat_close(pl);
+    return false;
+}
+
+/*
+ * The context moves between HOST THREADS, and this is the one place the
+ * two legs genuinely differ. ati_r350_gl_open() runs on QEMU's main
+ * thread (device realize); every draw runs on whichever vCPU thread
+ * reached the command processor; and ati_r350_gl_fetch() runs on the
+ * main thread again whenever ati_r350_update_display() releases the
+ * target for scanout (ati_r350.c). The BQL keeps two of them from being
+ * inside the backend at once, which is all CGL asks for -- but WGL asks
+ * for more: wglMakeCurrent FAILS while the context is current to a
+ * DIFFERENT thread, and no thread can release another thread's context.
+ * So here the context is taken for the duration of one entry point and
+ * given straight back, and r350_gl_done() is that give-back.
+ */
+static inline void r350_gl_makecurrent(R350GlPlat *pl)
+{
+    wglMakeCurrent(pl->dc, pl->ctx);
+}
+
+static inline void r350_gl_done(R350GlPlat *pl)
+{
+    (void)pl;
+    wglMakeCurrent(NULL, NULL);
+}
+
+#endif /* CONFIG_DARWIN */
 
 /*
  * One draw program and its uniform locations, resolved once at link
@@ -106,7 +633,7 @@ typedef struct R350GlProgSlot {
 } R350GlProgSlot;
 
 struct R350GlCtx {
-    CGLContextObj ctx;
+    R350GlPlat plat;
     R350GlProgSlot prog[R350_GL_PROGSLOTS];
     unsigned prog_next;         /* round-robin victim */
     uint64_t prog_hits, prog_links, prog_failed;
@@ -567,33 +1094,15 @@ static R350GlProg *gl_prog_for(R350GlCtx *g, const R350GlReq *r, bool add)
 
 R350GlCtx *ati_r350_gl_open(const char **err)
 {
-    CGLPixelFormatAttribute attrs[] = {
-        kCGLPFAOpenGLProfile,
-        (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
-        kCGLPFAAccelerated,
-        kCGLPFAColorSize, (CGLPixelFormatAttribute)24,
-        kCGLPFAAlphaSize, (CGLPixelFormatAttribute)8,
-        (CGLPixelFormatAttribute)0
-    };
-    CGLPixelFormatObj pix = NULL;
     R350GlCtx *g;
-    GLint npix = 0;
     unsigned k;
 
     *err = NULL;
-    if (CGLChoosePixelFormat(attrs, &pix, &npix) || !pix) {
-        *err = "no accelerated offscreen GL 3.3 core pixel format";
-        return NULL;
-    }
     g = g_new0(R350GlCtx, 1);
-    if (CGLCreateContext(pix, NULL, &g->ctx)) {
-        CGLDestroyPixelFormat(pix);
+    if (!r350_gl_plat_open(&g->plat, err)) {
         g_free(g);
-        *err = "CGLCreateContext failed";
         return NULL;
     }
-    CGLDestroyPixelFormat(pix);
-    CGLSetCurrentContext(g->ctx);
 
     g->ui2n = gl_link(vs_blit_src, NULL, NULL, fs_ui2n_src, err);
     g->n2ui = g->ui2n ? gl_link(vs_blit_src, NULL, NULL, fs_n2ui_src, err)
@@ -666,7 +1175,7 @@ R350GlCtx *ati_r350_gl_open(const char **err)
         }
     }
 
-    snprintf(g->desc, sizeof(g->desc), "CGL offscreen, %s / GLSL %s",
+    snprintf(g->desc, sizeof(g->desc), R350_GL_BACKEND_NAME ", %s / GLSL %s",
              (const char *)glGetString(GL_VERSION),
              (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
     if (glGetError() != GL_NO_ERROR) {
@@ -674,6 +1183,7 @@ R350GlCtx *ati_r350_gl_open(const char **err)
         *err = "GL reported an error while setting the backend up";
         return NULL;
     }
+    r350_gl_done(&g->plat);
     return g;
 }
 
@@ -682,10 +1192,10 @@ void ati_r350_gl_close(R350GlCtx *g)
     if (!g) {
         return;
     }
-    if (g->ctx) {
+    if (g->plat.ctx) {
         unsigned k;
 
-        CGLSetCurrentContext(g->ctx);
+        r350_gl_makecurrent(&g->plat);
         glDeleteTextures(1, &g->dst);
         glDeleteTextures(1, &g->acc);
         glDeleteTextures(R350_GL_TEXSLOTS + 1, g->tex);
@@ -702,8 +1212,7 @@ void ati_r350_gl_close(R350GlCtx *g)
         }
         glDeleteProgram(g->ui2n);
         glDeleteProgram(g->n2ui);
-        CGLSetCurrentContext(NULL);
-        CGLDestroyContext(g->ctx);
+        r350_gl_plat_close(&g->plat);
     }
     g_free(g->stage);
     g_free(g);
@@ -778,7 +1287,7 @@ bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
     if (w > 16384 || h > 16384) {
         return false;
     }
-    CGLSetCurrentContext(g->ctx);
+    r350_gl_makecurrent(&g->plat);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g->cbuf);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -808,11 +1317,13 @@ bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
         glGetError() != GL_NO_ERROR) {
         g->fb_w = g->fb_h = 0;
+        r350_gl_done(&g->plat);
         return false;
     }
     g->fb_w = w;
     g->fb_h = h;
     *lost = true;
+    r350_gl_done(&g->plat);
     return true;
 }
 
@@ -820,6 +1331,7 @@ bool ati_r350_gl_seed(R350GlCtx *g, int x0, int y0, int w, int h,
                       const uint8_t *base, unsigned pitch, unsigned xr)
 {
     uint8_t *st;
+    bool ok;
     int x, y;
 
     if (!g || w <= 0 || h <= 0 ||
@@ -838,18 +1350,21 @@ bool ati_r350_gl_seed(R350GlCtx *g, int x0, int y0, int w, int h,
             o[3] = p[3 ^ xr];           /* A */
         }
     }
-    CGLSetCurrentContext(g->ctx);
+    r350_gl_makecurrent(&g->plat);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g->cbuf);
     glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, w, h, GL_RGBA_INTEGER,
                     GL_UNSIGNED_BYTE, st);
-    return glGetError() == GL_NO_ERROR;
+    ok = glGetError() == GL_NO_ERROR;
+    r350_gl_done(&g->plat);
+    return ok;
 }
 
 bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
                        uint8_t *base, unsigned pitch, unsigned xr)
 {
     uint8_t *st;
+    bool ok;
     int x, y;
 
     if (!g || w <= 0 || h <= 0 ||
@@ -857,7 +1372,7 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
         return false;
     }
     st = gl_stage(g, (size_t)w * h * 4);
-    CGLSetCurrentContext(g->ctx);
+    r350_gl_makecurrent(&g->plat);
     glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                            GL_TEXTURE_2D, g->cbuf, 0);
@@ -873,13 +1388,16 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
             p[3 ^ xr] = i[3];
         }
     }
-    return glGetError() == GL_NO_ERROR;
+    ok = glGetError() == GL_NO_ERROR;
+    r350_gl_done(&g->plat);
+    return ok;
 }
 
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 {
     const R350GlProg *p;
     int sx0, sy0, sx1, sy1;
+    bool ok;
 
     if (!g || r->w <= 0 || r->h <= 0 || !r->nvert ||
         r->surf_w > g->fb_w || r->surf_h > g->fb_h) {
@@ -888,14 +1406,18 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     /*
      * Made current per draw rather than once: the device may reach this
      * from whichever thread runs the vCPU, and the big QEMU lock is what
-     * keeps two of them from being here at the same time. The call is a
-     * no-op when the context is already current.
+     * keeps two of them from being here at the same time. On darwin the
+     * call is a no-op when the context is already current and the paired
+     * r350_gl_done() is nothing; on Windows both are real, and why is in
+     * the win32 leg's threading comment.
      */
-    CGLSetCurrentContext(g->ctx);
+    r350_gl_makecurrent(&g->plat);
 
     p = gl_prog_for(g, r, r->add_blend);
     if (!p) {
-        return false;      /* the program would not compile: fall back */
+        /* the program would not compile: fall back */
+        r350_gl_done(&g->plat);
+        return false;
     }
     glUseProgram(p->prog);
     if (p->u_usk >= 0 && r->us_konst) {
@@ -955,6 +1477,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
              * can only be a bookkeeping error, and rendering from the
              * wrong texture is the silent kind of wrong, so refuse.
              */
+            r350_gl_done(&g->plat);
             return false;
         }
     } else {
@@ -1077,10 +1600,12 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_SCISSOR_TEST);
-    return glGetError() == GL_NO_ERROR;
+    ok = glGetError() == GL_NO_ERROR;
+    r350_gl_done(&g->plat);
+    return ok;
 }
 
-#else /* !CONFIG_DARWIN */
+#else /* no host GL backend */
 
 R350GlCtx *ati_r350_gl_open(const char **err)
 {
@@ -1126,4 +1651,4 @@ void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
     *hits = *links = *failed = 0;
 }
 
-#endif /* CONFIG_DARWIN */
+#endif /* CONFIG_DARWIN || _WIN32 */
