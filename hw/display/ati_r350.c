@@ -1670,6 +1670,8 @@ static void ati_r350_resolve_gui_context(ATIR350State *s)
 static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
                                     uint32_t val)
 {
+    ati_r350_audit_reg_write(s, base);
+
     /*
      * Diagnostic: the 2D source/destination context. Mac OS X programs
      * essentially all of this through the CCE (a whole window drag issues
@@ -4132,10 +4134,13 @@ void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
  * after exercising a guest, and anything the model quietly ignores is
  * named rather than left to be inferred from a wrong-looking screen.
  *
- * Registers are deliberately not counted here: a register this model
- * stores but never reads back is invisible from inside the device, so
- * that half of the coverage question stays with the offline audit
- * script, which diffs guest writes against our own source.
+ * Registers are counted separately, by the `silent-regs` property
+ * below: a register this model stores but never reads produces no gap
+ * from inside any implemented path, so those writes are checked
+ * against the generated ati_r350_audit.h bitmap instead. `gaps` stays
+ * register-free deliberately -- the Regression protocol's acceptance
+ * is the literal string "none", and silent registers are diagnostic
+ * leads, not automatic defects.
  */
 static char *ati_r350_get_gaps(Object *obj, Error **errp)
 {
@@ -4151,6 +4156,37 @@ static char *ati_r350_get_gaps(Object *obj, Error **errp)
                                        ati_r350_gap_names[k], i,
                                        s->gap_count[k][i]);
             }
+        }
+    }
+    if (!out->len) {
+        g_string_append(out, "none");
+    }
+    return g_string_free(out, FALSE);
+}
+
+/*
+ * `silent-regs` property: every register the guest wrote this run that
+ * no model code reads, with write counts -- the RBBM_GUICNTL class,
+ * which `gaps` cannot see. Read it from the monitor with
+ *   qom-get /machine/peripheral-anon/device[N] silent-regs
+ * A row here is a lead, not a verdict: WAIT_UNTIL or a cache-control
+ * register is harmless to ignore, RE_SHADE_MODEL is not. The bitmap it
+ * checks against is generated (ati_r350_audit.h); regenerate it when
+ * the model learns a register, or that register keeps being reported.
+ */
+static char *ati_r350_get_silent_regs(Object *obj, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+    GString *out = g_string_new(NULL);
+    unsigned i;
+
+    for (i = 0; i < R350_SILENT_REG_WORDS; i++) {
+        if (s->silent_reg_count[i]) {
+            g_string_append_printf(out, "%s0x%04x %s: %u",
+                                   out->len ? "\n" : "",
+                                   i << 2,
+                                   ati_r350_reg_name(i << 2),
+                                   s->silent_reg_count[i]);
         }
     }
     if (!out->len) {
@@ -4523,6 +4559,8 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
                                    ati_r350_get_cap_arm,
                                    ati_r350_set_cap_arm);
     object_class_property_add_str(klass, "gaps", ati_r350_get_gaps, NULL);
+    object_class_property_add_str(klass, "silent-regs",
+                                  ati_r350_get_silent_regs, NULL);
     object_class_property_add_str(klass, "scanout", ati_r350_get_scanout,
                                   NULL);
     object_class_property_add_str(klass, "gl-stats", ati_r350_get_gl, NULL);

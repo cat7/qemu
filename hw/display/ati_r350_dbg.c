@@ -1047,3 +1047,35 @@ const char *ati_r350_reg_name(uint32_t base)
     }
     return "?";
 }
+
+/*
+ * Silent-register audit: the register-level half of the gap tracker.
+ *
+ * ati_r350_note_gap() only fires where implemented code notices a
+ * request it cannot honour; a register the model stores and never
+ * reads produces no gap at all. That silent class is where three of
+ * this device's root causes lived (RBBM_GUICNTL, GUI_HOST_SWAP_CNTL,
+ * VAP_PROG_STREAM_CNTL's routing). The generated bitmap in
+ * ati_r350_audit.h says which registers some model code consumes;
+ * every write to any other register is tallied here, one slot per
+ * distinct register, and reported by the `silent-regs` property.
+ */
+#include "ati_r350_audit.h"
+
+QEMU_BUILD_BUG_ON(R350_REG_AUDIT_LIMIT / 4 != R350_SILENT_REG_WORDS);
+
+void ati_r350_audit_reg_write(ATIR350State *s, uint32_t base)
+{
+    unsigned bit;
+
+    if (base >= R350_REG_AUDIT_LIMIT) {
+        return;
+    }
+    bit = base >> 2;
+    if (ati_r350_reg_consumed[bit / 32] & (1u << (bit % 32))) {
+        return;
+    }
+    if (s->silent_reg_count[bit] != UINT32_MAX) {
+        s->silent_reg_count[bit]++;
+    }
+}

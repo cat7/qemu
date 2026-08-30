@@ -450,6 +450,18 @@ struct ATIR350State {
     uint32_t gap_count[R350_GAP_MAX][R350_GAP_SLOTS];
 
     /*
+     * Silent-register tally -- see ati_r350_audit_reg_write(). One
+     * counter per register in the audited window, indexed by offset>>2:
+     * a first-seen slot list saturated on Mac OS X 10.5, which writes
+     * over 200 distinct silent registers in one session (measured
+     * 2026-08-30: all 160 slots used, 75960 writes dropped). The word
+     * count mirrors R350_REG_AUDIT_LIMIT in the generated
+     * ati_r350_audit.h; ati_r350_dbg.c build-checks the pairing.
+     */
+#define R350_SILENT_REG_WORDS 6144
+    uint32_t silent_reg_count[R350_SILENT_REG_WORDS];
+
+    /*
      * 2D GUI (destination datapath) engine state -- ported from the
      * real upstream `ati-vga` device (hw/display/ati.c/ati_2d.c), not
      * generic/free-standing; register semantics are documented on the
@@ -800,6 +812,16 @@ const char *ati_r350_reg_name(uint32_t base);
  * Read the running tally with `qom-get <device> gaps`.
  */
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx);
+
+/*
+ * The register-level half of the same coverage question: tally a write
+ * to a register no model code reads (the RBBM_GUICNTL class -- stored
+ * into s->regs[] and consulted by no logic, so no gap ever fires).
+ * Called from the ati_r350_reg_write32() funnel, which both the MMIO
+ * path and PM4 type-0/1 packets go through. Read the tally with
+ * `qom-get <device> silent-regs`.
+ */
+void ati_r350_audit_reg_write(ATIR350State *s, uint32_t base);
 
 /* sizes of the private draw-capture payload structs (ati_r350_cap.h) */
 uint32_t ati_r350_cap_state_bytes(void);
