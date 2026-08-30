@@ -1402,6 +1402,8 @@ static void ati_rage128_resolve_gui_context(ATIRage128State *s)
 static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                                     uint32_t val)
 {
+    ati_rage128_audit_reg_write(s, base);
+
     /*
      * Diagnostic: the 2D source/destination context. Mac OS X programs
      * essentially all of this through the CCE (a whole window drag issues
@@ -3556,6 +3558,40 @@ static const Property ati_rage128_properties[] = {
     DEFINE_EDID_PROPERTIES(ATIRage128State, edid_info),
 };
 
+/*
+ * `silent-regs` property: every register the guest wrote this run that
+ * no model code reads, with write counts -- the class of defect the
+ * traces cannot show, because a trace proves a register was written,
+ * not that anything then looked at it. Read it from the monitor with
+ *   qom-get /machine/peripheral-anon/device[N] silent-regs
+ * A row is a lead, not a verdict: WAIT_UNTIL or a cache-control
+ * register is harmless to ignore, a 2D context register is not. A
+ * register with no name in ati_rage128_reg_name() is reported by
+ * offset, with "?" for its name. The bitmap it checks against is
+ * generated (ati_rage128_audit.h); regenerate it when the model learns
+ * a register, or that register keeps being reported.
+ */
+static char *ati_rage128_get_silent_regs(Object *obj, Error **errp)
+{
+    ATIRage128State *s = ATI_RAGE128(obj);
+    GString *out = g_string_new(NULL);
+    unsigned i;
+
+    for (i = 0; i < R128_SILENT_REG_WORDS; i++) {
+        if (s->silent_reg_count[i]) {
+            g_string_append_printf(out, "%s0x%04x %s: %u",
+                                   out->len ? "\n" : "",
+                                   i << 2,
+                                   ati_rage128_reg_name(i << 2),
+                                   s->silent_reg_count[i]);
+        }
+    }
+    if (!out->len) {
+        g_string_append(out, "none");
+    }
+    return g_string_free(out, FALSE);
+}
+
 static void ati_rage128_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -3587,6 +3623,8 @@ static void ati_rage128_class_init(ObjectClass *klass, const void *data)
     device_class_set_props(dc, ati_rage128_properties);
     rc->phases.hold = ati_rage128_reset_hold;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    object_class_property_add_str(klass, "silent-regs",
+                                  ati_rage128_get_silent_regs, NULL);
 }
 
 static const TypeInfo ati_rage128_type_info = {
