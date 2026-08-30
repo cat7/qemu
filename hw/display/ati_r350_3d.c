@@ -2374,18 +2374,30 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
              * sampling as texture coordinates is not a colour at all --
              * the eight-dword textured vertices whose second attribute is
              * a coordinate pair would otherwise arrive painted with it.
-             * Which attribute that is comes from the program where the
-             * program says (tex_attr), and only otherwise from the
-             * position of the coordinate in a flat vertex.
+             * Which attribute that is comes from the program: directly
+             * where the coordinate is FORWARDED (tex_attr), and from the
+             * input register its texture matrix reads where the program
+             * COMPUTES it instead -- the matrix names that register as
+             * surely as a forward does, and a computed coordinate is not
+             * obliged to sit where a flat vertex would keep it. Mac OS X
+             * 10.5's layer-backed UIs put a FLOAT_4 colour there and a
+             * coordinate computed from the attribute after it, so the
+             * position of the coordinate in a flat vertex answers only
+             * for the programs whose matrix will not resolve.
              */
             if (d->vs_run && ncolor &&
                 (d->vs.out_mask & (1u << first_color))) {
+                R300PvsTexMat tm;
                 int src = d->vs.out_src[first_color];
+                int tsrc = d->tex_attr[0];
                 bool computed = !d->vs.plain_matrix || src >= 0;
-                bool is_texcoord = d->textured && src >= 0 &&
-                                   src == (d->tex_attr[0] >= 0 ?
-                                           d->tex_attr[0] :
-                                           (vsize >= 12 ? 2 : 1));
+                bool is_texcoord;
+
+                if (tsrc < 0) {
+                    tsrc = r300_pvs_texmat(&d->vs, first_tex, &tm) ?
+                           (int)tm.in : (vsize >= 12 ? 2 : 1);
+                }
+                is_texcoord = d->textured && src >= 0 && src == tsrc;
 
                 d->vs_color = computed && !is_texcoord;
             }
