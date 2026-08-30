@@ -132,3 +132,42 @@ const char *ati_mach64_reg_name(uint32_t base)
     default:                          return "?";
     }
 }
+
+/*
+ * Silent-register audit: the register-level half of the coverage
+ * question this file's name table serves.
+ *
+ * A trace tells you a register was written; it does not tell you
+ * whether anything in the model then read it. A register this device
+ * stores and never consults is invisible from inside every implemented
+ * path -- no unimplemented-operation warning fires, and the screen is
+ * simply wrong somewhere else. That silent class is where the R350's
+ * RBBM_GUICNTL/GUI_HOST_SWAP_CNTL root causes lived, and this device
+ * has the same shape of blind spot.
+ *
+ * The generated bitmap in ati_mach64_audit.h says which registers some
+ * model code consumes; every write to any other register is tallied
+ * here, one counter per register, and reported by the `silent-regs`
+ * property. Regenerate the bitmap (doc/radeon9800/regaudit2.py
+ * mach64-g3 --emit-table) whenever the model learns to read a new
+ * register, or silent-regs will keep reporting it.
+ */
+#include "ati_mach64_audit.h"
+
+QEMU_BUILD_BUG_ON(MACH64_REG_AUDIT_LIMIT / 4 != MACH64_SILENT_REG_WORDS);
+
+void ati_mach64_audit_reg_write(ATIMach64State *s, uint32_t base)
+{
+    unsigned bit;
+
+    if (base >= MACH64_REG_AUDIT_LIMIT) {
+        return;
+    }
+    bit = base >> 2;
+    if (ati_mach64_reg_consumed[bit / 32] & (1u << (bit % 32))) {
+        return;
+    }
+    if (s->silent_reg_count[bit] != UINT32_MAX) {
+        s->silent_reg_count[bit]++;
+    }
+}

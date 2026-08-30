@@ -1687,6 +1687,8 @@ static void ati_mach64_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         return;
     }
 
+    ati_mach64_audit_reg_write(s, reg_num << 2);
+
     trace_ati_mach64_mmio_write(size, addr,
                                 ati_mach64_reg_name(addr & ~3ull), data);
     word = (word & ~mask) | ((uint32_t)data << shift);
@@ -2300,6 +2302,40 @@ static const Property ati_mach64_properties[] = {
     DEFINE_EDID_PROPERTIES(ATIMach64State, i2cddc.edid_info),
 };
 
+/*
+ * `silent-regs` property: every register the guest wrote this run that
+ * no model code reads, with write counts -- the class of defect the
+ * traces cannot show, because a trace proves a register was written,
+ * not that anything then looked at it. Read it from the monitor with
+ *   qom-get /machine/peripheral-anon/device[N] silent-regs
+ * A row is a lead, not a verdict: a status or test register is
+ * harmless to ignore, a draw-engine one is not. A register with no
+ * name in ati_mach64_reg_name() is reported by offset, with "?" for
+ * its name. The bitmap it checks against is generated
+ * (ati_mach64_audit.h); regenerate it when the model learns a
+ * register, or that register keeps being reported.
+ */
+static char *ati_mach64_get_silent_regs(Object *obj, Error **errp)
+{
+    ATIMach64State *s = ATI_MACH64(obj);
+    GString *out = g_string_new(NULL);
+    unsigned i;
+
+    for (i = 0; i < MACH64_SILENT_REG_WORDS; i++) {
+        if (s->silent_reg_count[i]) {
+            g_string_append_printf(out, "%s0x%04x %s: %u",
+                                   out->len ? "\n" : "",
+                                   i << 2,
+                                   ati_mach64_reg_name(i << 2),
+                                   s->silent_reg_count[i]);
+        }
+    }
+    if (!out->len) {
+        g_string_append(out, "none");
+    }
+    return g_string_free(out, FALSE);
+}
+
 static void ati_mach64_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -2359,6 +2395,8 @@ static void ati_mach64_class_init(ObjectClass *klass, const void *data)
     device_class_set_props(dc, ati_mach64_properties);
     device_class_set_legacy_reset(dc, ati_mach64_reset);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    object_class_property_add_str(klass, "silent-regs",
+                                  ati_mach64_get_silent_regs, NULL);
 }
 
 static void ati_mach64_init(Object *obj)

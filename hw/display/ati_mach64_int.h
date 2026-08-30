@@ -214,11 +214,37 @@ struct ATIMach64State {
     int hb_dst_pitch;      /* pixels */
     uint32_t hb_frgd_clr, hb_bkgd_clr;
     uint8_t hb_frgd_mix, hb_bkgd_mix;
+
+    /*
+     * Silent-register tally -- see ati_mach64_audit_reg_write(). One
+     * counter per register in the audited window, indexed by
+     * offset >> 2. A flat array rather than a first-seen slot list,
+     * following the R350's measurement: a 160-slot list saturated on a
+     * Mac OS X session and a truncated census reads as a complete one.
+     * The word count mirrors MACH64_REG_AUDIT_LIMIT in the generated
+     * ati_mach64_audit.h; ati_mach64_dbg.c build-checks the pairing.
+     * Deliberately not in vmstate: a diagnostic counter, not state a
+     * migrated guest can notice.
+     */
+#define MACH64_SILENT_REG_WORDS 1024
+    uint32_t silent_reg_count[MACH64_SILENT_REG_WORDS];
 };
 
 
 /* ati_mach64_dbg.c */
 const char *ati_mach64_reg_name(uint32_t base);
+
+/*
+ * Tally a write to a register no model code reads -- one stored into
+ * s->regs[] (or dropped) and consulted by no logic, so nothing else in
+ * the device can notice it. Called from ati_mach64_mmio_write(), which
+ * is this device's single register-write funnel: the MMIO BAR, the
+ * BAR1 I/O window, the BAR2 aperture, both register windows aliased
+ * inside VRAM, the BM_ADDR/BM_DATA indirection and every GUI
+ * bus-master descriptor all end up there. Read the tally with
+ * `qom-get <device> silent-regs`.
+ */
+void ati_mach64_audit_reg_write(ATIMach64State *s, uint32_t base);
 
 /* ati_mach64_2d.c */
 void ati_mach64_2d_op(ATIMach64State *s);
