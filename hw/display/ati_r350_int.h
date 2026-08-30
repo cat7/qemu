@@ -163,6 +163,28 @@ typedef enum ATIR350GlRel {
 } ATIR350GlRel;
 
 /*
+ * WHICH 2D path ended the residency. R350_GLR_2D above lumps three
+ * unrelated operations together, and they call for opposite fixes: a
+ * blit's ranges usually miss the render target entirely, a host-data
+ * push never can (its destination is an 8bpp glyph atlas), and the
+ * scaler is a video path 10.5 does not use at all. The cause enum
+ * itself cannot carry the split -- the offline gl-replay harness in
+ * doc/radeon9800 compiles ati_r350_3d.c against its own copy of this
+ * header -- so the three paths keep their own tally beside it, filled
+ * by ati_r350_2d_gl_note() and reported by `gl-stats`.
+ *
+ * A path is credited whatever cause the release was booked under, so
+ * the tally stays honest when a range-gated path releases through
+ * ati_r350_gl_sync() as R350_GLR_READ rather than as R350_GLR_2D.
+ */
+typedef enum ATIR350Gl2dPath {
+    R350_GL2D_BLIT,         /* ati_r350_2d_blt(), via its named ranges */
+    R350_GL2D_HOST,         /* ati_r350_host_data_flush(), CPU-pushed */
+    R350_GL2D_SCALE,        /* ati_r350_2d_scale_run() */
+    R350_GL2D_MAX
+} ATIR350Gl2dPath;
+
+/*
  * How long a DECODED TEXTURE may live. The default states the rule the
  * decode actually depends on -- see r300_gl_tex_current() -- and the
  * other two exist to measure it:
@@ -620,6 +642,9 @@ struct ATIR350State {
     uint64_t gl_flush_px, gl_seed_px;   /* ... and pixels moved each way */
     uint64_t gl_rel[R350_GLR_MAX];      /* which hook ended a residency */
     uint64_t gl_rel_px[R350_GLR_MAX];   /* ... and what it cost to */
+    /* the same question one level finer for the 2D engine's three paths */
+    uint64_t gl_rel_2d[R350_GL2D_MAX];
+    uint64_t gl_rel_2d_px[R350_GL2D_MAX];
     /*
      * Decoded textures, keyed on everything the decode depends on.
      *
@@ -851,6 +876,8 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why);
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len);
 void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len);
 const char *ati_r350_gl_rel_name(ATIR350GlRel why);
+/* the 2D sub-tally's row label -- see ATIR350Gl2dPath */
+const char *ati_r350_gl_2d_path_name(ATIR350Gl2dPath path);
 
 /*
  * The display refresh has just snapshotted and CLEARED the VGA dirty

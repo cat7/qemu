@@ -28,6 +28,36 @@
  * ROP3 fallback (all 16 codes) so a ROP this driver actually uses
  * doesn't silently vanish.
  */
+static const char *const ati_r350_gl_2d_path_names[R350_GL2D_MAX] = {
+    [R350_GL2D_BLIT]  = "blit",
+    [R350_GL2D_HOST]  = "host data",
+    [R350_GL2D_SCALE] = "scaler",
+};
+
+const char *ati_r350_gl_2d_path_name(ATIR350Gl2dPath path)
+{
+    return path < R350_GL2D_MAX && ati_r350_gl_2d_path_names[path]
+           ? ati_r350_gl_2d_path_names[path] : "?";
+}
+
+/*
+ * Credit one 2D path with a residency it ended. `was_res` and `px0` are
+ * s->gl_res and s->gl_flush_px sampled before the path's coherency call:
+ * only a release clears the resident flag, so the pair says both whether
+ * this path was the one that ended the residency and what the fetch back
+ * into VRAM cost. Sampling rather than reading gl_rel[] is what lets a
+ * range-gated path be credited even though ati_r350_gl_sync() books the
+ * release under R350_GLR_READ.
+ */
+static void ati_r350_2d_gl_note(ATIR350State *s, ATIR350Gl2dPath path,
+                                bool was_res, uint64_t px0)
+{
+    if (was_res && !s->gl_res) {
+        s->gl_rel_2d[path]++;
+        s->gl_rel_2d_px[path] += s->gl_flush_px - px0;
+    }
+}
+
 static int ati_r350_bpp_from_datatype(uint32_t datatype)
 {
     switch (datatype & 0xf) {
@@ -607,8 +637,6 @@ static void ati_r350_2d_scale_run(ATIR350State *s,
                    op->dst_factor == R350_ALPHA_BLEND_ZERO);
     int src_bpp, x, y;
 
-    /* the scaler reads VRAM directly, around ati_r350_2d_read_pixel() */
-    ati_r350_gl_release(s, R350_GLR_2D);
     vram = memory_region_get_ram_ptr(&s->vram);
     trace_ati_r350_scale(op->dst_x, op->dst_y, op->w, op->h, op->src_off,
                             op->src_pitch, op->x_inc, op->y_inc, op->dt);
@@ -637,6 +665,31 @@ static void ati_r350_2d_scale_run(ATIR350State *s,
     }
     if (blend) {
         trace_ati_r350_scale_blend(op->src_factor, op->dst_factor);
+    }
+
+    /*
+     * The scaler reads a source image and writes a destination through
+     * its own per-pixel path, both directly in VRAM. Name the two ranges
+     * rather than releasing the resident target unconditionally: this is
+     * the video path, so its destination is an overlay surface that
+     * usually has nothing to do with whatever the 3D engine is rendering
+     * into, and a release there costs a full fetch and re-seed for
+     * nothing. Both ranges run from the surface origin to the last row
+     * the DDA can reach, generously -- too wide only costs a flush,
+     * while too narrow is the silent kind of wrong. The source needs
+     * `src_bpp`, which is why this sits after the datatype switch rather
+     * than at the top; nothing above reads VRAM.
+     */
+    if (unlikely(s->gl_res || s->gl_tex_any)) {
+        bool was_res = s->gl_res;
+        uint64_t px0 = s->gl_flush_px;
+        uint32_t rows = (((uint32_t)op->h * op->y_inc) >> 12) + 1;
+
+        ati_r350_gl_dirty(s, op->dst_off,
+                          ((uint32_t)op->dst_y + op->h + 1) * op->dst_stride);
+        ati_r350_gl_touch(s, op->src_off,
+                          rows * op->src_pitch * (uint32_t)src_bpp);
+        ati_r350_2d_gl_note(s, R350_GL2D_SCALE, was_res, px0);
     }
 
     for (y = 0; y < op->h; y++) {
@@ -809,6 +862,8 @@ void ati_r350_2d_blt(ATIR350State *s)
         int bpp = ati_r350_bpp_from_dp_datatype(s);
         uint32_t ds = s->dst_pitch_bytes ? s->dst_pitch : s->dst_pitch * bpp;
         uint32_t ss = s->src_pitch_bytes ? s->src_pitch : s->src_pitch * bpp;
+        bool was_res = s->gl_res;
+        uint64_t px0 = s->gl_flush_px;
 
         ati_r350_gl_dirty(s, s->dst_offset,
                           (s->dst_y + s->dst_height + 1) * ds);
@@ -817,6 +872,7 @@ void ati_r350_2d_blt(ATIR350State *s)
             ati_r350_gl_touch(s, s->src_offset,
                               (s->src_y + s->dst_height + 1) * ss);
         }
+        ati_r350_2d_gl_note(s, R350_GL2D_BLIT, was_res, px0);
     }
 
     trace_ati_r350_2d_blt((s->src_x << 16) | s->src_y,
@@ -918,8 +974,6 @@ bool ati_r350_host_data_flush(ATIR350State *s)
         s->host_data_active = false;
         return false;
     }
-    /* CPU-pushed pixels land in VRAM behind the 3D engine's back */
-    ati_r350_gl_release(s, R350_GLR_2D);
 
     bypp = bpp / 8;
     /*
@@ -946,6 +1000,30 @@ bool ati_r350_host_data_flush(ATIR350State *s)
     if (!dst_stride) {
         s->host_data_active = false;
         return false;
+    }
+
+    /*
+     * CPU-pushed pixels land in VRAM behind the 3D engine's back, so the
+     * destination has to be named -- but only the destination: this is a
+     * pure writer, the payload arrives in the accumulator registers and
+     * no VRAM is read. Naming it rather than releasing outright is what
+     * this path has to gain: Leopard builds its glyph atlas here, and an
+     * 8bpp atlas can never be the 32bpp surface the 3D engine is
+     * rendering into, yet every one of the hundreds of pushes in a
+     * System Preferences repaint was ending the residency. The range
+     * runs from the surface origin to the last row the transfer can
+     * reach, generously -- too wide only costs a flush, while too narrow
+     * is the silent kind of wrong. It is stated across the whole
+     * transfer, not this chunk, because `dst_y`/`dst_height` are the
+     * transfer's and the chunk position is only where it has got to.
+     */
+    if (unlikely(s->gl_res || s->gl_tex_any)) {
+        bool was_res = s->gl_res;
+        uint64_t px0 = s->gl_flush_px;
+
+        ati_r350_gl_dirty(s, s->hd.dst_offset,
+                          (s->hd.dst_y + s->hd.dst_height + 1) * dst_stride);
+        ati_r350_2d_gl_note(s, R350_GL2D_HOST, was_res, px0);
     }
 
     /*

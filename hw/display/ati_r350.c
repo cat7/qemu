@@ -4354,6 +4354,21 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                    s->gl_rel_px[k]);
         }
     }
+    /*
+     * The 2D engine's three paths, counted apart: they are one cause
+     * above but call for opposite fixes, and a path that names its
+     * ranges instead of releasing outright is booked under "ranged
+     * read", so the line above cannot answer "how much of this is the
+     * 2D engine" on its own. See ATIR350Gl2dPath.
+     */
+    for (k = 0; k < R350_GL2D_MAX; k++) {
+        if (s->gl_rel_2d[k]) {
+            g_string_append_printf(out, "\n    2D %s: %" PRIu64
+                                   ", %" PRIu64 " px",
+                                   ati_r350_gl_2d_path_name(k),
+                                   s->gl_rel_2d[k], s->gl_rel_2d_px[k]);
+        }
+    }
     {
         uint64_t ph, pl, pf;
 
