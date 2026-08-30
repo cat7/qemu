@@ -431,11 +431,37 @@ struct ATIRage128State {
         uint32_t src_frgd_clr, src_bkgd_clr;
         int32_t sc_left, sc_top, sc_right, sc_bottom;
     } hd;
+
+    /*
+     * Silent-register tally -- see ati_rage128_audit_reg_write(). One
+     * counter per register in the audited window, indexed by
+     * offset >> 2. A flat array rather than a first-seen slot list,
+     * following the R350's measurement: a 160-slot list saturated on a
+     * Mac OS X session and a truncated census reads as a complete one.
+     * The word count mirrors R128_REG_AUDIT_LIMIT in the generated
+     * ati_rage128_audit.h; ati_rage128_dbg.c build-checks the pairing.
+     * Deliberately not in vmstate: a diagnostic counter, not state a
+     * migrated guest can notice.
+     */
+#define R128_SILENT_REG_WORDS 4096
+    uint32_t silent_reg_count[R128_SILENT_REG_WORDS];
 };
 
 
 /* ati_rage128_dbg.c */
 const char *ati_rage128_reg_name(uint32_t base);
+
+/*
+ * Tally a write to a register no model code reads -- one stored into
+ * s->regs[] (or dropped) and consulted by no logic, so nothing else in
+ * the device can notice it. Called from the ati_rage128_reg_write32()
+ * funnel, which every register write passes through: the MMIO and I/O
+ * BAR ops, the MM_INDEX/MM_DATA indirection, PM4 type-0/1 packets from
+ * both the ring and the PIO FIFO/indirect buffers, the packet-3 blit
+ * decoders, and GUI bus-master descriptors. Read the tally with
+ * `qom-get <device> silent-regs`.
+ */
+void ati_rage128_audit_reg_write(ATIRage128State *s, uint32_t base);
 
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
