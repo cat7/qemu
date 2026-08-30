@@ -1962,6 +1962,11 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_HOST_DATA6:
     case R128_HOST_DATA7:
     case R128_HOST_DATA_LAST:
+        /* the register-file host-data path (MMIO, MM_INDEX/MM_DATA and
+         * type-0 packets), as opposed to the HOSTDATA_BLT payload the
+         * CCE parser consumes directly */
+        trace_ati_rage128_host_data_reg(base, val, s->host_data_active,
+                                        s->host_data_next);
         if (!s->host_data_active) {
             break;
         }

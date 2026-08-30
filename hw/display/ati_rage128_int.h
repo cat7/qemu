@@ -402,6 +402,35 @@ struct ATIRage128State {
     bool host_data_active;
     uint32_t host_data_row, host_data_col, host_data_next;
     uint32_t host_data_acc[4];
+    /*
+     * The drawing context the transfer STARTED with. A host-data
+     * transfer spans many writes and its last partial accumulator is
+     * not flushed when the data stops arriving: it is flushed when the
+     * next blit turns up, from ati_rage128_2d_blt()'s implicit finish.
+     * By then that blit's caller has already installed its own
+     * destination rectangle -- every one of the packet handlers in
+     * ati_rage128.c assigns dst_x/dst_y/dst_width/dst_height and only
+     * then calls in -- so the tail would be written into the next
+     * operation's rectangle, and where the stale column index runs past
+     * the new width the unsigned `dst_width - col` underflows to a huge
+     * span and paints straight across its neighbours.
+     *
+     * The CCE packet handlers close their own transfer before returning,
+     * so they never reach that; the paths that can are the MMIO/type-0
+     * HOST_DATA0-7 register stream that ends without HOST_DATA_LAST, and
+     * a GEN_RESET_CNTL SOFT_RESET_GUI landing mid-packet (which drops
+     * the parser's packet state but not host_data_active). A transfer
+     * owns its context until it ends, which is what the FIFO semantics
+     * say, and it makes the ordering question disappear rather than
+     * adding a rule to each of the five callers.
+     */
+    struct {
+        uint32_t dst_x, dst_y, dst_width, dst_height;
+        uint32_t dst_offset, dst_pitch;
+        uint32_t datatype;
+        uint32_t src_frgd_clr, src_bkgd_clr;
+        int32_t sc_left, sc_top, sc_right, sc_bottom;
+    } hd;
 };
 
 
