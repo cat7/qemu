@@ -1427,15 +1427,48 @@ static unsigned r300_psc_dwords(unsigned type)
  * names a register this model does not keep. Under that test the census
  * changes exactly TWO draws in everything this project has ever
  * captured, and both of them are Leopard's multi-tap compositor draws.
+ *
+ * `guess` IS WHAT AN INLINE VERTEX HAS INSTEAD OF ARRAY BOUNDARIES: the
+ * whole vertex's dword count from a caller that could only split it four
+ * at a time, and zero from a caller whose sizes are real. A VBUF draw
+ * fetches element i from bound array i, so array i's dword count IS
+ * element i's and a disagreement means the registers are stale -- refuse,
+ * as above. An IMMD draw has no such thing, so the guard above refuses
+ * every inline vertex whose elements are not all FLOAT_4. Mac OS X 10.5's
+ * Aqua chrome strip is one: 0x2150/0x2154 = 0x01030001/0x23030201 names
+ * FOUR elements of 2, 4, 2 and 4 dwords into in[0..3], the guess splits
+ * the same twelve dwords 4, 4, 4 into in[0..2], the counts disagree, and
+ * in[3] -- which that draw's vertex program forwards to a texture
+ * coordinate -- reads the (0,0,0,1) default. One texel for every pixel,
+ * again. So when the caller has only a guess, and the elements the
+ * registers describe add up to EXACTLY the vertex in hand, the registers
+ * are the better answer and replace the guess wholesale.
+ *
+ * That the sum has to match is not a formality; it is the same test as
+ * before by another route. The all-zero reset value is refused twice over
+ * (no LAST_VEC, and its second element does not ascend past its first),
+ * and a stale layout left by another draw only survives if it describes a
+ * vertex of exactly this size out of elements this model keeps -- which
+ * is the most any register can claim.
+ *
+ * The added branch has its own census, over every register log this
+ * project holds -- 40 logs, 276835 draws, each decided by BOTH the
+ * shipped function and this one. It moves 209 draws, every one of them
+ * an inline draw in a Mac OS X 10.5 capture, and not one draw in any
+ * 10.4, OS 9 or saver capture: those hold 20599 inline draws for it to
+ * have moved, so the zero is a result and not an absence. Seeded the
+ * VBUF way -- the bound arrays, `guess` zero -- the two functions
+ * disagree on 0 of the 276835.
  */
 static void r300_stream_route(ATIR350State *s, unsigned *size,
-                              unsigned *count, R300VtxFmt *fmt)
+                              unsigned *count, unsigned guess,
+                              R300VtxFmt *fmt)
 {
     unsigned loc[R300_AOS_MAX], dw[R300_AOS_MAX], el[R300_AOS_MAX];
     unsigned ext[R300_AOS_MAX];
     uint32_t sgn_norm = s->regs[R300_VAP_PSC_SGN_NORM_CNTL >> 2];
-    unsigned n = 0, i, c, last = 0;
-    bool done = false, ident = true;
+    unsigned n = 0, i, c, last = 0, tot = 0;
+    bool done = false, ident = true, fits, derive = false;
 
     for (i = 0; i < 8 && !done; i++) {
         uint32_t v = s->regs[(R300_VAP_PROG_STREAM_CNTL_0 >> 2) + i];
@@ -1469,24 +1502,50 @@ static void r300_stream_route(ATIR350State *s, unsigned *size,
             }
         }
     }
-    if (!done || n != *count) {
+    if (!done) {
         return;
     }
+    /*
+     * `fits` is the shipped test, kept exactly: the element count and
+     * every element's dword count so far agree with the caller's sizes.
+     * It stops being true at the first disagreement and is never revived,
+     * so at any point in the loop it means what it meant before.
+     */
+    fits = (n == *count);
     for (i = 0; i < n; i++) {
         if ((el[i] & R300_PSC_DATA_TYPE_MASK) > R300_PSC_TYPE_FLT16_4) {
             /*
              * A reserved code: not even the number of dwords it eats is
-             * known, so nothing about this vertex can be believed. Say
-             * so and leave the caller's own sizes and the float read.
+             * known, so nothing about this vertex can be believed -- and
+             * `tot` cannot be completed either, so the derived route is
+             * out too. Say so and leave the caller's own sizes and the
+             * float read. Reported under the shipped condition, so a
+             * vertex these registers never described reports no more
+             * than it did before.
              */
-            ati_r350_note_gap(s, R350_GAP_VTX_DATA_TYPE,
-                              el[i] & R300_PSC_DATA_TYPE_MASK);
+            if (fits) {
+                ati_r350_note_gap(s, R350_GAP_VTX_DATA_TYPE,
+                                  el[i] & R300_PSC_DATA_TYPE_MASK);
+            }
             return;
         }
-        if (dw[i] != size[i]) {
-            /* not describing this vertex: keep what the caller derived */
+        tot += dw[i];
+        if (fits && dw[i] != size[i]) {
+            fits = false;
+        }
+    }
+    if (!fits) {
+        /*
+         * The caller's sizes are not what these registers describe. With
+         * array boundaries behind them that settles it -- keep them. With
+         * only a positional guess behind them, and a register layout that
+         * accounts for every dword of the vertex, the registers win and
+         * the guess is discarded.
+         */
+        if (!guess || tot != guess) {
             return;
         }
+        derive = true;
     }
     /*
      * PAST HERE THE REGISTERS DESCRIBE THIS VERTEX, so their element
@@ -1523,6 +1582,22 @@ static void r300_stream_route(ATIR350State *s, unsigned *size,
         fmt->meth[loc[i]] = (sgn_norm >> (2 * i)) & 3;
         fmt->swz[loc[i]] = ext[i];
         fmt->valid = true;
+    }
+    if (derive) {
+        /*
+         * The caller had a guess and these registers have a layout, so
+         * there is nothing of the guess to keep: every input register
+         * takes the dwords its own element carries, and one no element
+         * names takes none and reads the (0,0,0,1) default.
+         */
+        for (i = 0; i < R300_AOS_MAX; i++) {
+            size[i] = 0;
+        }
+        for (i = 0; i < n; i++) {
+            size[loc[i]] = dw[i];
+        }
+        *count = last + 1;
+        return;
     }
     if (ident) {
         return;                 /* nothing to move */
@@ -4869,14 +4944,17 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
 
     /*
      * Inline vertices have no array boundaries, so their dwords are
-     * taken four at a time in submission order, and then handed to the
-     * stream routing to be told which input register each of them is.
+     * taken four at a time in submission order -- a guess, and passed as
+     * one -- and then handed to the stream routing, which says which
+     * input register each of them is and replaces the guess outright
+     * wherever VAP_PROG_STREAM_CNTL describes a vertex of exactly this
+     * size.
      */
     for (i = 0; i < ARRAY_SIZE(d.attr_size) && i * 4 < vsize; i++) {
         d.attr_size[i] = MIN(vsize - i * 4, 4u);
     }
     d.attr_count = i;
-    r300_stream_route(s, d.attr_size, &d.attr_count, &fmt);
+    r300_stream_route(s, d.attr_size, &d.attr_count, vsize, &fmt);
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
@@ -5005,7 +5083,14 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
             d.attr_count = a + 1;
         }
     }
-    r300_stream_route(s, d.attr_size, &d.attr_count, &fmt);
+    /*
+     * Zero, not `vsize`: these sizes are the bound arrays themselves,
+     * and element i is fetched from array i, so registers that describe
+     * a different split of the same dwords are stale and not a better
+     * answer. (The whole packed-colour family reaches the fetch through
+     * here, and reaches it with the arrays and the registers agreeing.)
+     */
+    r300_stream_route(s, d.attr_size, &d.attr_count, 0, &fmt);
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
