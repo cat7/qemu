@@ -726,8 +726,14 @@ static void heathrow_get_gov_stat(Object *obj, Visitor *v, const char *name,
     case 4:
         value = gov.capped;
         break;
-    default:
+    case 5:
         value = gov.ignored;
+        break;
+    case 6:
+        value = gov.ungoverned;
+        break;
+    default:
+        value = gov.probes;
         break;
     }
     visit_type_uint64(v, name, &value, errp);
@@ -781,8 +787,10 @@ static void heathrow_class_init(ObjectClass *oc, const void *data)
                                   heathrow_get_calib_governor,
                                   heathrow_set_calib_governor);
     object_class_property_set_description(oc, "calibration-governor",
-        "Pace the CPU while a VIA T2 one-shot calibration window is open: "
-        "'on' (the default, 100 MIPS), 'off', or 'mips=<n>'");
+        "Pace the CPU while a VIA T2 one-shot calibration window is open and "
+        "the code running in it looks like a calibration spin: 'on' (the "
+        "default, 100 MIPS), 'off', 'mips=<n>', or 'warn-pct=<n>' for the "
+        "paced-share threshold of the runtime warning");
 
     object_class_property_add(oc, "calibration-governor-windows", "uint64",
                               heathrow_get_gov_stat, NULL, NULL,
@@ -802,6 +810,12 @@ static void heathrow_class_init(ObjectClass *oc, const void *data)
     object_class_property_add(oc, "calibration-governor-ignored", "uint64",
                               heathrow_get_gov_stat, NULL, NULL,
                               (void *)(uintptr_t)5);
+    object_class_property_add(oc, "calibration-governor-ungoverned", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)6);
+    object_class_property_add(oc, "calibration-governor-probes", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)7);
 }
 
 static const TypeInfo ppc_heathrow_machine_info = {

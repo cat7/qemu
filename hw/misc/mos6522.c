@@ -739,6 +739,8 @@ static HumanReadableText *qmp_x_query_via(Error **errp)
     g_string_append_printf(buf, "    windows=%" PRIu64 " re-arms=%" PRIu64
                                 " capped=%" PRIu64 " ignored=%" PRIu64 "\n",
                            gov.windows, gov.rearms, gov.capped, gov.ignored);
+    g_string_append_printf(buf, "    ungoverned=%" PRIu64 " probes=%" PRIu64
+                                "\n", gov.ungoverned, gov.probes);
     g_string_append_printf(buf, "    governed=%.3f ms slept=%.3f ms"
                                 " insns=%" PRIu64 "\n",
                            gov.governed_ns / 1.0e6, gov.slept_ns / 1.0e6,

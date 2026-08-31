@@ -1013,7 +1013,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * chained blocks do not come back here at all.
              */
             if (calib_governor_active()) {
-                calib_governor_account(cpu, tb->icount);
+                calib_governor_account(cpu, s.pc, tb->icount);
             }
 #endif
 

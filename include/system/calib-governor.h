@@ -14,11 +14,12 @@
 typedef struct CPUState CPUState;
 
 /*
- * True while a calibration window is open. Read on the hot path (once
- * per TCG execution-loop iteration, i.e. NOT once per translation block
- * when blocks are chained), so it is a plain global rather than anything
- * that needs a lock. Never write it directly: use calib_governor_arm()
- * and the internal close path.
+ * True while the vCPU is being paced -- i.e. a calibration window is
+ * open AND the spin detector has not (yet) ruled the window out. Read on
+ * the hot path (once per TCG execution-loop iteration, i.e. NOT once per
+ * translation block when blocks are chained), so it is a plain global
+ * rather than anything that needs a lock. Never write it directly: use
+ * calib_governor_arm() and the internal pace/unpace paths.
  */
 extern bool calib_gov_window_open;
 
@@ -39,9 +40,12 @@ bool calib_governor_arm(int64_t countdown_ns);
 
 /*
  * Accelerator side. Called from the TCG execution loop after each
- * translation block, but only while calib_governor_active().
+ * translation block, but only while calib_governor_active(). @pc is the
+ * address of the block that just ran: the spin detector profiles it, so
+ * a window that turns out to be running ordinary code stops being paced
+ * within a few blocks.
  */
-void calib_governor_account(CPUState *cpu, unsigned int n_insns);
+void calib_governor_account(CPUState *cpu, uint64_t pc, unsigned int n_insns);
 
 /*
  * Opt a board in. The T2 hook is generic to every mos6522, but the
@@ -60,7 +64,9 @@ typedef struct CalibGovStats {
     uint64_t rearms;        /* re-arms that extended an open window */
     uint64_t capped;        /* windows truncated by CALIB_GOV_MAX_WINDOW_NS */
     uint64_t ignored;       /* one-shots too long to be a calibration */
-    uint64_t governed_ns;   /* total real time spent inside windows */
+    uint64_t ungoverned;    /* epochs the spin detector refused to pace */
+    uint64_t probes;        /* pacing re-armed to look again mid-window */
+    uint64_t governed_ns;   /* total real time actually spent pacing */
     uint64_t insns;         /* guest instructions executed inside windows */
     uint64_t slept_ns;      /* real time spent asleep enforcing the cap */
 } CalibGovStats;

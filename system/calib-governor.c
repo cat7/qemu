@@ -60,12 +60,35 @@
  *    curr_cflags() goes back to its normal value and the guest resumes
  *    executing the ordinary chained copies.
  *
+ * 3. A SPIN DETECTOR, because the arm gate alone is not selective
+ *    enough. "T2 armed as a one-shot of 100 us to 2 ms" still admits
+ *    around a thousand ordinary Time Manager delays over a 9.2 boot,
+ *    and paced end to end those add up to a second or more of throttle
+ *    -- a full-session governor again, just a thinner one. But a
+ *    calibration spin does not merely arm a short timer, it *cycles a
+ *    handful of tiny blocks and nothing else* for the whole window,
+ *    while an ordinary delay runs ordinary varied code. So the window
+ *    is opened optimistically and then continuously checked against
+ *    that profile: over each CALIB_GOV_EPOCH_BLOCKS-block epoch, count
+ *    the distinct block addresses executed. A window that does not look
+ *    like a spin un-governs itself -- the pacing global is cleared,
+ *    which is exactly the live one_insn_per_tb toggle in curr_cflags()
+ *    (blocks are cflags-keyed, so the next exec-loop iteration simply
+ *    looks up the ordinary chained copy; nothing has to be flushed) --
+ *    but the window stays open, so a re-arm inside it starts looking
+ *    again. A window does not open *on* its spin, it opens on the arm's
+ *    own return path, so a contaminated sub-epoch first spends a
+ *    re-sync (see CALIB_GOV_RESYNC_TRIES) rather than condemning the
+ *    window.
+ *
  * A guest that arms a one-shot timer permanently must not throttle
  * forever, so a single window is capped at CALIB_GOV_MAX_WINDOW_NS and
  * every window is counted. The counters are readable as QOM properties
- * on the machine and in "info via"; if the governed total is more than
- * a few milliseconds across a boot, something is arming T2 constantly
- * and this has quietly become a full-session governor.
+ * on the machine and in "info via". A runtime warning fires if the
+ * *share of wall time actually spent pacing* stays above
+ * CALIB_GOV_WARN_PCT over a CALIB_GOV_WARN_SPAN_NS interval -- a rate,
+ * not a total, because a total large enough to be alarming is reached
+ * by any long enough session no matter how benign the pacing is.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  */
@@ -78,6 +101,15 @@
 #include "qapi/error.h"
 #include "hw/core/cpu.h"
 #include "system/calib-governor.h"
+
+/*
+ * Define CALIB_GOV_PROFILE to rebuild the per-window measurement
+ * instrumentation that the detector thresholds below were set from: it
+ * prints one CGPROF line per window with the distribution of "distinct
+ * blocks per 256-block epoch", and it makes the detector observe-only
+ * so the pacing being measured is the undetected baseline.
+ */
+#undef CALIB_GOV_PROFILE
 
 bool calib_gov_window_open;
 
@@ -154,8 +186,72 @@ bool calib_gov_window_open;
  */
 #define CALIB_GOV_MAX_WINDOW_NS (10 * 1000 * 1000)
 
-/* Warn once if the governed total gets implausibly large. */
-#define CALIB_GOV_WARN_TOTAL_NS (1000LL * 1000 * 1000)
+/*
+ * Spin detector, measured on a 9.2 boot with the per-window profiling
+ * above (doc/wingov-2026-08-31/REFINE-HANDOFF.md).
+ *
+ * The decision unit is a 256-block epoch and the statistic is the
+ * number of DISTINCT block addresses executed in it. The measurement is
+ * emphatic: the ROM's own calibration windows spend 97-98% of their
+ * epochs executing 4 distinct blocks (the TimeDBRA spin -- the 68K
+ * emulator's dbra fast path is a four-block cycle, not the single
+ * self-branching block that was assumed) or 7-8 (the TimeSCCDB /
+ * TimeSCSIDB spins, which touch MMIO each iteration), while 1700 of the
+ * boot's 2230 windows contain not one single epoch under 9 distinct
+ * blocks, and the median epoch of ordinary code overflows even a
+ * 64-entry table -- roughly 200 distinct blocks per 256 executed.
+ *
+ * So 12 sits with about 50% headroom over the widest genuine spin and
+ * an order of magnitude below ordinary code. Rejection is also cheap:
+ * varied code fills the table within a few dozen blocks, long before
+ * the epoch is up, and the window un-governs itself there and then.
+ *
+ * A "busiest block takes >= X% of the epoch" test was tried and
+ * rejected: the seven-block sibling spin puts its top block at 1/7 of
+ * the epoch, so any threshold loose enough to admit it admits ordinary
+ * code too. Distinct-block count alone does the whole job.
+ *
+ * RE-SYNC, and why the recovery cannot be a timer. A window does not
+ * begin with the spin: it begins with the arm's own return path and the
+ * handful of 68K instructions that set the loop counter up, which under
+ * the 68K emulator is a few dozen distinct PPC blocks. An epoch that
+ * straddles that setup fails no matter how clean the spin after it is --
+ * in the profiling boot the ROM's TimeDBRA window had 127 of its 129
+ * epochs at exactly 4 distinct blocks and the other two at 17-32 and 48,
+ * i.e. ~44 contaminating blocks concentrated at the edges. So a failed
+ * sub-epoch RE-SYNCS -- wipe the table, keep pacing, try again -- up to
+ * CALIB_GOV_RESYNC_TRIES times per arm, and the budget is restored by
+ * every clean full epoch. Ordinary code fails each retry within ~13
+ * blocks, so it still un-governs after ~120 blocks (~350 guest
+ * instructions, well under one pacing quantum: a rejected window never
+ * even reaches the accounting, let alone sleeps), while a genuine spin
+ * walks past its setup without losing any of the window.
+ *
+ * It has to work this way because gov_probe_timer cannot be relied on to
+ * do it. QEMU_CLOCK_REALTIME timers fire from the main loop, whose
+ * resolution is qemu_poll_ns()'s -- and on any host without ppoll()
+ * (macOS, where this is developed) that is g_poll() in whole
+ * milliseconds, rounded up. A 50 us probe therefore lands ~1 ms late,
+ * which is *after* the ~1.3 ms window it was meant to rescue. The probe
+ * timer is kept because it is exact on hosts that do have ppoll() and
+ * because it still covers long windows, but the detector must not depend
+ * on it, and the arm path re-probes synchronously for the same reason.
+ */
+#define CALIB_GOV_EPOCH_BLOCKS  256
+#define CALIB_GOV_PROBE_NS      (50 * 1000)
+#define CALIB_GOV_DET_SLOTS     32      /* > SPIN_DISTINCT: overflow rejects */
+#define CALIB_GOV_SPIN_DISTINCT 12
+#define CALIB_GOV_RESYNC_TRIES  8
+
+/*
+ * Warn when the share of wall time spent pacing stays high, not when a
+ * total is reached: over a long enough session any benign per-boot
+ * residual crosses any fixed total. Two buckets give a rolling span of
+ * between one and two times CALIB_GOV_WARN_BUCKET_NS.
+ */
+#define CALIB_GOV_WARN_BUCKET_NS (15LL * 1000 * 1000 * 1000)
+#define CALIB_GOV_WARN_SPAN_NS   (2 * CALIB_GOV_WARN_BUCKET_NS)
+#define CALIB_GOV_WARN_PCT       5
 
 #define CALIB_GOV_MAX_CPUS 16
 
@@ -186,11 +282,223 @@ static uint64_t gov_insn_per_quantum = MAX_QUANTUM_INSNS;
  * ever look at them while that flag is set.
  */
 static QEMUTimer *gov_close_timer;
+static QEMUTimer *gov_probe_timer;
+static bool gov_window_active;          /* a window is open (maybe unpaced) */
 static int64_t gov_window_open_ns;      /* host monotonic, window start */
 static int64_t gov_window_deadline_ns;  /* host monotonic, window end */
+static int64_t gov_paced_since_ns;      /* host monotonic, pacing armed at */
 static bool gov_warned;
+static unsigned gov_warn_pct = CALIB_GOV_WARN_PCT;
+
+/* Rolling pacing-share buckets for the warning. */
+static int64_t gov_warn_bucket_index = -1;
+static uint64_t gov_warn_bucket_ns[2];
+
+/*
+ * Spin detector state. Written only by the vCPU thread inside
+ * calib_governor_account(), i.e. only while pacing is armed; the probe
+ * timer resets it before arming, which the qatomic_set() of
+ * calib_gov_window_open publishes.
+ */
+typedef struct CalibGovDetSlot {
+    uint64_t pc;
+    uint32_t count;
+    uint32_t icount;
+} CalibGovDetSlot;
+
+static CalibGovDetSlot gov_det[CALIB_GOV_DET_SLOTS];
+static uint32_t gov_det_used;
+static uint32_t gov_det_blocks;
+static uint32_t gov_det_tries;          /* re-syncs left before giving up */
+static bool gov_det_overflow;
 
 static CalibGovStats gov_stats;
+
+/* ------------------------------------------------------------------ */
+/* TEMPORARY per-window execution profiling (step 1 measurement only). */
+/* ------------------------------------------------------------------ */
+#ifdef CALIB_GOV_PROFILE
+
+/*
+ * Profile each window the way the detector will actually see it: in
+ * fixed-size epochs, through a small fixed table that overflows on
+ * varied code. Per window we report the distribution of "distinct
+ * blocks per epoch" and "busiest block's share of the epoch", which is
+ * the statistic the detector thresholds are set from.
+ */
+#define CGP_EPOCH   256
+#define CGP_SLOTS   64           /* profiling table: wider than the detector */
+#define CGP_MAXEP   4096
+
+typedef struct CgpSlot {
+    uint64_t pc;
+    uint32_t count;
+    uint32_t icount;
+} CgpSlot;
+
+static CgpSlot cgp[CGP_SLOTS];
+static uint32_t cgp_used;
+static bool cgp_ovf;
+static uint32_t cgp_ep_blocks;
+
+/* per-epoch results for the current window */
+static uint16_t cgp_ep_distinct[CGP_MAXEP];
+static uint16_t cgp_ep_topcnt[CGP_MAXEP];
+static uint16_t cgp_ep_topic[CGP_MAXEP];
+static uint32_t cgp_neps;
+
+/* whole-window */
+static uint64_t cgp_blocks;
+static uint64_t cgp_insns;
+static int64_t cgp_countdown;
+static int64_t cgp_cd_min;
+static int64_t cgp_cd_max;
+static uint32_t cgp_arms;
+
+static void cgp_epoch_reset(void)
+{
+    memset(cgp, 0, sizeof(cgp));
+    cgp_used = 0;
+    cgp_ovf = false;
+    cgp_ep_blocks = 0;
+}
+
+static void cgp_reset(int64_t countdown_ns)
+{
+    cgp_epoch_reset();
+    cgp_neps = 0;
+    cgp_blocks = 0;
+    cgp_insns = 0;
+    cgp_countdown = countdown_ns;
+    cgp_cd_min = countdown_ns;
+    cgp_cd_max = countdown_ns;
+    cgp_arms = 1;
+}
+
+static void cgp_rearm(int64_t countdown_ns)
+{
+    cgp_arms++;
+    if (countdown_ns < cgp_cd_min) {
+        cgp_cd_min = countdown_ns;
+    }
+    if (countdown_ns > cgp_cd_max) {
+        cgp_cd_max = countdown_ns;
+    }
+}
+
+static void cgp_close_epoch(void)
+{
+    uint32_t i, top = 0, topic = 0;
+
+    for (i = 0; i < CGP_SLOTS; i++) {
+        if (cgp[i].count > top) {
+            top = cgp[i].count;
+            topic = cgp[i].icount;
+        }
+    }
+    if (cgp_neps < CGP_MAXEP) {
+        cgp_ep_distinct[cgp_neps] = cgp_ovf ? 0xffff : cgp_used;
+        cgp_ep_topcnt[cgp_neps] = top;
+        cgp_ep_topic[cgp_neps] = topic;
+        cgp_neps++;
+    }
+    cgp_epoch_reset();
+}
+
+static void cgp_record(uint64_t pc, unsigned int n_insns)
+{
+    uint32_t h = (uint32_t)((pc >> 2) * 2654435761u) % CGP_SLOTS;
+    uint32_t i;
+
+    cgp_blocks++;
+    cgp_insns += n_insns;
+    cgp_ep_blocks++;
+
+    if (!cgp_ovf) {
+        for (i = 0; i < CGP_SLOTS; i++) {
+            CgpSlot *s = &cgp[(h + i) % CGP_SLOTS];
+
+            if (s->count == 0) {
+                s->pc = pc;
+                s->count = 1;
+                s->icount = n_insns;
+                cgp_used++;
+                break;
+            }
+            if (s->pc == pc) {
+                s->count++;
+                s->icount = n_insns;
+                break;
+            }
+        }
+        if (i == CGP_SLOTS) {
+            cgp_ovf = true;
+        }
+    }
+
+    if (cgp_ep_blocks >= CGP_EPOCH) {
+        cgp_close_epoch();
+    }
+}
+
+static int cmp_u16(const void *a, const void *b)
+{
+    return (int)*(const uint16_t *)a - (int)*(const uint16_t *)b;
+}
+
+static void cgp_dump(uint64_t window, int64_t governed_ns)
+{
+    g_autofree uint16_t *d = NULL;
+    uint32_t i, n, pass4 = 0, pass8 = 0, pass16 = 0, pass32 = 0;
+    uint32_t rule = 0;
+
+    if (cgp_ep_blocks) {
+        cgp_close_epoch();
+    }
+    n = cgp_neps;
+    if (n == 0) {
+        return;
+    }
+    d = g_new(uint16_t, n);
+    for (i = 0; i < n; i++) {
+        uint16_t dist = cgp_ep_distinct[i];
+
+        d[i] = dist;
+        if (dist <= 4) {
+            pass4++;
+        }
+        if (dist <= 8) {
+            pass8++;
+        }
+        if (dist <= 16) {
+            pass16++;
+        }
+        if (dist <= 32) {
+            pass32++;
+        }
+        /* candidate rule: few distinct blocks, one of them dominant, tiny */
+        if (dist <= 12 && cgp_ep_topcnt[i] * 100 >= CGP_EPOCH * 15 &&
+            cgp_ep_topic[i] <= 16) {
+            rule++;
+        }
+    }
+    qsort(d, n, sizeof(*d), cmp_u16);
+
+    fprintf(stderr,
+            "CGPROF win=%" PRIu64 " cd_us=%" PRId64 " cdmin_us=%" PRId64
+            " cdmax_us=%" PRId64 " arms=%u gov_us=%" PRId64
+            " blocks=%" PRIu64 " insns=%" PRIu64
+            " eps=%u dmin=%u dp10=%u dmed=%u dp90=%u dmax=%u"
+            " le4=%0.3f le8=%0.3f le16=%0.3f le32=%0.3f rule=%0.3f\n",
+            window, cgp_countdown / 1000, cgp_cd_min / 1000,
+            cgp_cd_max / 1000, cgp_arms, governed_ns / 1000,
+            cgp_blocks, cgp_insns, n,
+            d[0], d[n / 10], d[n / 2], d[(n * 9) / 10], d[n - 1],
+            (double)pass4 / n, (double)pass8 / n, (double)pass16 / n,
+            (double)pass32 / n, (double)rule / n);
+    fflush(stderr);
+}
+#endif /* CALIB_GOV_PROFILE */
 
 static int64_t now_ns(void)
 {
@@ -212,29 +520,114 @@ static void calib_governor_kick_all(void)
     }
 }
 
-static void calib_governor_close(void)
+/*
+ * Fold @paced_ns of pacing at @now into the rolling share buckets and
+ * warn if the share over the rolling span is above the threshold. This
+ * measures what the warning claims to measure: a *rate* of throttling.
+ * The old absolute-total form fired on every long enough session --
+ * the benign ~1.7 s per boot this governor's own evidence recorded --
+ * and so said "full-session throttle" about its own normal behaviour.
+ */
+static void calib_governor_note_paced(int64_t now, int64_t paced_ns)
 {
-    int64_t governed;
+    int64_t bucket = now / CALIB_GOV_WARN_BUCKET_NS;
+    uint64_t sum;
+
+    if (bucket != gov_warn_bucket_index) {
+        if (bucket == gov_warn_bucket_index + 1) {
+            gov_warn_bucket_ns[1] = gov_warn_bucket_ns[0];
+        } else {
+            gov_warn_bucket_ns[1] = 0;
+        }
+        gov_warn_bucket_ns[0] = 0;
+        gov_warn_bucket_index = bucket;
+    }
+    gov_warn_bucket_ns[0] += (uint64_t)paced_ns;
+
+    if (gov_warned) {
+        return;
+    }
+    sum = gov_warn_bucket_ns[0] + gov_warn_bucket_ns[1];
+    if (sum * 100 > (uint64_t)CALIB_GOV_WARN_SPAN_NS * gov_warn_pct) {
+        gov_warned = true;
+        warn_report("calibration-governor: paced %" PRIu64 " ms of the last "
+                    "%" PRId64 " s (over %u%%) across %" PRIu64 " windows -- "
+                    "the guest is arming the VIA one-shot timer continuously "
+                    "and this has become a general throttle rather than a "
+                    "calibration window",
+                    sum / 1000000, CALIB_GOV_WARN_SPAN_NS / 1000000000,
+                    gov_warn_pct, qatomic_read(&gov_stats.windows));
+    }
+}
+
+/*
+ * Stop pacing. Clearing the global is all it takes: translation blocks
+ * are keyed on cflags, so the next cpu_exec_loop() iteration looks up
+ * the ordinary chained copy of whatever runs next, exactly as toggling
+ * one_insn_per_tb does at runtime. Nothing is flushed and no vCPU needs
+ * kicking -- the vCPU is between blocks by construction, since the
+ * non-chaining cflags are what brought it back here.
+ */
+static void calib_governor_unpace(int64_t now)
+{
+    int64_t paced;
 
     if (!qatomic_xchg(&calib_gov_window_open, false)) {
         return;
     }
 
-    governed = now_ns() - gov_window_open_ns;
-    if (governed < 0) {
-        governed = 0;
+    paced = now - gov_paced_since_ns;
+    if (paced < 0) {
+        paced = 0;
     }
-    qatomic_add(&gov_stats.governed_ns, (uint64_t)governed);
+    qatomic_add(&gov_stats.governed_ns, (uint64_t)paced);
+    calib_governor_note_paced(now, paced);
+}
 
-    if (!gov_warned &&
-        qatomic_read(&gov_stats.governed_ns) > CALIB_GOV_WARN_TOTAL_NS) {
-        gov_warned = true;
-        warn_report("calibration-governor: more than 1s of governed time "
-                    "across %" PRIu64 " windows -- the guest is arming the "
-                    "VIA one-shot timer continuously and this has become a "
-                    "full-session throttle",
-                    qatomic_read(&gov_stats.windows));
+/* Arm (or re-arm) pacing for the open window, starting a fresh epoch. */
+static void calib_governor_pace(int64_t now)
+{
+    int i;
+
+    for (i = 0; i < CALIB_GOV_MAX_CPUS; i++) {
+        gov_vcpu[i].quantum_insn = 0;
+        gov_vcpu[i].window_insn = 0;
+        gov_vcpu[i].window_start_ns = now;
     }
+    memset(gov_det, 0, sizeof(gov_det));
+    gov_det_used = 0;
+    gov_det_blocks = 0;
+    gov_det_tries = CALIB_GOV_RESYNC_TRIES;
+    gov_det_overflow = false;
+    gov_paced_since_ns = now;
+
+    qatomic_set(&calib_gov_window_open, true);
+
+    /*
+     * Break any translation-block chain that is already running, so the
+     * vCPU returns to the execution loop and picks up the non-chaining
+     * cflags. Without this the self-chained `dbra d0,self` block would
+     * simply never come back and the window would do nothing at all.
+     */
+    calib_governor_kick_all();
+}
+
+static void calib_governor_close(void)
+{
+    int64_t now = now_ns();
+
+    calib_governor_unpace(now);
+    if (!gov_window_active) {
+        return;
+    }
+    gov_window_active = false;
+    if (gov_probe_timer) {
+        timer_del(gov_probe_timer);
+    }
+
+#ifdef CALIB_GOV_PROFILE
+    cgp_dump(qatomic_read(&gov_stats.windows), now - gov_window_open_ns);
+#endif
 }
 
 static void calib_governor_close_timer_cb(void *opaque)
@@ -242,10 +635,29 @@ static void calib_governor_close_timer_cb(void *opaque)
     calib_governor_close();
 }
 
+/*
+ * Re-probe: the window is still open but the last epoch did not look
+ * like a spin. Turn pacing back on for one more epoch so that a spin
+ * starting part-way through the window is still caught.
+ */
+static void calib_governor_probe_timer_cb(void *opaque)
+{
+    int64_t now = now_ns();
+
+    if (!gov_window_active || qatomic_read(&calib_gov_window_open)) {
+        return;
+    }
+    if (now >= gov_window_deadline_ns) {
+        calib_governor_close();
+        return;
+    }
+    qatomic_inc(&gov_stats.probes);
+    calib_governor_pace(now);
+}
+
 bool calib_governor_arm(int64_t countdown_ns)
 {
     int64_t now, deadline;
-    int i;
 
     if (!gov_enabled) {
         return false;
@@ -268,7 +680,7 @@ bool calib_governor_arm(int64_t countdown_ns)
     now = now_ns();
     deadline = now + countdown_ns + CALIB_GOV_GUARD_NS;
 
-    if (qatomic_read(&calib_gov_window_open)) {
+    if (gov_window_active) {
         /*
          * Already inside a window: extend it rather than counting a new
          * one, but never past the hard cap measured from the ORIGINAL
@@ -278,6 +690,9 @@ bool calib_governor_arm(int64_t countdown_ns)
         int64_t hard = gov_window_open_ns + CALIB_GOV_MAX_WINDOW_NS;
 
         qatomic_inc(&gov_stats.rearms);
+#ifdef CALIB_GOV_PROFILE
+        cgp_rearm(countdown_ns);
+#endif
         if (deadline > hard) {
             deadline = hard;
             qatomic_inc(&gov_stats.capped);
@@ -288,39 +703,119 @@ bool calib_governor_arm(int64_t countdown_ns)
                          qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                          (deadline - now));
         }
+        /*
+         * A fresh arm is fresh evidence: re-probe at once rather than
+         * waiting out the probe interval, so the ROM's own arm-then-spin
+         * sequence is paced from its very first block even if the
+         * preceding window had already un-governed itself.
+         */
+        if (!qatomic_read(&calib_gov_window_open)) {
+            qatomic_inc(&gov_stats.probes);
+            calib_governor_pace(now);
+        }
         return true;
     }
 
-    /*
-     * Start every window with the pacing accumulators cleared: no
-     * credit banked from before the window can be spent inside it.
-     */
-    for (i = 0; i < CALIB_GOV_MAX_CPUS; i++) {
-        gov_vcpu[i].quantum_insn = 0;
-        gov_vcpu[i].window_insn = 0;
-        gov_vcpu[i].window_start_ns = now;
-    }
-
+    gov_window_active = true;
     gov_window_open_ns = now;
     gov_window_deadline_ns = deadline;
     qatomic_inc(&gov_stats.windows);
 
+#ifdef CALIB_GOV_PROFILE
+    cgp_reset(countdown_ns);
+#endif
+
     if (!gov_close_timer) {
         gov_close_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
                                        calib_governor_close_timer_cb, NULL);
+        gov_probe_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                       calib_governor_probe_timer_cb, NULL);
     }
     timer_mod_ns(gov_close_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + (deadline - now));
 
-    qatomic_set(&calib_gov_window_open, true);
+    /*
+     * Open optimistically: a genuine calibration spin starts on the
+     * window's very first block, so pacing has to be on before the guest
+     * runs anything. The detector in calib_governor_account() turns it
+     * straight back off if what actually executes is ordinary code.
+     */
+    calib_governor_pace(now);
+    return true;
+}
+
+/*
+ * Spin detector. Fold one executed block into the current epoch and,
+ * once the epoch is complete, say whether what ran looks like the ROM's
+ * dbra-to-self calibration spin: a tiny block, taken essentially
+ * exclusively, with almost no other block addresses beside it.
+ *
+ * Returns false only once the re-sync budget for this arm is spent. The
+ * table doubles as the distinct-block counter: exceeding the bound is
+ * already a verdict on the current sub-epoch, so ordinary code is judged
+ * within a few blocks rather than after a full epoch, and a sub-epoch
+ * contaminated by the window's pre-spin setup costs a re-sync rather
+ * than the whole window.
+ */
+static bool calib_governor_looks_like_spin(uint64_t pc, unsigned int n_insns)
+{
+    uint32_t h = (uint32_t)((pc >> 2) * 2654435761u) % CALIB_GOV_DET_SLOTS;
+    uint32_t i;
+
+    gov_det_blocks++;
+
+    if (!gov_det_overflow) {
+        for (i = 0; i < CALIB_GOV_DET_SLOTS; i++) {
+            CalibGovDetSlot *s = &gov_det[(h + i) % CALIB_GOV_DET_SLOTS];
+
+            if (s->count == 0) {
+                s->pc = pc;
+                s->count = 1;
+                s->icount = n_insns;
+                gov_det_used++;
+                break;
+            }
+            if (s->pc == pc) {
+                s->count++;
+                s->icount = n_insns;
+                break;
+            }
+        }
+        if (i == CALIB_GOV_DET_SLOTS) {
+            gov_det_overflow = true;
+        }
+    }
 
     /*
-     * Break any translation-block chain that is already running, so the
-     * vCPU returns to the execution loop and picks up the non-chaining
-     * cflags. Without this the self-chained `dbra d0,self` block would
-     * simply never come back and the window would do nothing at all.
+     * Too many distinct blocks: this sub-epoch is not a spin. Spend a
+     * re-sync and look again from here -- the contamination may just be
+     * the setup code this window opened on, with the spin behind it.
+     * Only when the budget is gone is the window itself given up.
      */
-    calib_governor_kick_all();
+    if (gov_det_overflow || gov_det_used > CALIB_GOV_SPIN_DISTINCT) {
+        if (gov_det_tries == 0) {
+            return false;
+        }
+        gov_det_tries--;
+        goto resync;
+    }
+    if (gov_det_blocks < CALIB_GOV_EPOCH_BLOCKS) {
+        return true;                    /* not enough evidence yet */
+    }
+
+    /*
+     * A full epoch inside the bound: this really is a spin, so restore
+     * the re-sync budget -- a later interrupt or the loop's exit path may
+     * contaminate an epoch without meaning the window has stopped being
+     * a calibration -- and start a fresh epoch.
+     */
+    gov_det_tries = CALIB_GOV_RESYNC_TRIES;
+
+resync:
+    memset(gov_det, 0, sizeof(gov_det));
+    gov_det_used = 0;
+    gov_det_blocks = 0;
+    gov_det_overflow = false;
     return true;
 }
 
@@ -339,7 +834,7 @@ static bool throttle_sleep(int64_t debt_ns)
     return true;
 }
 
-void calib_governor_account(CPUState *cpu, unsigned int n_insns)
+void calib_governor_account(CPUState *cpu, uint64_t pc, unsigned int n_insns)
 {
     CalibGovVCPU *v;
     int64_t now, due_ns, elapsed_ns;
@@ -349,6 +844,40 @@ void calib_governor_account(CPUState *cpu, unsigned int n_insns)
         return;
     }
     v = &gov_vcpu[index];
+
+#ifdef CALIB_GOV_PROFILE
+    cgp_record(pc, n_insns);
+#endif
+
+    if (unlikely(!calib_governor_looks_like_spin(pc, n_insns))) {
+#ifdef CALIB_GOV_PROFILE
+        /*
+         * Measurement build: observe the detector's verdict but do not
+         * act on it, so pacing behaviour stays identical to the
+         * un-detected baseline being measured against.
+         */
+        memset(gov_det, 0, sizeof(gov_det));
+        gov_det_used = 0;
+        gov_det_blocks = 0;
+        gov_det_tries = CALIB_GOV_RESYNC_TRIES;
+        gov_det_overflow = false;
+        qatomic_inc(&gov_stats.ungoverned);
+#else
+        /*
+         * Ordinary code inside the window. Stop pacing it right now; the
+         * window stays open and the probe timer will look again shortly,
+         * so a spin that starts later still gets caught.
+         */
+        qatomic_inc(&gov_stats.ungoverned);
+        calib_governor_unpace(now_ns());
+        if (gov_probe_timer) {
+            timer_mod_ns(gov_probe_timer,
+                         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                         CALIB_GOV_PROBE_NS);
+        }
+        return;
+#endif
+    }
 
     v->quantum_insn += n_insns;
     if (v->quantum_insn < gov_insn_per_quantum) {
@@ -402,6 +931,8 @@ void calib_governor_get_stats(CalibGovStats *out)
     out->rearms = qatomic_read(&gov_stats.rearms);
     out->capped = qatomic_read(&gov_stats.capped);
     out->ignored = qatomic_read(&gov_stats.ignored);
+    out->ungoverned = qatomic_read(&gov_stats.ungoverned);
+    out->probes = qatomic_read(&gov_stats.probes);
     out->governed_ns = qatomic_read(&gov_stats.governed_ns);
     out->insns = qatomic_read(&gov_stats.insns);
     out->slept_ns = qatomic_read(&gov_stats.slept_ns);
@@ -427,13 +958,15 @@ void calib_governor_default_on(void)
 
 bool calib_governor_configure(const char *value, Error **errp)
 {
-    gov_explicit = true;
     if (!g_strcmp0(value, "on")) {
+        gov_explicit = true;
         gov_enabled = true;
     } else if (!g_strcmp0(value, "off")) {
+        gov_explicit = true;
         gov_enabled = false;
         calib_governor_close();
     } else if (g_str_has_prefix(value, "mips=")) {
+        gov_explicit = true;
         const char *arg = value + strlen("mips=");
         uint64_t mips;
 
@@ -445,9 +978,25 @@ bool calib_governor_configure(const char *value, Error **errp)
         gov_enabled = true;
         gov_insn_per_second = mips * 1000 * 1000;
         calib_governor_recompute();
+    } else if (g_str_has_prefix(value, "warn-pct=")) {
+        /*
+         * Tuning knob for the "this has become a general throttle"
+         * warning, and the control that proves the warning can still
+         * fire: warn-pct=0 makes any pacing at all trip it.
+         */
+        const char *arg = value + strlen("warn-pct=");
+        uint64_t pct;
+
+        if (qemu_strtou64(arg, NULL, 10, &pct) < 0 || pct > 100) {
+            error_setg(errp, "calibration-governor: bad warn-pct value '%s'",
+                       arg);
+            return false;
+        }
+        gov_warn_pct = pct;
+        gov_warned = false;
     } else {
-        error_setg(errp, "calibration-governor: expected 'on', 'off' or "
-                         "'mips=<n>', got '%s'", value);
+        error_setg(errp, "calibration-governor: expected 'on', 'off', "
+                         "'mips=<n>' or 'warn-pct=<n>', got '%s'", value);
         return false;
     }
     return true;
