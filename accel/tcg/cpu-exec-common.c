@@ -23,6 +23,9 @@
 #include "qemu/plugin.h"
 #include "accel/tcg/cpu-loop.h"
 #include "internal-common.h"
+#ifndef CONFIG_USER_ONLY
+#include "system/calib-governor.h"
+#endif
 
 bool tcg_allowed;
 
@@ -54,6 +57,21 @@ uint32_t curr_cflags(CPUState *cpu)
     } else if (qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN)) {
         cflags |= CF_NO_GOTO_TB;
     }
+
+#ifndef CONFIG_USER_ONLY
+    /*
+     * While a calibration window is open, stop chaining so that every
+     * translation block returns to cpu_exec_loop() and can be paced.
+     * Both flags are needed: CF_NO_GOTO_TB alone still lets goto_ptr
+     * chain through the jump cache without ever coming back. See
+     * system/calib-governor.c. Off-window this is one predictable
+     * not-taken branch on a global that is false for the entire
+     * session apart from a few milliseconds of ROM calibration.
+     */
+    if (calib_governor_active()) {
+        cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR;
+    }
+#endif
 
     return cflags;
 }

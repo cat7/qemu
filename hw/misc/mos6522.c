@@ -36,6 +36,7 @@
 #include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "system/calib-governor.h"
 #include "trace.h"
 
 
@@ -588,6 +589,26 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->timers[1].latch = (s->timers[1].latch & 0xff) | (val << 8);
         s->ifr &= ~T2_INT;
         set_counter(s, &s->timers[1], s->timers[1].latch);
+        /*
+         * Writing T2C-H is the only way to arm T2, and in timed-interrupt
+         * mode (ACR bit 5 clear) it is a one-shot: the guest has just
+         * started a bounded wait it intends to notice the end of. Classic
+         * Mac OS ROMs use exactly this to time their TimeDBRA family of
+         * CPU-speed calibration spins, which are pure register loops that
+         * a modern host runs to completion long before ~1ms of real time
+         * has passed -- storing 0 and poisoning every later consumer that
+         * divides by them. Open a calibration window so the vCPU is paced
+         * to a period-plausible rate for the duration of this one-shot,
+         * and only for that: see system/calib-governor.c.
+         */
+        if (!(s->acr & T2MODE_COUNT)) {
+            int64_t countdown = s->timers[1].next_irq_time -
+                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            bool governed = calib_governor_arm(countdown);
+
+            trace_mos6522_t2_oneshot(s->timers[1].latch, s->ier, s->acr,
+                                     countdown, governed);
+        }
         break;
     case VIA_REG_SR:
         s->sr = val;
@@ -707,9 +728,21 @@ static int qmp_x_query_via_foreach(Object *obj, void *opaque)
 static HumanReadableText *qmp_x_query_via(Error **errp)
 {
     g_autoptr(GString) buf = g_string_new("");
+    g_autofree char *govcfg = calib_governor_get_config();
+    CalibGovStats gov;
 
     object_child_foreach_recursive(object_get_root(),
                                    qmp_x_query_via_foreach, buf);
+
+    calib_governor_get_stats(&gov);
+    g_string_append_printf(buf, "calibration-governor (%s):\n", govcfg);
+    g_string_append_printf(buf, "    windows=%" PRIu64 " re-arms=%" PRIu64
+                                " capped=%" PRIu64 " ignored=%" PRIu64 "\n",
+                           gov.windows, gov.rearms, gov.capped, gov.ignored);
+    g_string_append_printf(buf, "    governed=%.3f ms slept=%.3f ms"
+                                " insns=%" PRIu64 "\n",
+                           gov.governed_ns / 1.0e6, gov.slept_ns / 1.0e6,
+                           gov.insns);
 
     return human_readable_text_from_str(buf);
 }

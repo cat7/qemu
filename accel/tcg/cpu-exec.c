@@ -48,6 +48,7 @@
 #include "internal-common.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
+#include "system/calib-governor.h"
 #endif
 
 /* -icount align implementation. */
@@ -1000,6 +1001,21 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             }
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
+
+#ifndef CONFIG_USER_ONLY
+            /*
+             * Pace the guest while a calibration window is open. The
+             * window's cflags suppress all chaining, so exactly one
+             * translation block ran above and tb->icount is its guest
+             * instruction count. Off-window this is a load of a global
+             * that stays false for the whole session and a not-taken
+             * branch -- and it is not even on the hot path then, since
+             * chained blocks do not come back here at all.
+             */
+            if (calib_governor_active()) {
+                calib_governor_account(cpu, tb->icount);
+            }
+#endif
 
             /* Try to align the host and virtual clocks
                if the guest is in advance */

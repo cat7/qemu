@@ -53,6 +53,8 @@
 #include "qobject/qdict.h"
 #include "system/kvm.h"
 #include "system/reset.h"
+#include "system/calib-governor.h"
+#include "qapi/visitor.h"
 #include "kvm_ppc.h"
 
 #define MAX_IDE_BUS 2
@@ -274,6 +276,15 @@ static void ppc_heathrow_init(MachineState *machine)
     DriveInfo *dinfo, *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
     void *fw_cfg;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
+
+    /*
+     * This board's ROM is the one that needs the windowed calibration
+     * governor (see system/calib-governor.c), so this board is what
+     * turns it on -- the mos6522 hook itself is generic and stays inert
+     * on every other machine. An explicit calibration-governor= on the
+     * command line has already been applied and wins over this default.
+     */
+    calib_governor_default_on();
 
     /* init CPUs */
     for (i = 0; i < machine->smp.cpus; i++) {
@@ -681,6 +692,47 @@ static int heathrow_kvm_type(MachineState *machine, const char *arg)
     return 2;
 }
 
+static char *heathrow_get_calib_governor(Object *obj, Error **errp)
+{
+    return calib_governor_get_config();
+}
+
+static void heathrow_set_calib_governor(Object *obj, const char *value,
+                                        Error **errp)
+{
+    calib_governor_configure(value, errp);
+}
+
+static void heathrow_get_gov_stat(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    CalibGovStats gov;
+    uint64_t value;
+
+    calib_governor_get_stats(&gov);
+    switch ((uintptr_t)opaque) {
+    case 0:
+        value = gov.windows;
+        break;
+    case 1:
+        value = gov.governed_ns / 1000000;
+        break;
+    case 2:
+        value = gov.insns;
+        break;
+    case 3:
+        value = gov.slept_ns / 1000000;
+        break;
+    case 4:
+        value = gov.capped;
+        break;
+    default:
+        value = gov.ignored;
+        break;
+    }
+    visit_type_uint64(v, name, &value, errp);
+}
+
 static void heathrow_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -716,6 +768,40 @@ static void heathrow_class_init(ObjectClass *oc, const void *data)
      */
     mc->default_ram_size = 256 * MiB;
     fwc->get_dev_path = heathrow_fw_dev_path;
+
+    /*
+     * This machine's ROM calibrates its CPU-speed constants by spinning
+     * a pure register loop inside a ~1ms VIA T2 one-shot; unthrottled
+     * TCG finishes the loop first and stores zero, which later divides
+     * by zero in the ATAPI driver and Open Transport. The governor
+     * paces the vCPU only while such a one-shot is armed. On by default
+     * because the failure it prevents is a boot-blocker, not a nicety.
+     */
+    object_class_property_add_str(oc, "calibration-governor",
+                                  heathrow_get_calib_governor,
+                                  heathrow_set_calib_governor);
+    object_class_property_set_description(oc, "calibration-governor",
+        "Pace the CPU while a VIA T2 one-shot calibration window is open: "
+        "'on' (the default, 100 MIPS), 'off', or 'mips=<n>'");
+
+    object_class_property_add(oc, "calibration-governor-windows", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)0);
+    object_class_property_add(oc, "calibration-governor-governed-ms", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)1);
+    object_class_property_add(oc, "calibration-governor-insns", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)2);
+    object_class_property_add(oc, "calibration-governor-slept-ms", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)3);
+    object_class_property_add(oc, "calibration-governor-capped", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)4);
+    object_class_property_add(oc, "calibration-governor-ignored", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)5);
 }
 
 static const TypeInfo ppc_heathrow_machine_info = {

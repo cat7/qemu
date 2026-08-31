@@ -6,6 +6,7 @@ system_ss.add(files(
   'arch_init.c',
   'balloon.c',
   'bootdevice.c',
+  'calib-governor.c',
   'cpus.c',
   'cpu-timers.c',
   'dirtylimit.c',

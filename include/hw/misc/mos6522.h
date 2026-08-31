@@ -63,6 +63,9 @@
 /* Bits in ACR */
 #define T1MODE             0xc0    /* Timer 1 mode */
 #define T1MODE_CONT        0x40    /*  continuous interrupts */
+#define T2MODE             0x20    /* Timer 2 mode */
+#define T2MODE_COUNT       0x20    /*  count down pulses on PB6 (else: a
+                                    *  one-shot timed interrupt) */
 
 /* Bits in PCR */
 #define CB2_CTRL_MASK      0xe0
