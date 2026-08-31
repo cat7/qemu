@@ -4103,6 +4103,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_TEX_SWIZZLE]  = "texture component select",
     [R350_GAP_AOS_ARRAYS]   = "vertex arrays bound",
     [R350_GAP_VTE_FMT]      = "viewport vertex format",
+    [R350_GAP_VTX_DATA_TYPE] = "vertex element data type",
     [R350_GAP_FS_RGB_OP]    = "fragment colour opcode",
     [R350_GAP_FS_ALPHA_OP]  = "fragment alpha opcode",
     [R350_GAP_FS_TEX_OP]    = "fragment texture instruction",

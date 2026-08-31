@@ -1096,6 +1096,216 @@ static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v,
 }
 
 /*
+ * THE FORMAT EACH VERTEX ELEMENT ARRIVES IN, indexed by the vertex
+ * program INPUT REGISTER it feeds -- the same index `attr_size` uses.
+ *
+ * It is filled in by r300_stream_route() and ONLY when the stream
+ * control registers demonstrably describe the vertex in hand (see the
+ * MISFIT census in that function's comment). A zeroed R300VtxFmt means
+ * "the registers were not believed", and every reader then falls back
+ * to the raw-float read this model did before there was a decoder --
+ * which is exactly the behaviour of every capture and every guest that
+ * renders correctly today.
+ *
+ * It is deliberately NOT part of R300DrawState. That structure is
+ * written verbatim into a draw capture and its size is the capture
+ * format's version number, so growing it would invalidate every corpus
+ * on disk -- and a capture could not use these fields anyway, since it
+ * records vertices that have already been through the vertex stage.
+ */
+typedef struct R300VtxFmt {
+    bool valid;                     /* the registers described this vertex */
+    uint8_t type[R300_AOS_MAX];     /* DATA_TYPE */
+    uint16_t snf[R300_AOS_MAX];     /* SIGNED / NORMALIZE, as the reg bits */
+    uint8_t meth[R300_AOS_MAX];     /* VAP_PSC_SGN_NORM_CNTL method */
+    uint16_t swz[R300_AOS_MAX];     /* PROG_STREAM_CNTL_EXT half-word */
+} R300VtxFmt;
+
+/* the types this model fetches as plain IEEE floats, one per component */
+static bool r300_psc_is_float(unsigned type)
+{
+    return type <= R300_PSC_TYPE_FLOAT_4;
+}
+
+/*
+ * ONE FIXED-POINT COMPONENT, CONVERTED THE WAY THE VAP CONVERTS IT.
+ *
+ * `raw` is the field's bits, `bits` how many of them there are. SIGNED
+ * says whether they are two's complement and NORMALIZE whether the
+ * result is a fraction or a count, which is the table the register
+ * reference prints:
+ *
+ *   SIGNED NORMALIZE  range
+ *     0        0      0.0 .. 2^n - 1        (8-bit: 0 .. 255)
+ *     0        1      0.0 .. 1.0            (8-bit: value / 255)
+ *     1        0      -2^(n-1) .. 2^(n-1)-1
+ *     1        1      -1.0 .. 1.0, by one of three methods
+ *
+ * The three signed-normalised methods come from VAP_PSC_SGN_NORM_CNTL.
+ * SGN_NORM_NO_ZERO is written "(2 * value + 1)/2^n" in the reference
+ * but the two results the same sentence quotes -- -128 -> -255/255 and
+ * 127 -> 255/255 -- are the odd denominator, so 2^n - 1 is what is
+ * implemented here.
+ */
+static float r300_psc_fixed(uint32_t raw, unsigned bits, unsigned snf,
+                            unsigned meth)
+{
+    uint32_t full = (bits >= 32) ? 0xffffffffu : ((1u << bits) - 1u);
+    bool normalize = !!(snf & R300_PSC_NORMALIZE);
+    int32_t sv;
+
+    if (!(snf & R300_PSC_SIGNED)) {
+        return normalize ? (float)raw / (float)full : (float)raw;
+    }
+    sv = (int32_t)(raw << (32 - bits)) >> (32 - bits);
+    if (!normalize) {
+        return (float)sv;
+    }
+    switch (meth) {
+    case R300_PSC_SGN_NORM_NO_ZERO:
+        return (float)(2 * sv + 1) / (float)full;
+    case R300_PSC_SGN_NORM_ZERO_CLAMP:
+        return MAX((float)sv / (float)(full >> 1), -1.0f);
+    default:
+        return (float)sv / (float)(full >> 1);
+    }
+}
+
+/* SE5M10 with an exponent bias of 15, denormals included */
+static float r300_psc_f16(uint32_t h)
+{
+    uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1f;
+    uint32_t man = h & 0x3ff;
+
+    if (!exp) {
+        return sign ? -ldexpf((float)man, -24) : ldexpf((float)man, -24);
+    }
+    if (exp == 0x1f) {
+        return r300_f32(sign | 0x7f800000u | (man << 13));
+    }
+    return r300_f32(sign | ((exp + 127 - 15) << 23) | (man << 13));
+}
+
+/*
+ * ONE STREAM ELEMENT, UNPACKED.
+ *
+ * `dw` points at the element's first dword and `navail` is how many of
+ * them the vertex actually carries, so a short element cannot read past
+ * its own array. Components the element does not supply keep the
+ * (0,0,0,1) the input registers reset to, which is what lets a
+ * three-dword model-space position meet a 4x4 matrix and still pick up
+ * its translation column.
+ *
+ * The lane assignments are the register reference's, verbatim; the two
+ * that matter are BYTE (X = bits 7:0, W = bits 31:24) and D3DCOLOR,
+ * which is the same thing with X and Z exchanged.
+ */
+static void r300_psc_unpack(const R300VtxFmt *f, unsigned idx,
+                            const uint32_t *dw, unsigned navail,
+                            float out[4])
+{
+    unsigned type = f->type[idx], snf = f->snf[idx], meth = f->meth[idx];
+    uint32_t v = navail ? dw[0] : 0;
+    uint32_t v1 = navail > 1 ? dw[1] : 0;
+    unsigned c;
+
+    switch (type) {
+    case R300_PSC_TYPE_BYTE:
+        for (c = 0; c < 4; c++) {
+            out[c] = r300_psc_fixed((v >> (c * 8)) & 0xff, 8, snf, meth);
+        }
+        break;
+    case R300_PSC_TYPE_D3DCOLOR:
+        out[0] = r300_psc_fixed((v >> 16) & 0xff, 8, snf, meth);
+        out[1] = r300_psc_fixed((v >> 8) & 0xff, 8, snf, meth);
+        out[2] = r300_psc_fixed(v & 0xff, 8, snf, meth);
+        out[3] = r300_psc_fixed((v >> 24) & 0xff, 8, snf, meth);
+        break;
+    case R300_PSC_TYPE_SHORT_2:
+        out[0] = r300_psc_fixed(v & 0xffff, 16, snf, meth);
+        out[1] = r300_psc_fixed((v >> 16) & 0xffff, 16, snf, meth);
+        break;
+    case R300_PSC_TYPE_SHORT_4:
+        out[0] = r300_psc_fixed(v & 0xffff, 16, snf, meth);
+        out[1] = r300_psc_fixed((v >> 16) & 0xffff, 16, snf, meth);
+        out[2] = r300_psc_fixed(v1 & 0xffff, 16, snf, meth);
+        out[3] = r300_psc_fixed((v1 >> 16) & 0xffff, 16, snf, meth);
+        break;
+    case R300_PSC_TYPE_VECTOR_3_TTT:
+        out[0] = r300_psc_fixed(v & 0x3ff, 10, snf, meth);
+        out[1] = r300_psc_fixed((v >> 10) & 0x3ff, 10, snf, meth);
+        out[2] = r300_psc_fixed((v >> 20) & 0x3ff, 10, snf, meth);
+        break;
+    case R300_PSC_TYPE_VECTOR_3_EET:
+        out[0] = r300_psc_fixed(v & 0x7ff, 11, snf, meth);
+        out[1] = r300_psc_fixed((v >> 11) & 0x7ff, 11, snf, meth);
+        out[2] = r300_psc_fixed((v >> 22) & 0x3ff, 10, snf, meth);
+        break;
+    case R300_PSC_TYPE_FLT16_2:
+        out[0] = r300_psc_f16(v & 0xffff);
+        out[1] = r300_psc_f16(v >> 16);
+        break;
+    case R300_PSC_TYPE_FLT16_4:
+        out[0] = r300_psc_f16(v & 0xffff);
+        out[1] = r300_psc_f16(v >> 16);
+        out[2] = r300_psc_f16(v1 & 0xffff);
+        out[3] = r300_psc_f16(v1 >> 16);
+        break;
+    default:
+        /*
+         * A float type, or one r300_stream_route() already reported as
+         * a gap and left the format at FLOAT_1 for: read what is there.
+         */
+        for (c = 0; c < navail && c < 4; c++) {
+            out[c] = r300_f32(dw[c]);
+        }
+        break;
+    }
+}
+
+/*
+ * VAP_PROG_STREAM_CNTL_EXT's per-component select and write enable,
+ * applied to the four components the element produced.
+ *
+ * A write-enable of zero is the register's reset value and would
+ * discard the element entirely, which no driver programs deliberately;
+ * treated as "this word does not describe the element" and skipped, the
+ * same discipline the routing itself is held to. Everything else is
+ * taken literally -- and taken literally it is the whole of the
+ * BYTE-vs-D3DCOLOR question for a big-endian guest, because Mac OS X
+ * 10.5 pairs its one BYTE element with a W,Z,Y,X select.
+ */
+static void r300_psc_swizzle(const R300VtxFmt *f, unsigned idx,
+                             const float in[4], float out[4])
+{
+    unsigned w = f->swz[idx], ena, c;
+
+    ena = (w >> R300_PSC_WRITE_ENA_SHIFT) & R300_PSC_WRITE_ENA_MASK;
+    if (!ena) {
+        memcpy(out, in, sizeof(float) * 4);
+        return;
+    }
+    for (c = 0; c < 4; c++) {
+        unsigned sel = (w >> (c * R300_PSC_SWIZZLE_SHIFT)) &
+                       R300_PSC_SWIZZLE_MASK;
+
+        if (!(ena & (1u << c))) {
+            continue;           /* keeps the input register's default */
+        }
+        if (sel < 4) {
+            out[c] = in[sel];
+        } else if (sel == R300_PSC_SWIZZLE_FP_ZERO) {
+            out[c] = 0.0f;
+        } else if (sel == R300_PSC_SWIZZLE_FP_ONE) {
+            out[c] = 1.0f;
+        } else {
+            out[c] = in[c];     /* reserved; reported as a gap at setup */
+        }
+    }
+}
+
+/*
  * `pos` is how many of the leading dwords belong to the position
  * attribute, which is not always the whole vertex: an AOS draw's first
  * array can be three dwords of model-space x,y,z with the next array
@@ -1104,7 +1314,8 @@ static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v,
  * divide. Inline (IMMD) vertices have no array boundaries, so their
  * caller passes the whole vertex size and nothing changes for them.
  */
-static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
+static void r300_load_vtx(const R300DrawState *d, const R300VtxFmt *f,
+                          const uint32_t *dw,
                           unsigned vsize, unsigned pos, R300Vtx *v)
 {
     /* set by the caller for vertices that carry no colour of their own */
@@ -1112,6 +1323,25 @@ static void r300_load_vtx(const R300DrawState *d, const uint32_t *dw,
     v->y = pos >= 2 ? r300_f32(dw[1]) : 0.0f;
     v->z = pos >= 3 ? r300_f32(dw[2]) : 0.0f;
     v->w = pos >= 4 ? r300_f32(dw[3]) : 1.0f;
+    /*
+     * A position is four IEEE floats in every capture this project
+     * holds, but nothing says it has to be: the stream control word
+     * describes element 0 exactly as it describes the others. When it
+     * says the position is packed, unpack it -- and when it says
+     * anything else, or was not believed, the four reads above stand
+     * untouched.
+     */
+    if (f->valid && d->attr_count && !r300_psc_is_float(f->type[0])) {
+        float raw[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        float p[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+        r300_psc_unpack(f, 0, dw, d->attr_size[0], raw);
+        r300_psc_swizzle(f, 0, raw, p);
+        v->x = p[0];
+        v->y = p[1];
+        v->z = p[2];
+        v->w = p[3];
+    }
     v->r = d->flat_r;
     v->g = d->flat_g;
     v->b = d->flat_b;
@@ -1199,14 +1429,17 @@ static unsigned r300_psc_dwords(unsigned type)
  * captured, and both of them are Leopard's multi-tap compositor draws.
  */
 static void r300_stream_route(ATIR350State *s, unsigned *size,
-                              unsigned *count)
+                              unsigned *count, R300VtxFmt *fmt)
 {
-    unsigned loc[R300_AOS_MAX], dw[R300_AOS_MAX];
-    unsigned n = 0, i, last = 0;
+    unsigned loc[R300_AOS_MAX], dw[R300_AOS_MAX], el[R300_AOS_MAX];
+    unsigned ext[R300_AOS_MAX];
+    uint32_t sgn_norm = s->regs[R300_VAP_PSC_SGN_NORM_CNTL >> 2];
+    unsigned n = 0, i, c, last = 0;
     bool done = false, ident = true;
 
     for (i = 0; i < 8 && !done; i++) {
         uint32_t v = s->regs[(R300_VAP_PROG_STREAM_CNTL_0 >> 2) + i];
+        uint32_t x = s->regs[(R300_VAP_PROG_STREAM_CNTL_EXT_0 >> 2) + i];
         unsigned half;
 
         for (half = 0; half < 2; half++) {
@@ -1219,6 +1452,8 @@ static void r300_stream_route(ATIR350State *s, unsigned *size,
                 R300_PSC_SKIP_DWORDS_MASK) {
                 return;         /* a gap inside the vertex, not modelled */
             }
+            el[n] = w;
+            ext[n] = (x >> (half * 16)) & 0xffff;
             dw[n] = r300_psc_dwords(w & R300_PSC_DATA_TYPE_MASK);
             loc[n] = (w >> R300_PSC_DST_VEC_LOC_SHIFT) &
                      R300_PSC_DST_VEC_LOC_MASK;
@@ -1234,14 +1469,63 @@ static void r300_stream_route(ATIR350State *s, unsigned *size,
             }
         }
     }
-    if (!done || ident || n != *count) {
+    if (!done || n != *count) {
         return;
     }
     for (i = 0; i < n; i++) {
+        if ((el[i] & R300_PSC_DATA_TYPE_MASK) > R300_PSC_TYPE_FLT16_4) {
+            /*
+             * A reserved code: not even the number of dwords it eats is
+             * known, so nothing about this vertex can be believed. Say
+             * so and leave the caller's own sizes and the float read.
+             */
+            ati_r350_note_gap(s, R350_GAP_VTX_DATA_TYPE,
+                              el[i] & R300_PSC_DATA_TYPE_MASK);
+            return;
+        }
         if (dw[i] != size[i]) {
             /* not describing this vertex: keep what the caller derived */
             return;
         }
+    }
+    /*
+     * PAST HERE THE REGISTERS DESCRIBE THIS VERTEX, so their element
+     * FORMATS can be believed even when the destinations are the
+     * identity and there is no routing left to do. This is the only
+     * reason a draw whose stream control is the identity now reads
+     * these registers at all: without it a packed one-dword colour
+     * (Mac OS X 10.5's compositor sends exactly one, and sends it to
+     * in[1], its own index) would still be read as an IEEE float.
+     */
+    for (i = 0; i < n; i++) {
+        unsigned type = el[i] & R300_PSC_DATA_TYPE_MASK;
+
+        if (type == R300_PSC_TYPE_FLOAT_8) {
+            /*
+             * FLOAT_8 feeds TWO consecutive input registers from one
+             * element and this model routes one. Fall back to the float
+             * read for the register it does route, and say so.
+             */
+            ati_r350_note_gap(s, R350_GAP_VTX_DATA_TYPE, type);
+            type = R300_PSC_TYPE_FLOAT_1;
+        }
+        for (c = 0; c < 4; c++) {
+            unsigned sel = (ext[i] >> (c * R300_PSC_SWIZZLE_SHIFT)) &
+                           R300_PSC_SWIZZLE_MASK;
+
+            if (sel > R300_PSC_SWIZZLE_FP_ONE &&
+                ((ext[i] >> R300_PSC_WRITE_ENA_SHIFT) & (1u << c))) {
+                ati_r350_note_gap(s, R350_GAP_VTX_DATA_TYPE, 0x10 | sel);
+            }
+        }
+        fmt->type[loc[i]] = type;
+        fmt->snf[loc[i]] = el[i] & (R300_PSC_SIGNED | R300_PSC_NORMALIZE);
+        fmt->meth[loc[i]] = (sgn_norm >> (2 * i)) & 3;
+        fmt->swz[loc[i]] = ext[i];
+        fmt->valid = true;
+    }
+    if (ident) {
+        return;                 /* nothing to move */
     }
     for (i = n; i-- > 0; ) {
         size[loc[i]] = size[i];
@@ -1261,9 +1545,23 @@ static void r300_stream_route(ATIR350State *s, unsigned *size,
  * vertex does not supply keep the (0,0,0,1) default, which is what lets
  * a three-dword model-space position meet a 4x4 matrix and still pick up
  * its translation column.
+ *
+ * THE ELEMENT IS NOT ALWAYS FOUR IEEE FLOATS, and reading it as though
+ * it were is what row 0-RED-STATE was. VAP_PROG_STREAM_CNTL's DATA_TYPE
+ * says how each element is packed, and r300_psc_dwords() has always
+ * known that five of the codes fit a whole vector in ONE dword -- it
+ * just used that to SIZE the element and then read the dword as a
+ * float anyway. Mac OS X 10.5's compositor sends its per-vertex colour
+ * as a normalised BYTE quad, so a perfectly ordinary grey 0x666666ff
+ * arrived as (2.7e23, 0, 0, 1): the huge positive component saturates
+ * the fragment stage's multiply-add to RED (the pressed Dock icon) and
+ * a top bit set makes it hugely negative instead, which clamps to
+ * BLACK (a tooltip's text). `f` carries the formats and is empty --
+ * every element a plain float -- for every draw whose stream control
+ * registers did not describe the vertex in hand.
  */
-static void r300_vs_input(const R300DrawState *d, const uint32_t *dw,
-                          unsigned idx, float out[4])
+static void r300_vs_input(const R300DrawState *d, const R300VtxFmt *f,
+                          const uint32_t *dw, unsigned idx, float out[4])
 {
     unsigned off = 0, c;
 
@@ -1275,8 +1573,17 @@ static void r300_vs_input(const R300DrawState *d, const uint32_t *dw,
     for (c = 0; c < idx; c++) {
         off += d->attr_size[c];
     }
-    for (c = 0; c < d->attr_size[idx] && c < 4; c++) {
-        out[c] = r300_f32(dw[off + c]);
+    if (!f->valid) {
+        for (c = 0; c < d->attr_size[idx] && c < 4; c++) {
+            out[c] = r300_f32(dw[off + c]);
+        }
+        return;
+    }
+    {
+        float raw[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+        r300_psc_unpack(f, idx, dw + off, d->attr_size[idx], raw);
+        r300_psc_swizzle(f, idx, raw, out);
     }
 }
 
@@ -1452,7 +1759,8 @@ static void r300_texcoord_src(const R300DrawState *d, unsigned vsize,
  * every pixel of a band, so each band came out one flat colour and the
  * picture became horizontal stripes.
  */
-static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
+static void r300_attr_texcoord(const R300DrawState *d, const R300VtxFmt *f,
+                               const uint32_t *dw,
                                const R300TexSrc *ts, R300Vtx *v)
 {
     float c[4];
@@ -1474,7 +1782,7 @@ static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
             float in[4];
             unsigned r;
 
-            r300_vs_input(d, dw, ts[k].tm.in, in);
+            r300_vs_input(d, f, dw, ts[k].tm.in, in);
             for (r = 0; r < 4; r++) {
                 c[r] = m[r][0] * in[0] + m[r][1] * in[1] +
                        m[r][2] * in[2] + m[r][3] * in[3];
@@ -1486,7 +1794,7 @@ static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
             d->attr_size[a] < 2) {
             continue;
         }
-        r300_vs_input(d, dw, (unsigned)a, c);
+        r300_vs_input(d, f, dw, (unsigned)a, c);
         r300_vs_texcoord(d, v, k, c);
     }
 }
@@ -1500,8 +1808,8 @@ static void r300_attr_texcoord(const R300DrawState *d, const uint32_t *dw,
  * too -- one texel of a whole texture -- while a guest whose attribute
  * is already in texels prints the two the same and large.
  */
-static void r300_trace_texcoord(const R300DrawState *d, const uint32_t *dw,
-                                const R300Vtx *v)
+static void r300_trace_texcoord(const R300DrawState *d, const R300VtxFmt *f,
+                                const uint32_t *dw, const R300Vtx *v)
 {
     float c[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
@@ -1509,7 +1817,7 @@ static void r300_trace_texcoord(const R300DrawState *d, const uint32_t *dw,
         return;
     }
     if (d->tex_attr[0] >= 0 && (unsigned)d->tex_attr[0] < d->attr_count) {
-        r300_vs_input(d, dw, (unsigned)d->tex_attr[0], c);
+        r300_vs_input(d, f, dw, (unsigned)d->tex_attr[0], c);
     }
     trace_ati_r350_3d_texcoord(d->tex_attr[0], d->tex[0].w, d->tex[0].h,
                                (int32_t)(c[0] * 1000), (int32_t)(c[1] * 1000),
@@ -1568,7 +1876,8 @@ static void r300_vs_color1(R300Vtx *v, const float c[4])
  * program.
  */
 static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
-                        const uint32_t *dw, R300Vtx *v, float clip[4])
+                        const R300VtxFmt *f, const uint32_t *dw,
+                        R300Vtx *v, float clip[4])
 {
     R300PvsRegs r;
     R300PvsGaps g;
@@ -1583,7 +1892,7 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
          * if it emits one at all, is an attribute forwarded unchanged.
          */
         if (src >= 0 && r300_vs_has_color(d)) {
-            r300_vs_input(d, dw, src, col);
+            r300_vs_input(d, f, dw, src, col);
             r300_vs_color(v, col);
         }
         return false;
@@ -1594,7 +1903,7 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
         r.in[a][3] = 1.0f;
     }
     for (a = 0; a < d->attr_count; a++) {
-        r300_vs_input(d, dw, a, r.in[a]);
+        r300_vs_input(d, f, dw, a, r.in[a]);
     }
     memset(&g, 0, sizeof(g));
     r300_pvs_run(&d->vs, &r, &g);
@@ -4530,6 +4839,7 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
     unsigned nvtx = (vf >> 16) & 0xffff;
     unsigned vsize = s->regs[R300_VAP_VTX_SIZE >> 2] & 0x7f;
     R300DrawState d;
+    R300VtxFmt fmt = { 0 };
     unsigned i;
 
     if (walk != 3 || !nvtx) {
@@ -4566,7 +4876,7 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
         d.attr_size[i] = MIN(vsize - i * 4, 4u);
     }
     d.attr_count = i;
-    r300_stream_route(s, d.attr_size, &d.attr_count);
+    r300_stream_route(s, d.attr_size, &d.attr_count, &fmt);
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
@@ -4577,12 +4887,12 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
             const uint32_t *vd = &dw[1 + i * vsize];
             float clip[4];
 
-            r300_load_vtx(&d, vd, vsize, vsize, &vb[i]);
-            r300_attr_texcoord(&d, vd, ts, &vb[i]);
+            r300_load_vtx(&d, &fmt, vd, vsize, vsize, &vb[i]);
+            r300_attr_texcoord(&d, &fmt, vd, ts, &vb[i]);
             if (i == 0 && d.textured) {
-                r300_trace_texcoord(&d, vd, &vb[i]);
+                r300_trace_texcoord(&d, &fmt, vd, &vb[i]);
             }
-            if (d.vs_run && r300_vs_vtx(s, &d, vd, &vb[i], clip)) {
+            if (d.vs_run && r300_vs_vtx(s, &d, &fmt, vd, &vb[i], clip)) {
                 r300_xform_vtx(&d, &vb[i], clip);
             } else {
                 r300_xform_vtx(&d, &vb[i], NULL);
@@ -4645,6 +4955,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
     unsigned vsize = 0;
     unsigned swap = s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_VC_SWAP;
     R300DrawState d;
+    R300VtxFmt fmt = { 0 };
     unsigned i, a, c;
 
     if (narr > R300_AOS_MAX) {
@@ -4694,7 +5005,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
             d.attr_count = a + 1;
         }
     }
-    r300_stream_route(s, d.attr_size, &d.attr_count);
+    r300_stream_route(s, d.attr_size, &d.attr_count, &fmt);
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
@@ -4739,15 +5050,15 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                         n > base + 3 ? dw[base + 3] : 0);
                 }
             }
-            r300_load_vtx(&d, dw, vsize, size[0], &vb[i]);
-            r300_attr_texcoord(&d, dw, ts, &vb[i]);
+            r300_load_vtx(&d, &fmt, dw, vsize, size[0], &vb[i]);
+            r300_attr_texcoord(&d, &fmt, dw, ts, &vb[i]);
             if (i == 0 && d.textured) {
-                r300_trace_texcoord(&d, dw, &vb[i]);
+                r300_trace_texcoord(&d, &fmt, dw, &vb[i]);
             }
             if (d.vs_run) {
                 float clip[4];
 
-                if (r300_vs_vtx(s, &d, dw, &vb[i], clip)) {
+                if (r300_vs_vtx(s, &d, &fmt, dw, &vb[i], clip)) {
                     r300_xform_vtx(&d, &vb[i], clip);
                     continue;
                 }

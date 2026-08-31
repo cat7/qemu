@@ -94,6 +94,15 @@ typedef enum ATIR350GapKind {
     R350_GAP_TEX_SWIZZLE,    /* TX_FORMAT1 component select not modelled */
     R350_GAP_AOS_ARRAYS,     /* more vertex arrays bound than we fetch */
     R350_GAP_VTE_FMT,        /* VAP_VTE_CNTL vertex format bit not modelled */
+    /*
+     * VAP_PROG_STREAM_CNTL element format not unpacked. Indexed by the
+     * DATA_TYPE code itself for a type this model cannot fetch, and by
+     * 0x10 | code for a VAP_PROG_STREAM_CNTL_EXT swizzle select it does
+     * not know. Either way the element falls back to the raw-float read
+     * that predates the format decoder, so the tally is the only place
+     * the guest's request is visible.
+     */
+    R350_GAP_VTX_DATA_TYPE,
     R350_GAP_FS_RGB_OP,      /* US colour-side opcode not implemented */
     R350_GAP_FS_ALPHA_OP,    /* US alpha-side opcode not implemented */
     R350_GAP_FS_TEX_OP,      /* US texture instruction not implemented */

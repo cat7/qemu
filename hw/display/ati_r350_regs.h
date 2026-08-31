@@ -1148,8 +1148,8 @@
  * vertex whose second element lands in in[2].
  *
  * Field positions are R5xx_Accel.txt's, read directly (DATA_TYPE 3:0,
- * SKIP_DWORDS 7:4, DST_VEC_LOC 12:8, LAST_VEC 13, and the same four
- * sixteen bits higher for element 1).
+ * SKIP_DWORDS 7:4, DST_VEC_LOC 12:8, LAST_VEC 13, SIGNED 14,
+ * NORMALIZE 15, and the same six sixteen bits higher for element 1).
  */
 #define R300_VAP_PROG_STREAM_CNTL_0   0x2150
 #define R300_PSC_DATA_TYPE_MASK       0xf
@@ -1158,6 +1158,65 @@
 #define R300_PSC_DST_VEC_LOC_SHIFT    8
 #define R300_PSC_DST_VEC_LOC_MASK     0x1f
 #define R300_PSC_LAST_VEC             (1u << 13)
+#define R300_PSC_SIGNED               (1u << 14)
+#define R300_PSC_NORMALIZE            (1u << 15)
+
+/*
+ * DATA_TYPE, the format one stream element arrives in
+ * (R3xx_3D_Registers.pdf VAP_PROG_STREAM_CNTL_[0-7], and identically in
+ * R5xx_Acceleration_v1.5 which additionally documents codes 10-12;
+ * Mesa's src/gallium/drivers/r300/r300_reg.h names all thirteen the
+ * same way). The starred types -- everything from BYTE to VECTOR_3_EET
+ * -- are FIXED point and take their range from SIGNED and NORMALIZE.
+ *
+ * BYTE and D3DCOLOR differ in exactly one thing, the lane the X
+ * component comes out of: BYTE takes X from bits 7:0, D3DCOLOR from
+ * bits 23:16 (i.e. it swaps X and Z, which is what makes a D3D
+ * 0xAARRGGBB word read as r,g,b,a).
+ */
+#define R300_PSC_TYPE_FLOAT_1         0
+#define R300_PSC_TYPE_FLOAT_2         1
+#define R300_PSC_TYPE_FLOAT_3         2
+#define R300_PSC_TYPE_FLOAT_4         3
+#define R300_PSC_TYPE_BYTE            4
+#define R300_PSC_TYPE_D3DCOLOR        5
+#define R300_PSC_TYPE_SHORT_2         6
+#define R300_PSC_TYPE_SHORT_4         7
+#define R300_PSC_TYPE_VECTOR_3_TTT    8
+#define R300_PSC_TYPE_VECTOR_3_EET    9
+#define R300_PSC_TYPE_FLOAT_8         10
+#define R300_PSC_TYPE_FLT16_2         11
+#define R300_PSC_TYPE_FLT16_4         12
+
+/*
+ * VAP_PSC_SGN_NORM_CNTL -- for SIGNED and NORMALIZE together, which of
+ * the three ways of mapping a two's-complement fixed value onto
+ * -1.0..1.0 the element uses. Two bits per element, sixteen elements.
+ */
+#define R300_VAP_PSC_SGN_NORM_CNTL    0x21dc
+#define R300_PSC_SGN_NORM_ZERO        0
+#define R300_PSC_SGN_NORM_ZERO_CLAMP  1
+#define R300_PSC_SGN_NORM_NO_ZERO     2
+
+/*
+ * VAP_PROG_STREAM_CNTL_EXT_[0-7] -- the same two-elements-per-register
+ * walk as VAP_PROG_STREAM_CNTL, carrying each element's component
+ * SWIZZLE and its four-bit write enable. The select codes are
+ * 0-3 = X,Y,Z,W of the fetched element and 4,5 = the constants 0.0 and
+ * 1.0; 6 and 7 are reserved. A component whose write-enable bit is
+ * clear keeps the input register's (0,0,0,1) default.
+ *
+ * Mac OS X 10.5 programs W,Z,Y,X here for the one-dword colour its
+ * compositor sends, which is how a big-endian guest's R,G,B,A word
+ * survives the vertex fetcher's little-endian byte lanes.
+ */
+#define R300_VAP_PROG_STREAM_CNTL_EXT_0 0x21e0
+#define R300_PSC_SWIZZLE_SHIFT        3
+#define R300_PSC_SWIZZLE_MASK         0x7
+#define R300_PSC_SWIZZLE_FP_ZERO      4
+#define R300_PSC_SWIZZLE_FP_ONE       5
+#define R300_PSC_WRITE_ENA_SHIFT      12
+#define R300_PSC_WRITE_ENA_MASK       0xf
 #define R300_SE_VPORT_XSCALE          0x1d98
 #define R300_SC_SCISSOR0              0x43e0
 #define R300_SC_SCISSOR1              0x43e4
