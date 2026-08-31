@@ -45,6 +45,7 @@ static const char *mos6522_reg_names[MOS6522_NUM_REGS] = {
     "T2CL", "T2CH", "SR", "ACR", "PCR", "IFR", "IER", "ANH"
 };
 
+
 /* XXX: implement all timer modes */
 
 static void mos6522_timer1_update(MOS6522State *s, MOS6522Timer *ti,
@@ -473,6 +474,12 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         mos6522_update_irq(s);
         break;
     case VIA_REG_T1CH:
+        /*
+         * Reading the counter is the last thing pe_run_clock_test()
+         * does, so the measured loop is over: end any CPU-speed probe
+         * window now rather than pacing whatever runs next.
+         */
+        calib_governor_end_cpu_probe();
         val = get_counter(s, &s->timers[0]) >> 8;
         mos6522_update_irq(s);
         break;
@@ -567,6 +574,20 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->timers[0].latch = (s->timers[0].latch & 0xff) | (val << 8);
         s->ifr &= ~T1_INT;
         set_counter(s, &s->timers[0], s->timers[0].latch);
+        /*
+         * Loading T1's counter with 0xffff -- the full range, so the
+         * timer cannot expire during whatever comes next -- is the
+         * signature of XNU's pe_run_clock_test(), which uses T1 purely
+         * as a stopwatch across a fixed 10,000,000-CPU-clock loop and
+         * derives the CPU PLL multiplier from how long that took. Under
+         * TCG the loop finishes ~10x too fast; open a CPU-speed probe
+         * window so it is paced to this board's real clock. See
+         * system/calib-governor.c.
+         */
+        if (s->timers[0].latch == 0xffff) {
+            trace_mos6522_t1_cpu_probe(s->acr,
+                                       calib_governor_arm_cpu_probe());
+        }
         break;
     case VIA_REG_T1LL:
         s->timers[0].latch = (s->timers[0].latch & 0xff00) | val;
@@ -736,9 +757,11 @@ static HumanReadableText *qmp_x_query_via(Error **errp)
 
     calib_governor_get_stats(&gov);
     g_string_append_printf(buf, "calibration-governor (%s):\n", govcfg);
-    g_string_append_printf(buf, "    windows=%" PRIu64 " re-arms=%" PRIu64
+    g_string_append_printf(buf, "    windows=%" PRIu64 " (cpu-probe %" PRIu64
+                                ") re-arms=%" PRIu64
                                 " capped=%" PRIu64 " ignored=%" PRIu64 "\n",
-                           gov.windows, gov.rearms, gov.capped, gov.ignored);
+                           gov.windows, gov.cpu_probes, gov.rearms, gov.capped,
+                           gov.ignored);
     g_string_append_printf(buf, "    ungoverned=%" PRIu64 " probes=%" PRIu64
                                 "\n", gov.ungoverned, gov.probes);
     g_string_append_printf(buf, "    governed=%.3f ms slept=%.3f ms"

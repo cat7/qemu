@@ -187,6 +187,17 @@ bool calib_gov_window_open;
 #define CALIB_GOV_MAX_WINDOW_NS (10 * 1000 * 1000)
 
 /*
+ * A CPU-speed probe window has to outlast the whole 10M-instruction loop
+ * at the paced rate (~33ms at 300MHz), with room for a slow host, so it
+ * gets its own much larger cap. It normally ends long before this: the
+ * guest's own read of the T1 counter closes it exactly.
+ */
+#define CALIB_GOV_CPU_PROBE_MAX_NS (250 * 1000 * 1000)
+
+/* Give up on the idiom if it is being armed far more than a boot needs. */
+#define CALIB_GOV_CPU_PROBE_MAX_WINDOWS 256
+
+/*
  * Spin detector, measured on a 9.2 boot with the per-window profiling
  * above (doc/wingov-2026-08-31/REFINE-HANDOFF.md).
  *
@@ -273,6 +284,30 @@ static bool gov_enabled;
 static bool gov_explicit;
 static uint64_t gov_insn_per_second = 100 * 1000 * 1000;
 static uint64_t gov_insn_per_quantum = MAX_QUANTUM_INSNS;
+
+/*
+ * Second calibration idiom, same disease, different consumer: XNU's
+ * pe_run_clock_test() (pexpert/ppc/pe_clock_speed_asm.s, reached from
+ * PE_Determine_Clock_Speeds() via the IOKit VIA driver) arms VIA Timer 1
+ * with 0xffff, executes a loop of exactly 10,000,000 CPU clocks, then
+ * reads T1 and the timebase. It divides to get TWO numbers: the bus
+ * frequency from timebase-ticks/VIA-ticks (a ratio, so TCG's speed
+ * cancels out -- and cuda_get_counter_value() already fabricates T1 as
+ * the exact inverse of Apple's constant, so this half is right), and the
+ * CPU PLL multiplier from 10,000,000/timebase-ticks, which is a pure
+ * measurement of how fast the host executes 10M guest instructions.
+ * Ungoverned TCG runs them in ~3.3ms instead of the ~33ms a 300MHz 750
+ * takes, so the PLL comes out ~90 instead of 9 and every Mach kernel
+ * timing constant derived from it is wrong.
+ *
+ * So pace this window too -- but to the CPU clock this board advertises,
+ * not to the T2 window's slow spin rate: the whole point is that the
+ * loop must take the time real silicon takes.
+ */
+static uint64_t gov_cpu_clock_hz;       /* 0 = board never asked */
+static bool gov_cpu_probe_enabled = true;
+static bool gov_cpu_probe_window;       /* current window is a CPU probe */
+static uint64_t gov_cpu_probe_saved_ips;
 
 /*
  * Window state. gov_window_open_ns/gov_window_deadline_ns are written
@@ -568,6 +603,8 @@ static void calib_governor_note_paced(int64_t now, int64_t paced_ns)
  * kicking -- the vCPU is between blocks by construction, since the
  * non-chaining cflags are what brought it back here.
  */
+static void calib_governor_recompute(void);
+
 static void calib_governor_unpace(int64_t now)
 {
     int64_t paced;
@@ -621,6 +658,11 @@ static void calib_governor_close(void)
         return;
     }
     gov_window_active = false;
+    if (gov_cpu_probe_window) {
+        gov_cpu_probe_window = false;
+        gov_insn_per_second = gov_cpu_probe_saved_ips;
+        calib_governor_recompute();
+    }
     if (gov_probe_timer) {
         timer_del(gov_probe_timer);
     }
@@ -742,6 +784,76 @@ bool calib_governor_arm(int64_t countdown_ns)
      */
     calib_governor_pace(now);
     return true;
+}
+
+void calib_governor_set_cpu_clock(uint64_t hz)
+{
+    gov_cpu_clock_hz = hz;
+}
+
+/*
+ * XNU's CPU-speed probe has just armed T1 with 0xffff and is about to
+ * run its fixed 10,000,000-clock loop. Pace the loop at this board's
+ * advertised CPU clock so the guest measures the PLL real hardware
+ * would report. Returns true if a probe window was opened.
+ */
+bool calib_governor_arm_cpu_probe(void)
+{
+    int64_t now;
+
+    if (!gov_enabled || !gov_cpu_probe_enabled || !gov_cpu_clock_hz) {
+        return false;
+    }
+    if (qatomic_read(&gov_stats.cpu_probes) >=
+        CALIB_GOV_CPU_PROBE_MAX_WINDOWS) {
+        /*
+         * Far more arms than a boot-time calibration needs: something
+         * else is loading T1 with 0xffff. Stand down for this session
+         * rather than throttling it.
+         */
+        gov_cpu_probe_enabled = false;
+        warn_report("calibration-governor: too many T1 0xffff arms, "
+                    "CPU-speed probe pacing disabled");
+        return false;
+    }
+
+    /* A probe supersedes any T2 window that happens to be open. */
+    calib_governor_close();
+
+    now = now_ns();
+    gov_cpu_probe_window = true;
+    gov_cpu_probe_saved_ips = gov_insn_per_second;
+    gov_insn_per_second = gov_cpu_clock_hz;
+    calib_governor_recompute();
+
+    gov_window_active = true;
+    gov_window_open_ns = now;
+    gov_window_deadline_ns = now + CALIB_GOV_CPU_PROBE_MAX_NS;
+    qatomic_inc(&gov_stats.windows);
+    qatomic_inc(&gov_stats.cpu_probes);
+
+    if (!gov_close_timer) {
+        gov_close_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                       calib_governor_close_timer_cb, NULL);
+        gov_probe_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                       calib_governor_probe_timer_cb, NULL);
+    }
+    timer_mod_ns(gov_close_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                 CALIB_GOV_CPU_PROBE_MAX_NS);
+    calib_governor_pace(now);
+    return true;
+}
+
+/*
+ * The guest has read the T1 counter, which is the last thing
+ * pe_run_clock_test() does: the measured loop is over, so stop pacing
+ * immediately instead of waiting out the window cap.
+ */
+void calib_governor_end_cpu_probe(void)
+{
+    if (gov_cpu_probe_window) {
+        calib_governor_close();
+    }
 }
 
 /*
@@ -895,7 +1007,17 @@ void calib_governor_account(CPUState *cpu, uint64_t pc, unsigned int n_insns)
                        (double)NSEC_IN_ONE_SEC);
     elapsed_ns = now - v->window_start_ns;
 
-    if (due_ns > elapsed_ns) {
+    if (due_ns > elapsed_ns && gov_cpu_probe_window) {
+        /* Precise settle: see calib_governor_recompute(). */
+        int64_t until = now + (due_ns - elapsed_ns);
+        int64_t after;
+
+        do {
+            after = now_ns();
+        } while (after < until);
+        qatomic_add(&gov_stats.slept_ns, (uint64_t)(after - now));
+        now = after;
+    } else if (due_ns > elapsed_ns) {
         if (throttle_sleep(due_ns - elapsed_ns)) {
             int64_t after = now_ns();
             qatomic_add(&gov_stats.slept_ns, (uint64_t)(after - now));
@@ -928,6 +1050,7 @@ void calib_governor_account(CPUState *cpu, uint64_t pc, unsigned int n_insns)
 void calib_governor_get_stats(CalibGovStats *out)
 {
     out->windows = qatomic_read(&gov_stats.windows);
+    out->cpu_probes = qatomic_read(&gov_stats.cpu_probes);
     out->rearms = qatomic_read(&gov_stats.rearms);
     out->capped = qatomic_read(&gov_stats.capped);
     out->ignored = qatomic_read(&gov_stats.ignored);
@@ -940,9 +1063,26 @@ void calib_governor_get_stats(CalibGovStats *out)
 
 static void calib_governor_recompute(void)
 {
-    gov_insn_per_quantum = gov_insn_per_second / NUM_TIME_UPDATE_PER_SEC;
-    if (gov_insn_per_quantum > MAX_QUANTUM_INSNS) {
-        gov_insn_per_quantum = MAX_QUANTUM_INSNS;
+    if (gov_cpu_probe_window) {
+        /*
+         * The CPU-speed probe needs the paced rate to be ACCURATE, not
+         * just slow: the guest divides 10,000,000 by the timebase ticks
+         * it measures, and the PLL multiplier it gets has to round to
+         * the one real silicon reports (+-3%). A 2000-instruction
+         * quantum owes only a few microseconds at a time, and g_usleep()
+         * of a few microseconds overshoots by an order of magnitude on a
+         * modern host -- which is exactly why the T2 window settles near
+         * 40 MIPS however high its target. Owe a whole millisecond of
+         * guest work at a time instead, and settle the debt by busy-
+         * waiting (see calib_governor_account()), which is precise at
+         * this scale. ~35ms of spin per probe, ~11 probes per boot.
+         */
+        gov_insn_per_quantum = gov_insn_per_second / 1000;
+    } else {
+        gov_insn_per_quantum = gov_insn_per_second / NUM_TIME_UPDATE_PER_SEC;
+        if (gov_insn_per_quantum > MAX_QUANTUM_INSNS) {
+            gov_insn_per_quantum = MAX_QUANTUM_INSNS;
+        }
     }
     if (gov_insn_per_quantum < 1) {
         gov_insn_per_quantum = 1;
@@ -956,7 +1096,7 @@ void calib_governor_default_on(void)
     }
 }
 
-bool calib_governor_configure(const char *value, Error **errp)
+static bool calib_governor_configure_one(const char *value, Error **errp)
 {
     if (!g_strcmp0(value, "on")) {
         gov_explicit = true;
@@ -978,6 +1118,13 @@ bool calib_governor_configure(const char *value, Error **errp)
         gov_enabled = true;
         gov_insn_per_second = mips * 1000 * 1000;
         calib_governor_recompute();
+    } else if (!g_strcmp0(value, "cpu-probe=on")) {
+        gov_cpu_probe_enabled = true;
+    } else if (!g_strcmp0(value, "cpu-probe=off")) {
+        gov_cpu_probe_enabled = false;
+        if (gov_cpu_probe_window) {
+            calib_governor_close();
+        }
     } else if (g_str_has_prefix(value, "warn-pct=")) {
         /*
          * Tuning knob for the "this has become a general throttle"
@@ -996,8 +1143,26 @@ bool calib_governor_configure(const char *value, Error **errp)
         gov_warned = false;
     } else {
         error_setg(errp, "calibration-governor: expected 'on', 'off', "
-                         "'mips=<n>' or 'warn-pct=<n>', got '%s'", value);
+                         "'mips=<n>', 'cpu-probe=on|off' or "
+                         "'warn-pct=<n>', got '%s'", value);
         return false;
+    }
+    return true;
+}
+
+/*
+ * Accept a comma-separated list, so whatever the property reads back is
+ * also a legal thing to set it to.
+ */
+bool calib_governor_configure(const char *value, Error **errp)
+{
+    g_auto(GStrv) parts = g_strsplit(value, ",", -1);
+    int i;
+
+    for (i = 0; parts[i]; i++) {
+        if (!calib_governor_configure_one(parts[i], errp)) {
+            return false;
+        }
     }
     return true;
 }
@@ -1007,5 +1172,8 @@ char *calib_governor_get_config(void)
     if (!gov_enabled) {
         return g_strdup("off");
     }
-    return g_strdup_printf("mips=%" PRIu64, gov_insn_per_second / 1000000);
+    return g_strdup_printf("mips=%" PRIu64 ",cpu-probe=%s",
+                           gov_cpu_probe_window ? gov_cpu_probe_saved_ips / 1000000
+                                                : gov_insn_per_second / 1000000,
+                           gov_cpu_probe_enabled ? "on" : "off");
 }

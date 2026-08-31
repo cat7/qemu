@@ -285,6 +285,12 @@ static void ppc_heathrow_init(MachineState *machine)
      * command line has already been applied and wins over this default.
      */
     calib_governor_default_on();
+    /*
+     * ...and tell it what this machine's CPU clock is, so XNU's
+     * pe_run_clock_test() CPU-speed probe (VIA Timer 1 loaded with
+     * 0xffff) is paced to the real thing rather than to raw TCG speed.
+     */
+    calib_governor_set_cpu_clock(CLOCKFREQ);
 
     /* init CPUs */
     for (i = 0; i < machine->smp.cpus; i++) {

@@ -54,6 +54,25 @@ void calib_governor_account(CPUState *cpu, uint64_t pc, unsigned int n_insns);
  */
 void calib_governor_default_on(void);
 
+/*
+ * Tell the governor what CPU clock this board advertises. XNU's
+ * pe_run_clock_test() times a fixed 10,000,000-CPU-clock loop against
+ * VIA Timer 1 to derive the PLL multiplier; the loop is paced to this
+ * rate while it runs so the guest measures the real machine's ratio.
+ * Zero (the default) leaves the CPU-speed probe hook inert.
+ */
+void calib_governor_set_cpu_clock(uint64_t hz);
+
+/*
+ * Device side, Timer 1. Called (BQL held, from an MMIO write) when the
+ * guest has just loaded T1's counter with 0xffff -- the signature of
+ * pe_run_clock_test()'s arm. Opens a CPU-speed probe window.
+ */
+bool calib_governor_arm_cpu_probe(void);
+
+/* Called when the guest reads T1's counter, which ends that loop. */
+void calib_governor_end_cpu_probe(void);
+
 /* Machine-property plumbing: "on" | "off" | "mips=<n>". */
 bool calib_governor_configure(const char *value, Error **errp);
 char *calib_governor_get_config(void);
@@ -61,6 +80,7 @@ char *calib_governor_get_config(void);
 /* Statistics, for QOM properties and "info via". */
 typedef struct CalibGovStats {
     uint64_t windows;       /* windows opened */
+    uint64_t cpu_probes;    /* of those, XNU CPU-speed probe windows */
     uint64_t rearms;        /* re-arms that extended an open window */
     uint64_t capped;        /* windows truncated by CALIB_GOV_MAX_WINDOW_NS */
     uint64_t ignored;       /* one-shots too long to be a calibration */
