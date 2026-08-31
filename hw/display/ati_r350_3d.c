@@ -45,6 +45,17 @@ typedef struct R300Vtx {
      * fragment program may sample several units with any of them --
      * Mac OS X 10.5's compositor fetches unit 0 with set 0 and unit 1
      * with set 1 in a single program.
+     *
+     * UNITS: TEXELS of `R300DrawState::tc_unit[k]`, and that is a
+     * deliberate choice rather than the hardware's. The hardware
+     * interpolates the vertex program's own output and normalises
+     * nothing; this model multiplies by the bound size in
+     * r300_vs_texcoord() and divides it out again in r300_raster_tri()
+     * on the way into the fragment frame, so that this struct -- which
+     * is written verbatim into every R350CAP3 record and read straight
+     * by the specialised executor and the GL backend -- keeps one stable
+     * meaning. See the comment at r300_vs_texcoord() for why the two
+     * readers cannot tell.
      */
     float tc[R300_TEXCOORDS][2];
 } R300Vtx;
@@ -576,12 +587,26 @@ static inline bool r300_edge_accept(float w, bool top_left)
  * How the fragment executor samples a texture.
  *
  * The interpreter is device-state-free by design, so the fetch reaches
- * it as a callback; this is the device's end of it. The coordinate
- * arrives in TEXEL units with the projection already applied -- both are
- * settled upstream by r300_attr_texcoord() and the vertex program's own
- * texture-coordinate output -- which is why LD and PROJ do the same
- * thing here, exactly as they did when the fetch sat in front of the
- * program instead of inside it.
+ * it as a callback; this is the device's end of it, and it is where the
+ * NORMALISED coordinate the hardware's texture unit takes becomes the
+ * texel index this model's sampler wants -- one multiply by the size of
+ * the unit BEING FETCHED, which is the only unit whose size the answer
+ * can depend on.
+ *
+ * The guests are the authority on the unit, and they say it in their own
+ * constants: Mac OS X 10.5's menu-bar filter binds unit 0 at 1103x24 and
+ * carries k21 = (0.000906616, 0.0416665) = (1/1103, 1/24), which it
+ * multiplies into every coordinate immediately before the fetch; its
+ * neighbour binds 1024x22 and carries (1/1024, 1/22); a third binds
+ * 32x22 and carries (1/32, 1/22). A program that divides by the bound
+ * size just before LD is a program whose LD consumes a normalised
+ * coordinate.
+ *
+ * LD and PROJ still do the same thing: r300_fs_frame() puts 1.0 in the
+ * routed coordinate's fourth component, so the projective divide a
+ * directly-routed coordinate would take is the identity. A COMPUTED
+ * coordinate with a real q is not yet divided by it -- see the note in
+ * doc; that is a separate gap and not this one.
  *
  * A unit this draw does not bind reads WHITE, not black: the same 1x1
  * white texture the GL backend binds for an untextured draw, and the
@@ -604,7 +629,9 @@ static void r300_us_sample(void *ctx, unsigned unit, bool proj,
         texel[0] = texel[1] = texel[2] = texel[3] = 1.0f;
         return;
     }
-    t = r300_sample_tex(c->s, d, unit, (int)coord[0], (int)coord[1]);
+    t = r300_sample_tex(c->s, d, unit,
+                        (int)(coord[0] * (float)d->tex[unit].w),
+                        (int)(coord[1] * (float)d->tex[unit].h));
     texel[0] = r300_texel_chan(&d->tex[unit], t, 1);
     texel[1] = r300_texel_chan(&d->tex[unit], t, 2);
     texel[2] = r300_texel_chan(&d->tex[unit], t, 3);
@@ -635,13 +662,27 @@ static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
     f->out[0] = f->out[1] = f->out[2] = f->out[3] = 0.0f;
     f->kill = false;
     /*
-     * The interpolated texture COORDINATE, not a texel: since the
-     * executor performs the texture instructions itself, what the
-     * rasterizer owes the frame is what RS_INST routes into it. Verified
-     * against the whole offline corpus -- 29 of 29 LD/PROJ fetches name
-     * exactly this register as their source -- so for every program that
-     * predates indirection levels the executor samples the same texel
-     * the caller used to hand over.
+     * The interpolated texture COORDINATE, in the units the GUEST'S OWN
+     * VERTEX PROGRAM emitted it in -- which is the whole of what a
+     * fragment program is entitled to see, because the hardware's
+     * rasterizer interpolates that output and hands it over untouched.
+     *
+     * The caller has already divided the interpolant by the size the
+     * vertex stage multiplied it by, so what arrives here is the guest's
+     * number back again and every constant the program adds to it is in
+     * the same units it is. Getting that wrong is not academic: 10.5's
+     * menu-bar filter offsets its coordinate by a constant before
+     * normalising, and against a value 1103 times too large the offset
+     * simply disappears -- which is the ramp that saturates along the
+     * bottom edge of the bar. The nine-part Aqua strips are worse still:
+     * they tile with FRC, and FRC of a texel count is a number in [0,1)
+     * that (int) turns into texel (0,0) for every pixel of every draw in
+     * the family.
+     *
+     * Verified against the whole offline corpus -- 29 of 29 LD/PROJ
+     * fetches name exactly this register as their source -- so for every
+     * program that predates indirection levels the executor samples with
+     * exactly what the routing put here.
      */
     for (n = 0; n < R300_TEXCOORDS; n++) {
         if (p->rs.tex_reg[n] >= 0) {
@@ -667,11 +708,42 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     float area = r300_edge(v0, v1, v2->x, v2->y);
     float inv, dx0, dy0, dx1, dy1, dx2, dy2;
     float a0, b0, c0, a1, b1, c1;
+    float tcinv[R300_TEXCOORDS][2] = { { 1.0f, 1.0f } };
     bool flip, tl0, tl1, tl2;
     int x0, y0, x1, y1, x, y;
+    unsigned n;
 
     if (area == 0.0f) {
         return;
+    }
+    /*
+     * WHAT UNDOES THE VERTEX STAGE'S SCALING, once per triangle.
+     *
+     * r300_vs_texcoord() multiplies each coordinate set by the size of
+     * the unit r300_us_setup() decided fetches with it, so the value the
+     * rasterizer interpolates is in TEXELS of that unit -- which is what
+     * the specialised executor and the GL backend read straight, and
+     * what every capture on disk records. The fragment INTERPRETER wants
+     * the other thing: the guest's own number, because the guest's own
+     * program does arithmetic on it. Dividing once per triangle and
+     * folding the reciprocal into the per-pixel interpolation is the
+     * cheapest place the two can be reconciled, and it keeps the pair of
+     * scalings exact for a program that only fetches -- the same two
+     * factors, applied in the other order.
+     *
+     * Only the sets the routing named are computed -- one, for every
+     * draw that predates multitexturing -- because those are the only
+     * ones the per-pixel loop reads. The declaration's initialiser is
+     * there for a compiler that cannot follow this guard to the one
+     * below, and for nothing else.
+     */
+    if (d->fs_run && !d->fs->fast) {
+        for (n = 0; n < d->ntc && n < R300_TEXCOORDS; n++) {
+            const R300TexUnit *u = &d->tex[d->tc_unit[n]];
+
+            tcinv[n][0] = u->w ? 1.0f / (float)u->w : 1.0f;
+            tcinv[n][1] = u->h ? 1.0f / (float)u->h : 1.0f;
+        }
     }
     /*
      * Two things come out of the triangle once instead of per pixel.
@@ -894,14 +966,20 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                      * construction, so it must not pay for them.
                      * `ntc` is how many sets the routing named, so a
                      * one-coordinate program does no extra work at all.
+                     *
+                     * Each set leaves the interpolation in the guest's
+                     * own units -- the triangle's reciprocals undoing
+                     * the vertex stage's multiply by the bound size, so
+                     * that the program's arithmetic and its constants
+                     * are in the same units as each other.
                      */
-                    tc[0][0] = ts;
-                    tc[0][1] = tt;
+                    tc[0][0] = ts * tcinv[0][0];
+                    tc[0][1] = tt * tcinv[0][1];
                     for (k = 1; k < d->ntc; k++) {
-                        tc[k][0] = w0 * v0->tc[k][0] + w1 * v1->tc[k][0] +
-                                   w2 * v2->tc[k][0];
-                        tc[k][1] = w0 * v0->tc[k][1] + w1 * v1->tc[k][1] +
-                                   w2 * v2->tc[k][1];
+                        tc[k][0] = (w0 * v0->tc[k][0] + w1 * v1->tc[k][0] +
+                                    w2 * v2->tc[k][0]) * tcinv[k][0];
+                        tc[k][1] = (w0 * v0->tc[k][1] + w1 * v1->tc[k][1] +
+                                    w2 * v2->tc[k][1]) * tcinv[k][1];
                     }
                     for (; k < R300_TEXCOORDS; k++) {
                         tc[k][0] = tc[k][1] = 0.0f;
@@ -1710,18 +1788,30 @@ static bool r300_vs_has_color(const R300DrawState *d)
 }
 
 /*
- * The texture coordinate the program computed, in the texels this
- * model's sampler works in.
+ * The texture coordinate the program computed, in the TEXELS of the unit
+ * that fetches with this set -- which is the unit the interpolant is
+ * carried in and NOT the unit the fragment program sees.
  *
- * The hardware samples with normalised coordinates, so every program
- * that emits one divides by the bound texture's size on the way out --
- * which is why taking the raw attribute instead has worked so far:
- * Mac OS X's compositor hands the vertex a coordinate in texels and its
- * program's texture matrix is exactly diag(1/w, 1/h, 1, 1), so the two
- * paths agree by construction (1887 of 1887 draws across the captures).
- * Chess.app's board has no coordinate attribute at all -- its program
- * generates one -- so there the attribute path samples texel (0,0) for
- * every pixel and the board loses its texture entirely.
+ * The hardware samples with normalised coordinates and interpolates the
+ * vertex program's output untouched; this model instead multiplies by
+ * the bound size here and divides again in r300_raster_tri() on the way
+ * into the fragment frame. That looks like work undone one line later,
+ * and for a draw running the interpreter it is. It is kept because the
+ * interpolant is a FILE FORMAT: R300Vtx goes verbatim into every
+ * R350CAP3 record, and because the two paths that read it straight --
+ * the specialised executor and the GL backend -- provably cannot see the
+ * difference. `gl_simple` requires the program's one fetch to name the
+ * routed coordinate register itself, with no ALU in between, so neither
+ * path ever exposes the coordinate to guest arithmetic; leaving them in
+ * texels is what keeps them not merely equivalent but bit-identical.
+ *
+ * Taking the raw attribute instead has worked so far because Mac OS X's
+ * compositor hands the vertex a coordinate in texels and its program's
+ * texture matrix is exactly diag(1/w, 1/h, 1, 1), so the two paths agree
+ * by construction (1887 of 1887 draws across the captures). Chess.app's
+ * board has no coordinate attribute at all -- its program generates one
+ * -- so there the attribute path samples texel (0,0) for every pixel and
+ * the board loses its texture entirely.
  */
 static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
                              unsigned set, const float c[4])
@@ -2296,12 +2386,17 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
     d->fs_run = p->valid && p->expressible;
     d->fs_col1 = d->fs_run && p->rs.col_reg[1] >= 0;
     /*
-     * How many interpolated coordinate sets this draw carries, and what
-     * each of them is scaled by. The rasterizer works in TEXELS while
-     * the hardware samples normalised, so a coordinate the vertex stage
-     * produces is multiplied by a bound texture's size -- and once more
-     * than one unit is bound, WHICH texture is a question the program
-     * answers: the set feeds whichever unit fetches with it.
+     * How many interpolated coordinate sets this draw carries, and which
+     * unit's texels each is CARRIED IN.
+     *
+     * This decides a representation, not an answer. The vertex stage
+     * multiplies a set by this unit's size and r300_raster_tri() divides
+     * it out again on the way into the fragment frame, so which unit is
+     * named affects only the intermediate -- while the fetch itself
+     * scales by the size of the unit BEING FETCHED, per fetch, in
+     * r300_us_sample(). That is why two differently sized units sharing
+     * one coordinate set is now exact and no longer worth a gap: each of
+     * them reads the guest's own coordinate through its own size.
      *
      * A fetch whose source register is not one the rasterizer routed is
      * a dependent read of an ALU result and names no set at all, so it
@@ -2324,23 +2419,9 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
             continue;
         }
         for (k = 0; k < d->ntc; k++) {
-            if (p->rs.tex_reg[k] != t->src) {
-                continue;
-            }
-            if (!(tc_named & (1u << k))) {
+            if (p->rs.tex_reg[k] == t->src && !(tc_named & (1u << k))) {
                 d->tc_unit[k] = t->unit;
                 tc_named |= 1u << k;
-            } else if (d->tex[t->unit].w != d->tex[d->tc_unit[k]].w ||
-                       d->tex[t->unit].h != d->tex[d->tc_unit[k]].h) {
-                /*
-                 * A second unit sampling the SAME coordinate set out of
-                 * a DIFFERENTLY sized texture. The set is carried in the
-                 * texels of the first unit that named it, so the second
-                 * one is sampled at the wrong scale -- say so rather
-                 * than render it quietly. Two units of the same size
-                 * sharing a set is exact and is not reported.
-                 */
-                ati_r350_note_gap(s, R350_GAP_TEXCOORD_SCALE, t->unit);
             }
         }
     }

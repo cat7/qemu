@@ -22,6 +22,15 @@
  * is a diagnostic between one build of this device and one build of the
  * harness beside it, not an interchange format.
  *
+ * UNITS, because a size check cannot police them: a vertex's texture
+ * coordinate is in the TEXELS of the unit `R300DrawState::tc_unit[k]`
+ * names, which is what the vertex stage has always written and what
+ * every capture on disk holds. The device's fragment interpreter takes
+ * the guest's own units instead, and converts on the way into the
+ * fragment frame rather than in the vertex -- deliberately, so that this
+ * record keeps one meaning across the change that gave the sampler its
+ * normalised coordinate. A reader needs no version check for it.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
