@@ -21,6 +21,7 @@
 #include "qemu/log.h"
 #include "cpu.h"
 #include "exec/cputlb.h"
+#include "exec/tcg-mmu-stats.h"
 #include "exec/helper-proto.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
@@ -163,6 +164,11 @@ static void helper_mmcr0_facility_check(CPUPPCState *env, uint32_t bit,
 void helper_store_sdr1(CPUPPCState *env, target_ulong val)
 {
     if (env->spr[SPR_SDR1] != val) {
+        TCGMMUStats *st = tcg_mmu_slot(env_cpu(env)->cpu_index);
+
+        st->req[TCG_MMU_ORG_SDR1]++;
+        st->flush_direct++;
+        st->pending = 0;   /* satisfied by the flush below */
         ppc_store_sdr1(env, val);
         tlb_flush(env_cpu(env));
     }

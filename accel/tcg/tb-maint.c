@@ -22,6 +22,7 @@
 #include "qemu/qtree.h"
 #include "exec/cputlb.h"
 #include "exec/log.h"
+#include "exec/tcg-mmu-stats.h"
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
 #include "exec/tb-flush.h"
@@ -788,6 +789,7 @@ void tb_flush__exclusive_or_serial(void)
     tcg_region_reset_all();
     /* XXX: flush processor icache at this point if cache flush is expensive */
     qatomic_inc(&tb_ctx.tb_flush_count);
+    tcg_mmu_slot(0)->tb_flush++;
     qemu_plugin_flush_cb();
 }
 

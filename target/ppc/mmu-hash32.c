@@ -28,6 +28,7 @@
 #include "mmu-hash32.h"
 #include "mmu-books.h"
 #include "exec/log.h"
+#include "exec/tcg-mmu-stats.h"
 
 /* #define DEBUG_BATS */
 
@@ -219,11 +220,14 @@ static hwaddr ppc_hash32_pteg_search(PowerPCCPU *cpu, hwaddr pteg_off,
                                      bool secondary, target_ulong ptem,
                                      ppc_hash_pte32_t *pte)
 {
+    TCGMMUStats *st = tcg_mmu_slot(CPU(cpu)->cpu_index);
     hwaddr pte_offset = pteg_off;
     target_ulong pte0, pte1;
     int i;
 
+    st->hash32_pteg_probe++;
     for (i = 0; i < HPTES_PER_GROUP; i++) {
+        st->hash32_pte_slot++;
         pte0 = ppc_hash32_load_hpte0(cpu, pte_offset);
         /*
          * pte0 contains the valid bit and must be read before pte1,
@@ -290,8 +294,12 @@ static hwaddr ppc_hash32_htab_lookup(PowerPCCPU *cpu,
             " hash=" HWADDR_FMT_plx "\n",
             ppc_hash32_hpt_base(cpu), ppc_hash32_hpt_mask(cpu),
             vsid, ptem, hash);
+    tcg_mmu_slot(CPU(cpu)->cpu_index)->hash32_htab++;
     pteg_off = get_pteg_offset32(cpu, hash);
     pte_offset = ppc_hash32_pteg_search(cpu, pteg_off, 0, ptem, pte);
+    if (pte_offset != -1) {
+        tcg_mmu_slot(CPU(cpu)->cpu_index)->hash32_primary++;
+    }
     if (pte_offset == -1) {
         /* Secondary PTEG lookup */
         qemu_log_mask(CPU_LOG_MMU, "1 htab=" HWADDR_FMT_plx "/" HWADDR_FMT_plx
@@ -300,6 +308,11 @@ static hwaddr ppc_hash32_htab_lookup(PowerPCCPU *cpu,
                 ppc_hash32_hpt_mask(cpu), vsid, ptem, ~hash);
         pteg_off = get_pteg_offset32(cpu, ~hash);
         pte_offset = ppc_hash32_pteg_search(cpu, pteg_off, 1, ptem, pte);
+        if (pte_offset != -1) {
+            tcg_mmu_slot(CPU(cpu)->cpu_index)->hash32_secondary++;
+        } else {
+            tcg_mmu_slot(CPU(cpu)->cpu_index)->hash32_notfound++;
+        }
     }
 
     return pte_offset;
@@ -311,11 +324,14 @@ bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 {
     CPUState *cs = CPU(cpu);
     CPUPPCState *env = &cpu->env;
+    TCGMMUStats *st = tcg_mmu_slot(cs->cpu_index);
     target_ulong sr;
     hwaddr pte_offset, raddr;
     ppc_hash_pte32_t pte;
     bool key;
     int prot;
+
+    st->hash32_xlate++;
 
     /* There are no hash32 large pages. */
     *psizep = TARGET_PAGE_BITS;
@@ -323,6 +339,7 @@ bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
     /* 1. Handle real mode accesses */
     if (mmuidx_real(mmu_idx)) {
         /* Translation is off */
+        st->hash32_real++;
         *raddrp = eaddr;
         *protp = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
         return true;
@@ -350,6 +367,7 @@ bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
                 }
                 return false;
             }
+            st->hash32_bat_hit++;
             *raddrp = raddr;
             return true;
         }

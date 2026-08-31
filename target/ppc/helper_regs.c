@@ -25,6 +25,7 @@
 #include "system/tcg.h"
 #include "helper_regs.h"
 #include "power8-pmu.h"
+#include "exec/tcg-mmu-stats.h"
 #include "cpu-models.h"
 #include "spr_common.h"
 #include "internal.h"
@@ -376,11 +377,14 @@ void store_40x_sler(CPUPPCState *env, uint32_t val)
 void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
+    TCGMMUStats *st = tcg_mmu_slot(cs->cpu_index);
 
     /* Handle global flushes first */
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+        st->flush_global++;
+        tcg_mmu_flush_attribute(st);
         tlb_flush_all_cpus_synced(cs);
         return;
     }
@@ -388,6 +392,8 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     /* Then handle local ones */
     if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+        st->flush_local++;
+        tcg_mmu_flush_attribute(st);
         tlb_flush(cs);
     }
 }

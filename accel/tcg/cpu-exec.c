@@ -35,6 +35,7 @@
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
+#include "exec/tcg-mmu-stats.h"
 #include "qemu/main-loop.h"
 #include "exec/icount.h"
 #include "exec/replay-core.h"
@@ -245,13 +246,16 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
+        tcg_mmu_slot(cpu->cpu_index)->jc_hit++;
         goto hit;
     }
 
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
+        tcg_mmu_slot(cpu->cpu_index)->jc_miss_none++;
         return NULL;
     }
+    tcg_mmu_slot(cpu->cpu_index)->jc_miss_found++;
 
     jc->array[hash].pc = s.pc;
     qatomic_set(&jc->array[hash].tb, tb);

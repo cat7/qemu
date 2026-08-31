@@ -31,6 +31,7 @@
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/qemu-print.h"
+#include "exec/tcg-mmu-stats.h"
 #include "qapi/error.h"
 #include "qobject/qnull.h"
 #include "qapi/visitor.h"
@@ -7559,6 +7560,19 @@ static const TCGCPUOps ppc_tcg_ops = {
 };
 #endif /* CONFIG_TCG */
 
+/*
+ * `mmu-stats` property: the always-on MMU/TB counters (see
+ * include/exec/tcg-mmu-stats.h).  Read it repeatedly from the monitor with
+ *   qom-get /machine/unattached/device[0] mmu-stats
+ * and take start/end deltas -- the counters are cumulative and never reset,
+ * so a measurement window is a subtraction.  The values are the aggregate
+ * over all vCPUs, so reading any one CPU object gives the whole machine.
+ */
+static char *ppc_cpu_get_mmu_stats(Object *obj, Error **errp)
+{
+    return tcg_mmu_stats_dump();
+}
+
 static void ppc_cpu_class_init(ObjectClass *oc, const void *data)
 {
     PowerPCCPUClass *pcc = POWERPC_CPU_CLASS(oc);
@@ -7573,6 +7587,8 @@ static void ppc_cpu_class_init(ObjectClass *oc, const void *data)
     pcc->pvr_match = ppc_pvr_match_default;
 
     device_class_set_props(dc, powerpc_cpu_properties);
+    object_class_property_add_str(oc, "mmu-stats", ppc_cpu_get_mmu_stats,
+                                  NULL);
 
     resettable_class_set_parent_phases(rc, NULL, ppc_cpu_reset_hold, NULL,
                                        &pcc->parent_phases);

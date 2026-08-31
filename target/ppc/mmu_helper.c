@@ -28,6 +28,7 @@
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
 #include "exec/log.h"
+#include "exec/tcg-mmu-stats.h"
 #include "helper_regs.h"
 #include "qemu/error-report.h"
 #include "qemu/qemu-print.h"
@@ -155,7 +156,12 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     base = BATu & ~0x0001FFFF;
     end = base + mask + 0x00020000;
     if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
+        TCGMMUStats *st = tcg_mmu_slot(cs->cpu_index);
+
         /* Flushing 1024 4K pages is slower than a complete flush */
+        st->req[TCG_MMU_ORG_BAT]++;
+        st->bat_full_flush++;
+        st->flush_direct++;
         qemu_log_mask(CPU_LOG_MMU, "Flush all BATs\n");
         tlb_flush(cs);
         qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
@@ -164,6 +170,8 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     qemu_log_mask(CPU_LOG_MMU, "Flush BAT from " TARGET_FMT_lx
                   " to " TARGET_FMT_lx " (" TARGET_FMT_lx ")\n",
                   base, end, mask);
+    tcg_mmu_slot(cs->cpu_index)->bat_page_ranges++;
+    tcg_mmu_slot(cs->cpu_index)->bat_pages += (end - base) >> TARGET_PAGE_BITS;
     for (page = base; page != end; page += TARGET_PAGE_SIZE) {
         tlb_flush_page(cs, page);
     }
@@ -276,6 +284,14 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
         booke206_flush_tlb(env, -1, 0);
         break;
     case POWERPC_MMU_32B:
+        {
+            TCGMMUStats *st = tcg_mmu_slot(env_cpu(env)->cpu_index);
+
+            st->req[TCG_MMU_ORG_TLBIA]++;
+            st->flush_direct++;
+            /* the pending deferred requests are satisfied by this flush */
+            st->pending = 0;
+        }
         env->tlb_need_flush = 0;
         tlb_flush(env_cpu(env));
         break;
@@ -313,6 +329,9 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
          * account, we just mark the TLB to be flushed later (context
          * synchronizing event or sync instruction on 32-bit).
          */
+        tcg_mmu_slot(env_cpu(env)->cpu_index)->req[TCG_MMU_ORG_TLBIE]++;
+        tcg_mmu_slot(env_cpu(env)->cpu_index)->pending |=
+            1u << TCG_MMU_ORG_TLBIE;
         env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
         break;
     default:
@@ -360,25 +379,35 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
         ppc_store_slb(cpu, srnum, esid, vsid);
     } else
 #endif
-    if (env->sr[srnum] != value) {
-        env->sr[srnum] = value;
-        /*
-         * Invalidating 256MB of virtual memory in 4kB pages is way
-         * longer than flushing the whole TLB.
-         */
+    {
+        TCGMMUStats *st = tcg_mmu_slot(env_cpu(env)->cpu_index);
+
+        st->sr_writes++;
+        if (env->sr[srnum] == value) {
+            /* the early-out: no flush is requested for a no-op write */
+            st->sr_same_value++;
+        } else {
+            env->sr[srnum] = value;
+            /*
+             * Invalidating 256MB of virtual memory in 4kB pages is way
+             * longer than flushing the whole TLB.
+             */
 #if !defined(FLUSH_ALL_TLBS) && 0
-        {
-            target_ulong page, end;
-            /* Invalidate 256 MB of virtual memory */
-            page = (16 << 20) * srnum;
-            end = page + (16 << 20);
-            for (; page != end; page += TARGET_PAGE_SIZE) {
-                tlb_flush_page(env_cpu(env), page);
+            {
+                target_ulong page, end;
+                /* Invalidate 256 MB of virtual memory */
+                page = (16 << 20) * srnum;
+                end = page + (16 << 20);
+                for (; page != end; page += TARGET_PAGE_SIZE) {
+                    tlb_flush_page(env_cpu(env), page);
+                }
             }
-        }
 #else
-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+            st->req[TCG_MMU_ORG_SR]++;
+            st->pending |= 1u << TCG_MMU_ORG_SR;
+            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
 #endif
+        }
     }
 }
 
@@ -677,7 +706,11 @@ static inline int booke_page_size_to_tlb(target_ulong page_size)
 void helper_store_40x_pid(CPUPPCState *env, target_ulong val)
 {
     if (env->spr[SPR_40x_PID] != val) {
+        TCGMMUStats *st = tcg_mmu_slot(env_cpu(env)->cpu_index);
+
         env->spr[SPR_40x_PID] = val;
+        st->req[TCG_MMU_ORG_OTHER]++;
+        st->pending |= 1u << TCG_MMU_ORG_OTHER;
         env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
     }
 }
@@ -1363,9 +1396,15 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
                       bool probe, uintptr_t retaddr)
 {
     PowerPCCPU *cpu = POWERPC_CPU(cs);
+    TCGMMUStats *st = tcg_mmu_slot(cs->cpu_index);
     hwaddr raddr;
     int page_size, prot;
 
+    st->fill++;
+    st->fill_idx[mmu_idx & (TCG_MMU_STATS_MMU_IDX - 1)]++;
+    if (probe) {
+        st->fill_probe++;
+    }
     if (ppc_xlate(cpu, eaddr, access_type, &raddr,
                   &page_size, &prot, mmu_idx, !probe)) {
         tlb_set_page(cs, eaddr & TARGET_PAGE_MASK, raddr & TARGET_PAGE_MASK,
@@ -1375,6 +1414,7 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
     if (probe) {
         return false;
     }
+    st->fill_fail++;
     raise_exception_err_ra(&cpu->env, cs->exception_index,
                            cpu->env.error_code, retaddr);
 }
