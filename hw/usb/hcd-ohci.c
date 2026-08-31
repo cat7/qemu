@@ -1222,10 +1222,28 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
             }
 
             if (ed_cnt++ > ED_LINK_LIMIT) {
+                /*
+                 * This endpoint's work budget for the frame is used up:
+                 * stop here and pick the list up again next frame. The ED
+                 * write-back below records how far we got, so a
+                 * legitimately long TD queue still drains one budget at a
+                 * time, while a circular TD list still cannot spin forever
+                 * -- which is all this limit exists to prevent.
+                 *
+                 * Do not ohci_die() here: that raises
+                 * HcInterruptStatus.UnrecoverableError, and Mac OS X's
+                 * AppleUSBOHCI answers UE with a software reset
+                 * (HcCommandStatus.HCR) followed by HcControl back to
+                 * Operational WITHOUT rewriting HcHCCA. The reset zeroes
+                 * hcca (as OpenHCI 1.0a says it must), so the controller
+                 * then runs forever servicing address 0 and every device
+                 * on the bus -- keyboard and mouse included -- goes
+                 * permanently dead. A budget overrun is not an
+                 * unrecoverable controller error.
+                 */
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "ohci: Too many endpoint descriptors in loop\n");
-                ohci_die(ohci);
-                return 0;
+                break;
             }
         }
 
