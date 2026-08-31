@@ -150,6 +150,39 @@ typedef struct R300DrawState {
 } R300DrawState;
 
 /*
+ * DOES THIS DRAW USE A TEXTURE? That is not the question `textured`
+ * answers.
+ *
+ * `d->textured` says a texture is BOUND and that this model can produce
+ * a coordinate for it -- TX_ENABLE's first bit, plus a vertex wide
+ * enough to carry a coordinate positionally or a program that computes
+ * one. A guest binds a texture for the draws that sample it and leaves
+ * it bound across the ones that do not, so "bound" and "used" are
+ * different sets, and three decisions below need the second one.
+ *
+ * What USES a texture is the fragment program, and it has already said
+ * so: `tex_dst` is the frame register its first LD/PROJ writes, and -1
+ * when the program performs no fetch at all. That is the same answer the
+ * shading path acts on -- a program with no texture instruction samples
+ * nothing however much is bound -- so this only brings the setup into
+ * agreement with what the pixels already do.
+ *
+ * iTunes' visualiser is what named this. Its full-surface clears are
+ * giant point sprites carrying a real dark COLOR_0 and a fragment
+ * program with no texture instruction (US_CONFIG's FIRST_TEX clear, so
+ * the level contributes no texture slots at all), issued while the
+ * texture the NEXT draws sample is already bound. Read as `textured`
+ * they lost that colour three times over: discarded as a texture
+ * coordinate, replaced by a white flat constant, and then whitened again
+ * at the sprite's corners. 255 of 255 bound-but-fetchless draws in the
+ * 2026-08-31 evidence capture recorded (1,1,1) for a dark wash.
+ */
+static inline bool r300_draw_fetches(const R300DrawState *d)
+{
+    return d->textured && d->fs && d->fs->tex_dst >= 0;
+}
+
+/*
  * The GL backend's contract states its own texture-unit and coordinate-
  * set counts rather than including this file's headers -- it is meant to
  * be replaceable without the draw path noticing. That independence is
@@ -2768,6 +2801,12 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
              * coordinate computed from the attribute after it, so the
              * position of the coordinate in a flat vertex answers only
              * for the programs whose matrix will not resolve.
+             *
+             * And nothing is being sampled as a coordinate at all unless
+             * the fragment program fetches, which is why the test is
+             * r300_draw_fetches() and not `textured`: a draw issued with
+             * a texture merely BOUND has a colour in that attribute and
+             * a colour is what it is.
              */
             if (d->vs_run && ncolor &&
                 (d->vs.out_mask & (1u << first_color))) {
@@ -2781,7 +2820,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                     tsrc = r300_pvs_texmat(&d->vs, first_tex, &tm) ?
                            (int)tm.in : (vsize >= 12 ? 2 : 1);
                 }
-                is_texcoord = d->textured && src >= 0 && src == tsrc;
+                is_texcoord = r300_draw_fetches(d) && src >= 0 &&
+                              src == tsrc;
 
                 d->vs_color = computed && !is_texcoord;
             }
@@ -2859,8 +2899,15 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * read through the same 24-bit float decode as the rest of the
      * constant file. The desktop backdrop fill arrives exactly this
      * way, a colourless full-screen quad with the blue in PFS_PARAM_0.
+     *
+     * "Carries no colour" is a statement about the VERTEX, so the test
+     * has to be whether this draw's second attribute is being read as a
+     * coordinate -- which it is only when the program fetches. A bound
+     * but unfetched texture used to send the constant to white here, and
+     * white over a whole surface is what a clear looks like when its
+     * colour has been thrown away.
      */
-    if (vsize < 12 && !d->textured) {
+    if (vsize < 12 && !r300_draw_fetches(d)) {
         d->flat_r = r300_us_f24(s->regs[(R300_PFS_PARAM_0_X >> 2)]);
         d->flat_g = r300_us_f24(s->regs[(R300_PFS_PARAM_0_X >> 2) + 1]);
         d->flat_b = r300_us_f24(s->regs[(R300_PFS_PARAM_0_X >> 2) + 2]);
@@ -2945,6 +2992,11 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
          * size gate the setup applied does not apply here. The per-unit
          * enables have to follow it, or a unit would stay switched off
          * against the flag that is meant to speak for it.
+         *
+         * Which is a statement about BINDING, and the sprite's colour is
+         * a question about USE -- so the whitening below asks
+         * r300_draw_fetches() while the enables keep following
+         * TX_ENABLE.
          */
         d->textured = s->regs[R300_TX_ENABLE >> 2] & 1;
         for (u = 0; u < R300_TEX_UNITS; u++) {
@@ -2957,7 +3009,7 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
 
             for (c = 0; c < 4; c++) {
                 q[c] = vb[i];
-                if (d->textured) {
+                if (r300_draw_fetches(d)) {
                     /* composite sprites modulate by nothing */
                     q[c].r = q[c].g = q[c].b = q[c].a = 1.0f;
                 }
@@ -3912,7 +3964,7 @@ static unsigned r300_gl_point_list(ATIR350State *s, R300DrawState *d,
 
         for (c = 0; c < 4; c++) {
             q[c] = vb[i];
-            if (d->textured) {
+            if (r300_draw_fetches(d)) {
                 q[c].r = q[c].g = q[c].b = q[c].a = 1.0f;
             }
         }
