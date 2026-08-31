@@ -54,6 +54,7 @@ char *tcg_mmu_stats_dump(void)
         t.hash32_notfound += s->hash32_notfound;
         t.hash32_pteg_probe += s->hash32_pteg_probe;
         t.hash32_pte_slot += s->hash32_pte_slot;
+        t.hash32_pteg_map_fail += s->hash32_pteg_map_fail;
         t.jc_hit += s->jc_hit;
         t.jc_miss_found += s->jc_miss_found;
         t.jc_miss_none += s->jc_miss_none;
@@ -111,6 +112,8 @@ char *tcg_mmu_stats_dump(void)
                            t.hash32_pteg_probe);
     g_string_append_printf(out, "hash32_pte_slot=%" PRIu64 "\n",
                            t.hash32_pte_slot);
+    g_string_append_printf(out, "hash32_pteg_map_fail=%" PRIu64 "\n",
+                           t.hash32_pteg_map_fail);
     g_string_append_printf(out, "jc_hit=%" PRIu64 "\n", t.jc_hit);
     g_string_append_printf(out, "jc_miss_found=%" PRIu64 "\n",
                            t.jc_miss_found);

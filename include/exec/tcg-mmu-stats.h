@@ -77,6 +77,8 @@ typedef struct TCGMMUStats {
     uint64_t hash32_notfound;   /* ... by neither (guest page fault)        */
     uint64_t hash32_pteg_probe; /* PTEG searches (1 or 2 per htab lookup)   */
     uint64_t hash32_pte_slot;   /* PTE slots actually loaded (2 ldl each)   */
+    /* PTEG searches that could not map the group and fell back to ldl_phys */
+    uint64_t hash32_pteg_map_fail;
 
     /* --- TB jump cache ------------------------------------------------ */
     uint64_t jc_hit;            /* tb_lookup satisfied from the jump cache  */

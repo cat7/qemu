@@ -216,30 +216,88 @@ static target_ulong ppc_hash32_load_hpte1(PowerPCCPU *cpu, hwaddr pte_offset)
     return ldl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2);
 }
 
+/*
+ * Map a whole PTEG -- 8 PTEs, 64 bytes -- with one address_space_map(),
+ * the way ppc_hash64_map_hptes() does, so a search reads the PTEs straight
+ * out of the hash table's RAM block instead of paying a flatview lookup per
+ * ldl_phys().  Returns NULL if the table is not mapped contiguously (it can
+ * sit anywhere in the guest's address space, MMIO included), in which case
+ * the caller falls back to the per-PTE loads.
+ */
+static const uint32_t *ppc_hash32_map_pteg(PowerPCCPU *cpu, hwaddr pteg_off)
+{
+    hwaddr base = ppc_hash32_hpt_base(cpu);
+    hwaddr plen = HASH_PTEG_SIZE_32;
+    void *pteg;
+
+    pteg = address_space_map(CPU(cpu)->as, base + pteg_off, &plen, false,
+                             MEMTXATTRS_UNSPECIFIED);
+    if (pteg && plen < HASH_PTEG_SIZE_32) {
+        address_space_unmap(CPU(cpu)->as, pteg, plen, false, 0);
+        return NULL;
+    }
+    return pteg;
+}
+
+static void ppc_hash32_unmap_pteg(PowerPCCPU *cpu, const uint32_t *pteg)
+{
+    address_space_unmap(CPU(cpu)->as, (void *)pteg, HASH_PTEG_SIZE_32,
+                        false, HASH_PTEG_SIZE_32);
+}
+
+static inline bool ppc_hash32_pte_match(uint32_t pte0, bool secondary,
+                                        target_ulong ptem)
+{
+    return (pte0 & HPTE32_V_VALID)
+        && (secondary == !!(pte0 & HPTE32_V_SECONDARY))
+        && HPTE32_V_COMPARE(pte0, ptem);
+}
+
 static hwaddr ppc_hash32_pteg_search(PowerPCCPU *cpu, hwaddr pteg_off,
                                      bool secondary, target_ulong ptem,
                                      ppc_hash_pte32_t *pte)
 {
     TCGMMUStats *st = tcg_mmu_slot(CPU(cpu)->cpu_index);
+    const uint32_t *pteg;
     hwaddr pte_offset = pteg_off;
     target_ulong pte0, pte1;
     int i;
 
     st->hash32_pteg_probe++;
+
+    pteg = ppc_hash32_map_pteg(cpu, pteg_off);
+    if (pteg) {
+        for (i = 0; i < HPTES_PER_GROUP; i++) {
+            st->hash32_pte_slot++;
+            pte0 = ldl_p(&pteg[2 * i]);
+            /*
+             * pte0 contains the valid bit and must be read before pte1,
+             * otherwise we might see an old pte1 with a new valid bit and
+             * thus an inconsistent hpte value
+             */
+            smp_rmb();
+            pte1 = ldl_p(&pteg[2 * i + 1]);
+
+            if (ppc_hash32_pte_match(pte0, secondary, ptem)) {
+                pte->pte0 = pte0;
+                pte->pte1 = pte1;
+                ppc_hash32_unmap_pteg(cpu, pteg);
+                return pteg_off + i * HASH_PTE_SIZE_32;
+            }
+        }
+        ppc_hash32_unmap_pteg(cpu, pteg);
+        return -1;
+    }
+
+    st->hash32_pteg_map_fail++;
     for (i = 0; i < HPTES_PER_GROUP; i++) {
         st->hash32_pte_slot++;
         pte0 = ppc_hash32_load_hpte0(cpu, pte_offset);
-        /*
-         * pte0 contains the valid bit and must be read before pte1,
-         * otherwise we might see an old pte1 with a new valid bit and
-         * thus an inconsistent hpte value
-         */
+        /* see above */
         smp_rmb();
         pte1 = ppc_hash32_load_hpte1(cpu, pte_offset);
 
-        if ((pte0 & HPTE32_V_VALID)
-            && (secondary == !!(pte0 & HPTE32_V_SECONDARY))
-            && HPTE32_V_COMPARE(pte0, ptem)) {
+        if (ppc_hash32_pte_match(pte0, secondary, ptem)) {
             pte->pte0 = pte0;
             pte->pte1 = pte1;
             return pte_offset;
