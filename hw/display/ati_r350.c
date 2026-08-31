@@ -4317,6 +4317,19 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                            ati_r350_gl_describe(s->gl_ctx), s->gl_drawn, fb,
                            s->gl_drawn + fb
                            ? 100.0 * s->gl_drawn / (s->gl_drawn + fb) : 0.0);
+    if (s->gl_nowork) {
+        /*
+         * The share of the fallbacks that were proved to paint nothing
+         * and so kept the resident target instead of tearing it back
+         * off the GPU. Read beside "released by draw fell back" below:
+         * on a workload made of empty quads those two used to be the
+         * same number.
+         */
+        g_string_append_printf(out, "\n  of which %" PRIu64 " paint no "
+                               "pixels (%.2f%%): release skipped",
+                               s->gl_nowork,
+                               fb ? 100.0 * s->gl_nowork / fb : 0.0);
+    }
     /*
      * The coherency measurement the roadmap's E2.4 asks for: how often
      * the resident render target had to be handed back to VRAM, and how

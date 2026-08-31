@@ -602,6 +602,15 @@ struct ATIR350State {
     struct R350GlCtx *gl_ctx;
     uint64_t gl_drawn;          /* draws the backend rendered */
     uint64_t gl_fb[R350_GLF_MAX][R350_GAP_SLOTS];   /* fallbacks, by prim */
+    /*
+     * Of those fallbacks, the ones that were PROVED to paint no pixels
+     * and therefore did not give the resident render target back. They
+     * are counted in gl_fb[] as well -- this is a sub-count of it, not
+     * a family beside it, and it exists so that `gl-stats` shows the
+     * skipped release rather than leaving it to be inferred from a
+     * flush count that went down.
+     */
+    uint64_t gl_nowork;
     /* gl=verify: the per-pixel agreement between the two paths */
     uint64_t gl_v_px, gl_v_hist[4];     /* delta 0, 1, 2-4, above 4 */
     uint64_t gl_v_draws, gl_v_bad;      /* draws compared / with delta > 1 */

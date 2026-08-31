@@ -3230,15 +3230,43 @@ static bool r300_cap_xor(ATIR350State *s, uint32_t off, uint32_t len,
  * by a pixel because a line is expanded across its direction and a
  * rectangle list implies a fourth corner, then clipped exactly the way
  * r300_raster_tri() clips its scan.
+ *
+ * `empty`, when not NULL, comes back true for the ONE refusal that is a
+ * PROOF that the software rasterizer would paint nothing either: the
+ * widened bounding box is empty after the scissor. That is a proof and
+ * not an impression, because this box is a superset of every box
+ * r300_raster_tri() will scan for this draw --
+ *
+ *   - the vertex loop above takes the minimum/maximum over ALL of `vb`
+ *     (plus the corner a rectangle list implies, plus the point
+ *     sprite's RE_POINTSIZE half-extent, both of which the rasterizer
+ *     synthesises from the same registers), so any triangle it
+ *     assembles has its own min/max inside fx0..fx1, fy0..fy1;
+ *   - floorf()-1 / ceilf()+1 widen that by a further pixel, so the
+ *     rasterizer's un-widened floorf()/ceilf() bounds stay inside;
+ *   - the four clamps below are character for character the ones
+ *     r300_raster_tri() applies, and r300_span_clip() only ever
+ *     narrows a row further.
+ *
+ * So x1 <= x0 or y1 <= y0 here means every scan loop there is empty.
+ * The other refusals are NOT that proof and must not be treated as one:
+ * a non-finite or out-of-range coordinate says only that this helper
+ * declined to think about the draw, a zero pitch still lets the
+ * rasterizer write row 0 over and over, and the VRAM trim below drops
+ * rows using a widened x1 the real primitive may fall well short of.
  */
 static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
                           const R300Vtx *vb, unsigned nvtx, unsigned prim,
-                          int *rx0, int *ry0, int *rx1, int *ry1)
+                          int *rx0, int *ry0, int *rx1, int *ry1,
+                          bool *empty)
 {
     float fx0 = vb[0].x, fy0 = vb[0].y, fx1 = fx0, fy1 = fy0;
     int x0, y0, x1, y1;
     unsigned i;
 
+    if (empty) {
+        *empty = false;
+    }
     for (i = 1; i < nvtx; i++) {
         fx0 = MIN(fx0, vb[i].x); fx1 = MAX(fx1, vb[i].x);
         fy0 = MIN(fy0, vb[i].y); fy1 = MAX(fy1, vb[i].y);
@@ -3274,7 +3302,13 @@ static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
     y0 = MAX(y0, MAX(d->sc_y0, 0));
     x1 = MIN(x1, MIN(d->sc_x1 + 1, 8191));
     y1 = MIN(y1, MIN(d->sc_y1 + 1, 8191));
-    if (x1 <= x0 || y1 <= y0 || !d->dst_pitch) {
+    if (x1 <= x0 || y1 <= y0) {
+        if (empty) {
+            *empty = true;
+        }
+        return false;
+    }
+    if (!d->dst_pitch) {
         return false;
     }
     /* every byte of the rectangle has to be inside VRAM to be captured */
@@ -3332,7 +3366,7 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
      * because the harness reading it cannot tell the two apart.
      */
     if (d->resolve ||
-        !r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1) ||
+        !r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1, NULL) ||
         (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0) > s->cap_max_px ||
         !r300_cap_xor(s, d->dst_off + (uint32_t)y0 * d->dst_pitch,
                       (uint32_t)(y1 - 1 - y0) * d->dst_pitch +
@@ -3931,12 +3965,49 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
     return true;
 }
 
-static bool r300_gl_fallback(ATIR350State *s, ATIR350GlFallback why,
-                             unsigned prim, unsigned nvtx)
+/*
+ * What r300_gl_prims() did with a draw, and what the caller therefore
+ * owes the resident render target.
+ *
+ * R300_GL_SOFTWARE and R300_GL_NOWORK are BOTH fallbacks and both
+ * counted as such -- they differ only in whether VRAM is about to
+ * change. A fallback that is going to run the software rasterizer over
+ * the destination must have the target back first, because the
+ * rasterizer writes VRAM the GPU copy shadows; a fallback that has been
+ * PROVED to paint no pixels writes nothing, reads nothing, and needs no
+ * coherency action at all. Tearing the target off the GPU for one of
+ * those is pure loss: measured on Xbench's Spinning Squares, ~83% of
+ * ~4400 quads a frame have an empty post-scissor rectangle, and
+ * releasing for each of them cost 46,116 synchronous glReadPixels
+ * round trips and 1.66 G px each way in a single run.
+ */
+typedef enum R300GlOutcome {
+    R300_GL_SOFTWARE,   /* fall back; the rasterizer will write VRAM */
+    R300_GL_DRAWN,      /* the backend rendered it */
+    R300_GL_NOWORK      /* provably zero pixels; neither path need run */
+} R300GlOutcome;
+
+static R300GlOutcome r300_gl_fallback(ATIR350State *s, ATIR350GlFallback why,
+                                      unsigned prim, unsigned nvtx)
 {
     s->gl_fb[why][prim & (R350_GAP_SLOTS - 1)]++;
     trace_ati_r350_3d_gl_fallback(ati_r350_gl_fb_name(why), prim, nvtx);
-    return false;
+    return R300_GL_SOFTWARE;
+}
+
+/*
+ * The same fallback, counted identically -- the cause tally and the
+ * trace stay exactly what they were, so nothing that reads them has to
+ * learn a new name -- plus the sub-count `gl-stats` reports, which is
+ * the only place the changed BEHAVIOUR is visible. Only a caller
+ * holding a proof of emptiness may use this.
+ */
+static R300GlOutcome r300_gl_nowork(ATIR350State *s, ATIR350GlFallback why,
+                                    unsigned prim, unsigned nvtx)
+{
+    r300_gl_fallback(s, why, prim, nvtx);
+    s->gl_nowork++;
+    return R300_GL_NOWORK;
 }
 
 /*
@@ -4705,13 +4776,16 @@ static void r300_gl_verify(ATIR350State *s, const R300DrawState *d,
 }
 
 /*
- * Returns true when the backend rendered the draw and the caller must
- * not rasterize it again. In gl=verify the software rasterizer HAS been
- * run by the time this returns true -- its result is what stays in
- * VRAM, and the GL result is only compared against it.
+ * Returns R300_GL_DRAWN when the backend rendered the draw and the
+ * caller must not rasterize it again. In gl=verify the software
+ * rasterizer HAS been run by the time that is returned -- its result is
+ * what stays in VRAM, and the GL result is only compared against it.
+ * R300_GL_NOWORK means the draw was refused AND proved to paint
+ * nothing; anything else is R300_GL_SOFTWARE. See R300GlOutcome.
  */
-static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
-                          const R300Vtx *vb, unsigned nvtx, unsigned prim)
+static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
+                                   const R300Vtx *vb, unsigned nvtx,
+                                   unsigned prim)
 {
     g_autofree R300Vtx *rect_vb = NULL;
     g_autofree unsigned *idx = NULL;
@@ -4723,6 +4797,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     unsigned ntri = 0, npass = 1, i, xr = 0;
     int x0, y0, x1, y1, w, h;
     size_t rect_sz, texels = 0;
+    bool sc_empty = false;
 
     for (i = 0; i < R300_TEX_UNITS; i++) {
         texslot[i] = R350_GL_TEXSLOTS;
@@ -4797,12 +4872,28 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if ((d->dst_off | d->dst_pitch) & 3) {
         return r300_gl_fallback(s, R350_GLF_ALIGN, prim, nvtx);
     }
-    if (!r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1)) {
+    if (!r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1, &sc_empty)) {
         /*
          * Empty after the scissor, off-screen, or not a finite
-         * rectangle at all. The software path paints nothing for these
-         * either, so this is the one fallback that costs nothing.
+         * rectangle at all.
+         *
+         * When it is the FIRST of those -- `sc_empty`, the case
+         * r300_cap_rect() carries a proof for -- the software path
+         * paints nothing either, so there is nothing for the resident
+         * render target to be coherent WITH: no release, and no
+         * rasterizer call to make one necessary. This is the one
+         * fallback that costs nothing, and now it also costs nothing to
+         * the target.
+         *
+         * The other two keep the release. "Off-screen" and "not finite"
+         * arrive here together, and only the clipped-to-empty half of
+         * that pair is provable: a coordinate outside +-100000 is a
+         * draw this helper declined to reason about, not one that
+         * misses the screen, and the rasterizer will happily scan it.
          */
+        if (sc_empty) {
+            return r300_gl_nowork(s, R350_GLF_RECT, prim, nvtx);
+        }
         return r300_gl_fallback(s, R350_GLF_RECT, prim, nvtx);
     }
     w = x1 - x0;
@@ -4941,7 +5032,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
         r300_raster_prims(s, d, vb, nvtx, prim);
         r300_gl_verify(s, d, prim, ntri, xr, x0, y0, w, h);
         r300_gl_discard(s);
-        return true;
+        return R300_GL_DRAWN;
     }
     /* the GPU now holds bytes VRAM does not, over this rectangle */
     if (s->gl_dx1 <= s->gl_dx0) {
@@ -4950,7 +5041,7 @@ static bool r300_gl_prims(ATIR350State *s, R300DrawState *d,
         s->gl_dx0 = MIN(s->gl_dx0, x0); s->gl_dy0 = MIN(s->gl_dy0, y0);
         s->gl_dx1 = MAX(s->gl_dx1, x1); s->gl_dy1 = MAX(s->gl_dy1, y1);
     }
-    return true;
+    return R300_GL_DRAWN;
 }
 
 /*
@@ -5024,14 +5115,30 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
     if (s->cap_fp && s->cap_arm && nvtx) {
         ati_r350_gl_release(s, R350_GLR_FALLBACK);
         r300_cap_draw(s, d, vb, nvtx, prim);
-    } else if (s->gl_ctx && nvtx &&
-               r300_gl_prims(s, d, vb, nvtx, prim)) {
-        /* the backend rendered it (and, under verify, so did we) */
-    } else {
-        /* the software rasterizer writes VRAM the GPU copy shadows */
-        ati_r350_gl_release(s, R350_GLR_FALLBACK);
-        r300_raster_prims(s, d, vb, nvtx, prim);
+        return;
     }
+    if (s->gl_ctx && nvtx) {
+        R300GlOutcome o = r300_gl_prims(s, d, vb, nvtx, prim);
+
+        if (o == R300_GL_DRAWN) {
+            /* the backend rendered it (and, under verify, so did we) */
+            return;
+        }
+        if (o == R300_GL_NOWORK) {
+            /*
+             * A fallback with a proof that it paints no pixels. It
+             * writes no VRAM, so the rules above ask nothing of it: the
+             * resident target stays exactly as correct as it was, and
+             * the rasterizer is not called because it would walk an
+             * empty scan. The one rule this must not break is that the
+             * proof is a proof -- see r300_cap_rect()'s `empty`.
+             */
+            return;
+        }
+    }
+    /* the software rasterizer writes VRAM the GPU copy shadows */
+    ati_r350_gl_release(s, R350_GLR_FALLBACK);
+    r300_raster_prims(s, d, vb, nvtx, prim);
 }
 
 /*
