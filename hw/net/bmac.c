@@ -487,6 +487,16 @@ static ssize_t bmac_receive(NetClientState *nc, const uint8_t *buf,
     }
 
     /*
+     * frame_buf is sized for a maximum-length frame plus CRC and status
+     * trailer; a real BMAC rejects frames beyond RXMAX (1518) anyway.
+     * Without this bound an oversized frame from the net layer overruns
+     * the stack buffer -- host memory corruption, not just a guest bug.
+     */
+    if (size > BMAC_MAX_PACKET) {
+        return size;
+    }
+
+    /*
      * Frame layout the driver expects in the DMA buffer:
      *   [ethernet frame] [4-byte CRC, if RXCFG_CRCNOSTRIP] [2-byte
      *   rxPktStatus, big-endian, low bits = frame length]
@@ -669,6 +679,17 @@ static void bmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
 
     case BMAC_RXRST:
+        /*
+         * An RX-engine reset also invalidates any armed-but-unfilled RX
+         * DMA arm. The OS driver's init-time RXRST is the only thing
+         * standing between whatever the ROM (or a previous session) left
+         * armed and the new system's memory layout: without this, the
+         * next packet slirp delivers is DMA-written through the STALE
+         * address saved at arm time -- silent memory corruption in
+         * whatever the new boot placed there.
+         */
+        s->rx_dma_waiting = false;
+        s->rx_dma_io = NULL;
         s->regs[REG_INDEX(BMAC_RXRST)] = 0;
         return;
 

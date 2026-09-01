@@ -1056,6 +1056,29 @@ static void mac_dbdma_reset(DeviceState *d)
     for (i = 0; i < DBDMA_CHANNELS; i++) {
         DBDMA_channel *ch = &s->channels[i];
 
+        /*
+         * Tell the owning device to drop anything armed-and-parked
+         * BEFORE the channel state under it is cleared. Clearing only
+         * the channel's own fields (below) leaves the device's copy of
+         * the arm dangling: bmac, mesh and escc all save the DMA target
+         * (address/length/io pointer) at arm time and complete it later
+         * from an unrelated event -- a network packet, SCSI data, a
+         * chardev byte. After a warm restart that stale arm points into
+         * the PREVIOUS session's memory layout, so the first packet
+         * slirp delivers to the new session was DMA-written through the
+         * old address: silent guest memory corruption that surfaced as
+         * wandering "bus error"/hang crashes early in OS 9 boot
+         * (field-debugged on the Windows port, 2026-09-01: fresh
+         * installs crashed on first boot -- always a warm restart out
+         * of the installer -- while -nic none boots were clean). The
+         * flush callback is the existing contract for exactly this
+         * "drop your parked transfer" request, and is called while the
+         * registers are still intact, same as the CONTROL-write path.
+         */
+        if (ch->flush) {
+            ch->flush(&ch->io);
+        }
+
         memset(ch->regs, 0, DBDMA_SIZE);
         ch->sync_continue_count = 0;
 
