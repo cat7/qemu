@@ -34,12 +34,8 @@
 #include "mmu-book3s-v3.h"
 #include "mmu-radix64.h"
 #include "mmu-booke.h"
-#include "hw/core/boards.h"
 
 /* #define DUMP_PAGE_TABLES */
-
-/* One-shot latch for the classic Mac OS VM-on hint in ppc_xlate(). */
-static bool ppc_hash32_vm_hint_done;
 
 void ppc_store_sdr1(CPUPPCState *env, target_ulong value)
 {
@@ -839,43 +835,8 @@ bool ppc_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 #endif
 
     case POWERPC_MMU_32B:
-    {
-        bool ok = ppc_hash32_xlate(cpu, eaddr, access_type, raddrp,
-                                   psizep, protp, mmu_idx, guest_visible);
-        /*
-         * Classic Mac OS paged-virtual-memory tripwire. With VM on, the
-         * guest maps logical pages just past the top of physical RAM
-         * into RAM (the "VM Storage"-backed heap zones); with VM off no
-         * such mapping ever exists -- calibrated 2026-09-01 by diffing
-         * per-16MB translation maps of the same Mac OS 9.2 install with
-         * VM on vs off (the fixed high regions the OS maps in BOTH
-         * modes -- the 68K emulator at 0x68xxxxxx, I/O at 0xf3xxxxxx,
-         * ROM at 0xffxxxxxx -- all sit far above ram_size + 64MB, so a
-         * RAM-relative window excludes them structurally). VM-on is a
-         * known-unstable configuration on hosts with high main-loop
-         * timer latency (win32): the OS's paging-unsafe windows stretch
-         * until boot-time code faults on paged-out memory at an
-         * unresolvable moment -- presenting as intermittent "bus error"
-         * dialogs (field-debugged via MacsBug StdLog, 2026-09-01). Warn
-         * once so nobody has to rediscover that from symptoms.
-         */
-        if (unlikely(!ppc_hash32_vm_hint_done) && ok && guest_visible &&
-            (cpu->env.msr & (access_type == MMU_INST_FETCH ? 0x20 : 0x10))) {
-            uint64_t ram = current_machine ? current_machine->ram_size : 0;
-
-            if (ram && (uint32_t)eaddr - ram < 64 * MiB && *raddrp < ram) {
-                ppc_hash32_vm_hint_done = true;
-                warn_report("guest appears to be using paged virtual memory "
-                            "(logical 0x%08x beyond %" PRIu64 " MiB of RAM); "
-                            "classic Mac OS with Virtual Memory enabled can "
-                            "be unstable on this host -- if you see "
-                            "boot-time \"bus error\" dialogs, turn Virtual "
-                            "Memory off in the guest's Memory control panel",
-                            (uint32_t)eaddr, ram / MiB);
-            }
-        }
-        return ok;
-    }
+        return ppc_hash32_xlate(cpu, eaddr, access_type, raddrp,
+                               psizep, protp, mmu_idx, guest_visible);
     case POWERPC_MMU_BOOKE:
     case POWERPC_MMU_BOOKE206:
         return ppc_booke_xlate(cpu, eaddr, access_type, raddrp,
