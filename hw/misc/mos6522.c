@@ -55,7 +55,10 @@ static void mos6522_timer2_update(MOS6522State *s, MOS6522Timer *ti,
 
 static void mos6522_update_irq(MOS6522State *s)
 {
-    if (s->ifr & s->ier) {
+    bool raise = s->ifr & s->ier;
+
+    trace_mos6522_update_irq(s->ifr, s->ier, raise);
+    if (raise) {
         qemu_irq_raise(s->irq);
     } else {
         qemu_irq_lower(s->irq);

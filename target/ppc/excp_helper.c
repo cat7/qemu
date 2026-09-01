@@ -616,6 +616,7 @@ static void powerpc_excp_6xx(PowerPCCPU *cpu, int excp)
             msr |= 0x00040000;
             break;
         case POWERPC_EXCP_TRAP:
+            trace_ppc_excp_trap(env->nip);
             msr |= 0x00020000;
             break;
         default:
@@ -768,6 +769,7 @@ static void powerpc_excp_7xx(PowerPCCPU *cpu, int excp)
             msr |= 0x00040000;
             break;
         case POWERPC_EXCP_TRAP:
+            trace_ppc_excp_trap(env->nip);
             msr |= 0x00020000;
             break;
         default:
@@ -930,6 +932,7 @@ static void powerpc_excp_74xx(PowerPCCPU *cpu, int excp)
             msr |= 0x00040000;
             break;
         case POWERPC_EXCP_TRAP:
+            trace_ppc_excp_trap(env->nip);
             msr |= 0x00020000;
             break;
         default:
@@ -1551,6 +1554,7 @@ static void powerpc_excp_books(PowerPCCPU *cpu, int excp)
             msr |= 0x00040000;
             break;
         case POWERPC_EXCP_TRAP:
+            trace_ppc_excp_trap(env->nip);
             msr |= 0x00020000;
             break;
         default:

@@ -35,4 +35,5 @@ ppc_excp_dsi(uint64_t dsisr, uint64_t dar) "DSI exception: DSISR=0x%" PRIx64 " D
 ppc_excp_isi(uint64_t msr, uint64_t nip) "ISI exception: msr=0x%016" PRIx64 " nip=0x%" PRIx64
 ppc_excp_fp_ignore(void) "Ignore floating point exception"
 ppc_excp_inval(uint64_t nip) "Invalid instruction at 0x%" PRIx64
+ppc_excp_trap(uint64_t nip) "TRAP program exception at 0x%" PRIx64
 ppc_excp_print(const char *excp) "%s exception"
