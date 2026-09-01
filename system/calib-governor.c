@@ -95,6 +95,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
+#include "qemu/main-loop.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qemu/cutils.h"
@@ -123,24 +124,26 @@ bool calib_gov_window_open;
 #define NUM_TIME_UPDATE_PER_SEC 8000
 #define MAX_QUANTUM_INSNS       2000
 
-#ifdef _WIN32
 /*
- * Windows sleeps in whole milliseconds (g_usleep() is Sleep() rounded
- * up), so a debt below that granularity is settled by BUSY-WAITING
- * instead (see throttle_sleep()). The obvious alternative -- let
- * sub-millisecond debt ride until it is big enough to Sleep() on, which
- * is what contrib/plugins/governor.c does -- is correct only there,
- * where the debt is session-cumulative and eventually crosses the
- * granularity. Here the debt lives and dies inside a ~1.3 ms window: at
- * the default target a quantum owes ~20 us, so the ride never ends, the
- * window never pays a nanosecond, and the calibration spin measures raw
- * host speed -- TimeDBRA several times too high on a fast host (ATA/SCC
- * delays run too short) and the full 65536-count fall-through to the
- * divide-by-zero on a slow one. Measured on the Windows field report of
- * exactly those symptoms, 2026-09-01.
+ * Debts below this are settled by BUSY-WAITING, on every platform (see
+ * throttle_sleep()). Two reasons, both field-verified:
+ *
+ * - Windows cannot sleep for less than a millisecond (g_usleep() is
+ *   Sleep() rounded up), and the obvious alternative -- let sub-ms debt
+ *   ride until it is big enough to Sleep() on, as the full-session
+ *   contrib/plugins/governor.c correctly does -- never pays anything
+ *   inside a ~1.3 ms window whose quanta owe ~tens of us each: the
+ *   window closes, the debt is discarded, and the calibration spin
+ *   measures raw host speed (Windows field report 2026-09-01: bus
+ *   errors, divide-by-zero, unrecognized ATA disks).
+ *
+ * - POSIX g_usleep() of a few microseconds overshoots by an order of
+ *   magnitude, so wherever a sleep DID engage the nominal target and
+ *   the paced rate had nothing to do with each other. The calibrated
+ *   values must be HOST-INDEPENDENT, which means the paced rate must
+ *   be exact, not merely slow enough.
  */
 #define SLEEP_GRANULARITY_NS (1000 * 1000)
-#endif
 #define MAX_CREDIT_NS        (100 * 1000)
 
 /*
@@ -287,8 +290,44 @@ static CalibGovVCPU gov_vcpu[CALIB_GOV_MAX_CPUS];
  */
 static bool gov_enabled;
 static bool gov_explicit;
-static uint64_t gov_insn_per_second = 100 * 1000 * 1000;
+/*
+ * Default pacing rate for T2 calibration windows, chosen so that the
+ * paced dbra spin reproduces the verified-good TimeDBRA baseline on
+ * any host. Measured (2026-09-01, ROM-only golden-baseline boots with
+ * a TimeDBRA readback at 0xd00): one dbra iteration costs ~10
+ * host-emulated instructions (the 68K emulator's four-block cycle),
+ * so TimeDBRA = effective_MIPS * 995us / 10 -- confirmed linear at
+ * mips=12/30/45 (1238/2994/4330). The macOS baseline of ~7854 was
+ * never a paced number at all: at the old nominal 100 MIPS the due
+ * time per 2000-insn quantum (20us) sat BELOW the dev Mac's raw
+ * unchained execution time (~26us), so pacing never engaged for the
+ * spin and 7854 was simply that machine's raw floor (~78 MIPS) -- the
+ * value was host-dependent luck. 79 MIPS makes it nominal: hosts
+ * faster than this (where the broken host-speed values came from) are
+ * paced to TimeDBRA ~7860; hosts at or below it floor at raw speed
+ * exactly as the known-good baseline always did (measured: this
+ * default reads 7336 on the dev Mac, inside its 7336-7793 baseline
+ * spread).
+ */
+static uint64_t gov_insn_per_second = 79 * 1000 * 1000;
 static uint64_t gov_insn_per_quantum = MAX_QUANTUM_INSNS;
+
+/*
+ * On-time interrupt delivery for the governed one-shot. The QEMU timer
+ * that ends the calibration spin fires from the main loop; on hosts
+ * where main-loop service latency exceeds the guard tail (win32), the
+ * spin outlives the paced window and finishes at raw host speed,
+ * making the calibrated value host-dependent again however exact the
+ * pacing was. So the device registers a catch-up callback at arm time
+ * and the pacing loop -- which by construction runs on the vCPU every
+ * quantum -- delivers the overdue interrupt inline, never early. Same
+ * pattern as cuda_sr_int_catch_up(), which fixed the same host's
+ * boot-time SR starvation.
+ */
+static void (*gov_irq_cb)(void *opaque);
+static void *gov_irq_opaque;
+static int64_t gov_irq_due_ns;          /* host monotonic, one-shot expiry */
+static bool gov_irq_delivered;
 
 /*
  * Second calibration idiom, same disease, different consumer: XNU's
@@ -654,15 +693,48 @@ static void calib_governor_pace(int64_t now)
     calib_governor_kick_all();
 }
 
+/*
+ * Deliver the governed one-shot's interrupt if its expiry has passed on
+ * the host clock and it has not been delivered yet -- never early. May
+ * be called from a vCPU thread (no BQL) or the main loop (BQL held).
+ */
+static void calib_governor_irq_catch_up(int64_t now)
+{
+    bool locked;
+
+    if (!gov_irq_cb || gov_irq_delivered || now < gov_irq_due_ns) {
+        return;
+    }
+    gov_irq_delivered = true;
+    locked = bql_locked();
+    if (!locked) {
+        bql_lock();
+    }
+    gov_irq_cb(gov_irq_opaque);
+    if (!locked) {
+        bql_unlock();
+    }
+    qatomic_inc(&gov_stats.irq_catch_ups);
+}
+
 static void calib_governor_close(void)
 {
     int64_t now = now_ns();
 
+    /*
+     * Last chance before pacing ends: without this, a window closed by
+     * its deadline hands the still-spinning guest back to raw host
+     * speed with the interrupt still in flight on the main loop.
+     */
+    calib_governor_irq_catch_up(now);
+
     calib_governor_unpace(now);
     if (!gov_window_active) {
+        gov_irq_cb = NULL;
         return;
     }
     gov_window_active = false;
+    gov_irq_cb = NULL;
     if (gov_cpu_probe_window) {
         gov_cpu_probe_window = false;
         gov_insn_per_second = gov_cpu_probe_saved_ips;
@@ -702,7 +774,8 @@ static void calib_governor_probe_timer_cb(void *opaque)
     calib_governor_pace(now);
 }
 
-bool calib_governor_arm(int64_t countdown_ns)
+bool calib_governor_arm(int64_t countdown_ns,
+                        void (*irq_catch_up)(void *opaque), void *opaque)
 {
     int64_t now, deadline;
 
@@ -726,6 +799,17 @@ bool calib_governor_arm(int64_t countdown_ns)
 
     now = now_ns();
     deadline = now + countdown_ns + CALIB_GOV_GUARD_NS;
+
+    /*
+     * A fresh arm re-programs the one-shot, so the catch-up target is
+     * always the LATEST arm's expiry. The callback rechecks the
+     * device's own state, so superseding an undelivered older target
+     * is safe.
+     */
+    gov_irq_cb = irq_catch_up;
+    gov_irq_opaque = opaque;
+    gov_irq_due_ns = now + countdown_ns;
+    gov_irq_delivered = false;
 
     if (gov_window_active) {
         /*
@@ -955,11 +1039,11 @@ static int64_t settle_spin(int64_t until)
 /* Pay off a debt. */
 static void throttle_sleep(int64_t debt_ns)
 {
-#ifdef _WIN32
     if (debt_ns < SLEEP_GRANULARITY_NS) {
         settle_spin(now_ns() + debt_ns);
         return;
     }
+#ifdef _WIN32
     /* whole milliseconds only: g_usleep(N * 1000) is exactly Sleep(N) */
     g_usleep((debt_ns / SLEEP_GRANULARITY_NS) * 1000);
 #else
@@ -1022,6 +1106,15 @@ void calib_governor_account(CPUState *cpu, uint64_t pc, unsigned int n_insns)
     qatomic_add(&gov_stats.insns, v->quantum_insn);
     v->quantum_insn = 0;
 
+    /*
+     * The one-shot has expired but its main-loop timer may not have run
+     * yet; on hosts where that latency exceeds the guard tail the spin
+     * would outlive the window and finish at raw host speed. Deliver it
+     * from right here instead: this code runs every quantum, so the
+     * interrupt lands within one quantum's due time of its expiry.
+     */
+    calib_governor_irq_catch_up(now);
+
     /* how long SHOULD this window's instructions have taken? */
     due_ns = (int64_t)((double)v->window_insn /
                        (double)gov_insn_per_second *
@@ -1077,6 +1170,7 @@ void calib_governor_get_stats(CalibGovStats *out)
     out->governed_ns = qatomic_read(&gov_stats.governed_ns);
     out->insns = qatomic_read(&gov_stats.insns);
     out->slept_ns = qatomic_read(&gov_stats.slept_ns);
+    out->irq_catch_ups = qatomic_read(&gov_stats.irq_catch_ups);
 }
 
 static void calib_governor_recompute(void)

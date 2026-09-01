@@ -795,7 +795,7 @@ static void heathrow_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "calibration-governor",
         "Pace the CPU while a VIA T2 one-shot calibration window is open and "
         "the code running in it looks like a calibration spin: 'on' (the "
-        "default, 100 MIPS), 'off', 'mips=<n>', or 'warn-pct=<n>' for the "
+        "default, 79 MIPS), 'off', 'mips=<n>', or 'warn-pct=<n>' for the "
         "paced-share threshold of the runtime warning");
 
     object_class_property_add(oc, "calibration-governor-windows", "uint64",

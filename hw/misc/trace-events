@@ -135,6 +135,7 @@ mos6522_get_next_irq_time(uint16_t latch, int64_t d, int64_t delta) "latch=%d co
 mos6522_set_sr_int(void) "set sr_int"
 mos6522_t2_oneshot(unsigned int latch, unsigned int ier, unsigned int acr, int64_t ns, int governed) "T2 one-shot armed latch=%u ier=0x%02x acr=0x%02x countdown=%"PRId64"ns governed=%d"
 mos6522_t1_cpu_probe(unsigned int acr, int governed) "T1 loaded 0xffff acr=0x%02x cpu_probe_governed=%d"
+mos6522_t2_irq_catch_up(int64_t late_ns) "T2 one-shot IRQ delivered inline %"PRId64"ns past expiry"
 mos6522_write(uint64_t addr, const char *name, uint64_t val) "reg=0x%"PRIx64 " [%s] val=0x%"PRIx64
 mos6522_read(uint64_t addr, const char *name, unsigned val) "reg=0x%"PRIx64 " [%s] val=0x%x"
 

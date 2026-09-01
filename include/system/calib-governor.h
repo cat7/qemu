@@ -35,8 +35,20 @@ static inline bool calib_governor_active(void)
  * block chain so that the new cflags take effect immediately. Returns
  * true if a window was opened or extended -- a one-shot too long to be
  * a calibration spin is ignored.
+ *
+ * @irq_catch_up, if non-NULL, is invoked (BQL held) once the one-shot's
+ * expiry has passed on the host clock, from the vCPU thread that is
+ * being paced. A calibration spin is a pure register loop, so the
+ * device's own lazy catch-up on MMIO access can never fire mid-spin,
+ * and the QEMU timer that would deliver the interrupt runs from the
+ * main loop -- whose service latency on some hosts (win32: ~1ms poll
+ * granularity and worse) exceeds the window's guard tail, letting the
+ * loop run out at raw host speed after pacing ends. The callback must
+ * recheck its own device state (expiry actually reached, interrupt not
+ * already delivered) because it can be invoked late or after a re-arm.
  */
-bool calib_governor_arm(int64_t countdown_ns);
+bool calib_governor_arm(int64_t countdown_ns,
+                        void (*irq_catch_up)(void *opaque), void *opaque);
 
 /*
  * Accelerator side. Called from the TCG execution loop after each
@@ -89,6 +101,7 @@ typedef struct CalibGovStats {
     uint64_t governed_ns;   /* total real time actually spent pacing */
     uint64_t insns;         /* guest instructions executed inside windows */
     uint64_t slept_ns;      /* real time spent asleep enforcing the cap */
+    uint64_t irq_catch_ups; /* overdue one-shot IRQs delivered inline */
 } CalibGovStats;
 
 void calib_governor_get_stats(CalibGovStats *out);

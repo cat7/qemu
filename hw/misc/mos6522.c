@@ -396,6 +396,35 @@ static void mos6522_timer2(void *opaque)
     mos6522_update_irq(s);
 }
 
+/*
+ * Deliver an overdue T2 one-shot interrupt inline. Invoked (BQL held)
+ * by the calibration governor from the paced vCPU when the one-shot's
+ * expiry has passed on the host clock: the calibration spin is a pure
+ * register loop, so the lazy catch-up in mos6522_read() can never fire
+ * for it, and on hosts whose main loop services QEMU timers later than
+ * the window's guard tail (win32) the spin would otherwise outlive the
+ * paced window and run out at raw host speed -- making the calibrated
+ * value host-dependent however exact the pacing was. Never early: the
+ * expiry is rechecked against the virtual clock here. The pending
+ * main-loop timer is cancelled so the interrupt is not delivered a
+ * second time after the guest's ISR has already cleared it.
+ */
+static void mos6522_t2_irq_catch_up(void *opaque)
+{
+    MOS6522State *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (now < s->timers[1].next_irq_time || (s->ifr & T2_INT)) {
+        return;
+    }
+    if (s->timers[1].timer) {
+        timer_del(s->timers[1].timer);
+    }
+    trace_mos6522_t2_irq_catch_up(now - s->timers[1].next_irq_time);
+    s->ifr |= T2_INT;
+    mos6522_update_irq(s);
+}
+
 static uint64_t mos6522_get_counter_value(MOS6522State *s, MOS6522Timer *ti)
 {
     return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - ti->load_time,
@@ -625,7 +654,8 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         if (!(s->acr & T2MODE_COUNT)) {
             int64_t countdown = s->timers[1].next_irq_time -
                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            bool governed = calib_governor_arm(countdown);
+            bool governed = calib_governor_arm(countdown,
+                                               mos6522_t2_irq_catch_up, s);
 
             trace_mos6522_t2_oneshot(s->timers[1].latch, s->ier, s->acr,
                                      countdown, governed);
@@ -765,9 +795,10 @@ static HumanReadableText *qmp_x_query_via(Error **errp)
     g_string_append_printf(buf, "    ungoverned=%" PRIu64 " probes=%" PRIu64
                                 "\n", gov.ungoverned, gov.probes);
     g_string_append_printf(buf, "    governed=%.3f ms slept=%.3f ms"
-                                " insns=%" PRIu64 "\n",
+                                " insns=%" PRIu64 " irq-catch-ups=%" PRIu64
+                                "\n",
                            gov.governed_ns / 1.0e6, gov.slept_ns / 1.0e6,
-                           gov.insns);
+                           gov.insns, gov.irq_catch_ups);
 
     return human_readable_text_from_str(buf);
 }
