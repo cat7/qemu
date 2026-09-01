@@ -126,17 +126,22 @@ bool calib_gov_window_open;
 #ifdef _WIN32
 /*
  * Windows sleeps in whole milliseconds (g_usleep() is Sleep() rounded
- * up), so settling a few-microsecond debt with a sleep would
- * over-throttle by ~10x. Let sub-millisecond debt ride -- the window
- * accounting is cumulative so it stays owed -- and widen the credit cap
- * to one millisecond so Sleep()'s own overshoot is banked rather than
- * lost. Same reasoning as contrib/plugins/governor.c.
+ * up), so a debt below that granularity is settled by BUSY-WAITING
+ * instead (see throttle_sleep()). The obvious alternative -- let
+ * sub-millisecond debt ride until it is big enough to Sleep() on, which
+ * is what contrib/plugins/governor.c does -- is correct only there,
+ * where the debt is session-cumulative and eventually crosses the
+ * granularity. Here the debt lives and dies inside a ~1.3 ms window: at
+ * the default target a quantum owes ~20 us, so the ride never ends, the
+ * window never pays a nanosecond, and the calibration spin measures raw
+ * host speed -- TimeDBRA several times too high on a fast host (ATA/SCC
+ * delays run too short) and the full 65536-count fall-through to the
+ * divide-by-zero on a slow one. Measured on the Windows field report of
+ * exactly those symptoms, 2026-09-01.
  */
 #define SLEEP_GRANULARITY_NS (1000 * 1000)
-#define MAX_CREDIT_NS        (1000 * 1000)
-#else
-#define MAX_CREDIT_NS        (100 * 1000)
 #endif
+#define MAX_CREDIT_NS        (100 * 1000)
 
 /*
  * Guard tail: keep pacing this long past the timer's expiry, so the
@@ -931,19 +936,35 @@ resync:
     return true;
 }
 
-/* Sleep off a debt; returns false if the debt is too small to sleep on. */
-static bool throttle_sleep(int64_t debt_ns)
+/*
+ * Busy-wait until @until, returning the time when the wait ended.
+ * Precise where a sleep is not: both the CPU-probe settle and Windows'
+ * sub-millisecond debts need an accuracy neither g_usleep() nor Sleep()
+ * can deliver at these scales.
+ */
+static int64_t settle_spin(int64_t until)
+{
+    int64_t now;
+
+    do {
+        now = now_ns();
+    } while (now < until);
+    return now;
+}
+
+/* Pay off a debt. */
+static void throttle_sleep(int64_t debt_ns)
 {
 #ifdef _WIN32
     if (debt_ns < SLEEP_GRANULARITY_NS) {
-        return false;
+        settle_spin(now_ns() + debt_ns);
+        return;
     }
     /* whole milliseconds only: g_usleep(N * 1000) is exactly Sleep(N) */
     g_usleep((debt_ns / SLEEP_GRANULARITY_NS) * 1000);
 #else
     g_usleep(debt_ns / 1000);
 #endif
-    return true;
 }
 
 void calib_governor_account(CPUState *cpu, uint64_t pc, unsigned int n_insns)
@@ -1009,20 +1030,17 @@ void calib_governor_account(CPUState *cpu, uint64_t pc, unsigned int n_insns)
 
     if (due_ns > elapsed_ns && gov_cpu_probe_window) {
         /* Precise settle: see calib_governor_recompute(). */
-        int64_t until = now + (due_ns - elapsed_ns);
-        int64_t after;
+        int64_t after = settle_spin(now + (due_ns - elapsed_ns));
 
-        do {
-            after = now_ns();
-        } while (after < until);
         qatomic_add(&gov_stats.slept_ns, (uint64_t)(after - now));
         now = after;
     } else if (due_ns > elapsed_ns) {
-        if (throttle_sleep(due_ns - elapsed_ns)) {
-            int64_t after = now_ns();
-            qatomic_add(&gov_stats.slept_ns, (uint64_t)(after - now));
-            now = after;
-        }
+        int64_t after;
+
+        throttle_sleep(due_ns - elapsed_ns);
+        after = now_ns();
+        qatomic_add(&gov_stats.slept_ns, (uint64_t)(after - now));
+        now = after;
     } else if (elapsed_ns - due_ns > MAX_CREDIT_NS) {
         /*
          * Running below target: forgive the excess beyond the cap
