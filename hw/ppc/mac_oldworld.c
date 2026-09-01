@@ -187,7 +187,8 @@ static void ppc_heathrow_reset(void *opaque)
  * (verified against real Beige G3 ROM boot behavior): fixed 12 row
  * address bits, with column count and bank count varying by capacity.
  */
-static uint8_t *g3beige_spd_data_generate(uint64_t ram_size)
+static uint8_t *g3beige_spd_data_generate(uint64_t ram_size,
+                                          uint32_t *megs_out)
 {
     static const struct { uint32_t megs; uint8_t cols, banks; } table[] = {
         { 8,   6,  1 },
@@ -203,6 +204,9 @@ static uint8_t *g3beige_spd_data_generate(uint64_t ram_size)
 
     /* pick the largest supported capacity not exceeding what's configured */
     for (i = ARRAY_SIZE(table) - 1; i > 0 && table[i].megs > megs; i--) {
+    }
+    if (megs_out) {
+        *megs_out = table[i].megs;
     }
 
     uint8_t *spd = g_malloc0(256);
@@ -507,25 +511,47 @@ static void ppc_heathrow_init(MachineState *machine)
      * "RAM_DIMM_1", 0x57, ...)` etc. -- NOT the generic 168-pin-SPD
      * 0x50-based sequential scheme `spdram.h`'s own doc comment
      * describes, which is a different board's SA0-2 strapping, not this
-     * one). This machine only ever configures a single RAM bank, so only
-     * DIMM_1 (0x57) is populated; DIMM_2/3 (0x56/0x55) are correctly left
-     * unregistered, matching a real board with only the first slot
-     * filled (the I2C bus already NAKs unclaimed addresses, exactly the
-     * "empty slot" behavior real hardware would show there).
+     * one). The requested RAM size is split greedily across the three
+     * slots using the largest supported module capacities (max 512MB
+     * per DIMM, per the SPD table this shares with DingusPPC's
+     * SpdSdram168::set_capacity()): -m 512 stays the historical single
+     * 512MB DIMM, -m 768 becomes 512+256, -m 1024 becomes 512+512.
+     * The ROM reads each populated slot's SPD, sizes each bank, and
+     * programs the MPC106 bank-decode registers accordingly -- which is
+     * why those registers being writable (hw/pci-host/grackle.c) is a
+     * prerequisite for multi-DIMM configurations. Slots with no module
+     * are left unregistered: the I2C bus NAKs unclaimed addresses,
+     * exactly the "empty slot" behavior real hardware shows.
      *
-     * A prior version of this code used a nonstandard 0x50 (not a real
-     * address on this board at all) after switching to 0x57 once caused
-     * a regression -- but `g3beige_spd_data_generate()`'s content was
-     * never actually wrong: checked byte-for-byte against DingusPPC's
-     * own `SpdSdram168::eeprom_data`/`set_capacity()` (the reference this
-     * project's own real-Finder-boot milestone was achieved against) and
-     * it matches exactly, field for field, for every capacity DingusPPC
-     * supports. The earlier regression was most likely from registering
-     * TWO devices (0x50 and 0x57) simultaneously, not from bad content --
-     * fixed by registering only the one real address.
+     * History, kept because it cost real debugging time: a prior
+     * version used a nonstandard 0x50 (not a real address on this
+     * board), and a still earlier regression blamed on the 0x57 switch
+     * was actually from registering the same content at TWO addresses
+     * simultaneously -- the SPD content itself was verified
+     * byte-for-byte against DingusPPC's SpdSdram168 for every capacity.
+     * A leftover -m remainder smaller than the smallest module (8MB) is
+     * simply not represented; the guest sees the sum of the DIMMs, and
+     * a warning notes any shortfall.
      */
-    smbus_eeprom_init_one(CUDA(dev)->i2c_bus, 0x57,
-                          g3beige_spd_data_generate(machine->ram_size));
+    {
+        static const uint8_t dimm_addr[3] = { 0x57, 0x56, 0x55 };
+        uint64_t remaining = machine->ram_size;
+        int slot;
+
+        for (slot = 0; slot < 3 && remaining >= 8 * MiB; slot++) {
+            uint32_t megs = 0;
+            uint8_t *spd = g3beige_spd_data_generate(remaining, &megs);
+
+            smbus_eeprom_init_one(CUDA(dev)->i2c_bus, dimm_addr[slot], spd);
+            remaining -= (uint64_t)megs * MiB;
+        }
+        if (remaining) {
+            warn_report("g3beige: %" PRIu64 " MiB of RAM not representable "
+                        "as three DIMMs (max 512 MiB each); guest will see "
+                        "%" PRIu64 " MiB", remaining / MiB,
+                        (machine->ram_size - remaining) / MiB);
+        }
+    }
 
     /*
      * Real hardware also has a small I2C EEPROM at 0x53 identifying the
