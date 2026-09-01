@@ -318,8 +318,22 @@ static void escc_soft_reset_chn(ESCCChannelState *s)
     if (s->disabled) {
         s->rregs[R_STATUS] |= STATUS_DCD | STATUS_SYNC | STATUS_CTS;
     }
+    /*
+     * A real Z8530's RR1 "All Sent" bit reads 1 whenever the
+     * transmitter is completely idle -- including from reset, before
+     * anything has ever been transmitted. This model only ever SET the
+     * bit on TX completion, so a channel that had never transmitted
+     * read All Sent = 0 forever. Mac OS 9's system-error handler
+     * drains channel A before drawing its dialog (write reg-pointer 1
+     * to the control port, read RR1, poll bit 0) with a
+     * decrementer-based timeout as the only other exit -- and QEMU's
+     * re-arming decrementer can sawtooth over that target, so a
+     * crashed guest hung forever at an empty dialog frame
+     * (field-debugged on the Windows port, 2026-09-01: vCPU sampled
+     * spinning on lbz 2(r28) with r28 = the escc-legacy base).
+     */
     s->rregs[R_SPEC] &= SPEC_ALLSENT;
-    s->rregs[R_SPEC] |= SPEC_BITS8;
+    s->rregs[R_SPEC] |= SPEC_BITS8 | SPEC_ALLSENT;
     s->rregs[R_INTR] = 0;
     s->rregs[R_MISC] &= MISC_2CLKMISS;
 }
