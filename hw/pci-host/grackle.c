@@ -251,11 +251,31 @@ static void grackle_pci_config_write(PCIDevice *d, uint32_t addr,
 static void grackle_pci_realize(PCIDevice *d, Error **errp)
 {
     GrackleFunState *s = (GrackleFunState *)d;
+    int i;
 
     d->config[PCI_CLASS_PROG] = 0x01;
+
+    /*
+     * The MPC106 memory bank-decode registers must be WRITABLE, and
+     * read back what the firmware programs. PCI config space defaults
+     * every non-standard offset's wmask to 0 (read-only), so the
+     * tracking added for these registers never saw a byte change: the
+     * Beige ROM's bank programming was silently dropped and every
+     * read-back returned zero -- one reason guest-visible RAM stuck at
+     * 512MB regardless of -m (DingusPPC's MPC106 stores and returns
+     * all of these; verified against its devices/memctrl/mpc106.cpp).
+     */
+    for (i = GRACKLE_MSAR1; i <= GRACKLE_EMEAR2; i += 4) {
+        pci_set_long(d->wmask + i, 0xffffffff);
+    }
+    d->wmask[GRACKLE_MBER] = 0xff;          /* 8-bit bank-enable */
+    pci_set_long(d->wmask + GRACKLE_MCCR1, 0xffffffff);
+
     /* Real MPC106 reset default (NXP MPC106UM §5.1.11): 64-bit ROM bus,
-     * MEMGO already set. */
+     * MEMGO already set. Present it in config space too, so a read
+     * before the first write sees the real reset value. */
     s->mccr1 = 0xff820000;
+    pci_set_long(d->config + GRACKLE_MCCR1, s->mccr1);
 }
 
 static void grackle_pci_class_init(ObjectClass *klass, const void *data)
