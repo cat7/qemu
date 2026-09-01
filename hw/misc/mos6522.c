@@ -290,6 +290,7 @@ static void set_counter(MOS6522State *s, MOS6522Timer *ti, unsigned int val)
     trace_mos6522_set_counter(1 + ti->index, val);
     ti->load_time = get_load_time(s, ti);
     ti->counter_value = val;
+    ti->fired = false;          /* a fresh arm owes exactly one interrupt */
     if (ti->index == 0) {
         mos6522_timer1_update(s, ti, ti->load_time);
     } else {
@@ -371,13 +372,23 @@ static void mos6522_timer1(void *opaque)
     MOS6522Timer *ti = &s->timers[0];
 
     mos6522_timer1_update(s, ti, ti->next_irq_time);
-    s->ifr |= T1_INT;
+    /*
+     * The lazy catch-up in mos6522_read() may have delivered this
+     * period's interrupt already; don't deliver it twice. Clear the
+     * token afterwards either way: in continuous mode the update above
+     * armed the NEXT period, which owes its own interrupt.
+     */
+    if (!ti->fired) {
+        s->ifr |= T1_INT;
+    }
+    ti->fired = false;
     mos6522_update_irq(s);
 }
 
 static void mos6522_timer2(void *opaque)
 {
     MOS6522State *s = opaque;
+    MOS6522Timer *ti = &s->timers[1];
 
     /*
      * Unlike T1, real 6522 hardware's T2 (in its only mode relevant here,
@@ -391,9 +402,18 @@ static void mos6522_timer2(void *opaque)
      * turned T2 into a free-running periodic interrupt source once
      * enabled via IER, which native ROM code relying on T2's real
      * one-shot semantics never expects and can spin on forever.
+     *
+     * The fired token keeps this delivery unique per arm: the lazy
+     * catch-up in mos6522_read() or the calibration governor's inline
+     * catch-up may already have delivered this expiry, and re-asserting
+     * an already-acked one-shot is a spurious interrupt no real 6522
+     * generates.
      */
-    s->ifr |= T2_INT;
-    mos6522_update_irq(s);
+    if (!ti->fired) {
+        ti->fired = true;
+        s->ifr |= T2_INT;
+        mos6522_update_irq(s);
+    }
 }
 
 /*
@@ -414,9 +434,11 @@ static void mos6522_t2_irq_catch_up(void *opaque)
     MOS6522State *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (now < s->timers[1].next_irq_time || (s->ifr & T2_INT)) {
+    if (now < s->timers[1].next_irq_time || (s->ifr & T2_INT) ||
+        s->timers[1].fired) {
         return;
     }
+    s->timers[1].fired = true;
     if (s->timers[1].timer) {
         timer_del(s->timers[1].timer);
     }
@@ -455,18 +477,41 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
     int ctrl;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (now >= s->timers[0].next_irq_time) {
+    if (now >= s->timers[0].next_irq_time && !s->timers[0].fired) {
         mos6522_timer1_update(s, &s->timers[0], now);
         s->ifr |= T1_INT;
+        /*
+         * One delivery per period. The update above armed the next
+         * period, which owes its own interrupt in continuous mode; in
+         * one-shot mode there is no next period until the guest
+         * reloads the counter, and without the token every ~84ms
+         * counter wrap re-asserted T1_INT for an arm long consumed.
+         */
+        s->timers[0].fired = (s->acr & T1MODE) != T1MODE_CONT;
     }
-    if (now >= s->timers[1].next_irq_time) {
+    if (now >= s->timers[1].next_irq_time && !s->timers[1].fired) {
         /*
          * T2 is one-shot (see mos6522_timer2()) -- unlike T1, do not
          * call mos6522_timer2_update() here, or this lazy catch-up
          * check re-arms T2 on every single register read past its
          * expiry, turning it back into a free-running periodic
          * interrupt exactly like the bug fixed in the timer callback.
+         *
+         * The fired token matters just as much as the no-re-arm rule:
+         * an expired one-shot's next_irq_time stays in the past, so
+         * without it EVERY register read after the expiry re-asserted
+         * T2_INT -- including the CUDA ISR's own IFR/ORB/SR reads
+         * right after the guest ACKED the interrupt, which turned one
+         * expiry into a train of spurious T2 interrupts until the
+         * guest happened to re-arm. The window between expiry and
+         * re-arm is a few microseconds when QEMU timers are prompt but
+         * stretches with every millisecond of main-loop latency, which
+         * is why win32 hosts saw interrupt storms (and 68K-emulator
+         * re-entrancy assertions during boot) that macOS almost never
+         * produced. A real 6522 sets the IFR flag once per arm, full
+         * stop.
          */
+        s->timers[1].fired = true;
         s->ifr |= T2_INT;
     }
     switch (addr) {
@@ -826,7 +871,7 @@ static const MemoryRegionOps mos6522_ops = {
 
 static const VMStateDescription vmstate_mos6522_timer = {
     .name = "mos6522_timer",
-    .version_id = 0,
+    .version_id = 1,
     .minimum_version_id = 0,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(latch, MOS6522Timer),
@@ -834,6 +879,7 @@ static const VMStateDescription vmstate_mos6522_timer = {
         VMSTATE_INT64(load_time, MOS6522Timer),
         VMSTATE_INT64(next_irq_time, MOS6522Timer),
         VMSTATE_TIMER_PTR(timer, MOS6522Timer),
+        VMSTATE_BOOL_V(fired, MOS6522Timer, 1),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -889,12 +935,15 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
     s->timers[0].last_read_real_ns = -1;
     set_counter(s, &s->timers[0], 0xffff);
     timer_del(s->timers[0].timer);
+    /* nothing armed by the guest yet, so no interrupt is owed */
+    s->timers[0].fired = true;
 
     s->timers[1].frequency = s->frequency;
     s->timers[1].latch = 0xffff;
     s->timers[1].last_read_d = -1;
     s->timers[1].last_read_real_ns = -1;
     timer_del(s->timers[1].timer);
+    s->timers[1].fired = true;
 }
 
 static void mos6522_init(Object *obj)

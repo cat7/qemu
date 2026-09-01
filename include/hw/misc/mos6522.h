@@ -129,6 +129,18 @@ typedef struct MOS6522Timer {
      * every reload forever. Deliberately left out of vmstate.
      */
     int64_t last_read_real_ns;
+    /*
+     * True once this arm's expiry interrupt has been delivered (by the
+     * QEMU timer callback, the lazy catch-up in mos6522_read(), or the
+     * calibration governor's inline catch-up); cleared when the guest
+     * re-arms the timer via set_counter(). A real 6522 one-shot sets
+     * its IFR flag exactly ONCE per arm -- without this token, every
+     * register read past an expired one-shot's deadline re-asserted
+     * the flag, so an already-acked interrupt came back as a spurious
+     * new one on the very next IFR/ORB/SR read, and each delivery path
+     * could double up with the others.
+     */
+    bool fired;
 } MOS6522Timer;
 
 /**
