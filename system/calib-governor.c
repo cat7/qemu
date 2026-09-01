@@ -700,21 +700,41 @@ static void calib_governor_pace(int64_t now)
  */
 static void calib_governor_irq_catch_up(int64_t now)
 {
+    void (*cb)(void *opaque);
+    void *opaque;
     bool locked;
 
-    if (!gov_irq_cb || gov_irq_delivered || now < gov_irq_due_ns) {
+    /* Unlocked fast path: just a hint that there may be work. */
+    if (!qatomic_read(&gov_irq_cb) || gov_irq_delivered ||
+        now < gov_irq_due_ns) {
         return;
     }
-    gov_irq_delivered = true;
+
+    /*
+     * Everything that retires the callback -- calib_governor_close()
+     * from the close timer or a property write -- runs on the main loop
+     * WITH the BQL held, so the callback and its guards must be
+     * re-validated under the BQL before the call. The first version
+     * read gov_irq_cb once above and again at the call site: between
+     * those reads the main-loop close could NULL it, and the vCPU
+     * thread then called address zero (field crash on the Windows port,
+     * 2026-09-01: gdb showed CPU 0/TCG at PC 0 -- macOS never hit it
+     * because the vCPU's own deadline close nearly always wins there).
+     */
     locked = bql_locked();
     if (!locked) {
         bql_lock();
     }
-    gov_irq_cb(gov_irq_opaque);
+    cb = qatomic_read(&gov_irq_cb);
+    opaque = gov_irq_opaque;
+    if (cb && !gov_irq_delivered && now >= gov_irq_due_ns) {
+        gov_irq_delivered = true;
+        cb(opaque);
+        qatomic_inc(&gov_stats.irq_catch_ups);
+    }
     if (!locked) {
         bql_unlock();
     }
-    qatomic_inc(&gov_stats.irq_catch_ups);
 }
 
 static void calib_governor_close(void)
@@ -730,11 +750,11 @@ static void calib_governor_close(void)
 
     calib_governor_unpace(now);
     if (!gov_window_active) {
-        gov_irq_cb = NULL;
+        qatomic_set(&gov_irq_cb, NULL);
         return;
     }
     gov_window_active = false;
-    gov_irq_cb = NULL;
+    qatomic_set(&gov_irq_cb, NULL);
     if (gov_cpu_probe_window) {
         gov_cpu_probe_window = false;
         gov_insn_per_second = gov_cpu_probe_saved_ips;
@@ -806,10 +826,11 @@ bool calib_governor_arm(int64_t countdown_ns,
      * device's own state, so superseding an undelivered older target
      * is safe.
      */
-    gov_irq_cb = irq_catch_up;
     gov_irq_opaque = opaque;
     gov_irq_due_ns = now + countdown_ns;
     gov_irq_delivered = false;
+    /* published last: the unlocked fast-path read keys on it */
+    qatomic_set(&gov_irq_cb, irq_catch_up);
 
     if (gov_window_active) {
         /*
