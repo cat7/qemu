@@ -336,6 +336,21 @@ static void dbdma_end(DBDMA_io *io)
 
     DBDMA_DPRINTFCH(ch, "%s\n", __func__);
 
+    /*
+     * End-to-end completion latency as the guest experiences it, from
+     * the transfer being handed to the device to this completion. On
+     * hosts whose main loop services aio/BH/timer work late (win32),
+     * transfers whose completion rides those paths stretch from
+     * microseconds to milliseconds -- the leading suspect for classic
+     * Mac OS VM-on instability (a paging I/O completing grossly late or
+     * out of order versus what the guest's paging discipline can
+     * tolerate). Trace every completion; the analysis side buckets and
+     * correlates with crash timing.
+     */
+    trace_dbdma_io_latency(ch->channel,
+                           g_get_monotonic_time() * 1000 - io->start_ns,
+                           io->is_last);
+
     if (conditional_wait(ch))
         goto wait;
 
@@ -378,6 +393,7 @@ static void start_output(DBDMA_channel *ch, int key, uint32_t addr,
     ch->io.dma_end = dbdma_end;
     ch->io.is_dma_out = 1;
     ch->io.processing = true;
+    ch->io.start_ns = g_get_monotonic_time() * 1000;
     if (ch->rw) {
         ch->rw(&ch->io);
     }
@@ -404,6 +420,7 @@ static void start_input(DBDMA_channel *ch, int key, uint32_t addr,
     ch->io.dma_end = dbdma_end;
     ch->io.is_dma_out = 0;
     ch->io.processing = true;
+    ch->io.start_ns = g_get_monotonic_time() * 1000;
     if (ch->rw) {
         ch->rw(&ch->io);
     }

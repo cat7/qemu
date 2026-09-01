@@ -45,6 +45,15 @@ struct DBDMA_io {
     DBDMA_end dma_end;
     /* DMA is in progress, don't start another one */
     bool processing;
+    /*
+     * Host-monotonic time this transfer was handed to the device
+     * (start_output/start_input), for the dbdma_io_latency trace in
+     * dbdma_end(). Diagnostics only -- guest-visible completion latency
+     * as experienced end to end (device + aio + bottom-half + main
+     * loop) is the load-bearing number in the classic Mac OS VM-on
+     * stability investigation. Not migrated.
+     */
+    int64_t start_ns;
 };
 
 /*
