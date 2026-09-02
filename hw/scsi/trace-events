@@ -401,3 +401,5 @@ mesh_reg_write(uint64_t addr, uint64_t val) "addr=0x%" PRIx64 " val=0x%" PRIx64
 mesh_reg_read(uint64_t addr, uint64_t val) "addr=0x%" PRIx64 " val=0x%" PRIx64
 mesh_phase(uint8_t phase) "phase=0x%x"
 mesh_irq_update(uint8_t int_stat, uint8_t int_mask, int level) "int_stat=0x%x int_mask=0x%x level=%d"
+mesh_dma_xfer(int to_device, uint64_t addr, int len, int io_left, uint32_t to_xfer, int async_left) "to_device=%d addr=0x%" PRIx64 " len=%d desc_left=%d step_left=%u chunk_left=%d"
+mesh_phase_mismatch(uint8_t cmd, uint8_t phase, uint32_t to_xfer) "cmd=0x%x phase=0x%x step_left=%u"

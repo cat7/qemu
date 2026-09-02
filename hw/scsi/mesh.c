@@ -81,7 +81,6 @@ static uint8_t mesh_fifo_pop(MESHState *s)
     return val;
 }
 
-static void mesh_do_dma(MESHState *s);
 static void mesh_set_phase(MESHState *s, uint8_t phase);
 
 /*
@@ -128,10 +127,27 @@ static void mesh_command_complete(SCSIRequest *req, size_t resid)
 
     mesh_fifo_reset(s);
 
-    s->pio_active = false;
     mesh_set_phase(s, MESH_PH_STATUS);
 
-    mesh_raise_int(s, INT_CMD_DONE);
+    if ((s->pio_active || s->dma_active) && s->to_xfer > 0) {
+        /*
+         * The target left Data phase while a data sequencer step still
+         * had bytes to move: real MESH ends that step with a PHASE
+         * MISMATCH exception (xfer_count holding the residual), not a
+         * command-done. Linux's mesh.c relies on exactly this on real
+         * hardware -- it programs the full length and lets the
+         * exception mark the end of the data phase.
+         */
+        trace_mesh_phase_mismatch(s->cur_cmd, s->phase, s->to_xfer);
+        s->exception |= EXC_PHASE_MM;
+        mesh_raise_int(s, INT_EXCEPTION);
+    } else {
+        mesh_raise_int(s, INT_CMD_DONE);
+    }
+    s->pio_active = false;
+    s->dma_active = false;
+    s->to_xfer = 0;
+    s->step_done_pending = false;
 
     if (s->current_req) {
         scsi_req_unref(s->current_req);
@@ -151,6 +167,8 @@ static void mesh_request_cancelled(SCSIRequest *req)
 }
 
 static void mesh_pio_fill_fifo(MESHState *s);
+static void mesh_pio_out_drain(MESHState *s);
+static void mesh_dma_pump(MESHState *s);
 
 /* Called by the SCSI backend when it has data ready to transfer */
 static void mesh_transfer_data(SCSIRequest *req, uint32_t len)
@@ -161,12 +179,25 @@ static void mesh_transfer_data(SCSIRequest *req, uint32_t len)
     s->async_buf = scsi_req_get_buf(req);
     s->data_ready = true;
 
-    if (s->dma_waiting) {
-        mesh_do_dma(s);
-    } else if (s->pio_active && !s->to_device) {
-        /* a PIO Data In was already armed and waiting for this data */
-        mesh_pio_fill_fifo(s);
+    if (s->step_done_pending) {
+        /*
+         * The previous step consumed the last byte of the previous
+         * chunk; the target has more, so that step is now complete
+         * and the phase stays Data -- the driver will read it from
+         * BUS_STATUS0 and issue the next step.
+         */
+        s->step_done_pending = false;
         mesh_raise_int(s, INT_CMD_DONE);
+    }
+
+    if (s->dma_active) {
+        mesh_dma_pump(s);
+    } else if (s->pio_active) {
+        if (s->to_device) {
+            mesh_pio_out_drain(s);
+        } else {
+            mesh_pio_fill_fifo(s);
+        }
     }
 }
 
@@ -193,6 +224,9 @@ static void mesh_reset_state(MESHState *s)
     s->awaiting_cdb = false;
     s->awaiting_msg_out = false;
     s->pio_active = false;
+    s->dma_active = false;
+    s->to_xfer = 0;
+    s->step_done_pending = false;
     s->connected = false;
     mesh_set_phase(s, MESH_PH_BUS_FREE);
     s->int_mask = 0;
@@ -201,7 +235,6 @@ static void mesh_reset_state(MESHState *s)
     s->xfer_count = 0;
     s->src_id = 7;
     s->data_ready = false;
-    s->dma_waiting = false;
     s->async_len = 0;
     s->int_pending = 0;
     timer_del(s->sel_timer);
@@ -263,6 +296,10 @@ static void mesh_select(MESHState *s)
     }
     s->current_dev = NULL;
     s->connected = false;
+    s->pio_active = false;
+    s->dma_active = false;
+    s->to_xfer = 0;
+    s->step_done_pending = false;
     mesh_set_phase(s, MESH_PH_BUS_FREE);
 
     s->sel_pending_target = target;
@@ -314,18 +351,140 @@ static void mesh_do_command(MESHState *s)
  */
 static void mesh_pio_fill_fifo(MESHState *s)
 {
-    while (s->fifo_pos < MESH_FIFO_SIZE && s->async_len > 0) {
+    while (s->fifo_pos < MESH_FIFO_SIZE && s->async_len > 0 &&
+           s->to_xfer > 0) {
         mesh_fifo_push(s, *s->async_buf++);
         s->async_len--;
+        s->to_xfer--;
+        s->xfer_count--;
+    }
+    if (s->pio_active && s->to_xfer == 0) {
+        /*
+         * The step's last byte is in the FIFO: the transfer counter
+         * hit zero, so the sequencer command is done. The driver
+         * drains what is left by FIFO_COUNT (live-traced: it polls
+         * INTERRUPT and FIFO_COUNT alternately and pops whatever is
+         * there). Raising this at the FIRST fill instead, as the
+         * model used to, made the driver treat every step longer
+         * than the 16-byte FIFO as a short transfer and re-issue it
+         * with the residual (0x24 -> 0x14, 0x200 -> 0x1f0 -> ...).
+         * Request completion for Data In comes later, from the FIFO
+         * read path, once the driver has popped the last byte --
+         * completion resets the FIFO.
+         */
+        s->pio_active = false;
+        mesh_raise_int(s, INT_CMD_DONE);
+    }
+}
+
+/*
+ * A data-phase sequencer step (PIO Data Out, or DMA either way) has
+ * moved all of its xfer_count bytes. If the SCSI backend's chunk still
+ * has bytes, the target is simply ready for the next step; if the step
+ * ended exactly where the chunk did, ask the backend for what follows
+ * -- the next chunk (mesh_transfer_data) or completion
+ * (mesh_command_complete) raises the command-done, so the driver
+ * never sees a Data phase it cannot continue nor a Status phase before
+ * the backend has actually finished the I/O.
+ */
+static void mesh_step_done(MESHState *s)
+{
+    s->pio_active = false;
+    s->dma_active = false;
+    if (s->async_len == 0 && s->data_ready && s->current_req) {
+        s->data_ready = false;
+        s->step_done_pending = true;
+        scsi_req_continue(s->current_req);
+    } else {
+        mesh_raise_int(s, INT_CMD_DONE);
+    }
+}
+
+/* PIO Data Out bookkeeping after bytes were moved onto the bus */
+static void mesh_pio_out_advance(MESHState *s)
+{
+    if (!s->pio_active || !s->to_device) {
+        return;
+    }
+    if (s->to_xfer == 0) {
+        mesh_step_done(s);
+    } else if (s->async_len == 0 && s->data_ready && s->current_req) {
+        /* the step continues into the backend's next chunk */
+        s->data_ready = false;
+        scsi_req_continue(s->current_req);
+    }
+}
+
+/*
+ * Move bytes the driver has pushed into the FIFO onto the bus. Real
+ * MESH hands each byte to the target as it takes it, so the driver
+ * watches FIFO_COUNT fall and keeps pushing (it sends xfer_count bytes
+ * THROUGH the 16-byte FIFO); bytes that arrive before the backend has
+ * a buffer simply wait in the FIFO.
+ */
+static void mesh_pio_out_drain(MESHState *s)
+{
+    while (s->pio_active && s->to_device && s->fifo_pos > 0 &&
+           s->data_ready && s->async_len > 0 && s->to_xfer > 0) {
+        *s->async_buf++ = mesh_fifo_pop(s);
+        s->async_len--;
+        s->to_xfer--;
+        s->xfer_count--;
+    }
+    mesh_pio_out_advance(s);
+}
+
+/* The bus phase a transfer-type sequencer command expects, or -1 */
+static int mesh_cmd_phase(uint8_t cmd)
+{
+    switch (cmd & SEQ_CMD_MASK) {
+    case SEQ_COMMAND:
+        return MESH_PH_COMMAND;
+    case SEQ_STATUS:
+        return MESH_PH_STATUS;
+    case SEQ_DATA_OUT:
+        return MESH_PH_DATA_OUT;
+    case SEQ_DATA_IN:
+        return MESH_PH_DATA_IN;
+    case SEQ_MSG_OUT:
+        return MESH_PH_MSG_OUT;
+    case SEQ_MSG_IN:
+        return MESH_PH_MSG_IN;
+    default:
+        return -1;
     }
 }
 
 static void mesh_perform_command(MESHState *s, uint8_t cmd)
 {
+    int expected;
+
     trace_mesh_seq_cmd(cmd);
     s->cur_cmd = cmd;
     s->int_stat &= ~INT_CMD_DONE;
     s->int_pending &= ~INT_CMD_DONE;
+
+    /*
+     * A transfer command whose phase is not the one the target is in
+     * ends at once with a PHASE MISMATCH exception -- that is how the
+     * chip tells the initiator the target moved on, and the .MESH
+     * driver uses it as a probe: live-traced after a DMA READ(10),
+     * having drained the last PIO bytes and read BUS_STATUS0 = Status
+     * without REQ, it issued SEQ_DATA_IN xfer_count=1 and polled
+     * INTERRUPT/FIFO_COUNT for the answer; a model that silently
+     * accepted the command left it spinning there forever ("Installing
+     * device driver..." hang). Every transfer command in the working
+     * enumeration/ROM-scan traces was issued in its matching phase, so
+     * this only fires where real hardware would. (SEQ_BUS_FREE has its
+     * own probe semantics below.)
+     */
+    expected = mesh_cmd_phase(cmd);
+    if (expected >= 0 && s->connected && s->phase != expected) {
+        trace_mesh_phase_mismatch(cmd, s->phase, s->xfer_count);
+        s->exception |= EXC_PHASE_MM;
+        mesh_raise_int(s, INT_EXCEPTION);
+        return;
+    }
 
     switch (cmd & SEQ_CMD_MASK) {
     case SEQ_ARBITRATE:
@@ -365,35 +524,34 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         mesh_raise_int(s, INT_CMD_DONE);
         break;
     case SEQ_DATA_OUT:
-        s->to_device = true;
-        if (cmd & SEQ_DMA) {
-            if (s->current_req) {
-                scsi_req_continue(s->current_req);
-            }
-        } else {
-            /* PIO: bytes will arrive through the FIFO write path */
-            s->pio_active = true;
-            if (s->current_req && !s->data_ready) {
-                scsi_req_continue(s->current_req);
-            }
-        }
-        break;
     case SEQ_DATA_IN:
-        s->to_device = false;
+        /*
+         * One data-phase STEP of xfer_count bytes (0 = 65536), PIO
+         * through the FIFO or DMA through the DBDMA channel. The step
+         * completes -- INT_CMD_DONE -- when that many bytes have
+         * moved, whatever the SCSI request's total: the .MESH driver
+         * moves a 128000-byte WRITE(6) as 250 steps of 0x200 and
+         * waits for a command-done after each (live-traced; the old
+         * model only signalled when the backend's whole chunk was
+         * consumed, so the driver waited forever after step one --
+         * the Drive Setup "Initialize" hang). DingusPPC keeps the
+         * same counter (ScsiBusController::to_xfer).
+         */
+        s->to_device = (cmd & SEQ_CMD_MASK) == SEQ_DATA_OUT;
+        s->to_xfer = s->xfer_count ? s->xfer_count : 0x10000;
+        s->step_done_pending = false;
         if (cmd & SEQ_DMA) {
-            if (s->data_ready) {
-                mesh_do_dma(s);
-            }
+            s->pio_active = false;
+            s->dma_active = true;
+            mesh_dma_pump(s);
         } else {
-            /*
-             * PIO through the FIFO -- how the .MESH driver moves small
-             * transfers like INQUIRY (live-traced: xfer_count=5,
-             * SEQ_DATA_IN without the DMA bit, then FIFO pops).
-             */
+            s->dma_active = false;
             s->pio_active = true;
-            if (s->data_ready) {
+            if (s->to_device) {
+                /* bytes the driver may already have pushed */
+                mesh_pio_out_drain(s);
+            } else if (s->data_ready) {
                 mesh_pio_fill_fifo(s);
-                mesh_raise_int(s, INT_CMD_DONE);
             }
         }
         break;
@@ -447,6 +605,8 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         }
         s->connected = false;
         s->pio_active = false;
+        s->dma_active = false;
+        s->to_xfer = 0;
         mesh_set_phase(s, MESH_PH_BUS_FREE);
         mesh_raise_int(s, INT_CMD_DONE);
         break;
@@ -500,10 +660,17 @@ static uint64_t mesh_read_one(MESHState *s, hwaddr addr)
          * completion overwrites the FIFO with status bytes, so it must
          * never fire while data bytes are still queued.
          */
-        if (s->pio_active && !s->to_device && s->fifo_pos == 0) {
-            if (s->async_len > 0) {
+        if (!s->to_device && s->phase == MESH_PH_DATA_IN &&
+            s->fifo_pos == 0 && s->data_ready && s->current_req) {
+            if (s->pio_active && s->async_len > 0) {
                 mesh_pio_fill_fifo(s);
-            } else if (s->data_ready && s->current_req) {
+            } else if (s->async_len == 0) {
+                /*
+                 * Chunk fully drained (the step may already have
+                 * ended -- its command-done was raised when its last
+                 * byte entered the FIFO): fetch the next chunk, or
+                 * let the request complete into Status phase.
+                 */
                 s->data_ready = false;
                 scsi_req_continue(s->current_req);
             }
@@ -600,27 +767,19 @@ static void mesh_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->xfer_count = (s->xfer_count & 0x00ff) | ((val & 0xff) << 8);
         return;
     case MESH_FIFO:
-        if (s->pio_active && s->to_device && s->data_ready &&
-            s->async_len > 0) {
+        if (s->pio_active && s->to_device) {
             /*
              * PIO Data Out drains CONTINUOUSLY: real MESH moves each
              * byte from the FIFO onto the bus as the target takes it,
              * so the driver watches FIFO_COUNT fall and keeps pushing
-             * -- it sends xfer_count bytes THROUGH the 16-byte FIFO.
-             * The previous bulk handoff (fire once fifo_pos reaches
-             * async_len/xfer_count) could never trigger for transfers
-             * larger than the FIFO: live-traced with the 8.1 CD's
-             * Drive Setup scan, a WRITE(6) of one 512-byte block left
-             * the FIFO pegged at 16 with the driver politely polling
-             * for drain forever. Completion interrupts come from the
-             * request completing (mesh_command_complete()), or the
-             * next transfer_data() chunk re-arming async_buf.
+             * -- it sends xfer_count bytes THROUGH the 16-byte FIFO
+             * (a bulk handoff could never fire for a step larger than
+             * the FIFO; live-traced as FIFO_COUNT pegged at 16). The
+             * step's command-done comes from the transfer counter
+             * reaching zero (mesh_pio_out_advance()).
              */
-            *s->async_buf++ = val;
-            if (--s->async_len == 0 && s->current_req) {
-                s->data_ready = false;
-                scsi_req_continue(s->current_req);
-            }
+            mesh_fifo_push(s, val);
+            mesh_pio_out_drain(s);
             return;
         }
         mesh_fifo_push(s, val);
@@ -689,34 +848,53 @@ static const MemoryRegionOps mesh_ops = {
  * for its rx path: whichever side (DBDMA memory, or the SCSI backend)
  * becomes ready first waits for the other.
  */
-static void mesh_do_dma(MESHState *s)
+/*
+ * Move as much as all three sides allow: the armed DBDMA descriptor
+ * (io->len), the SCSI backend's current chunk (async_len) and the
+ * sequencer step's transfer counter (to_xfer). A descriptor is
+ * completed only when ITS byte count is satisfied -- the DBDMA engine
+ * does not know about SCSI chunk boundaries -- and ending it may
+ * synchronously start the next one (mesh_dma_rw() re-enters with the
+ * new io), so all state lives in `s` and the loop re-reads it.
+ */
+static void mesh_dma_pump(MESHState *s)
 {
-    DBDMA_io *io = s->dma_io;
+    DBDMA_io *io;
     int len;
 
-    if (!io || !s->data_ready) {
-        return;
+    while (s->dma_active && (io = s->dma_io) != NULL && s->data_ready &&
+           s->async_len > 0 && s->to_xfer > 0 && io->len > 0) {
+        len = MIN(io->len, MIN(s->async_len, (int)s->to_xfer));
+
+        if (s->to_device) {
+            dma_memory_read(&address_space_memory, io->addr, s->async_buf,
+                            len, MEMTXATTRS_UNSPECIFIED);
+        } else {
+            dma_memory_write(&address_space_memory, io->addr, s->async_buf,
+                             len, MEMTXATTRS_UNSPECIFIED);
+        }
+
+        s->async_buf += len;
+        s->async_len -= len;
+        s->to_xfer -= len;
+        s->xfer_count -= len;
+        io->addr += len;
+        io->len -= len;
+        trace_mesh_dma_xfer(s->to_device, io->addr - len, len, io->len,
+                            s->to_xfer, s->async_len);
+
+        if (io->len == 0) {
+            s->dma_io = NULL;
+            io->dma_end(io);
+        }
     }
 
-    len = MIN((int)io->len, s->async_len);
-
-    if (s->to_device) {
-        dma_memory_read(&address_space_memory, io->addr, s->async_buf, len,
-                        MEMTXATTRS_UNSPECIFIED);
-    } else {
-        dma_memory_write(&address_space_memory, io->addr, s->async_buf, len,
-                         MEMTXATTRS_UNSPECIFIED);
-    }
-
-    s->async_buf += len;
-    s->async_len -= len;
-    io->len -= len;
-
-    s->dma_waiting = false;
-    s->dma_io = NULL;
-    io->dma_end(io);
-
-    if (s->async_len == 0 && s->current_req) {
+    if (s->dma_active && s->to_xfer == 0) {
+        mesh_step_done(s);
+    } else if (s->dma_active && s->async_len == 0 && s->data_ready &&
+               s->current_req) {
+        /* the step continues into the backend's next chunk */
+        s->data_ready = false;
         scsi_req_continue(s->current_req);
     }
 }
@@ -725,23 +903,20 @@ static void mesh_dma_rw(DBDMA_io *io)
 {
     MESHState *s = io->opaque;
 
-    s->dma_addr = io->addr;
-    s->dma_len = io->len;
+    /*
+     * The descriptor may be armed before or after the sequencer
+     * command; the direction is the sequencer command's, and nothing
+     * moves until one is active (real MESH only asserts DMA request
+     * while a DMA sequencer step is running).
+     */
     s->dma_io = io;
-    s->to_device = io->is_dma_out;
-
-    if (s->data_ready) {
-        mesh_do_dma(s);
-    } else {
-        s->dma_waiting = true;
-    }
+    mesh_dma_pump(s);
 }
 
 static void mesh_dma_flush(DBDMA_io *io)
 {
     MESHState *s = io->opaque;
 
-    s->dma_waiting = false;
     s->dma_io = NULL;
 }
 
@@ -783,7 +958,7 @@ static void mesh_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_mesh = {
     .name = "mesh",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(fifo, MESHState, MESH_FIFO_SIZE),
@@ -804,6 +979,9 @@ static const VMStateDescription vmstate_mesh = {
         VMSTATE_BOOL_V(awaiting_msg_out, MESHState, 2),
         VMSTATE_BOOL_V(pio_active, MESHState, 2),
         VMSTATE_UINT8_V(int_pending, MESHState, 2),
+        VMSTATE_UINT32_V(to_xfer, MESHState, 3),
+        VMSTATE_BOOL_V(dma_active, MESHState, 3),
+        VMSTATE_BOOL_V(step_done_pending, MESHState, 3),
         VMSTATE_END_OF_LIST()
     }
 };

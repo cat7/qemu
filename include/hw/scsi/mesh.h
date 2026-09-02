@@ -181,16 +181,36 @@ struct MESHState {
     bool pio_active;
     bool awaiting_msg_out;
 
+    /*
+     * Bytes still to move in the CURRENT data-phase sequencer step
+     * (SEQ_DATA_IN/OUT, PIO or DMA): loaded from xfer_count when the
+     * command is issued (0 means 65536, as on the chip), decremented
+     * per byte moved. The step -- and its INT_CMD_DONE -- ends when
+     * this reaches zero, NOT when the SCSI request runs out of data:
+     * the .MESH driver moves a 250-block WRITE(6) as 250 separate
+     * 512-byte steps and waits for a command-done after each one
+     * (live-traced; DingusPPC's ScsiBusController::to_xfer is the same
+     * counter). dma_active marks a DMA step in progress the way
+     * pio_active marks a PIO one.
+     */
+    uint32_t to_xfer;
+    bool dma_active;
+    /*
+     * The step ended exactly where the SCSI backend's current chunk
+     * ended, so "step done" is only true once the backend has said
+     * what comes next (another chunk -> the target is ready again; or
+     * completion -> Status phase). Set by mesh_step_done(), consumed
+     * by mesh_transfer_data()/mesh_command_complete().
+     */
+    bool step_done_pending;
+
     /* Bridges the DBDMA-side and SCSI-backend-side of a data transfer,
      * following the same pattern as bmac's rx path: whichever side
      * becomes ready first waits for the other. */
     uint8_t *async_buf;
     int async_len;
     bool data_ready;
-    bool dma_waiting;
     bool to_device;
-    hwaddr dma_addr;
-    int dma_len;
     void *dma_io; /* DBDMA_io *, saved to complete the transfer later */
 };
 
