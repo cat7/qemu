@@ -15,17 +15,43 @@ Sources: Rage 128 Pro RRG (`doc/rage128-cce/rage128-RRG-G04500-C-text.txt`,
 section 2.1.6), Linux DRM `r128_reg.h` (`doc/rage128-cce/r128_reg.h`), the CCE
 PM4 addendum (`doc/rage128-cce/RagePro128-cce-pm4-addendum.md`).
 
-## Corpus status (2026-09-02)
+## Corpus status (2026-09-02, second pass — VERTEX LAYOUT CONFIRMED)
 
-**No 3D corpus captured yet — blocked on display-activation, not on tooling.**
-The guest RAVE stack is fully present (see Assets below), but with the standard
-dual-card config (`-device ati-rage128-pro` alongside the onboard mach64) the
-guest brings the desktop up on the **mach64** and leaves the rage128 idle:
-after a full boot to desktop, the rage128 saw **zero** CCE packet3 traffic
-(`ati_rage128_pm4_p3_hdr`/`_unimp` both empty) and `silent-regs` = "none". So
-before any 3D corpus can be taken, a future session must make the rage128 the
-**active display** (rage128-only boot, or primary-display selection), THEN run a
-RAVE workload on it. That display-activation step is the true gate on step 2.
+**Payload capture done; the GEN_PRIM wire format is now ground truth, not
+hypothesis.** Dual-card config (onboard mach64 + rage128 at addr 0x0e with the
+retail nexus ROM); the 9.2 guest image's Monitors setting makes the rage the
+primary display — that, not a rage-only config, is how the card goes active.
+Live Nanosaur gameplay, 72,364 GEN_PRIM packets with full payload
+(`nanosaur-payload-sample.log.gz` here; decoded stream in the session
+scratchpad as `nanosaur-3d-decoded.log.gz`):
+
+- Every packet: `vc_format=0xa7`, `vc_cntl=0x00030034` (TRI_LIST, walk 3,
+  num=3) — **one triangle per packet**, 35 payload dwords = 2 + 3x11.
+- Payload = `[VC_FORMAT] [VC_CNTL] [vertex x3]` (the Linux DRM GEN_INDX
+  layout minus the buffer dwords, as predicted).
+- **Vertex (11 dwords, every component its own little-endian float — this is
+  the CCE FPU path, so the BGR format bits mean three dwords, not a packed
+  colour):**
+  `x, y, z, rhw, b, g, r, a, fog, s, t`
+  with x/y in screen pixels (0..640/0..480), z 0..1 (~0.9997 observed),
+  rhw ~1.0, colours 0..1, s/t 0..1. Verified by decoding raw payload bytes
+  on exactly those boundaries — all fields sane simultaneously.
+- The morning sample's count=26 shape (990 packets) is then
+  2 + 3x8 = xyz + rhw + b,g,r,a: untextured, no fog.
+- `PM4_VC_FPU_SETUP` = 0x415e: 3D mode, Gouraud, no culling, CW front,
+  OGL flat-shade convention.
+- State around the triangles: double-buffered 640x480x16 (two alternating
+  DST_PITCH_OFFSET_C/Z_OFFSET_C pairs, pitch 640), Z_PITCH_C 0x00010050,
+  one scissor (SC_*_C 0,0..639,479), TEX_CNTL_C rewritten per triangle
+  (0x193 dominant), SEC_TEX_CNTL_C live, single MISC_3D_STATE_CNTL_REG
+  value 0x00510200.
+
+The device now parses GEN_PRIM/GEN_INDX_PRIM (streamed parser): stride from
+VC_FORMAT, per-vertex decode traced as `ati_rage128_3d_prim`/`_3d_vert`/
+`_3d_indx_prim` — trace-only, no rasterizer yet. Audio side note from the same
+session: wavcapture of Nanosaur gameplay shows healthy 44.1k stereo signal with
+whole seconds of exact digital silence interleaved — possible awacs pacing/
+underrun (the mac99 tumbler class); needs the user's ear + a dedicated pass.
 
 Capture recipe for when the card is active (proven tooling this session):
 - trace events: `ati_rage128_pm4_p3_hdr` (every packet3 opcode+count),
@@ -65,11 +91,10 @@ BITBLT 0x12/0x92, HOSTDATA_BLT 0x14/0x94, SCALING 0x16/0x96, TRANS_SCALING
 | 0x23 | `3D_RNDR_GEN_INDX_PRIM` | render indexed primitive (vertex array + indices) |
 | 0x25 | `3D_RNDR_GEN_PRIM`  | render primitive, vertices inline in the packet |
 
-`3D_RNDR_GEN_PRIM` (0x25) is the workhorse: header, then a state/prim-type
-dword, then inline vertices. Vertex format is governed by SCALE_3D_CNTL /
-SETUP_CNTL (position, optional Z, RGBA, S/T). Confirm exact vertex stride/layout
-against a live 0x25 payload capture — the RRG describes the fields but the
-driver's chosen vertex format is what matters.
+`3D_RNDR_GEN_PRIM` (0x25) is the workhorse; its exact wire format is now
+CONFIRMED from live payload bytes — see "Corpus status" above. GEN_PRIM and
+GEN_INDX_PRIM are parsed and traced by the device (`ati_rage128_3d_*` events);
+0x20/0x21 (save/play context) remain unimplemented-skip.
 
 ## 3D register groups (RRG 2.1.6) with the key offsets
 
@@ -107,15 +132,18 @@ packet's context) selects the 3D function path vs plain 2D.
 - `PM4_VC_FPU_SETUP` 0x071c, `COMPOSITE_SHADOW_ID` 0x...  (a count of 3D
   primitives executed — useful as a model self-check).
 
-## Frontend build order (proposed, corpus-gated)
+## Frontend build order (updated 2026-09-02)
 
-1. **Activate the card**: make the rage128 the guest's display so its CCE runs
-   at all (see Corpus status). This is prerequisite #0 and is config work.
-2. Capture a `3D_RNDR_GEN_PRIM` (0x25) payload from Graphing Calculator; decode
-   the exact inline vertex layout the RAVE driver uses.
-3. Implement flat/Gouraud untextured triangle rasterization into VRAM (position
-   + RGBA), honoring SC_* scissor, Z_STEN_CNTL_C z-buffering, SCALE_3D_CNTL
-   blend/alpha-test. This covers Graphing Calculator and most QD3D wireframe/
-   shaded output.
-4. Add single-texture mapping (TEX_CNTL_C group) against a textured-game capture.
-5. Secondary texture / fog / specular as later corpus demands.
+1. ~~Activate the card~~ — DONE: no config change needed; the user's 9.2 image
+   already selects the rage as primary monitor (Monitors control panel).
+2. ~~Capture a GEN_PRIM payload / decode the vertex layout~~ — DONE, layout
+   confirmed (see Corpus status). Parser + decode traces are in the device.
+3. Implement Gouraud triangle rasterization into VRAM (x,y,z,rhw,b,g,r,a),
+   honoring SC_*_C scissor, Z buffering per Z_STEN_CNTL_C/Z_OFFSET_C/Z_PITCH_C,
+   and the double-buffered DST_PITCH_OFFSET_C target. Untextured first: that
+   alone should put visible (flat-lit) geometry on Nanosaur's screen.
+4. Single-texture mapping: TEX_CNTL_C (0x193/0x183 observed) + PRIM_TEX_CNTL_C
+   + TEX_SIZE_PITCH_C + PRIM_TEX_n_OFFSET_C mip chain, s/t from the vertex.
+5. Fog (per-vertex fog float + FOG_COLOR_C), secondary texture
+   (SEC_TEX_CNTL_C is live in the corpus), blending per MISC_3D_STATE_CNTL_REG,
+   as the picture demands.

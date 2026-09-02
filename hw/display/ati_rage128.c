@@ -2674,6 +2674,91 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
 }
 
 /*
+ * How many dwords one inline GEN_PRIM vertex occupies for a given
+ * VC_FORMAT. Everything on this path is a float per component
+ * (PM4_VC_FPU_SETUP -- the CCE's FPU walks the vertices), so the BGR
+ * bits mean THREE dwords, not one packed colour; ARGB/FRGB are the
+ * packed single-dword forms. Live-verified against Nanosaur's RAVE
+ * driver (doc/rage128-3d): vc_format 0xa7 = xyz + rhw + b,g,r,a + fog
+ * + s,t = 11 dwords, and the raw payload decodes to sane screen-space
+ * floats exactly on those boundaries.
+ */
+static unsigned ati_rage128_vc_stride(uint32_t fmt)
+{
+    unsigned n = 3;
+
+    n += !!(fmt & R128_VC_FRMT_RHW);
+    n += (fmt & R128_VC_FRMT_DIFFUSE_BGR) ? 3 : 0;
+    n += !!(fmt & R128_VC_FRMT_DIFFUSE_A);
+    n += !!(fmt & R128_VC_FRMT_DIFFUSE_ARGB);
+    n += (fmt & R128_VC_FRMT_SPEC_BGR) ? 3 : 0;
+    n += !!(fmt & R128_VC_FRMT_SPEC_F);
+    n += !!(fmt & R128_VC_FRMT_SPEC_FRGB);
+    n += (fmt & R128_VC_FRMT_S_T) ? 2 : 0;
+    n += (fmt & R128_VC_FRMT_S2_T2) ? 2 : 0;
+    n += !!(fmt & R128_VC_FRMT_RHW2);
+    return n;
+}
+
+static float ati_rage128_vc_f32(uint32_t v)
+{
+    float f;
+
+    memcpy(&f, &v, sizeof(f));
+    return f;
+}
+
+/*
+ * Convert a 0..1 colour component float to a byte, saturating (the FPU
+ * path's colours arrive as one float per component).
+ */
+static unsigned ati_rage128_vc_col8(uint32_t v)
+{
+    float c = ati_rage128_vc_f32(v);
+
+    return c <= 0.0f ? 0 : c >= 1.0f ? 255 : (unsigned)(c * 255.0f + 0.5f);
+}
+
+/* Decode and trace one gathered GEN_PRIM vertex. */
+static void ati_rage128_3d_trace_vert(const ATIRage128PM4Parser *p)
+{
+    uint32_t fmt = p->p3_vc_format;
+    unsigned n = (p->p3_param_idx - 1) / p->p3_vtx_stride;
+    unsigned o = 3;
+    uint32_t argb = 0, s = 0, t = 0;
+
+    o += !!(fmt & R128_VC_FRMT_RHW);
+    if (fmt & R128_VC_FRMT_DIFFUSE_BGR) {
+        argb = ati_rage128_vc_col8(p->p3_vtx[o + 2]) << 16 |
+               ati_rage128_vc_col8(p->p3_vtx[o + 1]) << 8 |
+               ati_rage128_vc_col8(p->p3_vtx[o]);
+        o += 3;
+        if (fmt & R128_VC_FRMT_DIFFUSE_A) {
+            argb |= ati_rage128_vc_col8(p->p3_vtx[o]) << 24;
+            o++;
+        }
+    } else {
+        o += !!(fmt & R128_VC_FRMT_DIFFUSE_A);
+        if (fmt & R128_VC_FRMT_DIFFUSE_ARGB) {
+            argb = p->p3_vtx[o];
+            o++;
+        }
+    }
+    o += (fmt & R128_VC_FRMT_SPEC_BGR) ? 3 : 0;
+    o += !!(fmt & R128_VC_FRMT_SPEC_F);
+    o += !!(fmt & R128_VC_FRMT_SPEC_FRGB);
+    if ((fmt & R128_VC_FRMT_S_T) && o + 1 < ARRAY_SIZE(p->p3_vtx)) {
+        s = p->p3_vtx[o];
+        t = p->p3_vtx[o + 1];
+    }
+    trace_ati_rage128_3d_vert(n,
+                              (int)ati_rage128_vc_f32(p->p3_vtx[0]),
+                              (int)ati_rage128_vc_f32(p->p3_vtx[1]),
+                              (int)ati_rage128_vc_f32(p->p3_vtx[2]),
+                              argb, s, t);
+}
+
+/*
  * PIO alternative to the ring above: the real driver actually pushes
  * its command stream straight through PM4_FIFO_DATA_EVEN/ODD (see the
  * comment on those in ati_rage128_regs.h), one dword per write. Same
@@ -2713,7 +2798,9 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
                 p->p3_opcode != R128_PM4_OPCODE_BITBLT &&
                 p->p3_opcode != R128_PM4_OPCODE_BITBLT_MULTI &&
                 p->p3_opcode != R128_PM4_OPCODE_HOSTDATA_BLT &&
-                p->p3_opcode != R128_PM4_OPCODE_SCALING) {
+                p->p3_opcode != R128_PM4_OPCODE_SCALING &&
+                p->p3_opcode != R128_PM4_OPCODE_3D_RNDR_GEN_PRIM &&
+                p->p3_opcode != R128_PM4_OPCODE_3D_RNDR_GEN_INDX_PRIM) {
                 trace_ati_rage128_pm4_unimp(p->p3_opcode, p->remaining);
             }
             break;
@@ -2974,6 +3061,51 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
             }
             break;
         }
+        case R128_PM4_OPCODE_3D_RNDR_GEN_PRIM:
+            /*
+             * The 3D triangle path (RAVE / QuickDraw 3D on Mac OS 9,
+             * doc/rage128-3d). No rasterizer yet: the packet is decoded
+             * and traced so a live capture nails the vertex layout the
+             * driver chose, and the parser stays correctly framed.
+             */
+            if (p->p3_param_idx == 0) {
+                p->p3_vc_format = val;
+                p->p3_vtx_stride = ati_rage128_vc_stride(val);
+            } else if (p->p3_param_idx == 1) {
+                p->p3_vc_cntl = val;
+                trace_ati_rage128_3d_prim(p->p3_vc_format, p->p3_vtx_stride,
+                                          val & R128_VC_CNTL_PRIM_TYPE_MASK,
+                                          (val & R128_VC_CNTL_PRIM_WALK_MASK)
+                                          >> R128_VC_CNTL_PRIM_WALK_SHIFT,
+                                          val >> R128_VC_CNTL_NUM_SHIFT);
+            } else {
+                unsigned slot = (p->p3_param_idx - 2) % p->p3_vtx_stride;
+
+                if (slot < ARRAY_SIZE(p->p3_vtx)) {
+                    p->p3_vtx[slot] = val;
+                }
+                if (slot == p->p3_vtx_stride - 1) {
+                    ati_rage128_3d_trace_vert(p);
+                }
+            }
+            p->p3_param_idx++;
+            break;
+        case R128_PM4_OPCODE_3D_RNDR_GEN_INDX_PRIM:
+            /*
+             * Vertex-buffer form (Linux DRM layout): buffer offset and
+             * size, then the same VC_FORMAT/VC_CNTL pair, then indices
+             * when the walk mode says so. Trace-only, as above.
+             */
+            if (p->p3_param_idx < 4) {
+                p->p3_params[p->p3_param_idx] = val;
+                if (p->p3_param_idx == 3) {
+                    trace_ati_rage128_3d_indx_prim(p->p3_params[0],
+                                                   p->p3_params[1],
+                                                   p->p3_params[2], val);
+                }
+            }
+            p->p3_param_idx++;
+            break;
         default:
             /*
              * Payload of an opcode we do not model. Still advance the

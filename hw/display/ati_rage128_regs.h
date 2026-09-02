@@ -403,7 +403,32 @@
 #define R128_DP_GUI_MASTER_CNTL_C    0x1c84
 #define R128_SC_TOP_LEFT_C           0x1c88
 #define R128_SC_BOTTOM_RIGHT_C       0x1c8c
+/*
+ * The rest of the _C context block is the 3D pipeline's per-draw state.
+ * Mac OS 9's RAVE driver (Nanosaur corpus, doc/rage128-3d) programs the
+ * whole 0x1c80-0x1d44 run via packet0 before its GEN_PRIM triangles.
+ * Names per Linux DRM r128_reg.h; the RRG's own index confirms the ones
+ * it lists (TEX_CNTL_C, PRIM_TEXTURE_COMBINE_CNTL_C, SEC_TEX_COMBINE_
+ * CNTL_C).
+ */
+#define R128_Z_OFFSET_C              0x1c90
+#define R128_Z_PITCH_C               0x1c94
+#define R128_Z_STEN_CNTL_C           0x1c98
+#define R128_TEXTURE_CLR_CMP_CLR_C   0x1ca4
+#define R128_TEXTURE_CLR_CMP_MSK_C   0x1ca8
+#define R128_FOG_COLOR_C             0x1cac
+#define R128_PRIM_TEXTURE_COMBINE_CNTL_C 0x1cb4
+#define R128_TEX_SIZE_PITCH_C        0x1cb8
+#define R128_PRIM_TEX_0_OFFSET_C     0x1cbc  /* .. _10_OFFSET_C at 0x1ce4 */
+#define R128_PRIM_TEX_10_OFFSET_C    0x1ce4
+#define R128_SEC_TEX_CNTL_C          0x1d00
+#define R128_SEC_TEX_COMBINE_CNTL_C  0x1d04
+#define R128_SEC_TEX_0_OFFSET_C      0x1d08  /* .. _10_OFFSET_C at 0x1d30 */
+#define R128_SEC_TEX_10_OFFSET_C     0x1d30
 #define R128_CONSTANT_COLOR_C        0x1d34
+#define R128_PRIM_TEXTURE_BORDER_COLOR_C 0x1d38
+#define R128_SEC_TEXTURE_BORDER_COLOR_C  0x1d3c
+#define R128_STEN_REF_MASK_C         0x1d40
 #define R128_PLANE_3D_MASK_C         0x1d44
 #define R128_HOST_DATA0              0x17c0
 #define R128_HOST_DATA1              0x17c4
@@ -762,5 +787,59 @@
 #define R128_SCALE_DT_YUYV422         11
 #define R128_SCALE_DT_UYVY422         12
 #define R128_SCALE_DT_AYUV444         14
+
+/*
+ * 3D setup engine and vertex walker (RRG 2.1.6/2.1.7). The register
+ * traffic below is what the Mac OS 9 RAVE driver ("ATI Rage 128 3D
+ * Accelerator") actually generates -- see doc/rage128-3d for the live
+ * Nanosaur corpus this is checked against.
+ */
+#define R128_PM4_VC_FPU_SETUP         0x071c
+#define R128_SURFACE3_LOWER_BOUND     0x0b34
+#define R128_SURFACE3_UPPER_BOUND     0x0b38
+#define R128_SURFACE3_INFO            0x0b3c
+#define R128_BRUSH_SCALE              0x1470
+#define R128_FLUSH_7                  0x171c
+#define R128_PC_GUI_CTLSTAT           0x1748
+#define R128_SETUP_CNTL               0x1bc4
+#define R128_WINDOW_XY_OFFSET         0x1bcc
+#define R128_DRAW_LINE_POINT          0x1bd0
+#define R128_SETUP_CNTL_PM4           0x1bd4
+
+/*
+ * CCE packet3 3D opcodes. GEN_PRIM carries its vertices inline:
+ *   [VC_FORMAT] [VC_CNTL] [vertex 0] [vertex 1] ...
+ * GEN_INDX_PRIM names a vertex buffer instead:
+ *   [BUFFER_OFFSET] [BUFFER_SIZE] [VC_FORMAT] [VC_CNTL] ([indices] ...)
+ * (the GEN_INDX layout is Linux DRM r128_state.c's, byte for byte; the
+ * GEN_PRIM one is that layout minus the buffer dwords, and it is what
+ * makes the Nanosaur corpus's two packet shapes come out as exactly
+ * three 8-dword or three 11-dword vertices).
+ */
+#define R128_PM4_OPCODE_3D_SAVE_CONTEXT       0x20
+#define R128_PM4_OPCODE_3D_PLAY_CONTEXT       0x21
+#define R128_PM4_OPCODE_3D_RNDR_GEN_INDX_PRIM 0x23
+#define R128_PM4_OPCODE_3D_RNDR_GEN_PRIM      0x25
+
+/* VC_FORMAT: what each inline vertex carries beyond x, y, z */
+#define R128_VC_FRMT_RHW              0x00000001
+#define R128_VC_FRMT_DIFFUSE_BGR      0x00000002
+#define R128_VC_FRMT_DIFFUSE_A        0x00000004
+#define R128_VC_FRMT_DIFFUSE_ARGB     0x00000008
+#define R128_VC_FRMT_SPEC_BGR         0x00000010
+#define R128_VC_FRMT_SPEC_F           0x00000020
+#define R128_VC_FRMT_SPEC_FRGB        0x00000040
+#define R128_VC_FRMT_S_T              0x00000080
+#define R128_VC_FRMT_S2_T2            0x00000100
+#define R128_VC_FRMT_RHW2             0x00000200
+
+/* VC_CNTL: primitive type / walk mode / vertex count */
+#define R128_VC_CNTL_PRIM_TYPE_MASK   0x0000000f
+#define R128_VC_CNTL_PRIM_TYPE_TRI_LIST  4
+#define R128_VC_CNTL_PRIM_TYPE_TRI_FAN   5
+#define R128_VC_CNTL_PRIM_TYPE_TRI_STRIP 6
+#define R128_VC_CNTL_PRIM_WALK_MASK   0x00000030
+#define R128_VC_CNTL_PRIM_WALK_SHIFT  4
+#define R128_VC_CNTL_NUM_SHIFT        16
 
 #endif /* ATI_RAGE128_REGS_H */
