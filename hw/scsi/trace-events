@@ -398,4 +398,6 @@ mesh_seq_cmd(uint8_t cmd) "cmd=0x%x"
 mesh_select_start(uint8_t target) "target=%d"
 mesh_select_timeout_fire(uint8_t target, int found) "target=%d found=%d"
 mesh_reg_write(uint64_t addr, uint64_t val) "addr=0x%" PRIx64 " val=0x%" PRIx64
+mesh_reg_read(uint64_t addr, uint64_t val) "addr=0x%" PRIx64 " val=0x%" PRIx64
+mesh_phase(uint8_t phase) "phase=0x%x"
 mesh_irq_update(uint8_t int_stat, uint8_t int_mask, int level) "int_stat=0x%x int_mask=0x%x level=%d"

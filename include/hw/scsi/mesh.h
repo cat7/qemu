@@ -82,6 +82,38 @@ OBJECT_DECLARE_SIMPLE_TYPE(MESHState, MESH)
 #define INT_ERROR         (1 << 2)
 #define INT_ALL           (INT_CMD_DONE | INT_EXCEPTION | INT_ERROR)
 
+/*
+ * Bus status line bits, as read back from BUS_STATUS0/1. Bit positions
+ * follow the real chip (and DingusPPC's scsi.h SCSI_CTRL_* constants,
+ * with STATUS1 holding the upper byte's bits 5-7).
+ */
+#define BUS0_IO           (1 << 0)
+#define BUS0_CD           (1 << 1)
+#define BUS0_MSG          (1 << 2)
+#define BUS0_ATN          (1 << 3)
+#define BUS0_ACK          (1 << 4)
+#define BUS0_REQ          (1 << 5)
+#define BUS1_SEL          (1 << 5)
+#define BUS1_BSY          (1 << 6)
+#define BUS1_RST          (1 << 7)
+
+/*
+ * Synthesized SCSI bus phase. The classic Mac OS .MESH driver POLLS the
+ * bus-status registers between sequencer commands and takes the phase
+ * encoded in MSG/CD/IO as ground truth about what the target wants next
+ * -- reading constant zeros made it abandon every exchange right after
+ * delivering the CDB (live-traced: INQUIRY pushed, BUS_STATUS0 read,
+ * SEQ_BUS_FREE issued). Values chosen so the low three bits ARE the
+ * MSG/CD/IO encoding.
+ */
+#define MESH_PH_DATA_OUT  0x0
+#define MESH_PH_DATA_IN   (BUS0_IO)
+#define MESH_PH_COMMAND   (BUS0_CD)
+#define MESH_PH_STATUS    (BUS0_CD | BUS0_IO)
+#define MESH_PH_MSG_OUT   (BUS0_MSG | BUS0_CD)
+#define MESH_PH_MSG_IN    (BUS0_MSG | BUS0_CD | BUS0_IO)
+#define MESH_PH_BUS_FREE  0xff  /* not a line encoding: nothing driven */
+
 struct MESHState {
     /*< private >*/
     SysBusDevice parent_obj;
@@ -100,6 +132,19 @@ struct MESHState {
      * see mesh_select()/mesh_select_timeout_cb() in mesh.c. */
     QEMUTimer *sel_timer;
     int sel_pending_target;
+
+    /*
+     * All command-done/exception interrupts are raised a few
+     * microseconds AFTER the register access that caused them, via
+     * this timer -- never synchronously inside the guest's own store
+     * instruction. Real silicon works on the bus after the CPU moves
+     * on; DingusPPC defers every sequencer step through one-shot
+     * timers for the same reason. Raising inline made the .MESH
+     * driver's ISR re-enter against half-advanced state (live-traced
+     * as INTMASK 7->0->7 toggle storms) and abort healthy exchanges.
+     */
+    QEMUTimer *int_timer;
+    uint8_t int_pending;
 
     uint8_t fifo[MESH_FIFO_SIZE];
     int fifo_pos;
@@ -121,6 +166,20 @@ struct MESHState {
     uint8_t sync_params;
     uint8_t status;
     uint8_t lun;
+
+    /* Synthesized bus state the driver polls via BUS_STATUS0/1 */
+    uint8_t phase;          /* MESH_PH_* */
+    bool connected;         /* target selected and BSY */
+
+    /*
+     * The .MESH driver moves small transfers (INQUIRY and friends) by
+     * PIO through the FIFO: SEQ_DATA_IN/OUT *without* the DMA bit, with
+     * xfer_count programmed and the FIFO read/written byte-wise. The
+     * DBDMA path is only used when the sequencer command carries
+     * SEQ_DMA.
+     */
+    bool pio_active;
+    bool awaiting_msg_out;
 
     /* Bridges the DBDMA-side and SCSI-backend-side of a data transfer,
      * following the same pattern as bmac's rx path: whichever side
