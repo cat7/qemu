@@ -3,7 +3,9 @@
 Status (2026-09-02 evening): **Gouraud + Z + scissor triangle engine landed**
 (`ati_rage128_3d_triangle()`, harness-proven), GEN_PRIM wire format confirmed
 live, and the per-frame clear/present packets decode correctly (see "Why the
-scene was black"). Textures, fog, blending are next. This document enumerates
+scene was black"). Textures (perspective-correct, all combine modes, alpha test/blend) landed
+the same evening with a 3.1x per-pixel-overhead win (`raster_bench.py`); fog
+(FOG_ENABLE is set on every Nanosaur triangle) is the next functional gap. This document enumerates
 the 3D register/packet surface the rasterizer consumes, cross-referenced
 against the live Nanosaur corpus.
 
@@ -168,6 +170,12 @@ packet's context) selects the 3D function path vs plain 2D.
    Nanosaur boot (does terrain actually appear?) is still OWED.
 4. Single-texture mapping: TEX_CNTL_C (0x193/0x183 observed) + PRIM_TEX_CNTL_C
    + TEX_SIZE_PITCH_C + PRIM_TEX_n_OFFSET_C mip chain, s/t from the vertex.
-5. Fog (per-vertex fog float + FOG_COLOR_C), secondary texture
-   (SEC_TEX_CNTL_C is live in the corpus), blending per MISC_3D_STATE_CNTL_REG,
+4b. ~~Single-texture mapping~~ — DONE 2026-09-02 (harness 32/32: nearest +
+   bilinear exact texels, orientation proven, perspective proven vs affine,
+   565/4444/8888 formats, alpha test + blend; see HANDOFF-textures-perf.md
+   and the agent findings recorded in ati_rage128_regs.h: TEXMAP_ENABLE =
+   TEX_CNTL_C bit 4, base-level offset slot = TEX_SIZE index, MIP_MAP_DISABLE
+   always set by the RAVE driver).
+5. Fog (per-vertex fog float + FOG_COLOR_C; FOG_ENABLE set on every corpus
+   triangle), secondary texture (SEC_TEXMAP_ENABLE never set in the corpus),
    as the picture demands.

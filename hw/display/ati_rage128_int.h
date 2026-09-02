@@ -94,7 +94,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIRage128State, ATI_RAGE128)
  */
 typedef struct ATIRage128Vertex {
     float x, y, z;
+    float rhw;               /* 1/w, 1.0 when the format carries none */
     float b, g, r, a;
+    float s, t;              /* primary texture coordinates, 0 if absent */
 } ATIRage128Vertex;
 
 typedef struct ATIRage128PM4Parser {
