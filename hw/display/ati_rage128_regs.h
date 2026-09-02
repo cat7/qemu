@@ -571,28 +571,26 @@
 #define R128_TEX_MIN_SIZE_SHIFT      12
 #define R128_TEX_LOG2_MASK           0xf
 /*
- * PRIM_TEX_n_OFFSET_C: bits 23:0 the byte offset in VRAM, bits 31:24
- * flags (the DRM names 31:30 a tiling field; what the RAVE driver's
- * constant 0xc1 means is not documented). The width was MEASURED live
- * (2026-09-02): for seven of eight textures in play, VRAM holds
- * 50-100% non-zero texels over the texture's whole extent at
- * (raw & 0xffffff) and 0% at any wider interpretation (25, 26, 30
- * bits) -- the 30-bit reading put every texture 16MB too high, into
- * unwritten VRAM, which is why the scene came out black. The
- * Pro RRG does not document these eleven registers individually (only
- * the rename note "PRIM_7_OFFSET_C is now PRIM_TEX_7_OFFSET_C", B-4),
- * so which slot holds which level is settled from the corpus: with
- * TEX_SIZE 8 (256 texels) the ONLY slot that changes with the texture
- * is slot 8 (0x1cdc, three distinct top-of-VRAM offsets across the
- * gameplay sample); slots 0-7 and 9-10 hold constant stale shadow
- * (float-looking 0x3f800000, 0x437f0000 ...). Slot index = log2 of
- * that level's width, the base level at slot TEX_SIZE. The 8x8 texture
- * the driver also sets up (TEX_SIZE 3) has slot 3 at 0x01ff3e00, also
- * in VRAM, but no textured triangle was drawn with it -- suggestive,
- * not proven.
+ * PRIM_TEX_n_OFFSET_C: bits 29:0 the byte offset in VRAM, bits 31:30
+ * the DRM's tiling field (R128_TEX_TILED_BY_*; the RAVE driver writes
+ * 0xc1xxxxxx, i.e. 3, on every texture, and the linear fetch below
+ * matches what it uploaded -- see ati_rage128_2d.c). The earlier
+ * 24-bit reading was a misdiagnosis: the uploads were being dropped by
+ * the HOSTDATA_BLT header parse (see the ring parser), so VRAM held
+ * nothing at ANY reading and the one boot that showed data at the
+ * 24-bit address was stale heap. With the uploads landing, their
+ * DST_PITCH_OFFSET destinations and the offsets the 3D context names
+ * are compared in the texture-upload harness check and live.
+ * The Pro RRG does not document these eleven registers individually
+ * (only the rename note "PRIM_7_OFFSET_C is now PRIM_TEX_7_OFFSET_C",
+ * B-4), so which slot holds which level is settled from the corpus:
+ * with TEX_SIZE 8 (256 texels) the ONLY slot that changes with the
+ * texture is slot 8 (0x1cdc); slots 0-7 and 9-10 hold constant stale
+ * shadow (float-looking 0x3f800000, 0x437f0000 ...). Slot index =
+ * log2 of that level's width, the base level at slot TEX_SIZE.
  */
 #define R128_PRIM_TEX_OFFSET_C(n)    (R128_PRIM_TEX_0_OFFSET_C + (n) * 4)
-#define R128_TEX_OFFSET_MASK         0x00ffffff
+#define R128_TEX_OFFSET_MASK         0x3fffffff
 #define R128_HOST_DATA0              0x17c0
 #define R128_HOST_DATA1              0x17c4
 #define R128_HOST_DATA2              0x17c8

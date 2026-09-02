@@ -99,6 +99,8 @@ typedef struct ATIRage128Vertex {
     float s, t;              /* primary texture coordinates, 0 if absent */
 } ATIRage128Vertex;
 
+#define R128_HOSTDATA_HDR_MAX   (1 + 5 + 5)
+
 typedef struct ATIRage128PM4Parser {
     uint32_t remaining;      /* data dwords still expected */
     uint32_t type;           /* packet type of the in-flight packet */
@@ -107,7 +109,12 @@ typedef struct ATIRage128PM4Parser {
     uint32_t p1_reg1;        /* packet1's two register offsets */
     uint32_t p1_reg2;
     uint32_t p3_opcode;      /* packet3 2D-draw sub-state */
-    uint32_t p3_params[8];
+    /*
+     * HOSTDATA_BLT's full header is the context dword, up to five
+     * GMC-announced prefix dwords, and five fixed ones (see the ring
+     * parser); PAINT's inline-brush form needs seven.
+     */
+    uint32_t p3_params[R128_HOSTDATA_HDR_MAX];
     uint32_t p3_scale[16];      /* R128_SCALE_PKT_DWORDS */
     uint32_t p3_param_idx;
     uint32_t p3_total;       /* payload dwords the packet3 declared */
