@@ -1,10 +1,11 @@
 # Rage 128 (Pro) 3D surface — the checklist the software rasterizer is built against
 
-Status: **scaffolding**. Our `hw/display/ati_rage128.c` models 2D (paint/
-bitblt/hostdata/scaler) and the register-kicked video scaler. There is **no
-triangle engine**. This document enumerates the 3D register/packet surface the
-rasterizer frontend must consume, cross-referenced against a live corpus where
-one exists.
+Status (2026-09-02 evening): **Gouraud + Z + scissor triangle engine landed**
+(`ati_rage128_3d_triangle()`, harness-proven), GEN_PRIM wire format confirmed
+live, and the per-frame clear/present packets decode correctly (see "Why the
+scene was black"). Textures, fog, blending are next. This document enumerates
+the 3D register/packet surface the rasterizer consumes, cross-referenced
+against the live Nanosaur corpus.
 
 Design decision (settled, do not relitigate): **software rasterizer writing
 directly into emulated VRAM**, no host GL. Rationale in the ledger — the R350
@@ -76,6 +77,27 @@ Capture recipe for when the card is active (proven tooling this session):
 - **ATI retail driver set**: `ati-downloads/ui42_payload/ATI Universal Installer 4/`
   (`ATI Rage 128 3D Accelerator`, `ATI Nexus Driver`, etc.) — matched-set drivers
   for the retail PCI ROM this device advertises.
+
+
+## Why the scene was black with a working rasterizer (2026-09-02, later)
+
+Live: Nanosaur showed HUD pieces but the moving 3D scene stayed black. Not
+the rasterizer -- the 2D parser. Each frame the game clears the Z buffer
+(colour 0xffffffff) and the colour back buffer (sky 0x7bd87bd8) with
+PAINT_MULTI whose GMC (0x12f033da) has DST_PITCH_OFFSET_CNTL + DST_CLIPPING
+set: `[GMC][DST_PO][SC_TOP_LEFT][SC_BOTTOM_RIGHT][colour][rects]`. The parser
+knew only the pitch/offset dword, took SC_TOP_LEFT (0) as the colour and the
+scissor as a rectangle, so Z was cleared to 0 every frame and every terrain
+triangle (z ~0.99, LESS) was rejected; the HUD draws with Z off. Presentation
+is a BITBLT_MULTI back->front whose GMC (0x52cc33ff) has bits 0-3 all set:
+`[GMC][SRC_PO][DST_PO][SRC_SC_BOTTOM_RIGHT][SC_TOP_LEFT][SC_BOTTOM_RIGHT]
+[rects]` -- the three swallowed dwords decoded byte for byte to the source
+clip (361,510) and the window's screen rectangle (9,118)-(369,627). General
+rule now in both parsers (`ati_rage128_gmc_prefix_reg()`): after the
+context come SRC_PO (bit 0), DST_PO (bit 1), SRC_SC_BOTTOM_RIGHT (bit 2),
+SC_TOP_LEFT + SC_BOTTOM_RIGHT (bit 3), then the opcode payload. Render
+targets are heap-allocated per boot (this run: 510x361 window, dst
+0x1b48000 pitch 512, Z 0x1ae8000), so never hard-code the corpus offsets.
 
 ## CCE packet3 opcodes (header 0xC000xx00, OPCODE = (h>>8) & 0xff)
 

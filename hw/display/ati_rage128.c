@@ -2238,6 +2238,62 @@ static uint32_t ati_rage128_pm4_read_ring(ATIRage128State *s)
  * model). Packet format: see the comment on R128_PM4_BUFFER_OFFSET in
  * ati_rage128_regs.h.
  */
+/*
+ * The dwords a drawing packet's context announces BEFORE the opcode's
+ * own payload, in hardware order: SRC_PITCH_OFFSET (GMC bit 0),
+ * DST_PITCH_OFFSET (bit 1), SRC_SC_BOTTOM_RIGHT (bit 2), then the
+ * SC_TOP_LEFT / SC_BOTTOM_RIGHT pair (bit 3). Bits 0/1 were established
+ * on OS X's pointer save-under (2026-08-17); bits 2/3 on Nanosaur's
+ * per-frame clears and presentation blits (2026-09-02): its PAINT_MULTI
+ * carries [GMC][DST_PO][SC_TL][SC_BR][colour][rects] and its
+ * BITBLT_MULTI [GMC][SRC_PO][DST_PO][SRC_SC_BR][SC_TL][SC_BR][rects] --
+ * the three "extra" dwords decoded, byte for byte, to the game window's
+ * source clip and its screen rectangle. Reading the scissor top-left as
+ * the clear colour zeroed the Z buffer every frame, so every terrain
+ * triangle failed its LESS test and the 3D scene stayed black while the
+ * HUD (drawn with Z off) showed. HOSTDATA_BLT has its own bit-3 form and
+ * is left alone.
+ *
+ * Returns the register the k-th (0-based) prefix dword loads, or 0 when
+ * k is past the prefix.
+ */
+static uint32_t ati_rage128_gmc_prefix_reg(uint32_t gmc, unsigned k)
+{
+    static const struct {
+        uint32_t bit;
+        uint32_t reg[2];
+        unsigned n;
+    } tab[] = {
+        { R128_GMC_SRC_PITCH_OFFSET_CNTL, { R128_SRC_PITCH_OFFSET }, 1 },
+        { R128_GMC_DST_PITCH_OFFSET_CNTL, { R128_DST_PITCH_OFFSET }, 1 },
+        { R128_GMC_SRC_CLIPPING, { R128_SRC_SC_BOTTOM_RIGHT }, 1 },
+        { R128_GMC_DST_CLIPPING, { R128_SC_TOP_LEFT, R128_SC_BOTTOM_RIGHT },
+          2 },
+    };
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(tab); i++) {
+        if (!(gmc & tab[i].bit)) {
+            continue;
+        }
+        if (k < tab[i].n) {
+            return tab[i].reg[k];
+        }
+        k -= tab[i].n;
+    }
+    return 0;
+}
+
+static unsigned ati_rage128_gmc_prefix_len(uint32_t gmc)
+{
+    unsigned n = 0;
+
+    while (ati_rage128_gmc_prefix_reg(gmc, n)) {
+        n++;
+    }
+    return n;
+}
+
 static void ati_rage128_pm4_run(ATIRage128State *s)
 {
     int guard;
@@ -2387,16 +2443,17 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
                 ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, gmc);
                 i = 1;
                 /*
-                 * A context with DST_PITCH_OFFSET_CNTL set carries the
-                 * destination pitch/offset dword before the colour
-                 * (Linux's r128 DRM clear packet); Mac OS 9's context
-                 * (0x72f036d0) has the bit clear and goes straight to
-                 * the colour.
+                 * The context's announce bits say what sits between it
+                 * and the colour (see ati_rage128_gmc_prefix_reg): Mac
+                 * OS 9's desktop context (0x72f036d0) has none, Linux's
+                 * DRM clear carries DST_PITCH_OFFSET, Nanosaur's clears
+                 * carry that plus the scissor pair.
                  */
-                if ((gmc & R128_GMC_DST_PITCH_OFFSET_CNTL) &&
-                    i + 1 < (int)count) {
-                    ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET,
-                                            ati_rage128_pm4_read_ring(s));
+                while (ati_rage128_gmc_prefix_reg(gmc, i - 1) &&
+                       i + 1 < (int)count) {
+                    ati_rage128_reg_write32(s,
+                                    ati_rage128_gmc_prefix_reg(gmc, i - 1),
+                                    ati_rage128_pm4_read_ring(s));
                     i++;
                 }
                 color = ati_rage128_pm4_read_ring(s);
@@ -2454,16 +2511,12 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
 
                     ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, gmc);
                     i = 1;
-                    if ((gmc & R128_GMC_SRC_PITCH_OFFSET_CNTL) &&
-                        i < (int)count) {
-                        ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET,
-                                                ati_rage128_pm4_read_ring(s));
-                        i++;
-                    }
-                    if ((gmc & R128_GMC_DST_PITCH_OFFSET_CNTL) &&
-                        i < (int)count) {
-                        ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET,
-                                                ati_rage128_pm4_read_ring(s));
+                    /* pitch/offset and scissor dwords, per the context */
+                    while (ati_rage128_gmc_prefix_reg(gmc, i - 1) &&
+                           i < (int)count) {
+                        ati_rage128_reg_write32(s,
+                                    ati_rage128_gmc_prefix_reg(gmc, i - 1),
+                                    ati_rage128_pm4_read_ring(s));
                         i++;
                     }
                     for (; i + 3 <= (int)count; i += 3) {
@@ -3001,17 +3054,21 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
              */
             if (p->p3_param_idx == 0) {
                 /*
-                 * see the ring parser: a context with
-                 * DST_PITCH_OFFSET_CNTL set is followed by the
-                 * destination pitch/offset dword, then the colour
+                 * see the ring parser: the context's announce bits say
+                 * how many pitch/offset and scissor dwords precede the
+                 * colour; p3_params[3] counts the ones still to come,
+                 * p3_params[4] keeps the context to decode them by
                  */
                 ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, val);
-                p->p3_params[3] = (val & R128_GMC_DST_PITCH_OFFSET_CNTL) ?
-                                  1 : 0;
+                p->p3_params[3] = ati_rage128_gmc_prefix_len(val);
+                p->p3_params[4] = val;
+                p->p3_params[5] = 0;
                 p->p3_param_idx = 1;
             } else if (p->p3_param_idx == 1 && p->p3_params[3]) {
-                ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET, val);
-                p->p3_params[3] = 0;
+                ati_rage128_reg_write32(s,
+                    ati_rage128_gmc_prefix_reg(p->p3_params[4],
+                                               p->p3_params[5]++), val);
+                p->p3_params[3]--;
             } else if (p->p3_param_idx == 1) {
                 ati_rage128_reg_write32(s, R128_DP_BRUSH_FRGD_CLR, val);
                 p->p3_param_idx = 2;
@@ -3046,23 +3103,12 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
              */
             if (p->p3_param_idx == 0) {
                 ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL, val);
-                p->p3_params[3] = 0;
-                if (val & R128_GMC_SRC_PITCH_OFFSET_CNTL) {
-                    p->p3_params[3]++;
-                }
-                if (val & R128_GMC_DST_PITCH_OFFSET_CNTL) {
-                    p->p3_params[3]++;
-                }
+                p->p3_params[3] = ati_rage128_gmc_prefix_len(val);
                 p->p3_params[4] = val;
             } else if (p->p3_param_idx <= p->p3_params[3]) {
-                bool src_first = p->p3_params[4] &
-                                 R128_GMC_SRC_PITCH_OFFSET_CNTL;
-
-                if (p->p3_param_idx == 1 && src_first) {
-                    ati_rage128_reg_write32(s, R128_SRC_PITCH_OFFSET, val);
-                } else {
-                    ati_rage128_reg_write32(s, R128_DST_PITCH_OFFSET, val);
-                }
+                ati_rage128_reg_write32(s,
+                    ati_rage128_gmc_prefix_reg(p->p3_params[4],
+                                               p->p3_param_idx - 1), val);
             } else {
                 unsigned slot = (p->p3_param_idx - 1 - p->p3_params[3]) % 3;
 
