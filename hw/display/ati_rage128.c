@@ -42,19 +42,27 @@
 /*
  * How long the PCI IRQ line stays asserted after a VBLANK/VSYNC raise
  * if the guest never acknowledges GEN_INT_STATUS. Acks deassert the
- * line early (see ati_rage128_update_irq()). Real silicon holds the
- * line until software acks; this cap only exists so a bring-up phase
- * that enables the interrupt without servicing it cannot storm -- the
- * line always drops before the next blank start so every frame still
- * yields exactly one fresh edge. Measured live (OS 9.1, OpenBIOS
- * mac99, OpenPIC level source): with the old 1/8-frame pulse the guest
- * missed ~23% of VBLs (its ISR/other interrupt work often exceeded
- * 2 ms, and a level source that goes low before it is taken is simply
- * lost), which was the direct cause of jerky mouse motion -- Mac OS
- * moves the hardware cursor from its VBL task.
+ * line early (see ati_rage128_update_irq()).
+ *
+ * Real silicon holds the line until software acks, and on mac99 that is
+ * what this device does: measured there (OS 9.1, OpenBIOS, OpenPIC
+ * level source), a 1/8-frame pulse lost ~23% of VBLs because the
+ * guest's ISR work often outlasted the 2 ms assertion, which was the
+ * direct cause of jerky mouse motion (Mac OS moves the hardware cursor
+ * from its VBL task).
+ *
+ * On g3beige it must NOT be held. Nothing acks GEN_INT_STATUS between
+ * the card lighting up and the OS driver loading -- the Beige ROM
+ * never does, which is also why the onboard mach64 cannot take
+ * hold-until-ack (2026-07-28: every variant hung the boot). A held
+ * line means every rfi re-enters the interrupt path immediately:
+ * profiled live with a rage128 attached and an SDL console, the vCPU
+ * sat in helper_rfi -> hreg_store_msr -> ppc_maybe_interrupt taking
+ * and dropping the BQL, and boot went from ~2 minutes to well past 4
+ * with the Happy Mac barely reached. So this board keeps the short
+ * gated pulse it always used; the hold stays a mac99 behaviour.
  */
-#define ATI_RAGE128_VBLANK_IRQ_LEN_NS (ATI_RAGE128_VBLANK_PERIOD_NS - \
-                                       ATI_RAGE128_VBLANK_LEN_NS)
+#define ATI_RAGE128_VBLANK_IRQ_LEN_NS ATI_RAGE128_VBLANK_LEN_NS
 
 /* ---------------------------------------------------------------- */
 /* Display                                                          */
