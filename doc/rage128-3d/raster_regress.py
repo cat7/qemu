@@ -484,7 +484,7 @@ def check4(q, c):
 def check5(q, c):
     dst = 0x0F0300 << 5                       # corpus DST_PITCH_OFFSET_C
     zoff = 0x1C00000
-    texbase = 0x01D0AE00                      # corpus PRIM_TEX_8_OFFSET_C
+    texbase = 0x00D0AE00                      # corpus 0xC1D0AE00, bits 23:0
     pkts, cur = [], None
     with gzip.open(CORPUS, "rt") as f:
         for line in f:

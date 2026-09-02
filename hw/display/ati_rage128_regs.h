@@ -571,8 +571,14 @@
 #define R128_TEX_MIN_SIZE_SHIFT      12
 #define R128_TEX_LOG2_MASK           0xf
 /*
- * PRIM_TEX_n_OFFSET_C: bits 29:0 the byte offset in VRAM, bits 31:30 a
- * tiling field per the DRM (TEX_NO_TILE .. TEX_TILED_BY_STORAGE2). The
+ * PRIM_TEX_n_OFFSET_C: bits 23:0 the byte offset in VRAM, bits 31:24
+ * flags (the DRM names 31:30 a tiling field; what the RAVE driver's
+ * constant 0xc1 means is not documented). The width was MEASURED live
+ * (2026-09-02): for seven of eight textures in play, VRAM holds
+ * 50-100% non-zero texels over the texture's whole extent at
+ * (raw & 0xffffff) and 0% at any wider interpretation (25, 26, 30
+ * bits) -- the 30-bit reading put every texture 16MB too high, into
+ * unwritten VRAM, which is why the scene came out black. The
  * Pro RRG does not document these eleven registers individually (only
  * the rename note "PRIM_7_OFFSET_C is now PRIM_TEX_7_OFFSET_C", B-4),
  * so which slot holds which level is settled from the corpus: with
@@ -586,7 +592,7 @@
  * not proven.
  */
 #define R128_PRIM_TEX_OFFSET_C(n)    (R128_PRIM_TEX_0_OFFSET_C + (n) * 4)
-#define R128_TEX_OFFSET_MASK         0x3fffffff
+#define R128_TEX_OFFSET_MASK         0x00ffffff
 #define R128_HOST_DATA0              0x17c0
 #define R128_HOST_DATA1              0x17c4
 #define R128_HOST_DATA2              0x17c8
