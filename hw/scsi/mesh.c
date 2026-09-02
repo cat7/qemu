@@ -108,10 +108,15 @@ static void mesh_raise_int(MESHState *s, uint8_t bits)
 }
 
 /*
- * Called when a SCSI request completes (status phase reached). Push the
- * status byte and a COMMAND COMPLETE message byte into the FIFO for the
- * driver's Status/MessageIn sequencer commands to read back, and let it
- * know via the command-done interrupt.
+ * Called when a SCSI request completes (status phase reached). Only
+ * RECORD the status here -- real MESH delivers the status byte into the
+ * FIFO when the driver runs SEQ_STATUS, and the COMMAND COMPLETE
+ * message when it runs SEQ_MSG_IN. Pre-pushing both at completion time
+ * (as this used to) contaminated the tail of a PIO Data In transfer:
+ * the ROM's drain loop suddenly saw FIFO_COUNT=2 of bytes it never
+ * asked for and stalled polling (live-traced: INQUIRY data delivered
+ * fine, then an endless FIFO_COUNT=2 poll at the Data->Status
+ * boundary).
  */
 static void mesh_command_complete(SCSIRequest *req, size_t resid)
 {
@@ -122,8 +127,6 @@ static void mesh_command_complete(SCSIRequest *req, size_t resid)
     s->async_len = 0;
 
     mesh_fifo_reset(s);
-    mesh_fifo_push(s, s->status);
-    mesh_fifo_push(s, 0x00); /* COMMAND COMPLETE message */
 
     s->pio_active = false;
     mesh_set_phase(s, MESH_PH_STATUS);
@@ -353,10 +356,11 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         break;
     case SEQ_STATUS:
         /*
-         * Status byte is already sitting in the FIFO from completion.
-         * Once the driver has collected it, the target's next stop is
-         * Message In (COMMAND COMPLETE, also pre-queued).
+         * Deliver the recorded status byte now -- this sequencer command
+         * is what latches it into the FIFO on real hardware. The
+         * target's next stop is Message In (COMMAND COMPLETE).
          */
+        mesh_fifo_push(s, s->status);
         mesh_set_phase(s, MESH_PH_MSG_IN);
         mesh_raise_int(s, INT_CMD_DONE);
         break;
@@ -412,10 +416,35 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         }
         break;
     case SEQ_MSG_IN:
-        /* COMMAND COMPLETE message byte was already queued */
+        /* deliver the COMMAND COMPLETE message byte */
+        mesh_fifo_push(s, 0x00);
         mesh_raise_int(s, INT_CMD_DONE);
         break;
     case SEQ_BUS_FREE:
+        /*
+         * SEQ_BUS_FREE is the Mac driver's DISPATCH PROBE, not just a
+         * disconnect: after every completed step it asks "is the
+         * transaction over?", and real MESH answers with a
+         * PHASE-MISMATCH exception whenever the target is still
+         * connected in some further phase. The driver then reads
+         * BUS_STATUS0 for the new phase and issues the matching
+         * transfer command (SEQ_DATA_IN/SEQ_STATUS/...). Answering
+         * INT_CMD_DONE unconditionally -- as this did -- told the
+         * driver the transaction had ended right after the CDB, which
+         * is exactly the "driver issues SEQ_BUS_FREE and never
+         * transfers" dead end the bring-up traces showed. Semantics
+         * verified against DingusPPC's SeqCmd::BusFree (mesh.cpp): in
+         * MESSAGE_IN the probe ACCEPTS the final message and the
+         * target really does go bus-free; connected in any other phase
+         * raises EXC_PHASE_MM + INT_EXCEPTION; genuinely free answers
+         * INT_CMD_DONE.
+         */
+        if (s->connected && s->phase != MESH_PH_MSG_IN &&
+            s->phase != MESH_PH_BUS_FREE) {
+            s->exception |= EXC_PHASE_MM;
+            mesh_raise_int(s, INT_EXCEPTION);
+            break;
+        }
         s->connected = false;
         s->pio_active = false;
         mesh_set_phase(s, MESH_PH_BUS_FREE);
@@ -571,6 +600,29 @@ static void mesh_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->xfer_count = (s->xfer_count & 0x00ff) | ((val & 0xff) << 8);
         return;
     case MESH_FIFO:
+        if (s->pio_active && s->to_device && s->data_ready &&
+            s->async_len > 0) {
+            /*
+             * PIO Data Out drains CONTINUOUSLY: real MESH moves each
+             * byte from the FIFO onto the bus as the target takes it,
+             * so the driver watches FIFO_COUNT fall and keeps pushing
+             * -- it sends xfer_count bytes THROUGH the 16-byte FIFO.
+             * The previous bulk handoff (fire once fifo_pos reaches
+             * async_len/xfer_count) could never trigger for transfers
+             * larger than the FIFO: live-traced with the 8.1 CD's
+             * Drive Setup scan, a WRITE(6) of one 512-byte block left
+             * the FIFO pegged at 16 with the driver politely polling
+             * for drain forever. Completion interrupts come from the
+             * request completing (mesh_command_complete()), or the
+             * next transfer_data() chunk re-arming async_buf.
+             */
+            *s->async_buf++ = val;
+            if (--s->async_len == 0 && s->current_req) {
+                s->data_ready = false;
+                scsi_req_continue(s->current_req);
+            }
+            return;
+        }
         mesh_fifo_push(s, val);
         if (s->awaiting_cdb && s->xfer_count > 0 &&
             s->fifo_pos >= s->xfer_count) {
@@ -584,21 +636,6 @@ static void mesh_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             }
             mesh_fifo_reset(s);
             mesh_set_phase(s, MESH_PH_COMMAND);
-            mesh_raise_int(s, INT_CMD_DONE);
-        } else if (s->pio_active && s->to_device && s->data_ready &&
-                   (s->fifo_pos >= s->async_len ||
-                    (s->xfer_count > 0 && s->fifo_pos >= s->xfer_count))) {
-            /* PIO Data Out: hand the accumulated bytes to the backend */
-            int n = MIN(s->fifo_pos, s->async_len);
-
-            memcpy(s->async_buf, s->fifo, n);
-            s->async_buf += n;
-            s->async_len -= n;
-            mesh_fifo_reset(s);
-            if (s->async_len == 0 && s->current_req) {
-                s->data_ready = false;
-                scsi_req_continue(s->current_req);
-            }
             mesh_raise_int(s, INT_CMD_DONE);
         }
         return;
