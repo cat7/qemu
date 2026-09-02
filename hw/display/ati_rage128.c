@@ -2608,65 +2608,68 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
             case R128_PM4_OPCODE_HOSTDATA_BLT:
                 if (count >= 8) {
                     /*
-                     * Eight-dword header, then the pixel dwords. Only
-                     * three fields are needed: [0] the drawing context
-                     * (rop 0xCC, SRCCOPY, in every captured packet),
-                     * [5] DST_Y_X and [6] DST_HEIGHT_WIDTH; [7] is the
-                     * pixel dword count, which equals width x height in
-                     * every capture (72x14 -> 0x3f0, 80x12 -> 0x3c0),
-                     * and that identity is what pins this layout down.
-                     * [1]-[4] carry clip/state the driver has already
-                     * programmed through registers, so they are
-                     * skipped. Reading [0]/[1] as the rectangle -- the
-                     * short form below -- put every glyph and icon at a
-                     * nonsense position, which is why text and icons
-                     * were missing on this card.
+                     * Full form: the drawing context, then the pitch/
+                     * offset and scissor dwords its GMC bits announce
+                     * (ati_rage128_gmc_prefix_reg -- the same rule the
+                     * MULTI packets follow), two dwords the addendum
+                     * calls reserved, DST_Y_X, DST_HEIGHT_WIDTH and the
+                     * pixel dword count; then the pixels. So the header
+                     * is 1 + prefix + 5 dwords: seven from Linux's r128
+                     * (DST_PITCH_OFFSET only), eight from Mac OS's text
+                     * and icon blits (DST_CLIPPING: the two scissors),
+                     * NINE from the RAVE driver's texture uploads (both,
+                     * GMC 0x53cc33fa). Fixing the header at eight read
+                     * a texture packet's DST_Y_X as its size -- width 0
+                     * -- and dropped every texel, with the destination
+                     * left at whatever the previous blit used: that is
+                     * why Nanosaur's textures were black. Measured live
+                     * (2026-09-02): a 128x128 ARGB1555 texture arrives
+                     * as 8192 pixel dwords behind a nine-dword header
+                     * (count 8201), 64x64 as 2057, and the count
+                     * identity [nhdr-1] == count - nhdr holds for all
+                     * three forms (the HUD's 640x3 is 960 + 8 = 968).
                      */
-                    uint32_t hdr[8];
-                    int nhdr;
+                    uint32_t hdr[R128_HOSTDATA_HDR_MAX];
+                    unsigned nhdr, k;
 
-                    for (i = 0; i < 8; i++) {
+                    hdr[0] = ati_rage128_pm4_read_ring(s);
+                    nhdr = 1 + ati_rage128_gmc_prefix_len(hdr[0]) + 5;
+                    if (nhdr > count) {
+                        trace_ati_rage128_hostdata_hdr(hdr[0], nhdr, 0,
+                                                       count);
+                        for (i = 1; i < count; i++) {
+                            ati_rage128_pm4_read_ring(s);
+                        }
+                        break;
+                    }
+                    for (i = 1; i < nhdr; i++) {
                         hdr[i] = ati_rage128_pm4_read_ring(s);
                     }
-                    /*
-                     * The last header dword is the pixel-dword count,
-                     * so it must equal what is left of the packet --
-                     * that identity tells the two known header lengths
-                     * apart without guessing: Linux's r128 driver emits
-                     * seven (context, pitch/offset, write mask, clip,
-                     * position, size, count) while the Mac driver emits
-                     * eight, with one extra dword before the position.
-                     */
-                    nhdr = (hdr[7] == count - 8) ? 8 :
-                           (hdr[6] == count - 7) ? 7 : 8;
+                    if (hdr[nhdr - 1] != count - nhdr) {
+                        trace_ati_rage128_hostdata_hdr(hdr[0], nhdr,
+                                                       hdr[nhdr - 1], count);
+                    }
                     ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL,
                                             hdr[0]);
                     /*
-                     * hdr[1]/hdr[2] are the destination scissors, and
-                     * they are not decoration: the driver pads the blit
-                     * width up to a 4-pixel boundary and expects the
-                     * clip to discard the surplus. They must be
-                     * programmed AFTER the context dword, since a GMC
-                     * write with DST_CLIPPING clear resets them.
+                     * The prefix registers go in AFTER the context
+                     * dword, since a GMC write with DST_CLIPPING clear
+                     * resets the scissors -- and they are not
+                     * decoration: the driver pads the blit width up to
+                     * a 4-pixel boundary and expects the clip to
+                     * discard the surplus.
                      */
-                    if (nhdr == 8) {
-                        ati_rage128_reg_write32(s, R128_SC_TOP_LEFT, hdr[1]);
-                        ati_rage128_reg_write32(s, R128_SC_BOTTOM_RIGHT,
-                                                hdr[2]);
+                    for (k = 1; k < nhdr - 5; k++) {
+                        ati_rage128_reg_write32(s,
+                            ati_rage128_gmc_prefix_reg(hdr[0], k - 1),
+                            hdr[k]);
                     }
                     s->dst_x = hdr[nhdr - 3] & 0x3fff;
                     s->dst_y = (hdr[nhdr - 3] >> 16) & 0x3fff;
                     s->dst_width = hdr[nhdr - 2] & 0x3fff;
                     s->dst_height = (hdr[nhdr - 2] >> 16) & 0x3fff;
-                    if (nhdr == 7) {
-                        /* the 8th dword we already read is pixel data */
-                        s->host_data_acc[0] = hdr[7];
-                    }
                     ati_rage128_2d_blt(s); /* enters host-data mode */
-                    if (nhdr == 7 && s->host_data_active) {
-                        s->host_data_next = 1;
-                    }
-                    for (i = 8; i < count; i++) {
+                    for (i = nhdr; i < count; i++) {
                         uint32_t hdata = ati_rage128_pm4_read_ring(s);
 
                         if (s->host_data_active) {
@@ -3177,28 +3180,46 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
             break;
         case R128_PM4_OPCODE_HOSTDATA_BLT:
         {
-            /* header dwords before the pixel data -- see the ring parser */
-            uint32_t nhdr = p->p3_total >= 8 ? 8 : 2;
+            /*
+             * Header length from the context dword's prefix bits -- see
+             * the ring parser's copy of this case. Until the context
+             * dword is in, only that one dword is known to be header.
+             */
+            uint32_t nhdr = p->p3_total < 8 ? 2 : p->p3_param_idx == 0 ? 1 :
+                            1 + ati_rage128_gmc_prefix_len(p->p3_params[0]) +
+                            5;
 
             if (p->p3_param_idx < nhdr) {
                 p->p3_params[p->p3_param_idx++] = val;
-                if (p->p3_param_idx == nhdr) {
-                    uint32_t yx = nhdr == 8 ? p->p3_params[5]
-                                            : p->p3_params[0];
-                    uint32_t hw = nhdr == 8 ? p->p3_params[6]
-                                            : p->p3_params[1];
+                if (p->p3_total >= 8 && p->p3_param_idx == 1) {
+                    nhdr = 1 + ati_rage128_gmc_prefix_len(val) + 5;
+                    if (nhdr > p->p3_total) {
+                        trace_ati_rage128_hostdata_hdr(val, nhdr, 0,
+                                                       p->p3_total);
+                    }
+                }
+                if (p->p3_param_idx == nhdr && nhdr <= p->p3_total) {
+                    uint32_t yx = nhdr > 2 ? p->p3_params[nhdr - 3]
+                                           : p->p3_params[0];
+                    uint32_t hw = nhdr > 2 ? p->p3_params[nhdr - 2]
+                                           : p->p3_params[1];
 
-                    if (nhdr == 8) {
-                        /*
-                         * Context first, then the clip -- see the ring
-                         * parser's copy of this case.
-                         */
+                    if (nhdr > 2) {
+                        uint32_t gmc = p->p3_params[0];
+                        unsigned k;
+
+                        if (p->p3_params[nhdr - 1] != p->p3_total - nhdr) {
+                            trace_ati_rage128_hostdata_hdr(gmc, nhdr,
+                                p->p3_params[nhdr - 1], p->p3_total);
+                        }
+                        /* context first, then its prefix -- ring parser */
                         ati_rage128_reg_write32(s, R128_DP_GUI_MASTER_CNTL,
-                                                p->p3_params[0]);
-                        ati_rage128_reg_write32(s, R128_SC_TOP_LEFT,
-                                                p->p3_params[1]);
-                        ati_rage128_reg_write32(s, R128_SC_BOTTOM_RIGHT,
-                                                p->p3_params[2]);
+                                                gmc);
+                        for (k = 1; k < nhdr - 5; k++) {
+                            ati_rage128_reg_write32(s,
+                                ati_rage128_gmc_prefix_reg(gmc, k - 1),
+                                p->p3_params[k]);
+                        }
                     }
                     s->dst_x = yx & 0x3fff;
                     s->dst_y = (yx >> 16) & 0x3fff;

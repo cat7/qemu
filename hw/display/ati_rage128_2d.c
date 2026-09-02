@@ -1211,7 +1211,8 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
         trace_ati_rage128_3d_unsupported("mip-mapping (base level used)",
                                          cntl);
     }
-    trace_ati_rage128_3d_tex(t->base, t->w, t->h, t->dt, cntl,
+    trace_ati_rage128_3d_tex(s->regs[R128_PRIM_TEX_OFFSET_C(l2w) >> 2],
+                             t->base, t->w, t->h, t->dt, cntl,
                              s->regs[R128_PRIM_TEXTURE_COMBINE_CNTL_C >> 2]);
     return true;
 }

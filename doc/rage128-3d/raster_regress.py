@@ -65,6 +65,9 @@ TEX_SIZE_PITCH_C = 0x1CB8
 PRIM_TEX_0_OFFSET_C = 0x1CBC          # slot n at 0x1CBC + 4n, n = 0..10
 PRIM_TEXTURE_BORDER_COLOR_C = 0x1D38
 PLANE_3D_MASK_C = 0x1D44
+DEFAULT_OFFSET = 0x16E0
+DEFAULT_PITCH = 0x16E4
+DP_DATATYPE = 0x16C4
 SRC_PITCH_OFFSET = 0x1428
 DST_PITCH_OFFSET = 0x142C
 BRUSH_Y_X = 0x1474
@@ -484,7 +487,7 @@ def check4(q, c):
 def check5(q, c):
     dst = 0x0F0300 << 5                       # corpus DST_PITCH_OFFSET_C
     zoff = 0x1C00000
-    texbase = 0x00D0AE00                      # corpus 0xC1D0AE00, bits 23:0
+    texbase = 0x01D0AE00                      # corpus 0xC1D0AE00, bits 29:0
     pkts, cur = [], None
     with gzip.open(CORPUS, "rt") as f:
         for line in f:
@@ -881,16 +884,19 @@ def check14(q, c):
 
 def check15(q, c):
     """HOSTDATA_BLT coverage: 32x16 ARGB1555 pixels through the 8-dword
-    Mac header form, must land exactly."""
+    Mac header form (GMC DST_CLIPPING: context, the two scissors, two
+    fixed dwords, DST_Y_X, DST_HEIGHT_WIDTH, count -- the HUD text form,
+    destination from DEFAULT_OFFSET/PITCH), must land exactly."""
     off, rows = 0x8000, 40
     q.memset(BAR0 + off, rows * 1280, 0)
-    c.reg(DST_PITCH_OFFSET, 0x50 << 21 | off >> 5)
+    c.reg(DEFAULT_OFFSET, off)
+    c.reg(DEFAULT_PITCH, 0x50)
     pix = [((x * 7 + y * 13) & 0x7FFF) | 0x8000 for y in range(16)
            for x in range(32)]
     data = b"".join(struct.pack("<H", p) for p in pix)
     dwords = list(struct.unpack("<%dI" % (len(data) // 4), data))
-    gmc = 0x03CC33D2             # host src, colour src dt, dt 3, DST_PO
-    c.packet3(0x94, [gmc, 0, 0x3FFF3FFF, 0, 0, 5 << 16 | 20,
+    gmc = 0x03CC33D8             # host src, colour src dt, dt 3, DST_CLIP
+    c.packet3(0x94, [gmc, 0, 0x1FFF1FFF, 0, 0, 5 << 16 | 20,
                      16 << 16 | 32, len(dwords)] + dwords)
     fb = q.b64read(BAR0 + off, rows * 1280)
     bad = sum(1 for y in range(16) for x in range(32)
@@ -914,7 +920,7 @@ def check16(q, c):
     pkt[1] = 0x2 << 21 | src >> 5
     pkt[2] = 0x50 << 21 | off >> 5
     pkt[3] = 0
-    pkt[4] = 0x3FFF3FFF
+    pkt[4] = 0x1FFF1FFF
     pkt[8] = 3
     pkt[9] = src
     pkt[10] = 2                  # pitch 16 px / 8
@@ -938,6 +944,59 @@ def check16(q, c):
     crc_check("2d scaler", fb)
 
 
+def tex128(x, y):
+    """Asymmetric 128x128 ARGB1555 texture: r5 = x & 31, g5 = y & 31,
+    b5 = (x >> 5) | (y >> 5) << 2 -- every texel names its own (x, y)."""
+    return 0x8000 | (x & 31) << 10 | (y & 31) << 5 | (x >> 5) | (y >> 5) << 2
+
+
+def check17(q, c):
+    """The measured texture-upload chain (Nanosaur, 2026-09-02): the RAVE
+    driver uploads a 128x128 ARGB1555 texture as one HOSTDATA_BLT whose
+    header is NINE dwords -- GMC 0x53cc33fa announces DST_PITCH_OFFSET
+    (bit 1) and DST_CLIPPING (bit 3): [GMC][DST_PO][SC_TL][SC_BR][2 fixed]
+    [DST_Y_X][DST_HEIGHT_WIDTH][8192] -- with DP_DATATYPE 0x20030f03
+    (big-endian host payload), and then names the texture to the 3D
+    context as PRIM_TEX_7_OFFSET_C = 0xc1xxxxxx, the 30-bit offset of
+    that destination. The upload must land at the destination the
+    header names (and nowhere else), and a textured quad must read it
+    back texel-exact through the flagged offset."""
+    off, rows = 0x8000, 240
+    base = 0x1996600                          # a live Nanosaur value
+    alias = base & 0xFFFFFF                   # the disproven 24-bit reading
+    q.memset(BAR0 + off, rows * 1280, 0)
+    q.memset(BAR0 + base, 128 * 128 * 2, 0)
+    q.memset(BAR0 + alias, 128 * 128 * 2, 0)
+    texels = [tex128(x, y) for y in range(128) for x in range(128)]
+    data = b"".join(struct.pack(">H", t) for t in texels)   # host is BE
+    dwords = list(struct.unpack("<%dI" % (len(data) // 4), data))
+    c.reg(DP_DATATYPE, 0x20030F03)
+    c.packet3(0x94, [0x53CC33FA, 0x10 << 21 | base >> 5, 0, 0x007F007F,
+                     0, 0, 0, 128 << 16 | 128, len(dwords)] + dwords)
+    c.reg(DP_DATATYPE, 0)
+    got = q.b64read(BAR0 + base, 128 * 128 * 2)
+    want = b"".join(struct.pack("<H", t) for t in texels)
+    landed = got == want
+    stray = sum(1 for b in q.b64read(BAR0 + alias, 128 * 128 * 2) if b)
+    report("texture upload lands at the 30-bit DST_PITCH_OFFSET target",
+           landed and stray == 0,
+           f"{sum(1 for i in range(0, len(got), 2) if got[i:i + 2] == want[i:i + 2])}"
+           f"/16384 texels exact at 0x{base:x}, {stray} stray bytes at the "
+           f"24-bit alias 0x{alias:x}")
+    c.state(off, tex_cntl=TEXMAP_ENABLE)
+    c.texture(0xC0000000 | base, 7, 7, cntl=TEXC_NEAREST, comb=COMB_COPY)
+    c.tquad(100, 100, 228, 228)
+    fb = q.b64read(BAR0 + off, rows * 1280)
+    bad = sum(1 for y in range(128) for x in range(128)
+              if pix16(fb, 640, 100 + x, 100 + y) != tex128(x, y))
+    n = count16(fb)
+    report("textured quad through PRIM_TEX_7_OFFSET_C = 0xc1996600",
+           bad == 0 and n == 128 * 128,
+           f"{128 * 128 - bad}/16384 pixels texel-exact, {n} painted "
+           f"(want 16384)")
+    crc_check("texture upload chain", fb)
+
+
 def main():
     os.makedirs(SCRATCH, exist_ok=True)
     # the session scratchpad path is longer than AF_UNIX allows (104
@@ -951,7 +1010,7 @@ def main():
               f"BAR0=0x{BAR0:08x} BAR2=0x{BAR2:08x}")
         for chk in (check1, check2, check3, check4, check5, check6, check7,
                     check8, check9, check10, check11, check12, check13,
-                    check14, check15, check16):
+                    check14, check15, check16, check17):
             chk(q, c)
     finally:
         q.close()
