@@ -97,6 +97,10 @@ typedef struct ATIRage128PM4Parser {
     uint32_t p3_scale[16];      /* R128_SCALE_PKT_DWORDS */
     uint32_t p3_param_idx;
     uint32_t p3_total;       /* payload dwords the packet3 declared */
+    uint32_t p3_vc_format;   /* GEN_PRIM: VC_FORMAT dword */
+    uint32_t p3_vc_cntl;     /* GEN_PRIM: VC_CNTL dword */
+    uint32_t p3_vtx_stride;  /* dwords per vertex, from VC_FORMAT */
+    uint32_t p3_vtx[16];     /* the vertex currently being gathered */
 } ATIRage128PM4Parser;
 
 typedef struct ATIRage128Mode {

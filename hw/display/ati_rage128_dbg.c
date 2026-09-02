@@ -13,7 +13,56 @@
 
 const char *ati_rage128_reg_name(uint32_t base)
 {
+    /* runs of identically-named registers first */
+    if (base >= R128_BRUSH_DATA0 && base < R128_BRUSH_DATA0 + 32 * 4) {
+        return "BRUSH_DATAn";
+    }
+    if (base >= R128_PRIM_TEX_0_OFFSET_C &&
+        base <= R128_PRIM_TEX_10_OFFSET_C) {
+        return "PRIM_TEX_n_OFFSET_C";
+    }
+    if (base >= R128_SEC_TEX_0_OFFSET_C && base <= R128_SEC_TEX_10_OFFSET_C) {
+        return "SEC_TEX_n_OFFSET_C";
+    }
     switch (base) {
+    case R128_PM4_VC_FPU_SETUP:      return "PM4_VC_FPU_SETUP";
+    case R128_SURFACE3_LOWER_BOUND:  return "SURFACE3_LOWER_BOUND";
+    case R128_SURFACE3_UPPER_BOUND:  return "SURFACE3_UPPER_BOUND";
+    case R128_SURFACE3_INFO:         return "SURFACE3_INFO";
+    case R128_BRUSH_SCALE:           return "BRUSH_SCALE";
+    case R128_FLUSH_7:               return "FLUSH_7";
+    case R128_PC_GUI_CTLSTAT:        return "PC_GUI_CTLSTAT";
+    case R128_SETUP_CNTL:            return "SETUP_CNTL";
+    case R128_WINDOW_XY_OFFSET:      return "WINDOW_XY_OFFSET";
+    case R128_DRAW_LINE_POINT:       return "DRAW_LINE_POINT";
+    case R128_SETUP_CNTL_PM4:        return "SETUP_CNTL_PM4";
+    case R128_DST_PITCH_OFFSET_C:    return "DST_PITCH_OFFSET_C";
+    case R128_DP_GUI_MASTER_CNTL_C:  return "DP_GUI_MASTER_CNTL_C";
+    case R128_SC_TOP_LEFT_C:         return "SC_TOP_LEFT_C";
+    case R128_SC_BOTTOM_RIGHT_C:     return "SC_BOTTOM_RIGHT_C";
+    case R128_Z_OFFSET_C:            return "Z_OFFSET_C";
+    case R128_Z_PITCH_C:             return "Z_PITCH_C";
+    case R128_Z_STEN_CNTL_C:         return "Z_STEN_CNTL_C";
+    case R128_TEXTURE_CLR_CMP_CLR_C: return "TEXTURE_CLR_CMP_CLR_C";
+    case R128_TEXTURE_CLR_CMP_MSK_C: return "TEXTURE_CLR_CMP_MSK_C";
+    case R128_FOG_COLOR_C:           return "FOG_COLOR_C";
+    case R128_PRIM_TEXTURE_COMBINE_CNTL_C:
+        return "PRIM_TEXTURE_COMBINE_CNTL_C";
+    case R128_TEX_SIZE_PITCH_C:      return "TEX_SIZE_PITCH_C";
+    case R128_SEC_TEX_CNTL_C:        return "SEC_TEX_CNTL_C";
+    case R128_SEC_TEX_COMBINE_CNTL_C: return "SEC_TEX_COMBINE_CNTL_C";
+    case R128_CONSTANT_COLOR_C:      return "CONSTANT_COLOR_C";
+    case R128_PRIM_TEXTURE_BORDER_COLOR_C:
+        return "PRIM_TEXTURE_BORDER_COLOR_C";
+    case R128_SEC_TEXTURE_BORDER_COLOR_C:
+        return "SEC_TEXTURE_BORDER_COLOR_C";
+    case R128_STEN_REF_MASK_C:       return "STEN_REF_MASK_C";
+    case R128_PLANE_3D_MASK_C:       return "PLANE_3D_MASK_C";
+    case R128_DP_WRITE_MASK:         return "DP_WRITE_MASK";
+    case R128_DP_DATATYPE:           return "DP_DATATYPE";
+    case R128_BRUSH_Y_X:             return "BRUSH_Y_X";
+    case R128_DP_BRUSH_FRGD_CLR:     return "DP_BRUSH_FRGD_CLR";
+    case R128_DP_BRUSH_BKGD_CLR:     return "DP_BRUSH_BKGD_CLR";
     case R128_SCALE_SRC_HEIGHT_WIDTH: return "SCALE_SRC_HEIGHT_WIDTH";
     case R128_SCALE_OFFSET_0:        return "SCALE_OFFSET_0";
     case R128_SCALE_PITCH:           return "SCALE_PITCH";
