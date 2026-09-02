@@ -39,6 +39,22 @@
 
 #define ATI_RAGE128_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
 #define ATI_RAGE128_VBLANK_LEN_NS    (ATI_RAGE128_VBLANK_PERIOD_NS / 8)
+/*
+ * How long the PCI IRQ line stays asserted after a VBLANK/VSYNC raise
+ * if the guest never acknowledges GEN_INT_STATUS. Acks deassert the
+ * line early (see ati_rage128_update_irq()). Real silicon holds the
+ * line until software acks; this cap only exists so a bring-up phase
+ * that enables the interrupt without servicing it cannot storm -- the
+ * line always drops before the next blank start so every frame still
+ * yields exactly one fresh edge. Measured live (OS 9.1, OpenBIOS
+ * mac99, OpenPIC level source): with the old 1/8-frame pulse the guest
+ * missed ~23% of VBLs (its ISR/other interrupt work often exceeded
+ * 2 ms, and a level source that goes low before it is taken is simply
+ * lost), which was the direct cause of jerky mouse motion -- Mac OS
+ * moves the hardware cursor from its VBL task.
+ */
+#define ATI_RAGE128_VBLANK_IRQ_LEN_NS (ATI_RAGE128_VBLANK_PERIOD_NS - \
+                                       ATI_RAGE128_VBLANK_LEN_NS)
 
 /* ---------------------------------------------------------------- */
 /* Display                                                          */
@@ -511,6 +527,7 @@ static DirtyBitmapSnapshot *ati_rage128_take_dirty(ATIRage128State *s)
 }
 
 static void ati_rage128_cursor_update(ATIRage128State *s);
+static void ati_rage128_cursor_apply(ATIRage128State *s);
 
 static bool ati_rage128_update_display(void *opaque)
 {
@@ -714,7 +731,7 @@ static bool ati_rage128_update_display(void *opaque)
     default:
         break;
     }
-    ati_rage128_cursor_update(s);
+    ati_rage128_cursor_apply(s);
     qemu_console_update_full(s->con);
 
     return true;
@@ -725,7 +742,12 @@ static const GraphicHwOps ati_rage128_gfx_ops = {
 };
 
 /* ---------------------------------------------------------------- */
-/* VBLANK interrupt: gated pulse, as validated on the mach64 device */
+/*
+ * VBLANK interrupt: level held until acked (GEN_INT_STATUS is
+ * write-1-to-clear and the line follows STATUS & CNTL), with a
+ * per-frame fallback cap so a never-acking guest cannot storm -- see
+ * ATI_RAGE128_VBLANK_IRQ_LEN_NS.
+ */
 
 static void ati_rage128_update_irq(ATIRage128State *s)
 {
@@ -740,6 +762,8 @@ static void ati_rage128_vblank_end_tick(void *opaque)
 {
     ATIRage128State *s = opaque;
 
+    /* Fallback only: the guest normally lowered the line long ago by
+     * acking GEN_INT_STATUS (ati_rage128_update_irq()). */
     pci_set_irq(PCI_DEVICE(s), 0);
 }
 
@@ -759,7 +783,8 @@ static void ati_rage128_vblank_timer_tick(void *opaque)
             trace_ati_rage128_vblank_irq(1,
                 s->regs[R128_GEN_INT_CNTL >> 2]);
             pci_set_irq(PCI_DEVICE(s), 1);
-            timer_mod(s->vblank_end_timer, now + ATI_RAGE128_VBLANK_LEN_NS);
+            timer_mod(s->vblank_end_timer,
+                      now + ATI_RAGE128_VBLANK_IRQ_LEN_NS);
         }
     }
 
@@ -1029,21 +1054,83 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
              *   left classic Mac OS naming the display a generic
              *   "VGA Display".
              */
-            if (!(en & 1)) {
-                if (!s->monid_sda) {
-                    y &= ~1u; /* DDC2 slave holding SDA low */
-                } else {
-                    uint32_t frame = s->ddc1_pos / 9;
-                    uint32_t bit = s->ddc1_pos % 9;
-                    int sda = (bit == 8) ? 1 :
-                        (s->edid[frame % sizeof(s->edid)] >> (7 - bit)) & 1;
+            if (s->monid_pads12 && s->monitor_connected) {
+                /*
+                 * The AGP ROM's FCode also reads the Apple monitor sense
+                 * lines inside its DDC session (mask nibble still 0xf)
+                 * and through the same logical<->physical swap of pads
+                 * 1 and 2 (word 0x946): its probe n drives logical pin
+                 * (2,1,0) low -- physical pad (1,2,0) -- and reads the
+                 * other two, again swapped. Present the same MultiScan
+                 * 17" (6/0x23) as the plain-mask table below, expressed
+                 * in its layout: n=1 (pad 1 low) -> logical (Y1,Y0) =
+                 * physical (Y2,Y0) = 1,0; n=2 (pad 2 low) -> logical
+                 * (Y2,Y0) = physical (Y1,Y0) = 0,0; n=3 (pad 0 low) ->
+                 * logical (Y2,Y1) = physical (Y1,Y2) = 1,1. Standard
+                 * code 6 on Y2..Y0 with everything floating (SDA on pad
+                 * 1 idles high anyway; the slave's ACK below still wins
+                 * on that pad). Without this the ROM's table lookup gave
+                 * 0x73f = "no monitor" -> display-type "NONE", which
+                 * Mac OS X 10.3+'s BootX takes as "don't use this
+                 * display": no boot splash, no -v text.
+                 */
+                /*
+                 * Telling a sense probe from a DDC step on the same
+                 * pads: the probes (word 0x990) write A=0 for every pad,
+                 * while every DDC step keeps a released pad's A bit at 1
+                 * (0x0f040002 = SCL low in DDC vs 0x0f040000 = probe 2).
+                 * The DDC-presence check drives SCL low and expects SDA
+                 * still high, so probe 2's answer must not fire there.
+                 */
+                if ((en & 7) == 0) {
+                    y = (y & ~7u) | 6;
+                } else if ((a & 7) == 0 && en == 2) {
+                    y = (y & ~5u) | 4;          /* Y2=1, Y0=0 */
+                } else if ((a & 7) == 0 && en == 4) {
+                    y &= ~3u;                   /* Y1=0, Y0=0 */
+                } else if ((a & 7) == 0 && en == 1) {
+                    y |= 6;                     /* Y2=1, Y1=1 */
+                }
+            }
+            {
+                /* SDA pad: 0 for the OS drivers, 1 for the AGP ROM's
+                 * FCode (SCL on pad 2) -- see the write handler. */
+                uint32_t sda_bit = s->monid_pads12 ? 2u : 1u;
 
-                    y = (y & ~1u) | sda;
+                if (!(en & sda_bit)) {
+                    if (!s->monid_sda) {
+                        y &= ~sda_bit; /* DDC2 slave holding SDA low */
+                    } else if (s->monid_ddc2) {
+                        /* DDC2 mode: released SDA idles high, unless an
+                         * Apple-sense answer above pulled that pad */
+                        if (!s->monid_pads12) {
+                            y |= sda_bit;
+                        }
+                    } else {
+                        uint32_t frame = s->ddc1_pos / 9;
+                        uint32_t bit = s->ddc1_pos % 9;
+                        int sda = (bit == 8) ? 1 :
+                            (s->edid[frame % sizeof(s->edid)] >> (7 - bit)) & 1;
+
+                        y = (y & ~sda_bit) | (sda ? sda_bit : 0);
+                    }
                 }
             }
             if (!(en & 8) && s->monitor_connected) {
+                /*
+                 * VSYNC loopback on pad 3 follows V_SYNC_POL only while
+                 * the CRTC runs; with CRTC_EN clear there is no sync and
+                 * the pad reads low. The FCode relies on that: it turns
+                 * the CRTC off (CRTC_GEN_CNTL byte 3 <- 5) right before
+                 * its Apple-sense probes and indexes its decode table
+                 * with the whole Y nibble, so a stuck-high pad 3 landed
+                 * every lookup one row too far (-> 0x73f, "no monitor").
+                 */
+                bool crtc_on = s->regs[R128_CRTC_GEN_CNTL >> 2] & R128_CRTC_EN;
+
                 y = (y & ~8u) |
-                    (((s->regs[R128_CRTC_V_SYNC_STRT_WID >> 2] >> 23) & 1)
+                    ((crtc_on &&
+                      ((s->regs[R128_CRTC_V_SYNC_STRT_WID >> 2] >> 23) & 1))
                      << 3);
             }
         } else if (s->monid7_i2c) {
@@ -1737,6 +1824,23 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                          (val & 0x0f00) >> 8 | (val & 0x30f0) << 4 |
                          (val & 0x4000) << 16;
         s->dp_mix = (val & R128_GMC_ROP3_MASK) | (val & 0x7000000) >> 16;
+        /*
+         * GMC bits 28 and 30 are actions, not state (RRG 3-174): a
+         * write with CLR_CMP_CNTL_DIS clears both colour-compare
+         * functions, one with WR_MSK_DIS resets DP_WRITE_MSK and
+         * CLR_CMP_MSK to all-ones. Mac OS's driver relies on exactly
+         * this: its QuickDraw hilite (white<->highlight swap) is four
+         * fills that each start from a GMC write and then set only the
+         * compare/mask registers they need, so a mask left over from
+         * the previous fill would be applied to the wrong pass.
+         */
+        if (val & R128_GMC_CLR_CMP_CNTL_DIS) {
+            s->regs[R128_CLR_CMP_CNTL >> 2] &= ~0x707u;
+        }
+        if (val & R128_GMC_WR_MSK_DIS) {
+            s->dp_write_mask = 0xffffffff;
+            s->regs[R128_CLR_CMP_MASK >> 2] = 0xffffffff;
+        }
         ati_rage128_resolve_gui_context(s);
         break;
     case R128_DST_WIDTH_X:
@@ -1883,12 +1987,24 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_GPIO_MONID: {
         /*
-         * The FCode's DDC session (MASK nibble 0xf, distinct from the
-         * Apple-sense probes' 0x7): SDA on pad 0, SCL on pad 1, open
-         * drain -- a pad drives its A-bit level while its EN bit is
-         * set, floats high otherwise. Every edge feeds the DDC2
-         * bit-bang core, whose resulting SDA level the read handler
-         * feeds back on a floating pad 0.
+         * A DDC session (MASK nibble 0xf, distinct from the Apple-sense
+         * probes' 0x7): open drain -- a pad drives its A-bit level while
+         * its EN bit is set, floats high otherwise. Every edge feeds the
+         * DDC2 bit-bang core, whose resulting SDA level the read handler
+         * feeds back on the floating SDA pad.
+         *
+         * Two pad layouts exist on the same card. The Mac OS drivers
+         * (classic ndrv and OS X, observed live) use SDA on pad 0 and
+         * SCL on pad 1. The AGP ROM's own FCode (109-72700 rev 136,
+         * word 0x946 swaps logical bits 1<->2 before every GPIO write)
+         * uses SDA on pad 1 and SCL on pad 2 -- its START is pad 2 low,
+         * both low, pad 1 low with pad 2 released; under OpenBIOS the
+         * probe never got an ACK with the fixed pad-0/1 decode, spun 33k
+         * reads in ddc2-send-byte's ack wait and gave up, leaving
+         * display-type "NONE" and every mode but 640x480@60 disabled.
+         * Pad 2 is never driven by the pad-0/1 masters, so the first
+         * write of a session that drives pad 2 selects the FCode
+         * layout; session exit (mask leaving 0xf) resets it.
          */
         uint32_t oldmask = (s->regs[base >> 2] >> 24) & 0xf;
 
@@ -1896,13 +2012,35 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         if (((val >> 24) & 0xf) == 0xf) {
             uint32_t en = (val >> 16) & 0xf;
             uint32_t a = val & 0xf;
-            int scl = (en & 2) ? !!(a & 2) : 1;
-            int sda = (en & 1) ? !!(a & 1) : 1;
+            int scl, sda;
 
             if (oldmask != 0xf) {
                 /* session entry rewinds the DDC1 stream to byte 0 */
                 s->ddc1_pos = 0;
                 s->ddc1_half = 0;
+                s->monid_pads12 = false;
+                s->monid_ddc2 = false;
+            }
+            if (en & 4) {
+                s->monid_pads12 = true;
+            }
+            if (s->monid_pads12) {
+                scl = (en & 4) ? !!(a & 4) : 1;
+                sda = (en & 2) ? !!(a & 2) : 1;
+            } else {
+                scl = (en & 2) ? !!(a & 2) : 1;
+                sda = (en & 1) ? !!(a & 1) : 1;
+            }
+            if (!scl) {
+                /*
+                 * VESA DDC: a monitor that sees the host clock SCL
+                 * switches from DDC1 to DDC2 and stops shifting the
+                 * EDID bitstream out on SDA. Without this the FCode's
+                 * DDC2 STOP/idle check ("SDA released and high?") kept
+                 * reading EDID byte 0's zero bits and looped forever.
+                 * The stream resumes at the next session (mask re-entry).
+                 */
+                s->monid_ddc2 = true;
             }
             bitbang_i2c_set(&s->monid_i2c, BITBANG_I2C_SCL, scl);
             s->monid_sda = bitbang_i2c_set(&s->monid_i2c,
@@ -2578,6 +2716,8 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
     /* val is a data dword for the packet currently in flight */
     switch (p->type) {
     case 0:
+        trace_ati_rage128_pm4_reg(p->reg & 0x3ffc,
+                                  ati_rage128_reg_name(p->reg & 0x3ffc), val);
         ati_rage128_reg_write32(s, p->reg & 0x3ffc, val);
         if (!p->one_reg) {
             p->reg += 4;
@@ -2585,8 +2725,12 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
         break;
     case 1:
         if (p->remaining == 2) {
+            trace_ati_rage128_pm4_reg(p->p1_reg1 & 0x3ffc,
+                ati_rage128_reg_name(p->p1_reg1 & 0x3ffc), val);
             ati_rage128_reg_write32(s, p->p1_reg1 & 0x3ffc, val);
         } else {
+            trace_ati_rage128_pm4_reg(p->p1_reg2 & 0x3ffc,
+                ati_rage128_reg_name(p->p1_reg2 & 0x3ffc), val);
             ati_rage128_reg_write32(s, p->p1_reg2 & 0x3ffc, val);
         }
         break;
@@ -3165,6 +3309,10 @@ static void ati_rage128_reset_hold(Object *obj, ResetType type)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
     memset(s->palette, 0, sizeof(s->palette));
+    /* every driver's engine init writes all-ones here; a zero mask
+     * would silently draw nothing until it does */
+    s->dp_write_mask = 0xffffffff;
+    s->regs[R128_CLR_CMP_MASK >> 2] = 0xffffffff;
     s->dac_wr_index = 0;
     s->dac_rd_index = 0;
     s->i2c_offset = 0;
@@ -3205,7 +3353,12 @@ static void ati_rage128_reset_hold(Object *obj, ResetType type)
  * 50%-alpha black -- the same approximation the mach64 uses, and the
  * classic Mac cursors only use that code to soften edges.
  */
-static void ati_rage128_cursor_update(ATIRage128State *s)
+/*
+ * Apply the cursor registers to the host pointer. Called from the
+ * coalescing timer (see ati_rage128_cursor_update) and from the display
+ * refresh path.
+ */
+static void ati_rage128_cursor_apply(ATIRage128State *s)
 {
     uint32_t posn = s->regs[R128_CUR_HORZ_VERT_POSN >> 2];
     uint32_t coff = s->regs[R128_CUR_HORZ_VERT_OFF >> 2];
@@ -3274,8 +3427,19 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
         (int)horz_off;
     y = (int)(posn & R128_CUR_VERT_POSN_MASK);
 
+    /*
+     * Order-sensitive hash of the image plus everything that shapes it.
+     * The previous rotate-left-1/xor was blind to a 64-byte shift of the
+     * data (two full 32-bit rotations): OS X 10.2 first shows its arrow
+     * with CUR_OFFSET=0 (4 zero rows -- opaque white -- above the image
+     * at 0x40) and then moves CUR_OFFSET to 0x40; both views hashed the
+     * same (verified: 0x90627cdc for either offset), so the white-topped,
+     * 4-rows-late image was kept for good -- a 64x4 white bar above the
+     * arrow tip. Mix the offset in as well.
+     */
+    sum = 0x811c9dc5u ^ vram_off;
     for (row = 0; row < R128_CUR_IMAGE_BYTES; row++) {
-        sum = (sum << 1 | sum >> 31) ^ src[row];
+        sum = (sum ^ src[row]) * 0x01000193u;
     }
     sum ^= clr0 ^ clr1 ^ (uint32_t)horz_off ^ ((uint32_t)vert_off << 8);
 
@@ -3330,6 +3494,36 @@ static void ati_rage128_cursor_update(ATIRage128State *s)
     s->hw_cursor_x = x;
     s->hw_cursor_y = y;
     qemu_console_set_mouse(s->con, x, y, true);
+}
+
+static void ati_rage128_cursor_timer(void *opaque)
+{
+    ati_rage128_cursor_apply(opaque);
+}
+
+/*
+ * A guest moves the hardware cursor with a burst of separate register
+ * writes -- Mac OS 9's Rage 128 driver does six per move: both 16-bit
+ * halves of CUR_HORZ_VERT_POSN, both halves of CUR_HORZ_VERT_OFF,
+ * CUR_OFFSET and the CRTC_GEN_CNTL enable byte, none of them under
+ * CUR_LOCK. Publishing after every one of those turned each move into
+ * several host-cursor updates, the first with the new x but the old y (a
+ * visible L-shaped hitch), and re-hashed the 1KB image every time. On
+ * real hardware the whole burst is done long before the beam next
+ * reaches the cursor; model that by applying the registers once, a
+ * moment after the first write, so the burst is seen whole. Bounded
+ * latency: the timer is not re-armed by later writes in the burst.
+ */
+static void ati_rage128_cursor_update(ATIRage128State *s)
+{
+    if (!s->cursor_timer) {
+        ati_rage128_cursor_apply(s);
+        return;
+    }
+    if (!timer_pending(s->cursor_timer)) {
+        timer_mod(s->cursor_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS);
+    }
 }
 
 /*
@@ -3418,6 +3612,32 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
      * uses, since this device has no dirty-tracking use of its own to
      * conflict with.
      */
+
+    /*
+     * AGP capability block. The Rage 128 Pro OEM AGP ROMs (FCode part
+     * numbers 113-630xx / 113-720xx) walk the PCI capability chain for a
+     * PCI_CAP_ID_AGP block during their init probe; when it is absent they
+     * abort before ever programming the CRTC, so the card never lights up
+     * (observed: the v1.10/v1.36 AGP ROMs leave the CRTC at 8x1 bpp=0).
+     * Model a minimal AGP 2.0 capability -- advertise 1x/2x rates,
+     * sideband addressing and a full request queue in the read-only
+     * status word, and leave the command register guest-writable so the
+     * driver's AGP-enable handshake completes harmlessly. (The PCI-side
+     * Rage 128 retail ROM ignores this block, so it is safe on either
+     * bus.)
+     */
+    {
+        int cap = pci_add_capability(dev, PCI_CAP_ID_AGP, 0, 0x0c, errp);
+        if (cap < 0) {
+            return;
+        }
+        dev->config[cap + PCI_AGP_VERSION] = 0x20; /* AGP 2.0 */
+        pci_set_long(dev->config + cap + PCI_AGP_STATUS,
+                     PCI_AGP_STATUS_RQ_MASK | PCI_AGP_STATUS_SBA |
+                     PCI_AGP_STATUS_RATE2 | PCI_AGP_STATUS_RATE1);
+        pci_set_long(dev->wmask + cap + PCI_AGP_COMMAND, 0xffffffffu);
+    }
+
     memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
     memory_region_add_subregion(&s->aper, 0, &s->vram);
     memory_region_init_io(&s->vram_aper1, obj, &ati_rage128_aper1_ops, s,
@@ -3469,6 +3689,8 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
                                    ati_rage128_vblank_timer_tick, s);
     s->vblank_end_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        ati_rage128_vblank_end_tick, s);
+    s->cursor_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   ati_rage128_cursor_timer, s);
     timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               ATI_RAGE128_VBLANK_PERIOD_NS);
 
@@ -3524,6 +3746,7 @@ static void ati_rage128_exit(PCIDevice *dev)
 
     timer_free(s->vblank_timer);
     timer_free(s->vblank_end_timer);
+    timer_free(s->cursor_timer);
     qemu_graphic_console_close(s->con);
 }
 

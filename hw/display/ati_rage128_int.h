@@ -36,14 +36,22 @@
 
 #define PCI_VENDOR_ID_ATI              0x1002
 /*
- * 0x5245 = Rage 128 Pro, PCI (non-AGP) variant -- matches a genuine
- * retail PCI-slot card ROM (ati_ret_nexus128_103_pci_full.rom,
- * PCIR-confirmed) rather than the AGP 4x TMDS variant (0x5046) this
- * device previously used. The Beige G3 (Desktop/Minitower/AIO) never
- * had an AGP slot at all -- AGP debuted with the later Blue & White
- * G3 -- so a card in one of its real PCI slots is always the PCI
- * variant; 0x5046 was only ever a stand-in used because it was the
- * only Rage 128 Pro ROM dump available at the time.
+ * 0x5245 ("RE") is ATI's ID for the original, non-Pro Rage 128
+ * (GL/SG family), not the Rage 128 Pro -- in ATI's own naming scheme
+ * the "P"-prefixed IDs (0x5041-0x5052, "PA".."PR") are Pro parts and
+ * the "R"-prefixed IDs (0x5245-0x524C, "RE".."RL") are the earlier
+ * non-Pro chip. This device models the Pro feature set but currently
+ * advertises the non-Pro ID because it matches a genuine retail
+ * PCI-slot card ROM dump (ati_ret_nexus128_103_pci_full.rom,
+ * PCIR-confirmed; note the filename itself lacks "pro") rather than
+ * the AGP 4x TMDS Pro variant (0x5046, "PF") this device previously
+ * used. The Beige G3 (Desktop/Minitower/AIO) never had an AGP slot at
+ * all -- AGP debuted with the later Blue & White G3 -- so a card in
+ * one of its real PCI slots is always the PCI variant; 0x5046 was
+ * only ever a stand-in used because it was the only Rage 128 Pro ROM
+ * dump available at the time. The ID/feature-set mismatch hasn't
+ * mattered functionally so far; a genuine Rage 128 Pro PCI ROM would
+ * resolve it if one turns up.
  */
 #define PCI_DEVICE_ID_ATI_RAGE128PRO   0x5245
 
@@ -189,6 +197,8 @@ struct ATIRage128State {
      */
     QEMUTimer *vblank_timer;
     QEMUTimer *vblank_end_timer;
+    /* coalesces a burst of cursor-register writes into one host update */
+    QEMUTimer *cursor_timer;
 
     /*
      * Hardware I2C engine (I2C_CNTL_0/1 + I2C_DATA) serving a
@@ -215,6 +225,8 @@ struct ATIRage128State {
     bool host_cursor_published;   /* synthetic arrow handed to the UI */
     bitbang_i2c_interface monid_i2c;
     int monid_sda;           /* live SDA level fed back into MONID_Y */
+    bool monid_pads12;       /* DDC session uses SDA=pad1/SCL=pad2 (FCode) */
+    bool monid_ddc2;         /* host clocked SCL: DDC1 stream silenced */
     /*
      * A bit-banged I2C session on pads 1 (SDA) / 2 (SCL) under the
      * Apple-sense MASK nibble 0x7 -- what Mac OS 9's "ATI Resource
