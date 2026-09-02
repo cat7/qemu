@@ -2759,6 +2759,97 @@ static void ati_rage128_3d_trace_vert(const ATIRage128PM4Parser *p)
 }
 
 /*
+ * Decode the gathered vertex dwords into an ATIRage128Vertex. Same
+ * VC_FORMAT offset walk as ati_rage128_3d_trace_vert above (one float
+ * per component on the FPU path); rhw, specular, fog and s/t are
+ * stepped over but not carried -- perspective/fog/texturing are later
+ * steps. A vertex with no diffuse fields comes out solid white.
+ * Non-finite floats are stored as-is; the rasterizer rejects the
+ * triangle (per-triangle, so a poisoned vertex does not desync a
+ * strip's framing).
+ */
+static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
+                                  ATIRage128Vertex *v)
+{
+    uint32_t fmt = p->p3_vc_format;
+    unsigned o = 3;
+
+    v->x = ati_rage128_vc_f32(p->p3_vtx[0]);
+    v->y = ati_rage128_vc_f32(p->p3_vtx[1]);
+    v->z = ati_rage128_vc_f32(p->p3_vtx[2]);
+    v->b = v->g = v->r = v->a = 1.0f;
+    o += !!(fmt & R128_VC_FRMT_RHW);
+    if (fmt & R128_VC_FRMT_DIFFUSE_BGR) {
+        if (o + 2 < ARRAY_SIZE(p->p3_vtx)) {
+            v->b = ati_rage128_vc_f32(p->p3_vtx[o]);
+            v->g = ati_rage128_vc_f32(p->p3_vtx[o + 1]);
+            v->r = ati_rage128_vc_f32(p->p3_vtx[o + 2]);
+        }
+        o += 3;
+        if ((fmt & R128_VC_FRMT_DIFFUSE_A) && o < ARRAY_SIZE(p->p3_vtx)) {
+            v->a = ati_rage128_vc_f32(p->p3_vtx[o]);
+        }
+    } else {
+        o += !!(fmt & R128_VC_FRMT_DIFFUSE_A);
+        if ((fmt & R128_VC_FRMT_DIFFUSE_ARGB) && o < ARRAY_SIZE(p->p3_vtx)) {
+            uint32_t c = p->p3_vtx[o];
+
+            v->a = ((c >> 24) & 0xff) / 255.0f;
+            v->r = ((c >> 16) & 0xff) / 255.0f;
+            v->g = ((c >> 8) & 0xff) / 255.0f;
+            v->b = (c & 0xff) / 255.0f;
+        }
+    }
+}
+
+/*
+ * Accumulate one completed GEN_PRIM vertex per the primitive type and
+ * hand finished triangles to the rasterizer. Winding needs no tracking
+ * downstream -- there is no culling and the rasterizer canonicalizes
+ * the area sign -- so a strip keeps no parity and a fan just slides
+ * its middle vertex.
+ */
+static void ati_rage128_3d_prim_vertex(ATIRage128State *s,
+                                       ATIRage128PM4Parser *p)
+{
+    unsigned prim = p->p3_vc_cntl & R128_VC_CNTL_PRIM_TYPE_MASK;
+    unsigned n = p->p3_vtx_count++;
+    ATIRage128Vertex v;
+
+    ati_rage128_vc_decode(p, &v);
+    switch (prim) {
+    case R128_VC_CNTL_PRIM_TYPE_TRI_LIST:
+        p->p3_tri[n % 3] = v;
+        if (n % 3 == 2) {
+            ati_rage128_3d_triangle(s, p->p3_tri);
+        }
+        break;
+    case R128_VC_CNTL_PRIM_TYPE_TRI_FAN:
+        if (n < 2) {
+            p->p3_tri[n] = v;
+        } else {
+            p->p3_tri[2] = v;
+            ati_rage128_3d_triangle(s, p->p3_tri);
+            p->p3_tri[1] = v;
+        }
+        break;
+    case R128_VC_CNTL_PRIM_TYPE_TRI_STRIP:
+        if (n < 2) {
+            p->p3_tri[n] = v;
+        } else {
+            p->p3_tri[2] = v;
+            ati_rage128_3d_triangle(s, p->p3_tri);
+            p->p3_tri[0] = p->p3_tri[1];
+            p->p3_tri[1] = v;
+        }
+        break;
+    default:
+        /* points/lines/quads: traced once at VC_CNTL, not rasterized */
+        break;
+    }
+}
+
+/*
  * PIO alternative to the ring above: the real driver actually pushes
  * its command stream straight through PM4_FIFO_DATA_EVEN/ODD (see the
  * comment on those in ati_rage128_regs.h), one dword per write. Same
@@ -3064,20 +3155,30 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
         case R128_PM4_OPCODE_3D_RNDR_GEN_PRIM:
             /*
              * The 3D triangle path (RAVE / QuickDraw 3D on Mac OS 9,
-             * doc/rage128-3d). No rasterizer yet: the packet is decoded
-             * and traced so a live capture nails the vertex layout the
-             * driver chose, and the parser stays correctly framed.
+             * doc/rage128-3d). Vertices are gathered per the VC_FORMAT
+             * stride, decoded to screen-space floats and rasterized
+             * (ati_rage128_3d_triangle); the wire format is
+             * live-confirmed against Nanosaur's driver -- see the
+             * comment on ati_rage128_vc_stride().
              */
             if (p->p3_param_idx == 0) {
                 p->p3_vc_format = val;
                 p->p3_vtx_stride = ati_rage128_vc_stride(val);
             } else if (p->p3_param_idx == 1) {
+                unsigned prim = val & R128_VC_CNTL_PRIM_TYPE_MASK;
+
                 p->p3_vc_cntl = val;
+                p->p3_vtx_count = 0;
                 trace_ati_rage128_3d_prim(p->p3_vc_format, p->p3_vtx_stride,
-                                          val & R128_VC_CNTL_PRIM_TYPE_MASK,
+                                          prim,
                                           (val & R128_VC_CNTL_PRIM_WALK_MASK)
                                           >> R128_VC_CNTL_PRIM_WALK_SHIFT,
                                           val >> R128_VC_CNTL_NUM_SHIFT);
+                if (prim != R128_VC_CNTL_PRIM_TYPE_TRI_LIST &&
+                    prim != R128_VC_CNTL_PRIM_TYPE_TRI_FAN &&
+                    prim != R128_VC_CNTL_PRIM_TYPE_TRI_STRIP) {
+                    trace_ati_rage128_3d_unsupported("prim type", prim);
+                }
             } else {
                 unsigned slot = (p->p3_param_idx - 2) % p->p3_vtx_stride;
 
@@ -3086,6 +3187,7 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
                 }
                 if (slot == p->p3_vtx_stride - 1) {
                     ati_rage128_3d_trace_vert(p);
+                    ati_rage128_3d_prim_vertex(s, p);
                 }
             }
             p->p3_param_idx++;

@@ -138,10 +138,12 @@ packet's context) selects the 3D function path vs plain 2D.
    already selects the rage as primary monitor (Monitors control panel).
 2. ~~Capture a GEN_PRIM payload / decode the vertex layout~~ — DONE, layout
    confirmed (see Corpus status). Parser + decode traces are in the device.
-3. Implement Gouraud triangle rasterization into VRAM (x,y,z,rhw,b,g,r,a),
-   honoring SC_*_C scissor, Z buffering per Z_STEN_CNTL_C/Z_OFFSET_C/Z_PITCH_C,
-   and the double-buffered DST_PITCH_OFFSET_C target. Untextured first: that
-   alone should put visible (flat-lit) geometry on Nanosaur's screen.
+3. ~~Implement Gouraud triangle rasterization~~ — DONE offline 2026-09-02
+   (`ati_rage128_3d_triangle()` in `_2d.c`; contract in
+   `HANDOFF-rasterizer.md`, proof harness `raster_regress.py` — 6/6 checks:
+   exact known-answer pixel counts, Gouraud corners, Z both orders + z-off
+   control, scissor negative control, corpus replay, 2D unharmed). A live
+   Nanosaur boot (does terrain actually appear?) is still OWED.
 4. Single-texture mapping: TEX_CNTL_C (0x193/0x183 observed) + PRIM_TEX_CNTL_C
    + TEX_SIZE_PITCH_C + PRIM_TEX_n_OFFSET_C mip chain, s/t from the vertex.
 5. Fog (per-vertex fog float + FOG_COLOR_C), secondary texture

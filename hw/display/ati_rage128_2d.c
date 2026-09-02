@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/bswap.h"
 #include "system/memory.h"
 #include "ui/console.h"
@@ -995,3 +996,260 @@ bool ati_rage128_host_data_flush(ATIRage128State *s)
     return s->host_data_active;
 }
 
+
+/*
+ * 3D: untextured Gouraud triangle into VRAM (RAVE / QuickDraw 3D,
+ * doc/rage128-3d). Vertices arrive pre-transformed in screen pixels
+ * (the CCE FPU path), so this is a plain screen-space edge-function
+ * scan over the clipped bounding box -- no clipping beyond the
+ * scissor, no perspective (rhw unused). Render state comes from the
+ * _C context block, whose offsets the register funnel shares with the
+ * 2D context (they are aliases of the base registers on real
+ * silicon): destination from DST_PITCH_OFFSET_C and
+ * DP_GUI_MASTER_CNTL_C's datatype, scissor from SC_*_C, write mask
+ * from PLANE_3D_MASK_C; the Z buffer from Z_OFFSET_C / Z_PITCH_C /
+ * Z_STEN_CNTL_C, gated by TEX_CNTL_C's Z_ENABLE / Z_WRITE_ENABLE.
+ * Not applied yet (later steps): both texture units, fog
+ * (FOG_COLOR_C / FOG_3D_TABLE_*), blending (MISC_3D_STATE_CNTL_REG),
+ * stencil, WINDOW_XY_OFFSET (always 0 in the corpus).
+ */
+
+static unsigned ati_rage128_3d_col8(double c)
+{
+    return c <= 0.0 ? 0 : c >= 1.0 ? 255 : (unsigned)(c * 255.0 + 0.5);
+}
+
+/* colour components are untrusted guest floats; a NaN/inf reads as 0 */
+static double ati_rage128_3d_csan(float c)
+{
+    return isfinite(c) ? c : 0.0;
+}
+
+void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
+{
+    unsigned dt = s->dp_datatype & R128_DP_DST_DATATYPE;
+    int bpp = ati_rage128_bpp_from_dp_datatype(s);
+    uint32_t dst_offset = s->dst_offset;
+    uint32_t dst_stride = s->dst_pitch * bpp;   /* pitch in units of 8 px */
+    uint32_t tex_cntl = s->regs[R128_TEX_CNTL_C >> 2];
+    uint32_t zsten = s->regs[R128_Z_STEN_CNTL_C >> 2];
+    uint32_t z_offset = s->regs[R128_Z_OFFSET_C >> 2] & 0xfffffff0;
+    uint32_t z_stride = (s->regs[R128_Z_PITCH_C >> 2] & R128_Z_PITCH_MASK)
+                        * 16;                   /* 8 px units, 16-bit Z */
+    bool z_test = tex_cntl & R128_Z_ENABLE;
+    bool z_write = tex_cntl & R128_Z_WRITE_ENABLE;
+    uint32_t pixmask, wmask;
+    ATIRage128Vertex v[3];
+    double x[3], y[3], z[3], r[3], g[3], b[3], a[3];
+    double area, bx0, bx1, by0, by1;
+    /* edge i runs vertex (i+1)%3 -> (i+2)%3; w_i is vertex i's weight */
+    double ea[3], eb[3];
+    bool tl[3];
+    int sc_left, sc_top, sc_right, sc_bottom;
+    int minx, maxx, miny, maxy, px, py, i;
+
+    if (dt != 3 && dt != 4 && dt != 6) {
+        /* ARGB1555 / RGB565 / ARGB8888 only so far */
+        trace_ati_rage128_3d_unsupported("dst datatype", dt);
+        return;
+    }
+    if (!dst_stride || dst_offset >= ATI_RAGE128_VRAM_SIZE) {
+        return;
+    }
+    if ((z_test || z_write) &&
+        (zsten & R128_Z_PIX_WIDTH_MASK) != R128_Z_PIX_WIDTH_16) {
+        /* only the 16-bit Z buffer the corpus uses is modeled */
+        trace_ati_rage128_3d_unsupported("z pix width", zsten);
+        z_test = z_write = false;
+    }
+    if ((z_test || z_write) && !z_stride) {
+        z_test = z_write = false;
+    }
+
+    v[0] = vin[0];
+    v[1] = vin[1];
+    v[2] = vin[2];
+    for (i = 0; i < 3; i++) {
+        if (!isfinite(v[i].x) || !isfinite(v[i].y) || !isfinite(v[i].z)) {
+            return;                             /* untrusted guest data */
+        }
+    }
+    area = ((double)v[1].x - v[0].x) * ((double)v[2].y - v[0].y) -
+           ((double)v[1].y - v[0].y) * ((double)v[2].x - v[0].x);
+    if (area == 0.0) {
+        return;                                 /* degenerate */
+    }
+    if (area < 0.0) {
+        /* canonicalize to positive area so "inside" is all-w >= 0 */
+        ATIRage128Vertex t = v[1];
+
+        v[1] = v[2];
+        v[2] = t;
+        area = -area;
+    }
+    for (i = 0; i < 3; i++) {
+        x[i] = v[i].x;
+        y[i] = v[i].y;
+        z[i] = v[i].z;
+        r[i] = ati_rage128_3d_csan(v[i].r);
+        g[i] = ati_rage128_3d_csan(v[i].g);
+        b[i] = ati_rage128_3d_csan(v[i].b);
+        a[i] = ati_rage128_3d_csan(v[i].a);
+    }
+    for (i = 0; i < 3; i++) {
+        double xa = x[(i + 1) % 3], ya = y[(i + 1) % 3];
+        double xb = x[(i + 2) % 3], yb = y[(i + 2) % 3];
+
+        ea[i] = -(yb - ya);
+        eb[i] = xb - xa;
+        /*
+         * Top-left fill rule so a shared edge paints exactly once. In
+         * this y-down, positive-area winding a "top" edge is horizontal
+         * running +x, a "left" edge runs -y (derived from the canonical
+         * (0,0)/(10,0)/(0,10) triangle, whose top and left edges are
+         * v0->v1 and v2->v0).
+         */
+        tl[i] = yb < ya || (yb == ya && xb > xa);
+    }
+
+    sc_left = MAX(s->sc_left, 0);
+    sc_top = MAX(s->sc_top, 0);
+    sc_right = s->sc_right;
+    sc_bottom = s->sc_bottom;
+    if (sc_right == 0 && sc_bottom == 0) {
+        /* same never-programmed-scissor convention as the 2D engine */
+        sc_right = 0x3fff;
+        sc_bottom = 0x3fff;
+    }
+    /* rows past the end of VRAM can never produce a store */
+    sc_bottom = MIN(sc_bottom,
+                    (int)((ATI_RAGE128_VRAM_SIZE - dst_offset) / dst_stride));
+
+    /*
+     * clip the bbox in doubles first: coordinates are untrusted and
+     * may not survive an int cast
+     */
+    bx0 = MAX(floor(MIN(x[0], MIN(x[1], x[2]))), (double)sc_left);
+    bx1 = MIN(ceil(MAX(x[0], MAX(x[1], x[2]))), (double)sc_right);
+    by0 = MAX(floor(MIN(y[0], MIN(y[1], y[2]))), (double)sc_top);
+    by1 = MIN(ceil(MAX(y[0], MAX(y[1], y[2]))), (double)sc_bottom);
+    if (bx0 > bx1 || by0 > by1) {
+        return;
+    }
+    minx = (int)bx0;
+    maxx = (int)bx1;
+    miny = (int)by0;
+    maxy = (int)by1;
+
+    pixmask = bpp >= 32 ? 0xffffffffu : (1u << bpp) - 1;
+    wmask = s->dp_write_mask & pixmask;
+
+    trace_ati_rage128_3d_tri((int)x[0], (int)y[0], (int)x[1], (int)y[1],
+                             (int)x[2], (int)y[2],
+                             ati_rage128_3d_col8(a[0]) << 24 |
+                             ati_rage128_3d_col8(r[0]) << 16 |
+                             ati_rage128_3d_col8(g[0]) << 8 |
+                             ati_rage128_3d_col8(b[0]));
+
+    for (py = miny; py <= maxy; py++) {
+        double sy = py + 0.5;
+
+        for (px = minx; px <= maxx; px++) {
+            double sx = px + 0.5;
+            double w[3], w0, w1, w2, zd;
+            unsigned r8, g8, b8, a8;
+            uint32_t pix;
+
+            for (i = 0; i < 3; i++) {
+                w[i] = ea[i] * (sx - x[(i + 1) % 3]) +
+                       eb[i] * (sy - y[(i + 1) % 3]);
+            }
+            if (w[0] < 0 || w[1] < 0 || w[2] < 0 ||
+                (w[0] == 0 && !tl[0]) || (w[1] == 0 && !tl[1]) ||
+                (w[2] == 0 && !tl[2])) {
+                continue;
+            }
+            w0 = w[0] / area;
+            w1 = w[1] / area;
+            w2 = w[2] / area;
+
+            if (z_test || z_write) {
+                unsigned z16;
+
+                zd = w0 * z[0] + w1 * z[1] + w2 * z[2];
+                z16 = zd <= 0.0 ? 0 : zd >= 1.0 ? 65535
+                      : (unsigned)(zd * 65535.0 + 0.5);
+                if (z_test) {
+                    /*
+                     * an out-of-VRAM Z address reads back 0 (and the
+                     * write below is dropped): safe, deterministic
+                     */
+                    uint32_t zold = ati_rage128_2d_read_pixel(s, z_offset,
+                                                              z_stride,
+                                                              px, py, 16);
+                    bool pass;
+
+                    switch (zsten & R128_Z_TEST_MASK) {
+                    case R128_Z_TEST_NEVER:
+                        pass = false;
+                        break;
+                    case R128_Z_TEST_LESS:
+                        pass = z16 < zold;
+                        break;
+                    case R128_Z_TEST_LESSEQUAL:
+                        pass = z16 <= zold;
+                        break;
+                    case R128_Z_TEST_EQUAL:
+                        pass = z16 == zold;
+                        break;
+                    case R128_Z_TEST_GREATEREQUAL:
+                        pass = z16 >= zold;
+                        break;
+                    case R128_Z_TEST_GREATER:
+                        pass = z16 > zold;
+                        break;
+                    case R128_Z_TEST_NEQUAL:
+                        pass = z16 != zold;
+                        break;
+                    default:                    /* R128_Z_TEST_ALWAYS */
+                        pass = true;
+                        break;
+                    }
+                    if (!pass) {
+                        continue;
+                    }
+                }
+                if (z_write) {
+                    ati_rage128_2d_write_pixel(s, z_offset, z_stride,
+                                               px, py, 16, z16);
+                }
+            }
+
+            r8 = ati_rage128_3d_col8(w0 * r[0] + w1 * r[1] + w2 * r[2]);
+            g8 = ati_rage128_3d_col8(w0 * g[0] + w1 * g[1] + w2 * g[2]);
+            b8 = ati_rage128_3d_col8(w0 * b[0] + w1 * b[1] + w2 * b[2]);
+            a8 = ati_rage128_3d_col8(w0 * a[0] + w1 * a[1] + w2 * a[2]);
+            switch (dt) {
+            case 3:                             /* ARGB1555 */
+                pix = (a8 >= 128 ? 0x8000 : 0) | (r8 >> 3) << 10 |
+                      (g8 >> 3) << 5 | (b8 >> 3);
+                break;
+            case 4:                             /* RGB565 */
+                pix = (r8 >> 3) << 11 | (g8 >> 2) << 5 | (b8 >> 3);
+                break;
+            default:                            /* 6: ARGB8888 */
+                pix = a8 << 24 | r8 << 16 | g8 << 8 | b8;
+                break;
+            }
+            if (wmask != pixmask) {
+                uint32_t old = ati_rage128_2d_read_pixel(s, dst_offset,
+                                                         dst_stride,
+                                                         px, py, bpp);
+
+                pix = (old & ~wmask) | (pix & wmask);
+            }
+            ati_rage128_2d_write_pixel(s, dst_offset, dst_stride,
+                                       px, py, bpp, pix);
+        }
+    }
+}

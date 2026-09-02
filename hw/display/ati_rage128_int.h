@@ -85,6 +85,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIRage128State, ATI_RAGE128)
 #define ATI_RAGE128_NUM_PLLS    64
 #define ATI_RAGE128_FB_SCAN_BLOCK (64 * 1024)
 
+/*
+ * One decoded GEN_PRIM vertex: pre-transformed screen-space position
+ * (x/y in pixels on the render target, z in 0..1) and the diffuse
+ * colour as 0..1 floats -- the CCE FPU path's native form. rhw, fog
+ * and s/t are parsed for stride but not carried: perspective, fog and
+ * texturing are later steps.
+ */
+typedef struct ATIRage128Vertex {
+    float x, y, z;
+    float b, g, r, a;
+} ATIRage128Vertex;
+
 typedef struct ATIRage128PM4Parser {
     uint32_t remaining;      /* data dwords still expected */
     uint32_t type;           /* packet type of the in-flight packet */
@@ -101,6 +113,8 @@ typedef struct ATIRage128PM4Parser {
     uint32_t p3_vc_cntl;     /* GEN_PRIM: VC_CNTL dword */
     uint32_t p3_vtx_stride;  /* dwords per vertex, from VC_FORMAT */
     uint32_t p3_vtx[16];     /* the vertex currently being gathered */
+    uint32_t p3_vtx_count;   /* completed vertices in this packet */
+    ATIRage128Vertex p3_tri[3]; /* triangle accumulator (list/fan/strip) */
 } ATIRage128PM4Parser;
 
 typedef struct ATIRage128Mode {
@@ -469,6 +483,7 @@ void ati_rage128_audit_reg_write(ATIRage128State *s, uint32_t base);
 
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
+void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *v);
 void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt);
 void ati_rage128_2d_scale_regs(ATIRage128State *s);
 bool ati_rage128_host_data_flush(ATIRage128State *s);
