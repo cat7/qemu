@@ -451,12 +451,142 @@
 /* Z_PITCH_C: pitch in units of 8 pixels, low 12 bits (bit 16 = tiling) */
 #define R128_Z_PITCH_MASK            0x00000fff
 /*
- * TEX_CNTL_C enable bits the rasterizer consumes (same reference).
- * Nanosaur's dominant value 0x193 = Z_ENABLE | Z_WRITE_ENABLE |
- * TEXMAP_ENABLE | DITHER_ENABLE | ALPHA_ENABLE.
+ * TEX_CNTL_C enable bits the rasterizer consumes (same reference,
+ * r128_reg.h lines 1230-1259). Nanosaur's dominant value 0x193 =
+ * Z_ENABLE | Z_WRITE_ENABLE | TEXMAP_ENABLE | FOG_ENABLE |
+ * DITHER_ENABLE; its untextured triangles (no s/t in the vertex) run
+ * at 0x183 -- bit 4 is exactly the texturing switch, corpus-proven:
+ * all 231,625 s/t-carrying triangles at 0x193, all 990 without at
+ * 0x183. Neither ALPHA_ENABLE (blend) nor ALPHA_TEST_ENABLE is ever
+ * set in that corpus.
  */
 #define R128_Z_ENABLE                (1 << 0)
 #define R128_Z_WRITE_ENABLE          (1 << 1)
+#define R128_TEXMAP_ENABLE           (1 << 4)
+#define R128_SEC_TEXMAP_ENABLE       (1 << 5)
+#define R128_FOG_ENABLE              (1 << 7)
+#define R128_DITHER_ENABLE           (1 << 8)
+#define R128_ALPHA_ENABLE            (1 << 9)
+#define R128_ALPHA_TEST_ENABLE       (1 << 10)
+/*
+ * Alpha test function (r128_reg.h 1139-1147, listed under SCALE_3D_CNTL
+ * with the note that MISC_3D_STATE_CNTL_REG bits 26:16 carry the same
+ * layout) and its reference value (REF_ALPHA_MASK, line 1262). The
+ * rasterizer reads both from the _C block's MISC_3D_STATE_CNTL_REG,
+ * where the blend factors the scaler already consumes also live.
+ */
+#define R128_ALPHA_TEST_SHIFT        24
+#define R128_ALPHA_TEST_MASK         (7 << 24)
+#define R128_ALPHA_TEST_NEVER        (0 << 24)
+#define R128_ALPHA_TEST_LESS         (1 << 24)
+#define R128_ALPHA_TEST_LESSEQUAL    (2 << 24)
+#define R128_ALPHA_TEST_EQUAL        (3 << 24)
+#define R128_ALPHA_TEST_GREATEREQUAL (4 << 24)
+#define R128_ALPHA_TEST_GREATER      (5 << 24)
+#define R128_ALPHA_TEST_NEQUAL       (6 << 24)
+#define R128_ALPHA_TEST_ALWAYS       (7 << 24)
+#define R128_REF_ALPHA_MASK          0xff
+/*
+ * PRIM_TEX_CNTL_C (r128_reg.h 1279-1324). Nanosaur: 0x010300b6 (bilinear
+ * MAG, wrap, mip-mapping disabled, ARGB1555) on 98% of its textured
+ * triangles, 0x01030080 (nearest) on the rest, 0x010312b6 (clamp s/t)
+ * and 0x01060080 (ARGB8888) seen in the morning corpus. Bit 7 is set
+ * in every value the driver ever wrote, so only one mip level (the
+ * base) is ever fetched. The DRM defines MAG_BLEND as 0/1 in bits 6:4;
+ * the Pro driver writes 3 there -- bit 4 is taken as "linear" and the
+ * rest of the field ignored.
+ */
+#define R128_MIN_BLEND_MASK          (7 << 1)
+#define R128_MAG_BLEND_LINEAR        (1 << 4)
+#define R128_MAG_BLEND_MASK          (7 << 4)
+#define R128_MIP_MAP_DISABLE         (1 << 7)
+#define R128_TEX_CLAMP_S_SHIFT       8
+#define R128_TEX_CLAMP_T_SHIFT       11
+#define R128_TEX_CLAMP_MASK          3
+#define R128_TEX_CLAMP_WRAP          0
+#define R128_TEX_CLAMP_MIRROR        1
+#define R128_TEX_CLAMP_CLAMP         2
+#define R128_TEX_CLAMP_BORDER_COLOR  3
+#define R128_TEX_PERSPECTIVE_DISABLE (1 << 14)
+#define R128_TEX_DATATYPE_SHIFT      16
+#define R128_TEX_DATATYPE_MASK       (0xf << 16)
+#define R128_TEX_DATATYPE_ARGB1555   3
+#define R128_TEX_DATATYPE_RGB565     4
+#define R128_TEX_DATATYPE_RGB888     5
+#define R128_TEX_DATATYPE_ARGB8888   6
+#define R128_TEX_DATATYPE_ARGB4444   15
+/*
+ * PRIM_TEXTURE_COMBINE_CNTL_C (r128_reg.h 1325-1372): how the texel
+ * meets the interpolated ("input") colour. Nanosaur: 0x0418d043 on
+ * every textured triangle = COMB_MODULATE, COLOR_FACTOR_TEX,
+ * INPUT_FACTOR_INT_COLOR, COMB_ALPHA_MODULATE, ALPHA_FACTOR_TEX_ALPHA,
+ * INP_FACTOR_A_INT_ALPHA; 0x0418d040 (COMB_DIS) while texturing is off.
+ */
+#define R128_COMB_MASK               (15 << 0)
+#define R128_COMB_DIS                0
+#define R128_COMB_COPY               1
+#define R128_COMB_COPY_INP           2
+#define R128_COMB_MODULATE           3
+#define R128_COMB_MODULATE2X         4
+#define R128_COMB_MODULATE4X         5
+#define R128_COMB_ADD                6
+#define R128_COMB_ADD_SIGNED         7
+#define R128_COMB_BLEND_VERTEX       8
+#define R128_COMB_BLEND_TEXTURE      9
+#define R128_COMB_BLEND_CONST        10
+#define R128_COLOR_FACTOR_SHIFT      4
+#define R128_COLOR_FACTOR_MASK       15
+#define R128_COLOR_FACTOR_CONST_COLOR  0
+#define R128_COLOR_FACTOR_NCONST_COLOR 1
+#define R128_COLOR_FACTOR_TEX        4
+#define R128_COLOR_FACTOR_NTEX       5
+#define R128_COLOR_FACTOR_ALPHA      6
+#define R128_COLOR_FACTOR_NALPHA     7
+#define R128_COLOR_FACTOR_PREV_COLOR 8
+#define R128_INPUT_FACTOR_SHIFT      10
+#define R128_INPUT_FACTOR_MASK       15
+#define R128_INPUT_FACTOR_CONST_COLOR 2
+#define R128_INPUT_FACTOR_CONST_ALPHA 3
+#define R128_INPUT_FACTOR_INT_COLOR  4
+#define R128_INPUT_FACTOR_INT_ALPHA  5
+#define R128_COMB_ALPHA_SHIFT        14
+#define R128_COMB_ALPHA_MASK         15
+#define R128_ALPHA_FACTOR_SHIFT      18
+#define R128_ALPHA_FACTOR_MASK       15
+#define R128_ALPHA_FACTOR_TEX_ALPHA  6
+#define R128_ALPHA_FACTOR_NTEX_ALPHA 7
+#define R128_INP_FACTOR_A_SHIFT      25
+#define R128_INP_FACTOR_A_MASK       7
+#define R128_INP_FACTOR_A_CONST_ALPHA 1
+#define R128_INP_FACTOR_A_INT_ALPHA  2
+/*
+ * TEX_SIZE_PITCH_C (r128_reg.h 1373-1393): log2 texel pitch, width
+ * ("size"), height and smallest mip level, primary unit in the low
+ * half, secondary in the high. Nanosaur: 0x03330888 = 256x256, pitch
+ * 256, min 8x8.
+ */
+#define R128_TEX_PITCH_SHIFT         0
+#define R128_TEX_SIZE_SHIFT          4
+#define R128_TEX_HEIGHT_SHIFT        8
+#define R128_TEX_MIN_SIZE_SHIFT      12
+#define R128_TEX_LOG2_MASK           0xf
+/*
+ * PRIM_TEX_n_OFFSET_C: bits 29:0 the byte offset in VRAM, bits 31:30 a
+ * tiling field per the DRM (TEX_NO_TILE .. TEX_TILED_BY_STORAGE2). The
+ * Pro RRG does not document these eleven registers individually (only
+ * the rename note "PRIM_7_OFFSET_C is now PRIM_TEX_7_OFFSET_C", B-4),
+ * so which slot holds which level is settled from the corpus: with
+ * TEX_SIZE 8 (256 texels) the ONLY slot that changes with the texture
+ * is slot 8 (0x1cdc, three distinct top-of-VRAM offsets across the
+ * gameplay sample); slots 0-7 and 9-10 hold constant stale shadow
+ * (float-looking 0x3f800000, 0x437f0000 ...). Slot index = log2 of
+ * that level's width, the base level at slot TEX_SIZE. The 8x8 texture
+ * the driver also sets up (TEX_SIZE 3) has slot 3 at 0x01ff3e00, also
+ * in VRAM, but no textured triangle was drawn with it -- suggestive,
+ * not proven.
+ */
+#define R128_PRIM_TEX_OFFSET_C(n)    (R128_PRIM_TEX_0_OFFSET_C + (n) * 4)
+#define R128_TEX_OFFSET_MASK         0x3fffffff
 #define R128_HOST_DATA0              0x17c0
 #define R128_HOST_DATA1              0x17c4
 #define R128_HOST_DATA2              0x17c8
