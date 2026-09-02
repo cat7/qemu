@@ -430,6 +430,33 @@
 #define R128_SEC_TEXTURE_BORDER_COLOR_C  0x1d3c
 #define R128_STEN_REF_MASK_C         0x1d40
 #define R128_PLANE_3D_MASK_C         0x1d44
+/*
+ * Z_STEN_CNTL_C fields, z-buffer half only (the stencil half is not
+ * modeled). Field definitions per the Linux DRM reference r128_reg.h
+ * (doc/rage128-cce); Nanosaur programs 0x10 = 16-bit Z, Z_TEST_LESS.
+ */
+#define R128_Z_PIX_WIDTH_16          (0 << 1)
+#define R128_Z_PIX_WIDTH_24          (1 << 1)
+#define R128_Z_PIX_WIDTH_32          (2 << 1)
+#define R128_Z_PIX_WIDTH_MASK        (3 << 1)
+#define R128_Z_TEST_NEVER            (0 << 4)
+#define R128_Z_TEST_LESS             (1 << 4)
+#define R128_Z_TEST_LESSEQUAL        (2 << 4)
+#define R128_Z_TEST_EQUAL            (3 << 4)
+#define R128_Z_TEST_GREATEREQUAL     (4 << 4)
+#define R128_Z_TEST_GREATER          (5 << 4)
+#define R128_Z_TEST_NEQUAL           (6 << 4)
+#define R128_Z_TEST_ALWAYS           (7 << 4)
+#define R128_Z_TEST_MASK             (7 << 4)
+/* Z_PITCH_C: pitch in units of 8 pixels, low 12 bits (bit 16 = tiling) */
+#define R128_Z_PITCH_MASK            0x00000fff
+/*
+ * TEX_CNTL_C enable bits the rasterizer consumes (same reference).
+ * Nanosaur's dominant value 0x193 = Z_ENABLE | Z_WRITE_ENABLE |
+ * TEXMAP_ENABLE | DITHER_ENABLE | ALPHA_ENABLE.
+ */
+#define R128_Z_ENABLE                (1 << 0)
+#define R128_Z_WRITE_ENABLE          (1 << 1)
 #define R128_HOST_DATA0              0x17c0
 #define R128_HOST_DATA1              0x17c4
 #define R128_HOST_DATA2              0x17c8
