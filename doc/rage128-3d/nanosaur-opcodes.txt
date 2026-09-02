@@ -1,0 +1,5 @@
+232615 opcode=0x25
+ 760 opcode=0x9a
+ 379 opcode=0x9b
+   9 opcode=0x94
+   1 opcode=0x91
