@@ -699,6 +699,50 @@ static void bmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->regs[REG_INDEX(BMAC_TXRST)] = 0; /* reset self-clears */
         return;
 
+    case BMAC_RXCFG:
+        /*
+         * The RX MAC being switched on is the one edge that can newly make
+         * a packet acceptable, and nothing else in this device re-offers
+         * what the net layer is already holding: the only
+         * qemu_flush_queued_packets() call site is bmac_rx_dma_rw(), i.e.
+         * a NEW DBDMA arm.
+         *
+         * Measured on the user's -nic vmnet-bridged run
+         * (doc/vmnet/REPORT-vmnet-spin.md): the driver arms its first RX
+         * descriptor while RXCFG is still 0xb00 (ENABLE clear), so the LAN
+         * broadcasts that arrive in that window are rejected by the address
+         * filter and consumed WITHOUT completing the descriptor, and the
+         * next one is refused outright by bmac_can_receive() and parked in
+         * the net queue. The driver then sets RXCFG_ENABLE -- and deadlocks:
+         * its armed descriptor never completes (so it never arms another,
+         * so nothing ever flushes), and the parked packet is never
+         * re-offered (so the vmnet backend, which waits for that packet's
+         * send-completion, never reads another frame). Exactly one
+         * bmac_rx_dma_armed event in the whole 1097-line trace, then no RX
+         * for the rest of the run, is that deadlock.
+         *
+         * On slirp the same window exists but is empty -- slirp sends
+         * nothing until the guest speaks -- which is why every slirp
+         * regression passed and only a real LAN showed it.
+         *
+         * So flush on the 0->1 edge of RXCFG_ENABLE. The address-filter and
+         * hash-table registers need no hook of their own: this driver always
+         * clears RXCFG_ENABLE before touching them and sets it again after,
+         * so the edge covers those too.
+         */
+        {
+            bool was_enabled =
+                (s->regs[REG_INDEX(BMAC_RXCFG)] & RXCFG_ENABLE) != 0;
+            bool now_enabled = (val & RXCFG_ENABLE) != 0;
+
+            s->regs[REG_INDEX(BMAC_RXCFG)] = val;
+            if (!was_enabled && now_enabled) {
+                trace_bmac_rx_enable_flush(s->rx_dma_waiting);
+                qemu_flush_queued_packets(qemu_get_queue(s->nic));
+            }
+        }
+        return;
+
     case BMAC_RXRST:
         /*
          * An RX-engine reset also invalidates any armed-but-unfilled RX
