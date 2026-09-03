@@ -19,12 +19,14 @@
 #include "qapi/error.h"
 #include "system/runstate.h"
 #include "net/eth.h"
+#include "trace.h"
 
 #include <vmnet/vmnet.h>
 #include <dispatch/dispatch.h>
 
 
 static void vmnet_send_completed(NetClientState *nc, ssize_t len);
+static void vmnet_update_rx_events(VmnetState *s);
 
 
 const char *vmnet_status_map_str(vmnet_return_t status)
@@ -143,6 +145,67 @@ static int vmnet_read_packets(VmnetState *s)
 
 
 /**
+ * A batch is "parked" when QEMU refused a packet from it: the refused
+ * packet sits in the net layer's queue with vmnet_send_completed() as its
+ * callback and nothing is read from vmnet until that fires.
+ */
+static bool vmnet_batch_parked(VmnetState *s)
+{
+    return s->packets_send_current_pos < s->packets_send_end_pos;
+}
+
+
+/**
+ * Keep the PACKETS_AVAILABLE event callback registered exactly while we
+ * can act on it: the VM is running and no batch is parked.
+ *
+ * vmnet's event source is level-triggered: while packets are waiting in
+ * the interface its block runs again and again on if_queue (polling with
+ * getsockopt) and re-invokes our callback every time. With a batch parked
+ * each event only woke the main loop for a bottom half that returned at
+ * once -- observed as a 99%-system-time if_queue thread and ~240k
+ * syscalls/s on a quiet LAN, with one unread packet enough to keep it
+ * going. Unregister while parked, as net/tap.c does with
+ * tap_read_poll(s, false), and re-register from the completion.
+ *
+ * Main-loop only. vmnet_interface_set_event_callback() is safe to call
+ * from any thread; a block already in flight on if_queue at most
+ * schedules one more bottom half, which is harmless.
+ */
+static void vmnet_update_rx_events(VmnetState *s)
+{
+    bool want = s->vm_running && !vmnet_batch_parked(s);
+
+    if (want == s->rx_events_armed) {
+        return;
+    }
+    s->rx_events_armed = want;
+
+    if (want) {
+        vmnet_interface_set_event_callback(
+            s->vmnet_if,
+            VMNET_INTERFACE_PACKETS_AVAILABLE,
+            s->if_queue,
+            ^(interface_event_t event_id, xpc_object_t event) {
+                assert(event_id == VMNET_INTERFACE_PACKETS_AVAILABLE);
+                /*
+                 * This function is being called from a non qemu thread, so
+                 * we only schedule a BH, and do the rest of the io completion
+                 * handling from vmnet_send_bh() which runs in a qemu context.
+                 */
+                qemu_bh_schedule(s->send_bh);
+            });
+    } else {
+        vmnet_interface_set_event_callback(
+            s->vmnet_if,
+            VMNET_INTERFACE_PACKETS_AVAILABLE,
+            NULL,
+            NULL);
+    }
+}
+
+
+/**
  * Write packets from temporary buffers in VmnetState
  * to QEMU.
  */
@@ -171,8 +234,14 @@ static void vmnet_write_packets_to_qemu(VmnetState *s)
                                       vmnet_send_completed);
 
         if (size == 0) {
-            /* QEMU is not ready to consume more packets -
-             * stop and wait for completion callback call */
+            /*
+             * QEMU is not ready to consume more packets - stop and wait
+             * for the completion callback. Stop listening to vmnet
+             * meanwhile, otherwise its level-triggered event spins.
+             */
+            trace_vmnet_rx_parked(s->packets_send_end_pos -
+                                  s->packets_send_current_pos);
+            vmnet_update_rx_events(s);
             return;
         }
         ++s->packets_send_current_pos;
@@ -237,9 +306,19 @@ static void vmnet_send_completed(NetClientState *nc, ssize_t len)
     /* Complete sending packets left in VmnetState buffers */
     vmnet_write_packets_to_qemu(s);
 
-    /* And read new ones from vmnet if VmnetState buffer is ready */
-    if (s->packets_send_current_pos < s->packets_send_end_pos) {
-        qemu_bh_schedule(s->send_bh);
+    /*
+     * Batch fully drained: listen to vmnet again and read what arrived
+     * while we were parked. (The previous test here was inverted -- it
+     * scheduled the bottom half only while still parked, when the bh
+     * does nothing -- and only worked because the event kept firing.)
+     * Still parked: the next completion brings us back here.
+     */
+    if (!vmnet_batch_parked(s)) {
+        vmnet_update_rx_events(s);
+        if (s->rx_events_armed) {
+            trace_vmnet_rx_resumed();
+            qemu_bh_schedule(s->send_bh);
+        }
     }
 }
 
@@ -264,27 +343,8 @@ static void vmnet_vm_state_change_cb(void *opaque, bool running, RunState state)
 {
     VmnetState *s = opaque;
 
-    if (running) {
-        vmnet_interface_set_event_callback(
-            s->vmnet_if,
-            VMNET_INTERFACE_PACKETS_AVAILABLE,
-            s->if_queue,
-            ^(interface_event_t event_id, xpc_object_t event) {
-                assert(event_id == VMNET_INTERFACE_PACKETS_AVAILABLE);
-                /*
-                 * This function is being called from a non qemu thread, so
-                 * we only schedule a BH, and do the rest of the io completion
-                 * handling from vmnet_send_bh() which runs in a qemu context.
-                 */
-                qemu_bh_schedule(s->send_bh);
-            });
-    } else {
-        vmnet_interface_set_event_callback(
-            s->vmnet_if,
-            VMNET_INTERFACE_PACKETS_AVAILABLE,
-            NULL,
-            NULL);
-    }
+    s->vm_running = running;
+    vmnet_update_rx_events(s);
 }
 
 int vmnet_if_create(NetClientState *nc,
@@ -372,6 +432,8 @@ int vmnet_if_create(NetClientState *nc,
 
     s->packets_send_current_pos = 0;
     s->packets_send_end_pos = 0;
+    s->vm_running = false;
+    s->rx_events_armed = false;
 
     vmnet_vm_state_change_cb(s, 1, RUN_STATE_RUNNING);
 

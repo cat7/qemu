@@ -47,6 +47,11 @@ typedef struct VmnetState {
     struct iovec iov_buf[VMNET_PACKETS_LIMIT];
 
     VMChangeStateEntry *change;
+
+    /* Last VM run state seen by the change handler */
+    bool vm_running;
+    /* PACKETS_AVAILABLE event callback currently registered on if_queue */
+    bool rx_events_armed;
 } VmnetState;
 
 const char *vmnet_status_map_str(vmnet_return_t status);
