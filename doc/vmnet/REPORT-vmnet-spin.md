@@ -1,4 +1,4 @@
-# REPORT: g3beige + vmnet-bridged -- host thread spin (goal 1 done), dead guest RX (goal 2 pending log)
+# REPORT: g3beige + vmnet-bridged -- host thread spin (goal 1 done), dead guest RX (goal 2 fixed from code reading, awaiting the user's trace run)
 
 Contract: `doc/vmnet/HANDOFF-vmnet-spin.md`. Worktree branch `vmnet-spin`
 off `g3beige` (`b08253ace6`). Written 2026-09-03.
@@ -77,7 +77,9 @@ since 2026-08-30 is ppc only). Clean full build of the unmodified tree:
 1728 steps, exit 0 (`/Users/hsp/.claude/jobs/886cc763/tmp/build1.log`).
 Incremental rebuild with the change: 19 steps, `net_vmnet-common.m.o` and
 the other three vmnet objects recompiled, no warnings, exit 0
-(`.../build2.log`). Configure summary: SDL 2.32.70 YES, Cocoa YES,
+(`.../build2.log`). Third rebuild with the bmac requeue fix: 26 steps,
+`hw_net_bmac.c.o` recompiled, no warnings, exit 0 (`.../build3.log`).
+Configure summary: SDL 2.32.70 YES, Cocoa YES,
 vmnet.framework YES, slirp 4.9.3 YES, PNG YES -- the display/network
 backends the user's launcher needs.
 
@@ -139,6 +141,25 @@ Scratch cwd `/Users/hsp/.claude/jobs/886cc763/tmp/boot-none/`, QEMU pid
 Screendump viewed: `boot-none/none-090s-conv.png` -- the same Finder
 desktop 90 s after launch, guest clock 6:52 AM.
 
+### (b again) slirp boot on the binary with the bmac requeue fix (`e3d813717f`) -- PASS
+
+Fresh overlay, same scratch cwd, QEMU pid 32630; driver attached at
+launch + 1 s. This run exercises the changed `bmac_receive()` path
+directly (every slirp packet that lands between two arms is requeued).
+
+    [  1.0s] greeting ... "package": "v11.1.0-rc2-483-g045d8f8300-dirty" ...
+    [  1.0s] qmp_capabilities {} -> {"return": {}}
+    [ 90.6s] screendump desktop-090s.png -> {"return": {}}
+    [150.1s] screendump desktop-150s.png -> {"return": {}}
+    [210.5s] screendump desktop-210s.png -> {"return": {}}
+    [240.7s] screendump desktop-240s.png -> {"return": {}}
+    [240.7s] event SHUTDOWN {"guest": false, "reason": "host-qmp-quit"}
+    [240.7s] quit {} -> {"return": {}}
+    qemu exit=0, qemu.log (stderr) empty
+
+Screendump viewed: `boot-slirp/slirp2-090s-conv.png` -- Finder desktop
+90 s after launch, guest clock 7:00 AM.
+
 Both scratch dirs got a fresh `nvram.img`/`pram.img` created by the ROM
 (none existed before); the master image was never opened read-write (the
 overlay grew to 1.6-1.7 MB, the master's mtime is unchanged). No other
@@ -164,13 +185,36 @@ If the log passes 200 MB (`bmac_can_receive` fires on every
 `qemu_can_send_packet()` and can be chatty) stop early. Delete the log when
 the analysis is done.
 
-## 6. Goal 2 -- dead guest RX: hypotheses and analysis plan (log not yet received)
+## 6. Goal 2 -- dead guest RX: cause found by code reading, fixed (commit `e3d813717f`)
 
-Nothing in bmac was changed. The following is a code reading done while
-preparing goal 1; it ranks the contract's hypotheses and gives the trace
-signature that would confirm or refute each.
+The main session confirmed the leading hypothesis below independently
+and directed that it be acted on before the trace log. The fix, in
+`hw/net/bmac.c` `bmac_receive()`: the early return is split -- a packet
+the address filter rejects (or RX disabled) still returns `size`
+(consumed), but "no RX descriptor armed" (`!rx_dma_waiting || !io`) now
+returns 0 so the net layer requeues it. Verified in `net/net.c`:
+`qemu_deliver_packet_iov()` sets `nc->receive_disabled = 1` on a 0 return
+(line ~878) and `qemu_net_queue_flush()` re-inserts the packet at the head
+and stops; `qemu_flush_or_purge_queued_packets()` clears
+`receive_disabled` (line ~706) and is what `bmac_rx_dma_rw()` calls on
+every arm. The loopback caller `bmac_tx_dma_rw()` (bmac.c ~910) ignores
+the return value, so a self-addressed frame with no descriptor armed is
+dropped as before. The stale comment in `bmac_can_receive()` was
+corrected. New trace event `bmac_rx_requeue(size_t size)` in
+`hw/net/trace-events` ("no RX descriptor armed, requeued size=%zu"),
+covered by the launcher's `-trace 'bmac_rx_*'`.
 
-### Leading hypothesis: the contract's (b), whose "should not happen" clause is wrong
+Regression after the change: see section 4 (second slirp boot). The
+slirp path exercises the changed code directly -- every packet slirp
+hands over between two arms is now requeued instead of consumed.
+
+What the user's trace run should now show: `bmac_rx_requeue` lines
+instead of `bmac_rx_receive ... waiting=0 has_io=0` drops, one
+`bmac_rx_dma_armed` + delivery per packet, `vmnet_rx_parked`/`resumed`
+sparse, and the guest obtaining a DHCP lease (TCP/IP control panel shows
+a LAN address, host `ping` answers).
+
+### The cause: the contract's hypothesis (b), whose "should not happen" clause was wrong
 
 `qemu_net_queue_flush()` (net/queue.c) delivers queued packets with
 `qemu_net_queue_deliver()` -> `qemu_deliver_packet_iov()` -> `bmac_receive()`
@@ -216,17 +260,10 @@ packets were parked and K-1 drop lines follow, the hypothesis is proven.
 Refutes it: every parked batch is followed by K separate
 `bmac_rx_dma_armed` + delivery pairs.
 
-Candidate fix if confirmed (NOT applied; needs the log first): in
-`bmac_receive()` split the early return -- a packet the MAC filter rejects
-(`!bmac_can_receive_packet`) is consumed (`return size`), but a packet that
-arrives with no RX descriptor armed (`!rx_dma_waiting || !io`) must
-`return 0` so the net layer requeues it (`qemu_net_queue_flush` re-inserts
-it at the head and stops; `qemu_deliver_packet_iov` sets `receive_disabled`,
-which the next `bmac_rx_dma_rw()` flush clears). The loopback caller at
-bmac.c:910 ignores the return value, so it is unaffected. The regression
-protocol (slirp + none boots) must be re-run after that change.
+This is the fix applied in `e3d813717f` (details at the top of this
+section).
 
-### Contract hypothesis (a): first-descriptor / stale-arm wedge
+### Contract hypothesis (a): first-descriptor / stale-arm wedge (still worth a glance in the log)
 
 Check the first `bmac_rx_dma_armed` after the driver's `BMAC_RXRST` write
 (`bmac_reg_write`; the RXRST handler clears `rx_dma_waiting`, commit
@@ -262,10 +299,12 @@ accept foreign source MACs) or the DHCP server. Then stop, per the contract.
 3. Extract the window from the driver's RXRST to +30 s; list
    `bmac_rx_dma_armed` / `bmac_rx_receive` / `vmnet_rx_parked` in order;
    count deliveries vs drops per arm.
-4. Decide among the hypotheses with the signatures above; if the leading
-   one is confirmed, apply the `bmac_receive()` return-0 split, rebuild,
-   re-run the regression protocol, and hand the user a second trace run
-   to prove the DHCP lease.
+4. Count `bmac_rx_requeue` vs `bmac_rx_dma_armed`: with the fix every
+   requeued packet must be followed by an arm and a delivery; any
+   `bmac_rx_receive ... accepted=1 waiting=0 has_io=0` line without a
+   matching `bmac_rx_requeue` would mean a path not covered. Then check
+   hypothesis (a)'s signature and, above all, whether the guest got its
+   lease (ask the user; TCP/IP control panel, host `ping`).
 5. Delete the log.
 
 ## 7. Out of scope but noted for the re-run
