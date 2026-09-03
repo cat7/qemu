@@ -1,0 +1,11 @@
+   1 t=1788426710.698859 len=372 00:05:02:12:34:56 -> ff:ff:ff:ff:ff:ff IPv4 proto=17 0.0.0.0->255.255.255.255 udp 68->67 DHCP DISCOVER yiaddr=0.0.0.0
+   2 t=1788426710.699220 len=590 52:55:0a:00:02:02 -> ff:ff:ff:ff:ff:ff IPv4 proto=17 10.0.2.2->255.255.255.255 udp 67->68 DHCP OFFER yiaddr=10.0.2.15
+   3 t=1788426710.702159 len=378 00:05:02:12:34:56 -> ff:ff:ff:ff:ff:ff IPv4 proto=17 0.0.0.0->255.255.255.255 udp 68->67 DHCP REQUEST yiaddr=0.0.0.0
+   4 t=1788426710.702165 len=590 52:55:0a:00:02:02 -> ff:ff:ff:ff:ff:ff IPv4 proto=17 10.0.2.2->255.255.255.255 udp 67->68 DHCP ACK yiaddr=10.0.2.15
+   5 t=1788426710.714668 len=42 00:05:02:12:34:56 -> ff:ff:ff:ff:ff:ff ARP op=1 spa=0.0.0.0 tpa=10.0.2.15
+   6 t=1788426712.492930 len=42 00:05:02:12:34:56 -> ff:ff:ff:ff:ff:ff ARP op=1 spa=0.0.0.0 tpa=10.0.2.15
+   7 t=1788426714.498053 len=42 00:05:02:12:34:56 -> ff:ff:ff:ff:ff:ff ARP op=1 spa=0.0.0.0 tpa=10.0.2.15
+   8 t=1788426716.340981 len=42 00:05:02:12:34:56 -> ff:ff:ff:ff:ff:ff ARP op=1 spa=0.0.0.0 tpa=10.0.2.15
+   9 t=1788426718.115829 len=42 00:05:02:12:34:56 -> ff:ff:ff:ff:ff:ff ARP op=1 spa=10.0.2.15 tpa=10.0.2.15
+  10 t=1788426719.823740 len=42 00:05:02:12:34:56 -> ff:ff:ff:ff:ff:ff ARP op=1 spa=10.0.2.15 tpa=10.0.2.15
+total frames: 10

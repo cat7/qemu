@@ -312,3 +312,211 @@ accept foreign source MACs) or the DHCP server. Then stop, per the contract.
 "The Finder has unexpectedly quit" and the governor's 5%-paced warning in
 the incident run: record whether either recurs in the user's trace run
 with the spin gone.
+
+---
+
+# A/B: does networking still work?
+
+Added 2026-09-03 by a second agent. Question put by the main session: the
+earlier regression only proved the guest reached the Finder desktop; it
+never proved networking still WORKS. `e3d813717f` changes the net-layer
+return contract (returning 0 sets `nc->receive_disabled` until
+`qemu_flush_queued_packets()` clears it), so it could plausibly have
+broken RX for every backend, slirp included. Settled before anything else.
+
+## Method
+
+Two headless boots of the SAME disk, identical in every respect except the
+binary. Raw artifacts in `doc/vmnet/ab-slirp/` (traces, decoded pcaps, and
+the exact harness: `ab_boot.sh`, `ab_drive.py`, `pcapdump.py`).
+
+- Arm A = FIXED: `<worktree>/build/qemu-system-ppc`
+  (`v11.1.0-rc2-483-g045d8f8300-dirty`, both fixes; `strings` confirms
+  `bmac_rx_requeue` and `vmnet_rx_parked` are present).
+- Arm B = UNFIXED: `/Users/hsp/src/claude-code/qemu-master-g3/build-g3/qemu-system-ppc`
+  (`v11.1.0-rc2-479-g28e54ed2d3-dirty`; neither new trace event present).
+  `git diff 28e54ed2d3 b08253ace6 -- hw/net/bmac.c net/ include/hw/net/bmac.h`
+  is EMPTY, i.e. the two builds' networking code differs by exactly the two
+  commits under test and nothing else.
+- Each arm: own scratch cwd, no pre-existing nvram.img/pram.img, a fresh
+  qcow2 overlay whose backing file is `/Volumes/Macdata/qemu/hd/9.2-G3.img`
+  (`-F raw`, read-only, never opened rw). Master mtime `2026-08-31 22:07:55`
+  and size 2147483648 before AND after all runs -- unchanged.
+- `-M g3beige -m 512`, V3 ROM, ati_mach_gt romfile, `-display none`,
+  `-qmp unix:./qmp.sock,server=on,wait=off`,
+  `-nic user,model=bmac,mac=00:05:02:12:34:56,id=n0`,
+  `-object filter-dump,id=f0,netdev=n0,file=./net.pcap` (the `id=` on `-nic`
+  is what makes the netdev addressable by filter-dump),
+  `-trace 'bmac_rx_*' -trace bmac_tx_send -trace bmac_can_receive
+  -trace bmac_reg_write -trace bmac_irq_update -trace 'vmnet_*'`.
+  `bmac_tx_send` was missing from the user's vmnet run and is essential.
+- Screendump at t+120 s (desktop check) and t+210 s (90 s later, so the
+  TCP/IP stack has had time to finish DHCP), then QMP `quit`. Both PNGs
+  viewed. One guest at a time; only own pids; no `pkill`.
+
+## Verdict: BOTH arms get a lease. The two commits are clean.
+
+### Arm A (FIXED) -- PASS
+
+`ab-fixed/A-fixed-120s.png` and `-210s.png`: Mac OS 9.2 Finder desktop,
+menu bar, disk/QuickTime/Sherlock icons, clock running (9:58 -> 10:00).
+QMP: greeting, two `screendump` returns, `SHUTDOWN host-qmp-quit`,
+`qemu exit=0`.
+
+pcap (`doc/vmnet/ab-slirp/ab-fixed.pcap.txt`), 10 frames:
+
+    1 00:05:02:12:34:56 -> bcast  DHCP DISCOVER
+    2 52:55:0a:00:02:02 -> bcast  DHCP OFFER  yiaddr=10.0.2.15
+    3 00:05:02:12:34:56 -> bcast  DHCP REQUEST
+    4 52:55:0a:00:02:02 -> bcast  DHCP ACK    yiaddr=10.0.2.15
+    5-8 ARP probes  spa=0.0.0.0 tpa=10.0.2.15   (duplicate-address detection)
+    9-10 ARP         spa=10.0.2.15 tpa=10.0.2.15 (gratuitous: address taken)
+
+The guest's own frames carry source 10.0.2.15 after the ACK -- it took the
+lease. Not an inference: the address is on the wire.
+
+### Arm B (UNFIXED) -- PASS
+
+`ab-unfixed/B-unfixed-120s.png` and `-210s.png`: same desktop (clock 10:01
+-> 10:03). Same 10 frames, same DHCP exchange, same 10.0.2.15.
+
+### Side-by-side diff, arm A vs arm B
+
+| measure | A (fixed) | B (unfixed) |
+| --- | --- | --- |
+| Finder desktop by t+120 s | yes | yes |
+| slirp DHCP lease | 10.0.2.15 (DISCOVER/OFFER/REQUEST/ACK) | 10.0.2.15 (identical) |
+| pcap frames | 10 | 10, byte-identical decode |
+| trace lines | 445 | 445 |
+| `bmac_reg_write` | 409 | 409 |
+| `bmac_irq_update` | 20 | 20 |
+| `bmac_tx_send` | 8 (372, 378, 6x42) | 8 (372, 378, 6x42) |
+| `bmac_rx_dma_armed` | 3 | 3 |
+| `bmac_can_receive` | 3 (enabled=0/waiting=0 once, then 2x enabled=1 waiting=1) | 3, same |
+| `bmac_rx_receive` | 2, both `size=590 accepted=1 waiting=1 has_io=1` | 2, same |
+| `bmac_rx_requeue` | **0** | n/a (event does not exist) |
+| bmac init sequences | 1, ending RXCFG=0xb01 (ENABLE\|CRCNOSTRIP\|REJOWN\|HASHFILT) + TXCFG=0x1, never disabled again | 1, same |
+
+`diff A/trace.log B/trace.log` is ONE line: `addr=0x540` (the random-seed
+register) `0x5d84` vs `0x49ee`. Everything else is identical.
+
+**Why `bmac_rx_requeue` is 0 matters.** The requeue branch never executes on
+slirp, because slirp hands over one packet per socket event and only ever
+does so when `bmac_can_receive()` already said yes. `e3d813717f` is
+therefore INERT on slirp -- which is a stronger result than "it did no
+harm": it cannot regress the slirp path because it is not on it. The
+corresponding limit of this experiment, stated plainly: this A/B does NOT
+positively exercise the requeue-and-redeliver contract. That contract's
+recovery hook (a later `qemu_flush_queued_packets()`) is exactly what the
+next section shows was missing.
+
+## What the vmnet run actually shows, and where it diverges
+
+`/Users/hsp/.claude/jobs/886cc763/tmp/vmnet-trace.log`, 1097 lines:
+644 `bmac_reg_write`, 203 `bmac_rx_receive`, 203 `vmnet_rx_parked`,
+40 `bmac_irq_update`, 5 `bmac_can_receive`, 1 `vmnet_rx_resumed`,
+**1 `bmac_rx_dma_armed`**, 0 `bmac_rx_requeue`.
+`bmac_rx_receive` splits 200x `accepted=0 waiting=0 has_io=0` and
+3x `accepted=0 waiting=1 has_io=1`.
+
+Correcting the main session's reading: the two init sequences are NOT
+"device left disabled" throughout -- each one DOES reach
+`RXCFG=0xb01` + `TXCFG=0x1` and only then tears down
+(`RXCFG=0`, `XIFC=0`, `TXCFG=0`, `INTDISABLE=0xffff`). The driver opens the
+device, gets nothing, gives up, retries, gives up again, and Open Transport
+self-assigns 169.254.132.119.
+
+Filtering out the MII/SROM bit-bang (`addr=0x190`) and IRQ noise, the two
+runs are **identical instruction-for-instruction** through driver init:
+
+    slirp (arm A)                        vmnet (user)
+    ...                                  ...
+    0x210=0xfcff                         0x210=0xfcff       INTDISABLE
+    0x700..0x730 = 0                     0x700..0x730 = 0   hash table
+    0x630=0xb00   RX cfg, ENABLE CLEAR   0x630=0xb00        <- same
+    0x0=0x1       XIFC                   0x0=0x1
+    bmac_rx_dma_armed 0x73d790 len=1536  bmac_rx_dma_armed 0xbf6790 len=1536
+    -- nothing arrives --                bmac_rx_receive 86  accepted=0 waiting=1
+                                         bmac_rx_receive 106 accepted=0 waiting=1
+                                         bmac_rx_receive 101 accepted=0 waiting=1
+                                         vmnet_rx_parked pending=200   <-- DIVERGENCE
+    0x680/0x670/0x660 MADD               0x680/0x670/0x660 MADD
+    0x760/0x750/0x740/0x770 hash         0x760/0x750/0x740/0x770 hash
+    0x630=0xb01   RX ENABLE              0x630=0xb01        <- same
+    0x430=0x1     TX ENABLE              0x430=0x1
+    bmac_tx_send 372 (DHCP DISCOVER)     (tx not traced in the user's run)
+    bmac_rx_receive 590 accepted=1  <-- OFFER
+    bmac_rx_dma_armed (re-arm)           ... nothing, for the rest of the run ...
+    bmac_rx_receive 590 accepted=1  <-- ACK
+    bmac_rx_dma_armed (re-arm)
+    -> lease 10.0.2.15                   -> teardown, retry, teardown, 169.254.x
+
+The divergence is one window: **between arming the first RX descriptor and
+setting `RXCFG_ENABLE`**. slirp is silent in that window (it sends nothing
+until the guest speaks). A real LAN is not -- the user measured 3-24
+packets/s on `en0`, and one is enough.
+
+### Root cause (best-supported hypothesis)
+
+1. Packets that land in that window are rejected by
+   `bmac_can_receive_packet()` (RXCFG=0xb00, `RXCFG_ENABLE` clear) and are
+   consumed WITHOUT completing the armed descriptor -- correct behaviour for
+   a disabled RX MAC, but it leaves `rx_dma_waiting == true` forever.
+2. The next one is refused by `bmac_can_receive()` (`enabled=0`), so the net
+   layer queues it and `qemu_send_packet_async()` returns 0 -- vmnet parks
+   its 200-packet batch and (with `1fb7b2500b`) unregisters its event source.
+3. The driver then sets `RXCFG_ENABLE`. `bmac_can_receive()` is now true --
+   but nothing re-offers the packet the net layer is already holding.
+   **`bmac`'s only `qemu_flush_queued_packets()` call site is
+   `bmac_rx_dma_rw()`**, i.e. a NEW DBDMA arm; and the driver will not arm
+   again, because the descriptor it armed in step 1 never completed and so
+   never raised an RX interrupt.
+4. Deadlock. vmnet waits for a send-completion that needs a flush; bmac
+   waits for a packet that needs vmnet. The trace's single
+   `bmac_rx_dma_armed` in 1097 lines, and the total absence of RX between
+   the park and the teardown, are that deadlock.
+
+`1fb7b2500b` is not the cause -- before it, the level-triggered event kept
+firing but `vmnet_send_bh()` returned early while parked, so no packet moved
+either. It only makes the stall silent instead of spinning. And
+`e3d813717f` never fires here (`bmac_rx_requeue` = 0) because the packets
+are rejected by the filter, not by the missing descriptor.
+
+### Fix under test: flush on the `RXCFG_ENABLE` 0->1 edge
+
+`hw/net/bmac.c`: new `case BMAC_RXCFG:` in `bmac_write()` that stores the
+value and, on a 0->1 transition of `RXCFG_ENABLE`, calls
+`qemu_flush_queued_packets()`. New trace event
+`bmac_rx_enable_flush(waiting)` (matched by the `bmac_rx_*` pattern already
+in `doc/vmnet/vmnet-trace.command`). The address-filter and hash registers
+need no hook of their own: this driver always clears `RXCFG_ENABLE` before
+touching them and sets it again after, so the edge covers those too.
+
+Slirp regression (arm C, same harness, three boots -- two clean, one
+intermittent guest crash, see below): desktop at t+120 s and t+210 s,
+lease 10.0.2.15, same 10 pcap frames, trace identical to arm A apart from
+the random seed and two new
+`bmac_rx_enable_flush ... waiting=1` events at the two enable edges --
+`waiting=1` being precisely the state the vmnet deadlock needs.
+
+One of three arm-C boots died with a guest "bus error" during extension
+load. Its trace stops after 181 lines of pure SROM bit-banging with **no
+`0x630` write at all**, so the changed code had not executed when the guest
+crashed; the change cannot be the cause. Recorded, not explained -- the
+image has a history of intermittent boot faults.
+
+**This fix is UNVERIFIED on vmnet** (vmnet needs root; the agent cannot run
+it). `doc/vmnet/vmnet-trace.command` already points at the worktree build,
+so re-running it now tests exactly this hypothesis.
+
+### What the next vmnet run should show if the hypothesis is right
+
+- `bmac_rx_enable_flush ... waiting=1` right after each `0x630=0xb01`.
+- `bmac_rx_dma_armed` MANY times, not once.
+- `bmac_rx_receive ... accepted=1` for a 342-590 byte frame (DHCP
+  OFFER/ACK) shortly after the first enable.
+- A lease from the user's own DHCP server instead of 169.254.x.
+
+If instead the trace still shows one arm and no accepted frame, the next
+suspect is Apple's bridged mode itself (the OFFER never reaching vmnet),
+which is outside QEMU -- stop there, per the contract.
