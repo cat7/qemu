@@ -453,17 +453,17 @@ static bool bmac_can_receive(NetClientState *nc)
     BMACState *s = qemu_get_nic_opaque(nc);
 
     /*
-     * Must also gate on rx_dma_waiting: bmac_receive() silently drops
-     * any packet that arrives before the driver has armed the next RX
-     * descriptor (returns size without ever writing/completing it).
-     * Reporting "can receive" from RXCFG_ENABLE alone told the net
-     * layer it was always safe to deliver immediately, so any packet
-     * landing in the gap between one RX completion and the driver
-     * re-arming the ring (e.g. an ARP reply or DHCP offer during
-     * negotiation) was lost with no retry -- qemu_flush_queued_packets()
-     * is already called from bmac_rx_dma_rw() once a descriptor is
-     * armed, so gating here lets the net layer's normal queuing take
-     * over instead.
+     * Must also gate on rx_dma_waiting: a packet can only be completed
+     * into an armed RX descriptor. Reporting "can receive" from
+     * RXCFG_ENABLE alone told the net layer it was always safe to
+     * deliver immediately, so any packet landing in the gap between one
+     * RX completion and the driver re-arming the ring (e.g. an ARP reply
+     * or DHCP offer during negotiation) was lost with no retry --
+     * qemu_flush_queued_packets() is already called from
+     * bmac_rx_dma_rw() once a descriptor is armed, so gating here lets
+     * the net layer's normal queuing take over instead. This check is
+     * only consulted for NEW packets; bmac_receive() has to handle the
+     * flush path itself (see there).
      */
     bool enabled = (s->regs[REG_INDEX(BMAC_RXCFG)] & RXCFG_ENABLE) != 0;
     trace_bmac_can_receive(enabled, s->rx_dma_waiting);
@@ -482,8 +482,29 @@ static ssize_t bmac_receive(NetClientState *nc, const uint8_t *buf,
 
     trace_bmac_rx_receive(size, bmac_can_receive_packet(s, buf),
                           s->rx_dma_waiting, io != NULL);
-    if (!bmac_can_receive_packet(s, buf) || !s->rx_dma_waiting || !io) {
+    if (!bmac_can_receive_packet(s, buf)) {
+        /* RX disabled or rejected by the address filter: consumed. */
         return size;
+    }
+    if (!s->rx_dma_waiting || !io) {
+        /*
+         * No RX descriptor armed. bmac_can_receive() already reports this,
+         * but qemu_net_queue_flush() delivers a queued packet WITHOUT
+         * consulting can_receive: after the flush from bmac_rx_dma_rw()
+         * delivers the head packet into the one armed descriptor, the
+         * sender's completion callback (vmnet's, which hands over its
+         * batch one packet at a time) runs inside that loop, its next
+         * packet lands in the queue, and the same loop delivers it here
+         * with rx_dma_waiting already false. Returning size consumed it
+         * silently -- one packet per DBDMA arm, the rest of every vmnet
+         * batch lost, which is how the DHCP OFFER/ACK never reached a
+         * Mac OS 9 guest on vmnet-bridged (slirp never batches). Return 0
+         * instead: the net layer re-inserts the packet at the head of the
+         * queue and sets receive_disabled, and the next arm's
+         * qemu_flush_queued_packets() clears that and delivers it.
+         */
+        trace_bmac_rx_requeue(size);
+        return 0;
     }
 
     /*
