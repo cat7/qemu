@@ -520,3 +520,18 @@ so re-running it now tests exactly this hypothesis.
 If instead the trace still shows one arm and no accepted frame, the next
 suspect is Apple's bridged mode itself (the OFFER never reaching vmnet),
 which is outside QEMU -- stop there, per the contract.
+
+## A note on the helper scripts this report mentions
+
+`vmnet-trace.command` (the traced launcher), `watch-qemu-threads.sh` (the
+read-only host-CPU sampler) and the `ab-slirp/` harness (`ab_boot.sh`,
+`ab_drive.py`, `pcapdump.py`) are deliberately **not** in the repository.
+They carry absolute paths into one developer's machine and exist to
+reproduce this investigation, not to be maintained as project tooling.
+The trace logs and packet decodes they produced are kept here as the
+evidence for the claims above. Anything the scripts did is described in
+enough detail in this report and in `HANDOFF-vmnet-spin.md` to redo by
+hand: run the machine's normal launcher under `sudo` with
+`-trace 'bmac_rx_*' -trace bmac_tx_send -trace bmac_can_receive -trace
+bmac_reg_write -trace bmac_irq_update -trace 'vmnet_*'`, and watch host
+CPU with `ps -M <pid>` looking at SYSTEM time, not CPU percent.
