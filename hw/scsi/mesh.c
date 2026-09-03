@@ -107,6 +107,33 @@ static void mesh_raise_int(MESHState *s, uint8_t bits)
 }
 
 /*
+ * Deferring the interrupt is right for a driver that waits for the IRQ
+ * line (see the int_timer comment in mesh.h), but the Interrupt register
+ * itself must never lie to a driver that POLLS it. Mac OS X Server 1.2v3
+ * (Rhapsody) drives the MESH by polling: it writes a sequencer command
+ * and reads Interrupt on the very next instruction, expecting the
+ * command-done bit to be there. With delivery parked on a 10us timer it
+ * read 0, decided the sequencer had not responded, and gave up before
+ * ever issuing the SELECT -- the boot stopped on the "Starting Mac OS X
+ * Server" splash with the wheel spinning.
+ *
+ * So collapse the delay whenever the guest reads the register: by then
+ * the store that armed the interrupt has long retired, which is the
+ * whole hazard the deferral exists to avoid. A driver that takes the
+ * IRQ instead is unaffected -- by the time its ISR reads Interrupt the
+ * timer has already fired and there is nothing pending to flush.
+ */
+static void mesh_int_flush(MESHState *s)
+{
+    if (s->int_pending) {
+        timer_del(s->int_timer);
+        s->int_stat |= s->int_pending;
+        s->int_pending = 0;
+        mesh_update_irq(s);
+    }
+}
+
+/*
  * Called when a SCSI request completes (status phase reached). Only
  * RECORD the status here -- real MESH delivers the status byte into the
  * FIFO when the driver runs SEQ_STATUS, and the COMMAND COMPLETE
@@ -617,7 +644,26 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         mesh_raise_int(s, INT_CMD_DONE);
         break;
     case SEQ_RESET_MESH:
-        mesh_reset_state(s);
+        /*
+         * "Reset MESH" resets the sequencer and its transfer state. It is
+         * NOT a chip reset: the interrupt-mask register is a CPU-visible
+         * register of its own, and the driver's copy of it has to survive.
+         * Clearing it here silently masked off the INT_CMD_DONE this very
+         * command then raises, and every interrupt after it.
+         *
+         * Mac OS X Server 1.2v3 (Rhapsody) is the guest that shows it: its
+         * SCSI driver writes IntMask = 0x6 and only then issues Reset MESH,
+         * so from that point on no MESH interrupt could ever be delivered
+         * and the boot stopped on the "Starting Mac OS X Server" splash
+         * with the wheel still spinning. Mac OS 9 programs the mask after
+         * the reset instead, which is why it never noticed.
+         */
+        {
+            uint8_t saved_mask = s->int_mask;
+
+            mesh_reset_state(s);
+            s->int_mask = saved_mask;
+        }
         mesh_raise_int(s, INT_CMD_DONE);
         break;
     case SEQ_FLUSH_FIFO:
@@ -635,7 +681,12 @@ static uint64_t mesh_read_one(MESHState *s, hwaddr addr);
 static uint64_t mesh_read(void *opaque, hwaddr addr, unsigned size)
 {
     MESHState *s = MESH(opaque);
-    uint64_t val = mesh_read_one(s, addr);
+    uint64_t val;
+
+    if (addr == MESH_INTERRUPT) {
+        mesh_int_flush(s);
+    }
+    val = mesh_read_one(s, addr);
 
     trace_mesh_reg_read(addr, val);
     return val;
