@@ -969,12 +969,31 @@ static void bmac_tx_dma_rw(DBDMA_io *io)
         dma_memory_read(&address_space_memory, io->addr, buf, io->len,
                         MEMTXATTRS_UNSPECIFIED);
 
-        if (memcmp(buf, s->mac_addr, 6) == 0) {
-            /* Destination is our own MAC: loop back to the RX path */
-            trace_bmac_tx_send(io->len, true);
+        /*
+         * Loopback is a property of the XIF, not of the destination
+         * address. Real BMAC silicon only feeds a transmitted frame back
+         * into its own receiver when the driver has asked for it, by
+         * setting XIFC_LBCK (internal loopback, TX never reaches the
+         * wire) or XIFC_MIILB (loopback in the MII transceiver). With
+         * neither bit set every frame goes out, self-addressed or not,
+         * and whether it ever comes back is the network's business.
+         *
+         * This device used to loop ANY frame whose destination equalled
+         * our own MAC straight into bmac_receive(). That is a receive the
+         * driver never asked for: Rhapsody's Ethernet(BMac) driver sends
+         * exactly one 64-byte frame to its own address during bring-up
+         * with XIFC = TXOE only (no loopback bit) and RXCFG_REJOWN set --
+         * i.e. it explicitly told the MAC to reject its own packets --
+         * and the unsolicited completion left its ring at
+         * RxHead=1/RxTail=0 forever.
+         */
+        uint16_t xifc = s->regs[REG_INDEX(BMAC_XIFC)];
+        bool loopback = (xifc & (XIFC_LBCK | XIFC_MIILB)) != 0;
+
+        trace_bmac_tx_send(io->len, loopback);
+        if (loopback) {
             bmac_receive(qemu_get_queue(s->nic), buf, io->len);
         } else {
-            trace_bmac_tx_send(io->len, false);
             qemu_send_packet(qemu_get_queue(s->nic), buf, io->len);
         }
 
