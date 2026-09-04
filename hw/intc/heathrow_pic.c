@@ -47,9 +47,48 @@
  */
 #define HEATHROW_INT_MODE_68K 0x80000000
 
+/*
+ * A level-triggered source keeps the CPU request asserted for as long as
+ * its line is physically high -- that is what "level triggered" means,
+ * and it is what lets a guest that looks late still find the source
+ * pending (the ATI VBL hold-until-ack behaviour depends on it).
+ *
+ * The failure mode it also creates is a source nothing is servicing.
+ * The onboard/slot GPUs assert for a whole blanking interval each frame
+ * whether or not any driver acknowledges the chip, and the Beige ROM's
+ * own interrupt dispatcher (0xfff16880: acknowledge both banks, read
+ * mask+levels, post a 68K interrupt level, rfi) has no way to lower a
+ * device's line. With the request still asserted at the rfi the handler
+ * re-enters immediately: measured on Mac OS 8.1 with a Rage 128 Pro in
+ * slot B1 (line 0x18, bit 24), ~120,000 external interrupts a second
+ * for the whole 12.5% of each frame that the card holds INTA#.
+ *
+ * So a level-triggered source that the guest has ALREADY acknowledged
+ * here stops driving the CPU request until its line genuinely falls and
+ * rises again. This cannot lose an interrupt: by definition the guest
+ * has seen the one it is acknowledging, and a fresh assertion re-arms
+ * the source through heathrow_set_irq(). It is also what the
+ * real-hardware-verified reference does -- DingusPPC's
+ * GrandCentral::signal_cpu_int() drives the CPU from latched events
+ * only and never from the live level.
+ *
+ * Note this deliberately does NOT touch the "levels" register the guest
+ * reads (offset 0xc): the Beige ROM acknowledges BEFORE it reads that
+ * register and computes its 68K interrupt level from it, so clearing
+ * the raw level on acknowledge would throw the interrupt away. (That is
+ * also the 2026-07-30 note in heathrow_read() below.)
+ */
 static inline int heathrow_check_irq(HeathrowPICState *pic)
 {
-    return (pic->events | (pic->levels & pic->level_triggered)) & pic->mask;
+    return (pic->events |
+            (pic->levels & pic->level_triggered & ~pic->acked_levels)) &
+           pic->mask;
+}
+
+/* Remember which still-high level sources this acknowledge covered. */
+static inline void heathrow_ack_levels(HeathrowPICState *pic, uint32_t bits)
+{
+    pic->acked_levels |= pic->levels & pic->level_triggered & bits;
 }
 
 /* update the CPU irq state */
@@ -111,6 +150,7 @@ static void heathrow_write(void *opaque, hwaddr addr,
         if ((s->pics[1].mask & HEATHROW_INT_MODE_68K) &&
             (value & HEATHROW_INT_MODE_68K)) {
             /* 68k-style "clear everything" acknowledgement */
+            heathrow_ack_levels(pic, ~0u);
             pic->events = 0;
         } else {
             /*
@@ -139,7 +179,11 @@ static void heathrow_write(void *opaque, hwaddr addr,
              * that do ack the device (Mac OS X 10.2's NDRV path)
              * deassert through the device first anyway.
              */
+            heathrow_ack_levels(pic, value);
             pic->levels &= ~(value & (0x7ff | (1 << 0x16)));
+            /* a level cleared here never sees a falling edge, so re-arm
+             * it directly rather than through heathrow_set_irq() */
+            pic->acked_levels &= pic->levels;
             /*
              * Acks clear latched events for every source, matching the
              * latch change above (DingusPPC clears int_events by the
@@ -257,9 +301,13 @@ static void heathrow_set_irq(void *opaque, int num, int level)
              * Rhapsody screen-refresh/clock problems).
              */
             pic->events |= irq_bit;
+            pic->acked_levels &= ~irq_bit;
         }
         pic->levels |= irq_bit;
     } else {
+        /* A genuine falling edge re-arms a source that was acknowledged
+         * while its line was still high (see heathrow_check_irq()). */
+        pic->acked_levels &= ~irq_bit;
         /*
          * NOTE (2026-07-29): re-tested both-edges latching (DingusPPC's
          * MacIoBase::ack_int_common() approach) again, this time with an
@@ -284,13 +332,14 @@ static void heathrow_set_irq(void *opaque, int num, int level)
 
 static const VMStateDescription vmstate_heathrow_pic_one = {
     .name = "heathrow_pic_one",
-    .version_id = 0,
+    .version_id = 1,
     .minimum_version_id = 0,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(events, HeathrowPICState),
         VMSTATE_UINT32(mask, HeathrowPICState),
         VMSTATE_UINT32(levels, HeathrowPICState),
         VMSTATE_UINT32(level_triggered, HeathrowPICState),
+        VMSTATE_UINT32_V(acked_levels, HeathrowPICState, 1),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -320,6 +369,8 @@ static void heathrow_reset(DeviceState *d)
 {
     HeathrowState *s = HEATHROW(d);
 
+    s->pics[0].acked_levels = 0;
+    s->pics[1].acked_levels = 0;
     s->pics[0].level_triggered = 0;
     /*
      * Bits 20-28 are the DMA/PCI level sources, EXCEPT the GPU line

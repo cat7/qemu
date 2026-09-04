@@ -37,6 +37,14 @@ typedef struct HeathrowPICState {
     uint32_t mask;
     uint32_t levels;
     uint32_t level_triggered;
+    /*
+     * Level-triggered sources the guest has already acknowledged at this
+     * PIC while their raw line was still high. They stop contributing to
+     * the CPU request until the line actually falls and rises again; the
+     * raw "levels" register still reports them truthfully. See
+     * heathrow_check_irq().
+     */
+    uint32_t acked_levels;
 } HeathrowPICState;
 
 struct HeathrowState {
