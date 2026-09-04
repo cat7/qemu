@@ -247,5 +247,6 @@ void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
                             DBDMA_rw rw, DBDMA_flush flush,
                             void *opaque);
 void DBDMA_kick(DBDMAState *dbdma);
+void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat);
 
 #endif

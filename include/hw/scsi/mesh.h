@@ -196,6 +196,22 @@ struct MESHState {
     uint32_t to_xfer;
     bool dma_active;
     /*
+     * The DMA step moves a non-data phase (Message Out, Command,
+     * Status, Message In) and so goes through the FIFO rather than the
+     * SCSI backend's buffer. Mac OS X's channel program DMAs every one
+     * of those; the Mac OS driver pushes/pops them by hand.
+     */
+    bool dma_fifo;
+
+    /*
+     * A sequencer command has been written and has not yet reached its
+     * command-done or exception -- the "busy" line the DBDMA channel
+     * program waits on. A DMA step does not count: it is parked waiting
+     * for the channel to arm its descriptor, and the channel is in turn
+     * waiting on this line, so calling that busy deadlocks the pair.
+     */
+    bool seq_running;
+    /*
      * The step ended exactly where the SCSI backend's current chunk
      * ended, so "step done" is only true once the backend has said
      * what comes next (another chunk -> the target is ready again; or
@@ -212,6 +228,14 @@ struct MESHState {
     bool data_ready;
     bool to_device;
     void *dma_io; /* DBDMA_io *, saved to complete the transfer later */
+
+    /*
+     * The DBDMA controller this chip's channel lives on, kept so the
+     * chip can publish its status lines (ChannelStatus[7:0]) there --
+     * Mac OS X's driver runs the whole SCSI transaction as a DBDMA
+     * command list that waits and branches on them.
+     */
+    void *dbdma;
 };
 
 /* Called by macio once its DBDMA controller is realized */

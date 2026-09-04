@@ -41,6 +41,54 @@
  */
 #define MESH_SEL_TIMEOUT_NS (250 * 1000 * 1000)
 
+#define MESH_DMA_CHANNEL 0
+
+/*
+ * The chip's four status lines into its DBDMA channel
+ * (ChannelStatus[7:0]), all active low.
+ *
+ * Mac OS X's AppleMesh does not drive the sequencer from its interrupt
+ * handler at all: it builds ONE DBDMA command list per SCSI
+ * transaction, whose STORE_QUAD commands write the sequencer commands
+ * and whose `WAIT_IFSET` / `BR_IFCLR` conditions test these lines --
+ * WaitSelect = mask 0x20 value 0x20 and BranchSelect = mask 0xc0 value
+ * 0xc0, both programmed by the driver's own initCP() (read out of
+ * AppleMesh.kext). So the list waits while STAT_BUSY is high and takes
+ * its error branch unless BOTH STAT_NO_EXC and STAT_NO_ERR are high.
+ * That is why the driver masks command-done off (IntMask = 0x6) yet
+ * still expects the transaction to advance: the interrupt is for the
+ * exceptional cases, the DBDMA lines carry the normal flow.
+ */
+#define MESH_DEVSTAT_BUSY    0x20  /* set until the step can proceed */
+#define MESH_DEVSTAT_NO_EXC  0x40  /* clear once an exception is pending */
+#define MESH_DEVSTAT_NO_ERR  0x80  /* clear once an error is pending */
+
+static void mesh_update_devstat(MESHState *s)
+{
+    uint8_t devstat = 0;
+
+    /*
+     * "Ready" is command-done for a step the chip finishes on its own,
+     * and "armed, waiting for the descriptor" for a DMA step: the
+     * driver's list stores the sequencer command and only then arms the
+     * transfer, with a wait in between (e.g. SEQUENCE = 0x83 DMA
+     * Command, then OUT_LAST of the CDB), so a DMA step that still
+     * needs its bytes must not read as busy or the two deadlock.
+     */
+    if (s->seq_running && !s->dma_active) {
+        devstat |= MESH_DEVSTAT_BUSY;
+    }
+    if (!(s->int_stat & INT_EXCEPTION)) {
+        devstat |= MESH_DEVSTAT_NO_EXC;
+    }
+    if (!(s->int_stat & INT_ERROR)) {
+        devstat |= MESH_DEVSTAT_NO_ERR;
+    }
+    if (s->dbdma) {
+        DBDMA_set_devstat(s->dbdma, MESH_DMA_CHANNEL, devstat);
+    }
+}
+
 static void mesh_update_irq(MESHState *s)
 {
     int level = !!(s->int_stat & s->int_mask);
@@ -50,6 +98,7 @@ static void mesh_update_irq(MESHState *s)
     } else {
         qemu_irq_lower(s->irq);
     }
+    mesh_update_devstat(s);
 }
 
 static void mesh_fifo_reset(MESHState *s)
@@ -101,6 +150,13 @@ static void mesh_int_timer_cb(void *opaque)
 
 static void mesh_raise_int(MESHState *s, uint8_t bits)
 {
+    /*
+     * The step is over the moment the chip decides its outcome; only
+     * the CPU-visible interrupt is deferred (see below). The DBDMA
+     * status lines are not deferred -- they are the chip's own wiring
+     * into the channel, not a register the CPU races against.
+     */
+    s->seq_running = false;
     s->int_pending |= bits;
     timer_mod(s->int_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MESH_INT_DELAY_NS);
@@ -196,6 +252,7 @@ static void mesh_request_cancelled(SCSIRequest *req)
 static void mesh_pio_fill_fifo(MESHState *s);
 static void mesh_pio_out_drain(MESHState *s);
 static void mesh_dma_pump(MESHState *s);
+static void mesh_arm_fifo_dma(MESHState *s, bool to_device);
 
 /* Called by the SCSI backend when it has data ready to transfer */
 static void mesh_transfer_data(SCSIRequest *req, uint32_t len)
@@ -252,6 +309,8 @@ static void mesh_reset_state(MESHState *s)
     s->awaiting_msg_out = false;
     s->pio_active = false;
     s->dma_active = false;
+    s->dma_fifo = false;
+    s->seq_running = false;
     s->to_xfer = 0;
     s->step_done_pending = false;
     s->connected = false;
@@ -293,6 +352,7 @@ static void mesh_select_timeout_cb(void *opaque)
 
     s->current_dev = scsi_device_find(&s->bus, 0, s->sel_pending_target, 0);
     trace_mesh_select_timeout_fire(s->sel_pending_target, s->current_dev != NULL);
+    s->seq_running = false;
     if (!s->current_dev) {
         s->exception |= EXC_SEL_TIMEOUT;
         s->int_stat |= INT_EXCEPTION | INT_CMD_DONE;
@@ -334,6 +394,8 @@ static void mesh_select(MESHState *s)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               (present ? MESH_SEL_PRESENT_NS : MESH_SEL_TIMEOUT_NS));
 }
+
+static void mesh_msg_out_delivered(MESHState *s);
 
 static void mesh_do_command(MESHState *s)
 {
@@ -418,6 +480,7 @@ static void mesh_step_done(MESHState *s)
 {
     s->pio_active = false;
     s->dma_active = false;
+    s->dma_fifo = false;
     if (s->async_len == 0 && s->data_ready && s->current_req) {
         s->data_ready = false;
         s->step_done_pending = true;
@@ -461,6 +524,34 @@ static void mesh_pio_out_drain(MESHState *s)
     mesh_pio_out_advance(s);
 }
 
+/*
+ * The initiator's MESSAGE OUT (IDENTIFY, 0x80 | LUN) has arrived in the
+ * FIFO -- pushed byte by byte by the driver, or DMA'd in by the
+ * channel program. QEMU's SCSI layer takes the LUN when the request is
+ * created, so keep it for the CDB that follows.
+ */
+static void mesh_msg_out_delivered(MESHState *s)
+{
+    s->awaiting_msg_out = false;
+    if (s->fifo_pos > 0 && (s->fifo[0] & 0x80)) {
+        s->lun = s->fifo[0] & 0x07;
+    }
+    mesh_fifo_reset(s);
+    /*
+     * ATN still asserted means "I have more of this message to send":
+     * the target stays in Message Out. A multi-byte message is sent as
+     * two steps -- all but the last byte with ATN (SEQUENCE = 0xa7),
+     * then the last byte with ATN dropped (0x87) -- which is how Mac OS
+     * X sends IDENTIFY followed by a synchronous-transfer request.
+     * Ending the phase after the first step answered the second one
+     * with a phase mismatch and the driver retried the command forever.
+     */
+    if (!(s->cur_cmd & SEQ_ATN)) {
+        mesh_set_phase(s, MESH_PH_COMMAND);
+    }
+    mesh_raise_int(s, INT_CMD_DONE);
+}
+
 /* The bus phase a transfer-type sequencer command expects, or -1 */
 static int mesh_cmd_phase(uint8_t cmd)
 {
@@ -490,6 +581,7 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
     s->cur_cmd = cmd;
     s->int_stat &= ~INT_CMD_DONE;
     s->int_pending &= ~INT_CMD_DONE;
+    s->seq_running = true;
 
     /*
      * A transfer command whose phase is not the one the target is in
@@ -534,7 +626,12 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
          * the bytes already happen to be present; otherwise wait for
          * mesh_write()'s MESH_FIFO case to notice the CDB is complete.
          */
-        if (s->fifo_pos > 0) {
+        if (cmd & SEQ_DMA) {
+            /* Mac OS X DMAs the CDB in: SEQUENCE = 0x83, then OUT_LAST */
+            mesh_arm_fifo_dma(s, true);
+            s->awaiting_cdb = true;
+            mesh_dma_pump(s);
+        } else if (s->fifo_pos > 0) {
             mesh_do_command(s);
         } else {
             s->awaiting_cdb = true;
@@ -549,6 +646,10 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         mesh_fifo_push(s, s->status);
         mesh_set_phase(s, MESH_PH_MSG_IN);
         mesh_raise_int(s, INT_CMD_DONE);
+        if (cmd & SEQ_DMA) {
+            mesh_arm_fifo_dma(s, false);
+            mesh_dma_pump(s);
+        }
         break;
     case SEQ_DATA_OUT:
     case SEQ_DATA_IN:
@@ -570,6 +671,7 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         if (cmd & SEQ_DMA) {
             s->pio_active = false;
             s->dma_active = true;
+            s->dma_fifo = false;
             mesh_dma_pump(s);
         } else {
             s->dma_active = false;
@@ -589,13 +691,12 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
          * scsi layer takes the LUN at scsi_req_new() time, so parse it
          * out for the upcoming command; then advance to Command phase.
          */
-        if (s->fifo_pos > 0) {
-            if (s->fifo[0] & 0x80) {
-                s->lun = s->fifo[0] & 0x07;
-            }
-            mesh_fifo_reset(s);
-            mesh_set_phase(s, MESH_PH_COMMAND);
-            mesh_raise_int(s, INT_CMD_DONE);
+        if (cmd & SEQ_DMA) {
+            mesh_arm_fifo_dma(s, true);
+            s->awaiting_msg_out = true;
+            mesh_dma_pump(s);
+        } else if (s->fifo_pos > 0) {
+            mesh_msg_out_delivered(s);
         } else {
             s->awaiting_msg_out = true;
         }
@@ -604,6 +705,10 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         /* deliver the COMMAND COMPLETE message byte */
         mesh_fifo_push(s, 0x00);
         mesh_raise_int(s, INT_CMD_DONE);
+        if (cmd & SEQ_DMA) {
+            mesh_arm_fifo_dma(s, false);
+            mesh_dma_pump(s);
+        }
         break;
     case SEQ_BUS_FREE:
         /*
@@ -668,12 +773,21 @@ static void mesh_perform_command(MESHState *s, uint8_t cmd)
         break;
     case SEQ_FLUSH_FIFO:
         mesh_fifo_reset(s);
+        s->seq_running = false;
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "mesh: unsupported sequencer command 0x%x\n",
                       cmd);
         break;
     }
+
+    /*
+     * The status lines the channel program waits on move with every
+     * sequencer command -- including the command-done this one just
+     * cleared, and the "armed, waiting for its descriptor" state a DMA
+     * step enters -- so republish them before returning.
+     */
+    mesh_update_devstat(s);
 }
 
 static uint64_t mesh_read_one(MESHState *s, hwaddr addr);
@@ -839,14 +953,7 @@ static void mesh_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             s->awaiting_cdb = false;
             mesh_do_command(s);
         } else if (s->awaiting_msg_out) {
-            /* IDENTIFY (0x80 | LUN) delivered after SEQ_MSG_OUT */
-            s->awaiting_msg_out = false;
-            if (s->fifo[0] & 0x80) {
-                s->lun = s->fifo[0] & 0x07;
-            }
-            mesh_fifo_reset(s);
-            mesh_set_phase(s, MESH_PH_COMMAND);
-            mesh_raise_int(s, INT_CMD_DONE);
+            mesh_msg_out_delivered(s);
         }
         return;
     case MESH_SEQUENCE:
@@ -861,6 +968,33 @@ static void mesh_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
     case MESH_INTERRUPT:
         s->int_stat &= ~(val & INT_ALL);
+        /*
+         * Acknowledging an interrupt must also cancel it if it is still
+         * sitting on the delivery timer, or it comes back 10us later as
+         * a brand-new one. Mac OS X's channel program deliberately
+         * provokes a phase-mismatch (it pokes SEQUENCE = 0x24 to assert
+         * ATN) and clears it in the very next command -- the
+         * resurrected exception then arrived in the middle of the
+         * following data transfer and sent the program down its error
+         * branch, aborting every read.
+         */
+        s->int_pending &= ~(val & INT_ALL);
+        if (!s->int_pending) {
+            timer_del(s->int_timer);
+        }
+        /*
+         * The Exception register is the detail behind INT_EXCEPTION, so
+         * it goes when that interrupt is acknowledged -- otherwise it
+         * stands forever and every later read reports an exception that
+         * has already been dealt with. Mac OS X reads Exception on every
+         * pass of its register-poll helper and folds "non-zero" back
+         * into the interrupt byte it acts on, so a stale value made it
+         * treat every subsequent SCSI command as failed and retry the
+         * bus scan indefinitely.
+         */
+        if (val & INT_EXCEPTION) {
+            s->exception = 0;
+        }
         mesh_update_irq(s);
         return;
     case MESH_SOURCE_ID:
@@ -908,10 +1042,100 @@ static const MemoryRegionOps mesh_ops = {
  * synchronously start the next one (mesh_dma_rw() re-enters with the
  * new io), so all state lives in `s` and the loop re-reads it.
  */
+/*
+ * Arm a DMA step that moves a non-data phase through the FIFO. Nothing
+ * moves until the channel program arms its descriptor (mesh_dma_rw), and
+ * the descriptor may equally arrive first -- the driver's list stores
+ * the sequencer command and the transfer command as two separate DBDMA
+ * commands, in that order.
+ */
+static void mesh_arm_fifo_dma(MESHState *s, bool to_device)
+{
+    s->to_device = to_device;
+    s->to_xfer = s->xfer_count ? s->xfer_count : 0x10000;
+    s->pio_active = false;
+    s->dma_active = true;
+    s->dma_fifo = true;
+    s->step_done_pending = false;
+}
+
+static void mesh_dma_fifo_pump(MESHState *s)
+{
+    uint8_t buf[MESH_FIFO_SIZE];
+    DBDMA_io *io;
+    int len, i;
+
+    while (s->dma_active && s->dma_fifo && (io = s->dma_io) != NULL &&
+           io->len > 0 && s->to_xfer > 0) {
+        if (s->to_device) {
+            len = MIN(io->len, MIN((int)s->to_xfer,
+                                   MESH_FIFO_SIZE - s->fifo_pos));
+            if (len <= 0) {
+                break;
+            }
+            dma_memory_read(&address_space_memory, io->addr, buf, len,
+                            MEMTXATTRS_UNSPECIFIED);
+            for (i = 0; i < len; i++) {
+                mesh_fifo_push(s, buf[i]);
+            }
+        } else {
+            len = MIN(io->len, MIN((int)s->to_xfer, s->fifo_pos));
+            if (len <= 0) {
+                break;
+            }
+            for (i = 0; i < len; i++) {
+                buf[i] = mesh_fifo_pop(s);
+            }
+            dma_memory_write(&address_space_memory, io->addr, buf, len,
+                             MEMTXATTRS_UNSPECIFIED);
+        }
+        trace_mesh_dma_xfer(s->to_device, io->addr, len, io->len - len,
+                            s->to_xfer - len, 0);
+        io->addr += len;
+        io->len -= len;
+        s->to_xfer -= len;
+        if (s->xfer_count >= len) {
+            s->xfer_count -= len;
+        }
+
+        /*
+         * Finish the step BEFORE releasing the descriptor: dma_end()
+         * hands control straight back to the channel, which runs the
+         * next commands of the list inline -- the very next one is
+         * usually the sequencer command for the phase this step just
+         * moved the target into. Ending the descriptor first made the
+         * driver's Command step arrive while the model still believed
+         * the bus was in Message Out, and answered it with a phase
+         * mismatch.
+         */
+        if (s->to_xfer == 0) {
+            s->dma_active = false;
+            s->dma_fifo = false;
+            if (s->awaiting_msg_out) {
+                mesh_msg_out_delivered(s);
+            } else if (s->awaiting_cdb) {
+                s->awaiting_cdb = false;
+                mesh_do_command(s);
+            }
+            mesh_update_devstat(s);
+        }
+
+        if (io->len == 0) {
+            s->dma_io = NULL;
+            io->dma_end(io);
+        }
+    }
+}
+
 static void mesh_dma_pump(MESHState *s)
 {
     DBDMA_io *io;
     int len;
+
+    if (s->dma_fifo) {
+        mesh_dma_fifo_pump(s);
+        return;
+    }
 
     while (s->dma_active && (io = s->dma_io) != NULL && s->data_ready &&
            s->async_len > 0 && s->to_xfer > 0 && io->len > 0) {
@@ -933,6 +1157,19 @@ static void mesh_dma_pump(MESHState *s)
         io->len -= len;
         trace_mesh_dma_xfer(s->to_device, io->addr - len, len, io->len,
                             s->to_xfer, s->async_len);
+
+        /*
+         * End the STEP before the descriptor: dma_end() returns control
+         * to the channel, which runs the rest of its command list
+         * inline. Mac OS X's list stores the Status sequencer command
+         * immediately after the data descriptor, so releasing the
+         * descriptor first got that command answered with a phase
+         * mismatch -- the model was still in Data In, because the step
+         * that ends the data phase had not run yet.
+         */
+        if (s->to_xfer == 0) {
+            mesh_step_done(s);
+        }
 
         if (io->len == 0) {
             s->dma_io = NULL;
@@ -971,10 +1208,9 @@ static void mesh_dma_flush(DBDMA_io *io)
     s->dma_io = NULL;
 }
 
-#define MESH_DMA_CHANNEL 0
-
 void mesh_register_dma(MESHState *s, void *dbdma)
 {
+    s->dbdma = dbdma;
     DBDMA_register_channel(dbdma, MESH_DMA_CHANNEL, s->dma_irq,
                            mesh_dma_rw, mesh_dma_flush, s);
 }
@@ -1009,7 +1245,7 @@ static void mesh_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_mesh = {
     .name = "mesh",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(fifo, MESHState, MESH_FIFO_SIZE),
@@ -1033,6 +1269,8 @@ static const VMStateDescription vmstate_mesh = {
         VMSTATE_UINT32_V(to_xfer, MESHState, 3),
         VMSTATE_BOOL_V(dma_active, MESHState, 3),
         VMSTATE_BOOL_V(step_done_pending, MESHState, 3),
+        VMSTATE_BOOL_V(dma_fifo, MESHState, 4),
+        VMSTATE_BOOL_V(seq_running, MESHState, 4),
         VMSTATE_END_OF_LIST()
     }
 };

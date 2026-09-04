@@ -141,8 +141,8 @@ static void conditional_interrupt(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_INTR_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & DEVSTAT;
+    sel_value = ch->regs[DBDMA_INTR_SEL] & DEVSTAT;
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -182,8 +182,8 @@ static int conditional_wait(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_WAIT_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & DEVSTAT;
+    sel_value = ch->regs[DBDMA_WAIT_SEL] & DEVSTAT;
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -248,8 +248,8 @@ static void conditional_branch(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_BRANCH_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & DEVSTAT;
+    sel_value = ch->regs[DBDMA_BRANCH_SEL] & DEVSTAT;
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -712,6 +712,40 @@ static void DBDMA_run_bh(void *opaque)
     DBDMA_DPRINTF("<- DBDMA_run_bh\n");
 }
 
+/*
+ * Publish a device's status lines (ChannelStatus[7:0], "s7..s0") for the
+ * channel it owns. A DBDMA command list steers itself on these through
+ * the WaitSelect / BranchSelect / IntSelect registers, so a device that
+ * never drives them can only ever be driven by a command list that does
+ * not test them.
+ *
+ * Mac OS X's AppleMesh is exactly such a driver: its whole SCSI
+ * transaction is one DBDMA command list that stores sequencer commands
+ * into the MESH and parks on `NOP + WAIT_IFSET` until the chip answers
+ * on these lines. Without them the list stalls on the first wait after
+ * the SELECT and the bus scan finds nothing.
+ */
+void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat)
+{
+    DBDMAState *s = dbdma;
+    DBDMA_channel *ch = &s->channels[nchan];
+    uint32_t old = ch->regs[DBDMA_STATUS];
+
+    ch->regs[DBDMA_STATUS] = (old & ~(uint32_t)DEVSTAT) | devstat;
+
+    /*
+     * A channel parked on an unmet wait re-evaluates on its own slow
+     * timer, but the device knowing the lines just moved lets the list
+     * continue at once instead of up to a millisecond later -- with a
+     * wait between every SCSI phase that is the difference between a
+     * usable disk and a crawling one.
+     */
+    if (ch->regs[DBDMA_STATUS] != old &&
+        (ch->regs[DBDMA_STATUS] & RUN) && (ch->regs[DBDMA_STATUS] & ACTIVE)) {
+        DBDMA_kick(s);
+    }
+}
+
 void DBDMA_kick(DBDMAState *dbdma)
 {
     qemu_bh_schedule(dbdma->bh);
@@ -894,6 +928,31 @@ static void dbdma_control_write(DBDMA_channel *ch)
         ch->current.xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
         ch->current.res_count = cpu_to_le16(ch->io.len);
         dbdma_cmdptr_save(ch);
+    }
+
+    /*
+     * A channel the driver has STOPPED (RUN 1->0) has no outstanding
+     * device transfer any more: ch->flush() above has just told the
+     * device to drop it, and the descriptor's residual has been written
+     * back. Leaving `processing` set outlives the stop and permanently
+     * blocks this channel -- only dma_end() ever clears it, and the
+     * transfer that would have called dma_end() is the one just
+     * abandoned. The re-activation path below then skips
+     * dbdma_cmdptr_load(), so the channel resumes on the STALE cached
+     * command instead of the new command pointer the driver has just
+     * written.
+     *
+     * Mac OS X's AppleMesh does exactly this on every short SCSI
+     * transfer: its interrupt handler stops the channel with a
+     * descriptor still half-consumed (a 96-byte INQUIRY that the target
+     * answered in 36), then points the channel at a fresh command list.
+     * Without this the SCSI bus scan died after its second command --
+     * arbitration and selection still ran from the CPU, but the channel
+     * program that issues everything after them never fetched again.
+     * (Same failure mode, and same fix, as the reset path below.)
+     */
+    if ((mask & RUN) && !(value & RUN)) {
+        ch->io.processing = false;
     }
 
     /* Finally update the status register image */
