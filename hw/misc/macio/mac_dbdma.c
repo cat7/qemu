@@ -118,6 +118,36 @@ static void kill_channel(DBDMA_channel *ch)
     qemu_irq_raise(ch->irq);
 }
 
+/*
+ * How many bits of ChannelStatus a Wait/Branch/Int condition may be
+ * compared against on this channel.
+ *
+ * The low nibble is the channel's own status (ACTIVE/DEAD/WAKE/FLUSH);
+ * bits 7:4 ("s7..s4") are driven by the attached device. A device that
+ * models those lines publishes them with DBDMA_set_devstat() and gets
+ * the full 8-bit comparison the hardware performs -- Mac OS X's
+ * AppleMesh steers its whole SCSI transaction on s5/s6/s7, so nothing
+ * less will do for that channel.
+ *
+ * A device that does NOT model them is a different matter. Its
+ * ChannelStatus[7:4] read back as zero, which is not what real silicon
+ * would present, so an 8-bit comparison answers the driver's question
+ * with a confident lie rather than declining to answer it. Mac OS X's
+ * BMac Ethernet driver is the case that matters: it programs its
+ * transmit channel's BranchSelect on those upper bits, and answering
+ * "condition false" sends its command list round its own loop forever
+ * -- each pass re-entering the device callback from dbdma_end(), so the
+ * main loop recurses with the BQL held until the process is wedged at
+ * 100% CPU (found by sampling a hung QEMU: thousands of nested
+ * bmac_tx_dma_rw frames under DBDMA_run_bh, vCPU blocked on the BQL in
+ * an MMIO read). Keeping the historical low-nibble mask there restores
+ * the always-true answer those drivers have always been given.
+ */
+static uint16_t devstat_sel_mask(DBDMA_channel *ch)
+{
+    return ch->devstat_driven ? DEVSTAT : 0x0f;
+}
+
 static void conditional_interrupt(DBDMA_channel *ch)
 {
     dbdma_cmd *current = &ch->current;
@@ -141,8 +171,8 @@ static void conditional_interrupt(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & DEVSTAT;
-    sel_value = ch->regs[DBDMA_INTR_SEL] & DEVSTAT;
+    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_INTR_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -182,8 +212,8 @@ static int conditional_wait(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & DEVSTAT;
-    sel_value = ch->regs[DBDMA_WAIT_SEL] & DEVSTAT;
+    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_WAIT_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -248,8 +278,8 @@ static void conditional_branch(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & DEVSTAT;
-    sel_value = ch->regs[DBDMA_BRANCH_SEL] & DEVSTAT;
+    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_BRANCH_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -731,6 +761,7 @@ void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat)
     DBDMA_channel *ch = &s->channels[nchan];
     uint32_t old = ch->regs[DBDMA_STATUS];
 
+    ch->devstat_driven = true;
     ch->regs[DBDMA_STATUS] = (old & ~(uint32_t)DEVSTAT) | devstat;
 
     /*

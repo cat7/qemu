@@ -1213,6 +1213,13 @@ void mesh_register_dma(MESHState *s, void *dbdma)
     s->dbdma = dbdma;
     DBDMA_register_channel(dbdma, MESH_DMA_CHANNEL, s->dma_irq,
                            mesh_dma_rw, mesh_dma_flush, s);
+    /*
+     * Publish the idle lines straight away. The channel only compares a
+     * driver's Wait/Branch/Int condition against the full 8-bit device
+     * status once it has been told this device drives those lines, and
+     * the first thing a channel program does may well be a wait.
+     */
+    mesh_update_devstat(s);
 }
 
 static void mesh_reset(DeviceState *dev)
@@ -1223,6 +1230,7 @@ static void mesh_reset(DeviceState *dev)
     s->dst_id = 0;
     s->sync_params = 2;
     s->status = 0;
+    mesh_update_devstat(s);
 }
 
 static void mesh_realize(DeviceState *dev, Error **errp)

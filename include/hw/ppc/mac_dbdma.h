@@ -200,6 +200,16 @@ typedef struct DBDMA_channel {
     DBDMA_flush flush;
     dbdma_cmd current;
     /*
+     * True once the owning device has published its status lines through
+     * DBDMA_set_devstat(). Only then may a Wait/Branch/Int condition be
+     * evaluated against the full 8-bit ChannelStatus[7:0]; a device that
+     * does not model those lines reads as all-zero, which is NOT what the
+     * hardware would show, and comparing against it turns a driver's
+     * condition into a definite (usually wrong) answer instead of the
+     * historical always-true. See the comment in devstat_sel_mask().
+     */
+    bool devstat_driven;
+    /*
      * Completing an unassigned channel's transfer synchronously let a
      * guest that kicks it in a tight, continuously-repeating loop (e.g.
      * probing for an audio-input device that isn't modeled) re-arm it
