@@ -85,6 +85,7 @@
 #define CMD_PTR_MASK   0x07
 #define CMD_CMD_MASK   0x38
 #define CMD_HI         0x08
+#define CMD_CLR_EXTINT 0x10
 #define CMD_CLR_TXINT  0x28
 #define CMD_CLR_IUS    0x38
 #define W_INTR    1
@@ -106,6 +107,9 @@
 #define TXCTRL1_1HSTOP 0x08
 #define TXCTRL1_2STOP  0x0c
 #define TXCTRL1_STPMSK 0x0c
+#define TXCTRL1_SYNCMOD 0x00 /* stop-bit field == 0: synchronous modes */
+#define TXCTRL1_SYNCMSK 0x30
+#define TXCTRL1_SDLC   0x20
 #define TXCTRL1_CLK1X  0x00
 #define TXCTRL1_CLK16X 0x40
 #define TXCTRL1_CLK32X 0x80
@@ -264,11 +268,46 @@ static int escc_update_irq_chn(ESCCChannelState *s)
             s->rxint == 1) ||
         /* rx ints enabled, pending */
         ((s->wregs[W_EXTINT] & EXTINT_BRKINT) &&
-            (s->rregs[R_STATUS] & STATUS_BRK)))) {
+            (s->rregs[R_STATUS] & STATUS_BRK)) ||
         /* break int e&p */
+        ((s->wregs[W_INTR] & INTR_INTALL) && s->extint))) {
+        /* external/status int e&p */
         return 1;
     }
     return 0;
+}
+
+static void escc_update_irq(ESCCChannelState *s);
+
+/*
+ * Raise an External/Status condition: set the RR0 bit and, if that source
+ * is enabled in WR15, latch an external/status interrupt. Cleared by the
+ * WR0 "Reset External/Status Interrupts" command.
+ */
+static void set_extint(ESCCChannelState *s, uint8_t status_bit)
+{
+    s->rregs[R_STATUS] |= status_bit;
+    if (!(s->wregs[W_EXTINT] & status_bit)) {
+        return;
+    }
+    s->extint = 1;
+    if (s->chn == escc_chn_a) {
+        s->rregs[R_INTR] |= INTR_EXTINTA;
+    } else {
+        s->otherchn->rregs[R_INTR] |= INTR_EXTINTB;
+    }
+    escc_update_irq(s);
+}
+
+static void clr_extint(ESCCChannelState *s)
+{
+    s->extint = 0;
+    if (s->chn == escc_chn_a) {
+        s->rregs[R_INTR] &= ~INTR_EXTINTA;
+    } else {
+        s->otherchn->rregs[R_INTR] &= ~INTR_EXTINTB;
+    }
+    escc_update_irq(s);
 }
 
 static void escc_update_irq(ESCCChannelState *s)
@@ -288,6 +327,7 @@ static void escc_reset_chn(ESCCChannelState *s)
     s->rx = s->tx = 0;
     s->rxint = s->txint = 0;
     s->rxint_under_svc = s->txint_under_svc = 0;
+    s->extint = 0;
     s->e0_mode = s->led_mode = s->caps_lock_mode = s->num_lock_mode = 0;
     s->sunmouse_dx = s->sunmouse_dy = s->sunmouse_buttons = 0;
     clear_queue(s);
@@ -575,6 +615,9 @@ static void escc_mem_write(void *opaque, hwaddr addr,
             case CMD_HI:
                 newreg |= CMD_HI;
                 break;
+            case CMD_CLR_EXTINT:
+                clr_extint(s);
+                break;
             case CMD_CLR_TXINT:
                 clr_txint(s);
                 break;
@@ -821,6 +864,22 @@ static void escc_dma_tx_rw(DBDMA_io *io)
     }
     io->len = 0;
     io->dma_end(io);
+
+    /*
+     * In SDLC, the end of a frame is signalled to the driver as the Tx
+     * Underrun/EOM External/Status condition: the transmitter runs out of
+     * data, closes the frame with the CRC and the closing flag, and sets
+     * RR0 bit 6. Mac OS's LocalTalk driver enables exactly that source
+     * (WR15 bit 6) and waits for it to learn that its LLAP frame went out.
+     *
+     * Restricted to SDLC because it is the SDLC frame boundary that is
+     * being reported; an asynchronous port has no frames and its driver
+     * must not be handed an interrupt it never armed a handler for.
+     */
+    if ((s->wregs[W_TXCTRL1] & TXCTRL1_STPMSK) == TXCTRL1_SYNCMOD &&
+        (s->wregs[W_TXCTRL1] & TXCTRL1_SYNCMSK) == TXCTRL1_SDLC) {
+        set_extint(s, STATUS_TXUNDRN);
+    }
 }
 
 static void escc_dma_tx_flush(DBDMA_io *io)
@@ -872,7 +931,7 @@ void escc_register_dma(ESCCState *s, void *dbdma)
 
 static const VMStateDescription vmstate_escc_chn = {
     .name = "escc_chn",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(vmstate_dummy, ESCCChannelState),
@@ -885,16 +944,17 @@ static const VMStateDescription vmstate_escc_chn = {
         VMSTATE_UINT8(tx, ESCCChannelState),
         VMSTATE_BUFFER(wregs, ESCCChannelState),
         VMSTATE_BUFFER(rregs, ESCCChannelState),
+        VMSTATE_UINT32_V(extint, ESCCChannelState, 3),
         VMSTATE_END_OF_LIST()
     }
 };
 
 static const VMStateDescription vmstate_escc = {
     .name = "escc",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_STRUCT_ARRAY(chn, ESCCState, 2, 2, vmstate_escc_chn,
+        VMSTATE_STRUCT_ARRAY(chn, ESCCState, 2, 3, vmstate_escc_chn,
                              ESCCChannelState),
         VMSTATE_END_OF_LIST()
     }

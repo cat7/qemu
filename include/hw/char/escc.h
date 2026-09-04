@@ -61,6 +61,14 @@ typedef struct ESCCChannelState {
     qemu_irq dma_rx_irq;
     void *rx_dma_io; /* DBDMA_io *, saved to complete RX DMA on byte arrival */
     bool rx_dma_waiting;
+
+    /*
+     * External/Status interrupt latch. The 8530 latches a set of RR0
+     * condition bits and raises one interrupt for them; the driver clears
+     * the latch with the WR0 "Reset External/Status Interrupts" command.
+     * Only the Break condition was ever modelled here.
+     */
+    uint32_t extint;
 } ESCCChannelState;
 
 struct ESCCState {
