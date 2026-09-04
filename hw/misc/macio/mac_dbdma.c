@@ -740,6 +740,7 @@ static void dbdma_control_write(DBDMA_channel *ch)
     uint16_t mask, value;
     uint32_t status;
     bool do_flush = false;
+    bool flush_cmd = false;
 
     mask = (ch->regs[DBDMA_CONTROL] >> 16) & 0xffff;
     value = ch->regs[DBDMA_CONTROL] & 0xffff;
@@ -823,6 +824,7 @@ static void dbdma_control_write(DBDMA_channel *ch)
          */
         ch->regs[DBDMA_STATUS] |= FLUSH;
         do_flush = true;
+        flush_cmd = true;
     }
 
     /* If either RUN or PAUSE is clear, so should ACTIVE be,
@@ -856,6 +858,42 @@ static void dbdma_control_write(DBDMA_channel *ch)
      */
     if (do_flush && ch->flush) {
         ch->flush(&ch->io);
+    }
+
+    /*
+     * A flush is not just "push the FIFO out": the DBDMA channel also
+     * updates the current command's resCount and xferStatus in memory
+     * before it clears the Flush bit, and it is that write-back the
+     * driver is really asking for. Apple's own idiom is
+     *
+     *     set Flush; while (ChannelStatus & Flush) ;
+     *     while (!(cmd->xferStatus & kdbdmaStatusActive)) { set Flush; ... }
+     *
+     * -- poll the *descriptor*, not the channel, because a channel that
+     * is still legitimately running tells you nothing about how far the
+     * current command got.
+     *
+     * Every other path here writes the descriptor back when the device
+     * completes (dbdma_end()). A command whose device has taken the
+     * transfer and parked -- an armed receive descriptor on a port with
+     * nothing arriving, which is the normal idle state of a serial or
+     * network receive channel -- never reaches that path, so without
+     * this the status word stays 0 forever and the loop above never
+     * terminates. Measured on g3beige: Mac OS 9.2 hangs on "Starting
+     * Up..." spinning on exactly this loop against the ESCC channel B
+     * receive channel (mac-io 0x8700), which the system arms while
+     * enumerating the built-in serial ports.
+     *
+     * Only an explicit Flush request writes back, and only while a
+     * device transfer is genuinely outstanding: if the device completed
+     * inside ch->flush() above, dbdma_end() has already done this and
+     * has advanced the command pointer, and re-writing here would stamp
+     * the current status over the *next* descriptor.
+     */
+    if (flush_cmd && ch->io.processing) {
+        ch->current.xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+        ch->current.res_count = cpu_to_le16(ch->io.len);
+        dbdma_cmdptr_save(ch);
     }
 
     /* Finally update the status register image */
