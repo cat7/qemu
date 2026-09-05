@@ -50,4 +50,15 @@ struct MacIONVRAMState {
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);
 void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr);
 
+/* True while the Old World OF partition is still exactly the default we
+ * wrote: valid, boot-device "/AAPL,ROM", no nvramrc. Once the guest has
+ * saved its own settings this is false and they must not be touched. */
+bool pmac_oldworld_nvram_is_default(MacIONVRAMState *nvr);
+
+/* Install an explicit boot path plus the nvramrc shim an Old World ROM
+ * needs to start Mac OS X (see mac_nvram.c for what the shim does and
+ * where it came from). */
+void pmac_oldworld_nvram_set_osx_startup(MacIONVRAMState *nvr,
+                                         const char *device);
+
 #endif /* MAC_NVRAM_H */

@@ -233,18 +233,12 @@ static const uint8_t oldworld_of_partition_strings[] = {
  * used to tell an already-valid, persisted partition (loaded from an
  * attached backing file, e.g. a prior boot's saved boot-device) apart
  * from a fresh/blank one that still needs our defaults. */
-static bool oldworld_of_partition_valid(const uint8_t *buf)
+static uint16_t oldworld_of_checksum(const uint8_t *buf)
 {
     uint8_t tmp[OLDWORLD_OF_SIZE];
     uint32_t acc = 0;
-    uint16_t stored;
     int i;
 
-    if (lduw_be_p(buf) != 0x1275 || buf[2] != 5) {
-        return false;
-    }
-
-    stored = lduw_be_p(buf + 4);
     memcpy(tmp, buf, OLDWORLD_OF_SIZE);
     tmp[4] = tmp[5] = 0;
     for (i = 0; i < OLDWORLD_OF_SIZE; i += 2) {
@@ -252,7 +246,97 @@ static bool oldworld_of_partition_valid(const uint8_t *buf)
     }
     acc = (acc + (acc >> 16)) & 0xffff;
 
-    return ((~acc) & 0xffff) == stored;
+    return (~acc) & 0xffff;
+}
+
+static bool oldworld_of_partition_valid(const uint8_t *buf)
+{
+    if (lduw_be_p(buf) != 0x1275 || buf[2] != 5) {
+        return false;
+    }
+
+    return oldworld_of_checksum(buf) == lduw_be_p(buf + 4);
+}
+
+/*
+ * The partition's string variables. Each is an (offset, length) pair of
+ * big-endian 16-bit words at OLDWORLD_OF_VARS, in this fixed order; the
+ * offsets are absolute NVRAM offsets into a string heap that grows DOWN
+ * from the end of the partition. "top" in the header tracks the lowest
+ * byte the heap has reached. Cross-checked against DingusPPC's
+ * devices/common/ofnvram.cpp, which exposes the same table to its
+ * debugger's setenv.
+ */
+#define OLDWORLD_OF_TOP         0x08
+#define OLDWORLD_OF_FLAGS       0x0c
+#define OLDWORLD_OF_VARS        0x34
+
+enum {
+    OF_VAR_BOOT_DEVICE, OF_VAR_BOOT_FILE, OF_VAR_DIAG_DEVICE,
+    OF_VAR_DIAG_FILE, OF_VAR_INPUT_DEVICE, OF_VAR_OUTPUT_DEVICE,
+    OF_VAR_OEM_BANNER, OF_VAR_OEM_LOGO, OF_VAR_NVRAMRC,
+    OF_VAR_BOOT_COMMAND, OF_VAR__COUNT
+};
+
+/* Flag bits are numbered from the MSB of the flags word, in the order
+ * little-endian?, real-mode?, auto-boot?, diag-switch?, fcode-debug?,
+ * oem-banner?, oem-logo?, use-nvramrc?, f-segment? -- same source. */
+#define OLDWORLD_OF_AUTO_BOOT       0x20000000
+#define OLDWORLD_OF_USE_NVRAMRC     0x01000000
+
+static const char *oldworld_of_get_var(const uint8_t *buf, int var,
+                                       unsigned *len)
+{
+    unsigned off = lduw_be_p(buf + OLDWORLD_OF_VARS + 4 * var);
+
+    *len = lduw_be_p(buf + OLDWORLD_OF_VARS + 4 * var + 2);
+    if (off < OLDWORLD_OF_OFFSET ||
+        off + *len > OLDWORLD_OF_OFFSET + OLDWORLD_OF_SIZE) {
+        *len = 0;
+        return NULL;
+    }
+    return (const char *)buf + (off - OLDWORLD_OF_OFFSET);
+}
+
+/*
+ * Rewrite the partition's variables, rebuilding the string heap. Returns
+ * false (leaving the partition untouched) if the strings do not fit.
+ */
+static bool oldworld_of_set_vars(uint8_t *buf,
+                                 const char *const value[OF_VAR__COUNT],
+                                 uint32_t flags)
+{
+    unsigned heap = OLDWORLD_OF_SIZE, off[OF_VAR__COUNT], len[OF_VAR__COUNT];
+    uint8_t new_part[OLDWORLD_OF_SIZE];
+    unsigned table_end = lduw_be_p(buf + 0x06) - OLDWORLD_OF_OFFSET;
+    int i;
+
+    memcpy(new_part, buf, OLDWORLD_OF_SIZE);
+
+    for (i = 0; i < OF_VAR__COUNT; i++) {
+        len[i] = value[i] ? strlen(value[i]) : 0;
+        if (len[i] > heap || heap - len[i] < table_end) {
+            return false;
+        }
+        heap -= len[i];
+        memcpy(new_part + heap, value[i], len[i]);
+        off[i] = heap;
+    }
+
+    memset(new_part + table_end, 0, heap - table_end);
+    for (i = 0; i < OF_VAR__COUNT; i++) {
+        /* an empty variable still needs a plausible offset: the heap top */
+        stw_be_p(new_part + OLDWORLD_OF_VARS + 4 * i,
+                 OLDWORLD_OF_OFFSET + (len[i] ? off[i] : heap));
+        stw_be_p(new_part + OLDWORLD_OF_VARS + 4 * i + 2, len[i]);
+    }
+    stw_be_p(new_part + OLDWORLD_OF_TOP, OLDWORLD_OF_OFFSET + heap);
+    stl_be_p(new_part + OLDWORLD_OF_FLAGS, flags);
+    stw_be_p(new_part + 4, 0);
+    stw_be_p(new_part + 4, oldworld_of_checksum(new_part));
+
+    memcpy(buf, new_part, OLDWORLD_OF_SIZE);
+    return true;
 }
 
 /* Set up the Old World genuine-OF NVRAM partition (not the CHRP/OpenBIOS
@@ -307,6 +391,131 @@ void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr)
             error_report("%s: failed to write default Old World NVRAM "
                         "partition", blk_name(nvr->blk));
         }
+    }
+}
+
+/*
+ * Point a pristine Old World NVRAM at a Mac OS X startup device.
+ *
+ * The ROM's own "/AAPL,ROM" boot scan only ever finds a classic Mac OS
+ * system, and Old World Open Firmware cannot read HFS+ at all, so a
+ * machine whose only disk holds Mac OS X reaches the flashing question
+ * mark and stops. On real hardware you escape that by booting Mac OS 9
+ * once: its Startup Disk control panel writes an explicit boot-device
+ * AND an nvramrc that patches OF's mac-parts package so it can load
+ * BootX, patches mac-io's decode-unit so the unit address in that path
+ * parses, and releases the low memory BootX needs. Both halves are
+ * required -- either one alone gets as far as switching the video mode
+ * and then dies with the CPU at address 0 (measured, 2026-09-06).
+ *
+ * A guest that has never run Mac OS 9 has no way to get that written,
+ * so do for it what the control panel would: when the partition is
+ * still exactly our untouched default, install the shim and the path.
+ * Anything the guest itself has since written is left alone.
+ */
+/*
+ * The word is called "bootr", and boot-command invokes it exactly as
+ * Apple's does, because Mac OS X rewrites boot-command to "0 bootr "
+ * itself during its first boot while leaving nvramrc alone (observed
+ * 2026-09-06). Under any other name our shim would define a word that
+ * nothing calls afterwards, and the second boot would fail. The leading
+ * 0 is an argument Apple's version reads; ours ignores it.
+ */
+static const char oldworld_osx_boot_command[] = "0 bootr ";
+
+/*
+ * The shim itself. Three jobs, and every one of them was proven
+ * necessary by dropping it and watching the boot die (2026-09-06):
+ *
+ *  - mac-parts: Old World OF cannot read HFS+, so its partition package
+ *    is branch-patched until it can load BootX off the volume. Without
+ *    this the boot reaches the video-mode switch and the CPU ends at 0.
+ *  - mac-io decode-unit: makes the "@0" unit address in a boot path like
+ *    "ide0/@0:6" parse as hex. Without it the path does not resolve and
+ *    the boot dies the same way.
+ *  - qmem/qargs: release the low memory BootX loads into, stop OF
+ *    reinstalling its interrupt vectors over it, and give /chosen the
+ *    empty "machargs" property the kernel looks for.
+ *
+ * This is our own Forth, written against the behaviour above and tested
+ * on a Mac OS X 10.0 volume, which it boots to the desktop in ~90 s.
+ * Apple's own control panel writes a longer script for the same job,
+ * with key-map polling for the boot-time modifier keys and a retry loop;
+ * none of that is reproduced here.
+ */
+static const char oldworld_osx_boot_shim[] =
+    "hex\r"
+    ": qE device-end ;\r"
+    ": qL BLpatch ;\r"
+    ": qR BRpatch ;\r"
+    ": qprop 0 to my-self property ;\r"
+    ": qargs \" \" encode-string \" machargs\" \" /chosen\" find-device "
+        "qprop qE ;\r"
+    ": qmem ['] install-interrupt-vectors ['] noop qR\r"
+    "0 4000 release-mem 8000 2000 release-mem ;\r"
+    "dev /packages/mac-parts\r"
+    ": qM 7F00 - 4 ;\r"
+    "' my-init-program 34 + ' qM qL\r"
+    "' load-partition dup\r"
+    "80 + ' 2drop qL\r"
+    "104 + ' 0 qL\r"
+    "' load 15C + ' 0 qL\r"
+    "qE\r"
+    "dev mac-io\r"
+    ": decode-unit parse-1hex ;\r"
+    "qE\r"
+    ": bootr qargs qmem boot ;\r";
+
+bool pmac_oldworld_nvram_is_default(MacIONVRAMState *nvr)
+{
+    const uint8_t *buf = &nvr->data[OLDWORLD_OF_OFFSET];
+    const char *dev;
+    unsigned dev_len, rc_len;
+
+    if (!oldworld_of_partition_valid(buf)) {
+        return false;
+    }
+    dev = oldworld_of_get_var(buf, OF_VAR_BOOT_DEVICE, &dev_len);
+    oldworld_of_get_var(buf, OF_VAR_NVRAMRC, &rc_len);
+
+    return rc_len == 0 && dev_len == strlen("/AAPL,ROM") &&
+           !memcmp(dev, "/AAPL,ROM", dev_len);
+}
+
+void pmac_oldworld_nvram_set_osx_startup(MacIONVRAMState *nvr,
+                                         const char *device)
+{
+    uint8_t *buf = &nvr->data[OLDWORLD_OF_OFFSET];
+    const char *value[OF_VAR__COUNT] = { NULL };
+    unsigned len;
+    int i;
+
+    for (i = 0; i < OF_VAR__COUNT; i++) {
+        value[i] = oldworld_of_get_var(buf, i, &len);
+        value[i] = len ? g_strndup(value[i], len) : NULL;
+    }
+    g_free((char *)value[OF_VAR_BOOT_DEVICE]);
+    value[OF_VAR_BOOT_DEVICE] = g_strdup(device);
+    g_free((char *)value[OF_VAR_NVRAMRC]);
+    value[OF_VAR_NVRAMRC] = g_strdup(oldworld_osx_boot_shim);
+    g_free((char *)value[OF_VAR_BOOT_COMMAND]);
+    value[OF_VAR_BOOT_COMMAND] = g_strdup(oldworld_osx_boot_command);
+
+    if (!oldworld_of_set_vars(buf, value,
+                              ldl_be_p(buf + OLDWORLD_OF_FLAGS) |
+                              OLDWORLD_OF_AUTO_BOOT |
+                              OLDWORLD_OF_USE_NVRAMRC)) {
+        warn_report("NVRAM: Mac OS X startup shim does not fit, leaving "
+                    "the default partition alone");
+    } else if (nvr->blk &&
+               blk_pwrite(nvr->blk, OLDWORLD_OF_OFFSET, OLDWORLD_OF_SIZE,
+                          buf, 0) < 0) {
+        error_report("%s: failed to write the Mac OS X startup NVRAM "
+                     "partition", blk_name(nvr->blk));
+    }
+
+    for (i = 0; i < OF_VAR__COUNT; i++) {
+        g_free((char *)value[i]);
     }
 }
 

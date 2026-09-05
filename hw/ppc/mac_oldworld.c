@@ -40,6 +40,7 @@
 #include "hw/pci/pci_host.h"
 #include "hw/pci-host/grackle.h"
 #include "hw/nvram/fw_cfg.h"
+#include "hw/nvram/mac_nvram.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
 #include "hw/misc/macio/cuda.h"
@@ -227,6 +228,128 @@ static uint8_t *g3beige_spd_data_generate(uint64_t ram_size,
  * persisted content is read back and left alone instead of being
  * overwritten again (see pmac_format_nvram_partition_oldworld()).
  */
+/*
+ * What can this volume start? Reads the HFS+ volume header (hopping
+ * through an HFS wrapper if there is one) and looks at the two blessed
+ * directory IDs Apple defines in Technote 1150: finderInfo[3] is the
+ * Mac OS 8/9 System Folder, finderInfo[5] the Mac OS X one. Verified
+ * against three of this project's disks -- a 9.2 install reports only
+ * [3], a 10.0 and a 10.2 install only [5].
+ */
+static void mac_oldworld_volume_systems(BlockBackend *blk, uint64_t part_start,
+                                        bool *has_osx, bool *has_classic)
+{
+    uint8_t vh[512];
+    uint64_t base = part_start * 512;
+
+    if (blk_pread(blk, base + 1024, sizeof(vh), vh, 0) < 0) {
+        return;
+    }
+    if (!memcmp(vh, "BD", 2)) {              /* HFS wrapper around an HFS+ */
+        uint32_t al_size = ldl_be_p(vh + 20);
+        uint16_t al_start = lduw_be_p(vh + 28);
+        uint16_t embed = lduw_be_p(vh + 126);
+
+        if (memcmp(vh + 124, "H+", 2) || !al_size) {
+            return;                          /* a plain HFS volume */
+        }
+        base += (uint64_t)al_start * 512 + (uint64_t)embed * al_size;
+        if (blk_pread(blk, base + 1024, sizeof(vh), vh, 0) < 0) {
+            return;
+        }
+    }
+    if (memcmp(vh, "H+", 2) && memcmp(vh, "HX", 2)) {
+        return;
+    }
+    *has_osx |= ldl_be_p(vh + 80 + 5 * 4) != 0;
+    *has_classic |= ldl_be_p(vh + 80 + 3 * 4) != 0;
+}
+
+/*
+ * Walk a disk's Apple partition map. Returns the partition number of a
+ * Mac OS X system volume, counting the way Open Firmware does (the map
+ * itself is 1), or 0 for none; *has_classic is set if anything on the
+ * disk can be started by the ROM on its own.
+ */
+static int mac_oldworld_osx_partition(BlockBackend *blk, bool *has_classic)
+{
+    uint8_t buf[512];
+    uint32_t map_blocks = 1;
+    int osx_part = 0;
+    uint32_t i;
+
+    if (blk_pread(blk, 0, sizeof(buf), buf, 0) < 0 || memcmp(buf, "ER", 2)) {
+        return 0;
+    }
+    for (i = 1; i <= map_blocks && i < 64; i++) {
+        bool osx = false;
+
+        if (blk_pread(blk, (uint64_t)i * 512, sizeof(buf), buf, 0) < 0 ||
+            memcmp(buf, "PM", 2)) {
+            break;
+        }
+        map_blocks = ldl_be_p(buf + 4);
+        if (strncmp((char *)buf + 48, "Apple_HFS", 9)) {
+            continue;
+        }
+        mac_oldworld_volume_systems(blk, ldl_be_p(buf + 8), &osx, has_classic);
+        if (osx && !osx_part) {
+            osx_part = i;
+        }
+    }
+    return osx_part;
+}
+
+/*
+ * Do for a fresh machine what Mac OS 9's Startup Disk control panel does
+ * for a real one. The ROM's own boot scan only finds classic systems, so
+ * a machine whose disks hold only Mac OS X would sit at the flashing
+ * question mark forever with nothing able to write the NVRAM that fixes
+ * it. When that -- and only that -- is the situation, point NVRAM at the
+ * Mac OS X volume and install the shim OF needs to load it.
+ *
+ * Anything else is left alone: a disk the ROM can boot by itself, a
+ * guest that has since written its own NVRAM, an NVRAM image the user
+ * supplied.
+ */
+static void mac_oldworld_pick_startup_device(Object *macio, DriveInfo **hd,
+                                             int n)
+{
+    MacIONVRAMState *nvram;
+    bool has_classic = false;
+    int i, osx_drive = -1, osx_part = 0;
+
+    nvram = MACIO_NVRAM(object_resolve_path_component(macio, "nvram"));
+    if (!pmac_oldworld_nvram_is_default(nvram)) {
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        BlockBackend *blk;
+        int part;
+
+        if (!hd[i]) {
+            continue;
+        }
+        blk = blk_by_legacy_dinfo(hd[i]);
+        part = blk ? mac_oldworld_osx_partition(blk, &has_classic) : 0;
+        if (part && osx_drive < 0) {
+            osx_drive = i;
+            osx_part = part;
+        }
+    }
+
+    if (has_classic || osx_drive < 0) {
+        return;
+    }
+
+    g_autofree char *device = g_strdup_printf("ide%d/@%d:%d", osx_drive / 2,
+                                              osx_drive % 2, osx_part);
+    info_report("NVRAM: no disk this ROM can start on its own, but %s holds "
+                "Mac OS X -- pointing a fresh NVRAM at it", device);
+    pmac_oldworld_nvram_set_osx_startup(nvram, device);
+}
+
 static BlockBackend *mac_oldworld_default_nvram_blk(void)
 {
     static const char filename[] = "nvram.img";
@@ -493,6 +616,10 @@ static void ppc_heathrow_init(MachineState *machine)
 
     macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
     macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
+
+    /* after the drives are attached, so reading them needs no permissions
+     * of our own */
+    mac_oldworld_pick_startup_device(macio, hd, ARRAY_SIZE(hd));
 
     /* MacIO CUDA/ADB */
     dev = DEVICE(object_resolve_path_component(macio, "cuda"));
