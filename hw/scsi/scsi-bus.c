@@ -1231,11 +1231,23 @@ static int scsi_req_xfer(SCSICommand *cmd, SCSIDevice *dev, uint8_t *buf)
     case SEND_DIAGNOSTIC:
         cmd->xfer = buf[4] | (buf[3] << 8);
         break;
-    case READ_CD:
     case READ_BUFFER:
     case WRITE_BUFFER:
     case SEND_CUE_SHEET:
         cmd->xfer = buf[8] | (buf[7] << 8) | (buf[6] << 16);
+        break;
+    case READ_CD:
+        /*
+         * The 24-bit field is a BLOCK count, and how many bytes a block is
+         * depends on which parts of the sector byte 9 asks for -- 2048 for
+         * the cooked user data, 2352 for the whole raw sector.  Counting it
+         * as bytes made every READ CD a one-byte transfer.
+         */
+        cmd->xfer = (buf[8] | (buf[7] << 8) | (buf[6] << 16)) *
+                    scsi_read_cd_block_size(buf[9]);
+        break;
+    case READ_CD_DA:
+        cmd->xfer = ldl_be_p(&buf[6]) * scsi_read_cd_da_block_size(buf[10]);
         break;
     case PERSISTENT_RESERVE_OUT:
         cmd->xfer = ldl_be_p(&buf[5]) & 0xffffffffULL;

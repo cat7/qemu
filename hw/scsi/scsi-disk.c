@@ -1441,6 +1441,101 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
     return buflen;
 }
 
+/*
+ * Wrap 2048 bytes of user data, already sitting at buf + 16, in the header
+ * and ECC area of a 2352-byte raw Mode 1 CD sector.  Same shape as
+ * hw/ide/atapi.c's cd_data_to_raw(): the ECC/EDC bytes are zeroed rather
+ * than computed, which is enough for a driver that reads a raw sector to
+ * learn the sector's mode.
+ */
+static void scsi_cd_data_to_raw(uint8_t *buf, int lba)
+{
+    buf[0] = 0x00;
+    memset(buf + 1, 0xff, 10);
+    buf[11] = 0x00;
+    lba += 150;
+    buf[12] = (lba / 75) / 60;
+    buf[13] = (lba / 75) % 60;
+    buf[14] = lba % 75;
+    buf[15] = 0x01;                             /* mode 1 data */
+    memset(buf + 16 + 2048, 0, 288);
+}
+
+/*
+ * READ CD (0xbe) and the vendor READ CD-DA (0xd8).
+ *
+ * Apple's CD drivers establish a disc's sector format by reading LBA 0 as
+ * a raw 2352-byte sector before they will mount anything on it: Mac OS X
+ * 10.1 asks with READ CD and every sector area selected, 10.2 asks with
+ * READ CD-DA.  Answering either with INVALID COMMAND makes the driver give
+ * up on the disc and eject it, so an emulated SCSI CD-ROM has to serve
+ * them.  hw/ide/atapi.c has had READ CD since 2006, which is why the same
+ * disc mounts from the ATAPI CD-ROM and not from here.
+ *
+ * Returns the number of bytes placed in outbuf, or -1 when the sense has
+ * been set and the caller should just return.
+ */
+static int scsi_disk_emulate_read_cd(SCSIDiskReq *r, uint8_t *outbuf)
+{
+    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
+    uint8_t *buf = r->req.cmd.buf;
+    uint64_t nb_sectors, total_blocks;
+    uint32_t lba, nblocks, block_size;
+    uint32_t i;
+
+    lba = ldl_be_p(&buf[2]);
+    if (buf[0] == READ_CD) {
+        nblocks = buf[8] | (buf[7] << 8) | (buf[6] << 16);
+        if ((buf[9] & 0xf8) == 0) {
+            return 0;                           /* nothing was asked for */
+        }
+        block_size = scsi_read_cd_block_size(buf[9]);
+    } else {
+        nblocks = ldl_be_p(&buf[6]);
+        block_size = scsi_read_cd_da_block_size(buf[10]);
+    }
+    if (nblocks == 0) {
+        return 0;
+    }
+    if (block_size == 0) {
+        /* a combination of sector areas or subchannels we do not build */
+        scsi_check_condition(r, SENSE_CODE(INVALID_FIELD));
+        return -1;
+    }
+
+    /* CD sectors are 2048 bytes on the medium whatever MODE SELECT said */
+    blk_get_geometry(s->qdev.conf.blk, &nb_sectors);
+    total_blocks = nb_sectors / (2048 / BDRV_SECTOR_SIZE);
+    if (lba >= total_blocks || nblocks > total_blocks - lba) {
+        scsi_check_condition(r, SENSE_CODE(LBA_OUT_OF_RANGE));
+        return -1;
+    }
+    if ((uint64_t)nblocks * block_size > r->buflen) {
+        /*
+         * The emulated-command buffer is capped at 64K.  A driver probing
+         * a sector's format reads one or two of them; anything larger is
+         * declined rather than silently truncated.
+         */
+        scsi_check_condition(r, SENSE_CODE(INVALID_FIELD));
+        return -1;
+    }
+
+    for (i = 0; i < nblocks; i++) {
+        uint8_t *p = outbuf + (size_t)i * block_size;
+        uint8_t *data = (block_size == 2048) ? p : p + 16;
+
+        if (blk_pread(s->qdev.conf.blk, ((uint64_t)lba + i) * 2048,
+                      2048, data, 0) < 0) {
+            scsi_check_condition(r, SENSE_CODE(READ_ERROR));
+            return -1;
+        }
+        if (block_size != 2048) {
+            scsi_cd_data_to_raw(p, lba + i);
+        }
+    }
+    return nblocks * block_size;
+}
+
 static int scsi_disk_emulate_read_toc(SCSIRequest *req, uint8_t *outbuf)
 {
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, req->dev);
@@ -1449,6 +1544,19 @@ static int scsi_disk_emulate_read_toc(SCSIRequest *req, uint8_t *outbuf)
 
     msf = req->cmd.buf[1] & 2;
     format = req->cmd.buf[2] & 0xf;
+    if (format == 0) {
+        /*
+         * MMC-1 and SCSI-2 carried the format in the top two bits of byte
+         * 9; MMC-2 moved it to byte 2 and left byte 9 vendor-specific, so
+         * a drive has to honour both.  hw/ide/atapi.c reads byte 9 only,
+         * and this read byte 2 only -- which is why Apple's CD drivers,
+         * classic Mac OS and Mac OS X 10.0-10.2 alike, get a plain TOC
+         * here where they asked for the full one and read the ATAPI CD
+         * fine.  Byte 2 wins when it is set, so nothing that uses the
+         * modern field changes.
+         */
+        format = req->cmd.buf[9] >> 6;
+    }
     start_track = req->cmd.buf[6];
     blk_get_geometry(s->qdev.conf.blk, &nb_sectors);
     trace_scsi_disk_emulate_read_toc(start_track, format, msf >> 1);
@@ -2088,6 +2196,22 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
             goto illegal_request;
         }
         break;
+    case READ_CD:
+    case READ_CD_DA:
+        if (s->qdev.type != TYPE_ROM) {
+            goto unknown_command;
+        }
+        buflen = scsi_disk_emulate_read_cd(r, outbuf);
+        if (buflen < 0) {
+            return 0;
+        }
+        break;
+    case SET_CD_SPEED:
+        /* the model has no spindle to slow down, but saying so is fatal */
+        if (s->qdev.type != TYPE_ROM) {
+            goto unknown_command;
+        }
+        break;
     case RESERVE:
         if (req->cmd.buf[1] & 1) {
             goto illegal_request;
@@ -2266,6 +2390,7 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
         trace_scsi_disk_emulate_command_FORMAT_UNIT(r->req.cmd.xfer);
         break;
     default:
+    unknown_command:
         trace_scsi_disk_emulate_command_UNKNOWN(buf[0],
                                                 scsi_command_name(buf[0]));
         scsi_check_condition(r, SENSE_CODE(INVALID_OPCODE));

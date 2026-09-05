@@ -148,6 +148,7 @@
 #define SET_CD_SPEED          0xbb
 #define MECHANISM_STATUS      0xbd
 #define READ_CD               0xbe
+#define READ_CD_DA            0xd8
 #define SEND_DVD_STRUCTURE    0xbf
 
 /*

@@ -134,6 +134,8 @@ uint64_t scsi_cmd_lba(SCSICommand *cmd);
 uint32_t scsi_data_cdb_xfer(uint8_t *buf);
 uint32_t scsi_cdb_xfer(uint8_t *buf);
 int scsi_cdb_length(uint8_t *buf);
+uint32_t scsi_read_cd_block_size(uint8_t flags);
+uint32_t scsi_read_cd_da_block_size(uint8_t subcode);
 
 /* Linux SG_IO interface.  */
 #ifdef CONFIG_LINUX

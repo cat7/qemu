@@ -61,6 +61,9 @@ uint64_t scsi_cmd_lba(SCSICommand *cmd)
     case 4:
         lba = ldq_be_p(&buf[2]);
         break;
+    case 6:
+        lba = (buf[0] == READ_CD_DA) ? ldl_be_p(&buf[2]) : -1;
+        break;
     default:
         lba = -1;
 
@@ -86,10 +89,48 @@ int scsi_cdb_length(uint8_t *buf)
     case 5:
         cdb_len = 12;
         break;
+    case 6:
+        /*
+         * Vendor-specific group.  The only opcode in it we understand is
+         * the Sony/Matsushita READ CD-DA that Mac OS X 10.2 uses to read a
+         * CD's raw sectors, and that is a 12-byte CDB.  Everything else in
+         * the group stays unparseable, as before.
+         */
+        cdb_len = (buf[0] == READ_CD_DA) ? 12 : -1;
+        break;
     default:
         cdb_len = -1;
     }
     return cdb_len;
+}
+
+/*
+ * Bytes a CD-ROM returns per block for the sector areas selected by the
+ * flags in byte 9 of READ CD, or 0 for a combination we do not build.
+ * Only the two ATAPI (hw/ide/atapi.c) supports are meaningful in practice:
+ * the cooked 2048-byte user data, and the whole 2352-byte raw sector.
+ */
+uint32_t scsi_read_cd_block_size(uint8_t flags)
+{
+    switch (flags & 0xf8) {
+    case 0x10:
+        return 2048;
+    case 0xf8:
+        return 2352;
+    default:
+        /* 0x00 asks for nothing at all; anything else we decline */
+        return 0;
+    }
+}
+
+/*
+ * Same, for the subcode selection in byte 10 of the vendor READ CD-DA.
+ * Subcode 0 is the bare 2352-byte sector; the P-W and Q variants would
+ * need subchannel data we do not have.
+ */
+uint32_t scsi_read_cd_da_block_size(uint8_t subcode)
+{
+    return subcode == 0 ? 2352 : 0;
 }
 
 SCSISense scsi_parse_sense_buf(const uint8_t *in_buf, int in_len)
