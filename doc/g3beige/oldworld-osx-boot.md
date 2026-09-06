@@ -160,9 +160,51 @@ The partition numbering matches what Apple's own control panel produces:
 this machine's saved NVRAM for a 10.2 disk reads `ide1/@1:9`, and our
 scan independently picks partition 9 on that disk.
 
+### SCSI disks count too
+
+The scan runs from a machine-init-done notifier, not from machine init,
+because SCSI disks arrive as `-device scsi-hd` and do not exist until the
+command-line devices have been created. It then walks the eight MESH
+targets. A classic system on SCSI means hands off, exactly as on IDE —
+the ROM scans SCSI first, so that disk is what it would boot. This was
+found the hard way: a fresh NVRAM with several OS X disks on IDE and
+Mac OS 8.1 on SCSI was pointed at OS X before SCSI was looked at at all.
+
+A Mac OS X system on a SCSI disk is *not* selected as the startup device;
+only its classic-or-not verdict is used. The Open Firmware path form for
+a MESH target has not been established here.
+
+### A slave behind a CD-ROM cannot be opened (not an NVRAM problem)
+
+Selecting a 10.2 disk from the Startup Disk pane inside 10.0 wrote a
+correct `boot-device` of `ide1/@1:9` — byte-identical to what Apple's
+own Mac OS 9 control panel had written on this machine — and the next
+boot went black. The cause is not the NVRAM: after a reset Open Firmware
+drops to its prompt with
+
+```
+unable to open: ide1/@1:9
+```
+
+In that layout the 10.2 install CD sat at `ide1/@0`, so the disk was a
+slave behind an ATAPI master. Cold-boot arms on that exact layout:
+
+| nvramrc | CD at `ide1/@0` | result |
+|---|---|---|
+| Apple's full script | yes | loops, falls back to a garbled classic-ROM screen |
+| ours, with `mac-parts` | yes | NIP 0 |
+| ours, short | **no** | 10.2 desktop |
+| ours, short, disk alone at `ide0/@0:9` | — | 10.2 desktop |
+
+So the shim is irrelevant and the CD on the same bus is the trigger.
+Whether real OF 2.4 can open a slave behind an ATAPI master is not
+known; on this emulation it cannot. Until that is understood, keep a
+CD-ROM on a different bus from any OS X disk you want to select, or
+detach it for the boot. There is no `pram.img` in the affected machine
+folder at all, which is a separate oddity; PRAM is not involved here.
+
 ### Limits
 
-- Only the IDE drives are scanned. SCSI (MESH) disks are not looked at.
 - The partition map is read assuming 512-byte blocks. A CD image whose
   Apple partition map uses 2048-byte blocks (most `.iso` files in this
   project, e.g. `iso/9.0.4.iso`) is not detected: the reads land on the

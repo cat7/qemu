@@ -41,6 +41,7 @@
 #include "hw/pci-host/grackle.h"
 #include "hw/nvram/fw_cfg.h"
 #include "hw/nvram/mac_nvram.h"
+#include "hw/scsi/scsi.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
 #include "hw/misc/macio/cuda.h"
@@ -329,36 +330,63 @@ static int mac_oldworld_osx_partition(BlockBackend *blk, bool *has_classic)
  * guest that has since written its own NVRAM, an NVRAM image the user
  * supplied.
  *
- * Limits: only the IDE drives are looked at -- SCSI (MESH) disks are not
- * scanned. The partition map is read assuming 512-byte blocks; a CD
- * image whose Apple partition map uses 2048-byte blocks is therefore not
- * detected (its reads land on the wrong sectors and count as "nothing"),
- * so such a CD neither becomes the startup device nor counts as classic.
+ * Runs from a machine-init-done notifier rather than from machine init,
+ * because SCSI disks arrive as -device scsi-hd and only exist once the
+ * command-line devices have been created. A classic system on the MESH
+ * bus counts exactly like one on IDE: the ROM scans SCSI first, so a
+ * Mac OS 8/9 disk there is what it would boot, and we must not override
+ * it (2026-09-06: a fresh NVRAM with several OS X IDE disks and Mac OS
+ * 8.1 on SCSI was pointed at OS X before this looked at SCSI at all).
+ *
+ * Limits: a Mac OS X system on a SCSI disk is not selected -- only its
+ * classic-or-not verdict is used -- because the Open Firmware path for a
+ * MESH target has not been established here. The partition map is read
+ * assuming 512-byte blocks; a CD image whose Apple partition map uses
+ * 2048-byte blocks is therefore not detected (its reads land on the
+ * wrong sectors and count as "nothing"), so such a CD neither becomes
+ * the startup device nor counts as classic.
  */
-static void mac_oldworld_pick_startup_device(Object *macio, DriveInfo **hd,
-                                             int n)
+typedef struct {
+    Notifier notifier;
+    Object *macio;
+    DriveInfo *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
+} MacOldworldStartupPick;
+
+static void mac_oldworld_pick_startup_device(Notifier *notifier, void *data)
 {
+    MacOldworldStartupPick *pick =
+        container_of(notifier, MacOldworldStartupPick, notifier);
     MacIONVRAMState *nvram;
+    MESHState *mesh;
     bool has_classic = false;
     int i, osx_drive = -1, osx_part = 0;
 
-    nvram = MACIO_NVRAM(object_resolve_path_component(macio, "nvram"));
+    nvram = MACIO_NVRAM(object_resolve_path_component(pick->macio, "nvram"));
     if (!pmac_oldworld_nvram_is_default(nvram)) {
         return;
     }
 
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < ARRAY_SIZE(pick->hd); i++) {
         BlockBackend *blk;
         int part;
 
-        if (!hd[i]) {
+        if (!pick->hd[i]) {
             continue;
         }
-        blk = blk_by_legacy_dinfo(hd[i]);
+        blk = blk_by_legacy_dinfo(pick->hd[i]);
         part = blk ? mac_oldworld_osx_partition(blk, &has_classic) : 0;
         if (part && osx_drive < 0) {
             osx_drive = i;
             osx_part = part;
+        }
+    }
+
+    mesh = MESH(object_resolve_path_component(pick->macio, "mesh"));
+    for (i = 0; i < 8; i++) {
+        SCSIDevice *sd = scsi_device_find(&mesh->bus, 0, i, 0);
+
+        if (sd && sd->conf.blk) {
+            mac_oldworld_osx_partition(sd->conf.blk, &has_classic);
         }
     }
 
@@ -640,9 +668,15 @@ static void ppc_heathrow_init(MachineState *machine)
     macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
     macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
 
-    /* after the drives are attached, so reading them needs no permissions
-     * of our own */
-    mac_oldworld_pick_startup_device(macio, hd, ARRAY_SIZE(hd));
+    /* once every -device is in place, so the SCSI disks are visible too */
+    {
+        MacOldworldStartupPick *pick = g_new0(MacOldworldStartupPick, 1);
+
+        pick->notifier.notify = mac_oldworld_pick_startup_device;
+        pick->macio = macio;
+        memcpy(pick->hd, hd, sizeof(pick->hd));
+        qemu_add_machine_init_done_notifier(&pick->notifier);
+    }
 
     /* MacIO CUDA/ADB */
     dev = DEVICE(object_resolve_path_component(macio, "cuda"));
