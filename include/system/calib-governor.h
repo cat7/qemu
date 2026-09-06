@@ -83,7 +83,13 @@ void calib_governor_set_cpu_clock(uint64_t hz);
 bool calib_governor_arm_cpu_probe(void);
 
 /* Called when the guest reads T1's counter, which ends that loop. */
-void calib_governor_end_cpu_probe(void);
+/*
+ * The guest has read T1 back: the probe loop is over. Returns the time
+ * the loop took for the guest's purposes (nanoseconds, see the governor
+ * for how that is derived), 0 for a window that ran nothing, or -1 when
+ * no probe window was open.
+ */
+int64_t calib_governor_end_cpu_probe(void);
 
 /* Machine-property plumbing: "on" | "off" | "mips=<n>". */
 bool calib_governor_configure(const char *value, Error **errp);

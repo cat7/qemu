@@ -288,6 +288,37 @@ static unsigned int get_counter(MOS6522State *s, MOS6522Timer *ti)
     return counter;
 }
 
+/*
+ * T1 as read back after XNU's CPU-speed probe loop. Reading the counter
+ * is the last thing pe_run_clock_test() does, so the first read of
+ * either byte ends the probe window; the governor says how long the
+ * loop took for the guest's purposes, and both bytes are served from
+ * that one answer so the guest never mixes a real byte with an answered
+ * one whichever order it reads them in. With no window open, or for a
+ * window that ran nothing, this is the plain counter.
+ */
+static unsigned int mos6522_t1_probe_read(MOS6522State *s)
+{
+    MOS6522Timer *ti = &s->timers[0];
+    int64_t answer_ns;
+
+    if (s->t1_probe_pending) {
+        s->t1_probe_pending = false;
+        return s->t1_probe_value;
+    }
+    answer_ns = calib_governor_end_cpu_probe();
+    if (answer_ns <= 0) {
+        return get_counter(s, ti);
+    }
+    /* the loop started from 0xffff and ran for answer_ns of T1 ticks */
+    s->t1_probe_value = 0xffff - (unsigned int)(muldiv64(answer_ns,
+                                                         ti->frequency,
+                                                         NANOSECONDS_PER_SECOND)
+                                                & 0xffff);
+    s->t1_probe_pending = true;
+    return s->t1_probe_value;
+}
+
 static void set_counter(MOS6522State *s, MOS6522Timer *ti, unsigned int val)
 {
     trace_mos6522_set_counter(1 + ti->index, val);
@@ -546,18 +577,12 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         val = s->dira;
         break;
     case VIA_REG_T1CL:
-        val = get_counter(s, &s->timers[0]) & 0xff;
+        val = mos6522_t1_probe_read(s) & 0xff;
         s->ifr &= ~T1_INT;
         mos6522_update_irq(s);
         break;
     case VIA_REG_T1CH:
-        /*
-         * Reading the counter is the last thing pe_run_clock_test()
-         * does, so the measured loop is over: end any CPU-speed probe
-         * window now rather than pacing whatever runs next.
-         */
-        calib_governor_end_cpu_probe();
-        val = get_counter(s, &s->timers[0]) >> 8;
+        val = mos6522_t1_probe_read(s) >> 8;
         mos6522_update_irq(s);
         break;
     case VIA_REG_T1LL:
@@ -661,6 +686,7 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
          * window so it is paced to this board's real clock. See
          * system/calib-governor.c.
          */
+        s->t1_probe_pending = false;
         if (s->timers[0].latch == 0xffff) {
             trace_mos6522_t1_cpu_probe(s->acr,
                                        calib_governor_arm_cpu_probe());

@@ -353,6 +353,20 @@ static bool gov_cpu_probe_enabled = true;
 static bool gov_cpu_probe_window;       /* current window is a CPU probe */
 static uint64_t gov_cpu_probe_saved_ips;
 static uint64_t gov_cpu_probe_insns_at_open;   /* gov_stats.insns snapshot */
+static int64_t gov_cpu_probe_answer_ns;        /* what the closing read reports */
+/*
+ * XNU's pe_run_clock_test() loop is 10,000,000 counted cycles, and on
+ * this emulation it retires 11,125,534 guest instructions doing them
+ * (measured on Mac OS X 10.0: identical on every one of the seven
+ * probes per boot). The guest divides the cycle count by the T1 time the
+ * loop took, so the loop's time is answered from the instructions it
+ * executed, at the advertised clock, at that ratio -- not from how long
+ * the host happened to take, which is bounded below by the exit-per-
+ * block accounting itself (~40 ms, i.e. ~240 MHz, however the window is
+ * paced).
+ */
+#define CALIB_GOV_CPU_PROBE_CYCLES  10000000.0
+#define CALIB_GOV_CPU_PROBE_INSNS   11125534.0
 
 /*
  * Window state. gov_window_open_ns/gov_window_deadline_ns are written
@@ -758,39 +772,37 @@ static void calib_governor_close(void)
     qatomic_set(&gov_irq_cb, NULL);
     if (gov_cpu_probe_window) {
         int64_t took = now - gov_window_open_ns;
+        uint64_t insns = qatomic_read(&gov_stats.insns) -
+                         gov_cpu_probe_insns_at_open;
+        static bool reported;
 
         gov_cpu_probe_window = false;
         gov_insn_per_second = gov_cpu_probe_saved_ips;
         calib_governor_recompute();
         /*
-         * XNU divides its fixed 10,000,000-cycle loop by the T1 time it
-         * took, so this is the clock it is about to believe in. Paced at
-         * the advertised clock the answer should be that clock; a lower
-         * figure is pacing under-delivering, a huge one is an unpaced
-         * window. A window closed by its cap rather than by the guest's
-         * T1 read is flagged, since its length says nothing.
+         * The time the loop "took" for the guest's purposes: its
+         * instructions at the advertised clock, at the loop's measured
+         * instructions-per-cycle. A window that ran nothing (XNU arms
+         * and reads T1 straight back a few times before the real loop)
+         * answers 0 and the VIA reports the truth. Report the first
+         * real window only: XNU runs the same loop seven times per boot.
          */
-        uint64_t insns = qatomic_read(&gov_stats.insns) -
-                         gov_cpu_probe_insns_at_open;
-        static bool reported;
-
-        /*
-         * XNU arms T1 with 0xffff and reads it straight back a few
-         * times before the real loop; those open and close a window
-         * with nothing executed and say nothing. Report the first real
-         * window only: it runs the same loop seven times per boot.
-         */
+        gov_cpu_probe_answer_ns = (int64_t)((double)insns *
+                                            CALIB_GOV_CPU_PROBE_CYCLES /
+                                            CALIB_GOV_CPU_PROBE_INSNS *
+                                            (double)NSEC_IN_ONE_SEC /
+                                            (double)gov_cpu_clock_hz);
         if (insns && !reported) {
             reported = true;
-            info_report("calibration-governor: CPU-speed probe window %s after "
-                    "%.1f ms, %" PRIu64 " guest insns (%.0f M/s delivered) -> "
-                    "guest will derive ~%" PRId64 " MHz (advertised %" PRIu64
-                    " MHz)",
-                    took >= CALIB_GOV_CPU_PROBE_MAX_NS ? "CAPPED" : "closed",
-                    took / 1e6, insns,
-                    took > 0 ? insns * 1e3 / took : 0.0,
-                    took > 0 ? (int64_t)(10000000LL * 1000 / took) : -1,
-                    gov_cpu_clock_hz / 1000000);
+            info_report("calibration-governor: CPU-speed probe: loop of %"
+                        PRIu64 " insns took %.1f ms, answered as %.1f ms -> "
+                        "guest derives ~%" PRId64 " MHz (advertised %" PRIu64
+                        " MHz)", insns, took / 1e6,
+                        gov_cpu_probe_answer_ns / 1e6,
+                        gov_cpu_probe_answer_ns > 0 ?
+                            (int64_t)(10000000LL * 1000 /
+                                      gov_cpu_probe_answer_ns) : -1,
+                        gov_cpu_clock_hz / 1000000);
         }
     }
     if (gov_probe_timer) {
@@ -974,6 +986,7 @@ bool calib_governor_arm_cpu_probe(void)
     gov_cpu_probe_window = true;
     gov_cpu_probe_saved_ips = gov_insn_per_second;
     gov_cpu_probe_insns_at_open = qatomic_read(&gov_stats.insns);
+    gov_cpu_probe_answer_ns = 0;
     gov_insn_per_second = gov_cpu_clock_hz;
     calib_governor_recompute();
 
@@ -1000,11 +1013,13 @@ bool calib_governor_arm_cpu_probe(void)
  * pe_run_clock_test() does: the measured loop is over, so stop pacing
  * immediately instead of waiting out the window cap.
  */
-void calib_governor_end_cpu_probe(void)
+int64_t calib_governor_end_cpu_probe(void)
 {
     if (gov_cpu_probe_window) {
         calib_governor_close();
+        return gov_cpu_probe_answer_ns;
     }
+    return -1;
 }
 
 /*

@@ -180,6 +180,10 @@ struct MOS6522State {
 
     qemu_irq irq;
     uint8_t last_irq_levels;
+
+    /* a CPU-speed probe answer, served across both T1 byte reads */
+    bool t1_probe_pending;
+    unsigned int t1_probe_value;
 };
 
 #define TYPE_MOS6522 "mos6522"
