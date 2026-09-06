@@ -352,6 +352,7 @@ static uint64_t gov_cpu_clock_hz;       /* 0 = board never asked */
 static bool gov_cpu_probe_enabled = true;
 static bool gov_cpu_probe_window;       /* current window is a CPU probe */
 static uint64_t gov_cpu_probe_saved_ips;
+static uint64_t gov_cpu_probe_insns_at_open;   /* gov_stats.insns snapshot */
 
 /*
  * Window state. gov_window_open_ns/gov_window_deadline_ns are written
@@ -756,9 +757,41 @@ static void calib_governor_close(void)
     gov_window_active = false;
     qatomic_set(&gov_irq_cb, NULL);
     if (gov_cpu_probe_window) {
+        int64_t took = now - gov_window_open_ns;
+
         gov_cpu_probe_window = false;
         gov_insn_per_second = gov_cpu_probe_saved_ips;
         calib_governor_recompute();
+        /*
+         * XNU divides its fixed 10,000,000-cycle loop by the T1 time it
+         * took, so this is the clock it is about to believe in. Paced at
+         * the advertised clock the answer should be that clock; a lower
+         * figure is pacing under-delivering, a huge one is an unpaced
+         * window. A window closed by its cap rather than by the guest's
+         * T1 read is flagged, since its length says nothing.
+         */
+        uint64_t insns = qatomic_read(&gov_stats.insns) -
+                         gov_cpu_probe_insns_at_open;
+        static bool reported;
+
+        /*
+         * XNU arms T1 with 0xffff and reads it straight back a few
+         * times before the real loop; those open and close a window
+         * with nothing executed and say nothing. Report the first real
+         * window only: it runs the same loop seven times per boot.
+         */
+        if (insns && !reported) {
+            reported = true;
+            info_report("calibration-governor: CPU-speed probe window %s after "
+                    "%.1f ms, %" PRIu64 " guest insns (%.0f M/s delivered) -> "
+                    "guest will derive ~%" PRId64 " MHz (advertised %" PRIu64
+                    " MHz)",
+                    took >= CALIB_GOV_CPU_PROBE_MAX_NS ? "CAPPED" : "closed",
+                    took / 1e6, insns,
+                    took > 0 ? insns * 1e3 / took : 0.0,
+                    took > 0 ? (int64_t)(10000000LL * 1000 / took) : -1,
+                    gov_cpu_clock_hz / 1000000);
+        }
     }
     if (gov_probe_timer) {
         timer_del(gov_probe_timer);
@@ -911,7 +944,14 @@ bool calib_governor_arm_cpu_probe(void)
 {
     int64_t now;
 
-    if (!gov_enabled || !gov_cpu_probe_enabled || !gov_cpu_clock_hz) {
+    /*
+     * Deliberately not gated on gov_enabled: "calibration-governor=off"
+     * switches off the calibration-spin pacing, and the CPU-speed probe
+     * is a separate feature with its own cpu-probe= switch. Left to run
+     * at host speed, XNU's probe derives a CPU clock in the gigahertz
+     * and reports it everywhere (2026-09-06).
+     */
+    if (!gov_cpu_probe_enabled || !gov_cpu_clock_hz) {
         return false;
     }
     if (qatomic_read(&gov_stats.cpu_probes) >=
@@ -933,6 +973,7 @@ bool calib_governor_arm_cpu_probe(void)
     now = now_ns();
     gov_cpu_probe_window = true;
     gov_cpu_probe_saved_ips = gov_insn_per_second;
+    gov_cpu_probe_insns_at_open = qatomic_read(&gov_stats.insns);
     gov_insn_per_second = gov_cpu_clock_hz;
     calib_governor_recompute();
 
@@ -1303,7 +1344,8 @@ bool calib_governor_configure(const char *value, Error **errp)
 char *calib_governor_get_config(void)
 {
     if (!gov_enabled) {
-        return g_strdup("off");
+        return g_strdup_printf("off,cpu-probe=%s",
+                               gov_cpu_probe_enabled ? "on" : "off");
     }
     return g_strdup_printf("mips=%" PRIu64 ",cpu-probe=%s",
                            gov_cpu_probe_window ? gov_cpu_probe_saved_ips / 1000000
