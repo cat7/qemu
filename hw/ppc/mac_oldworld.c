@@ -293,7 +293,8 @@ static int mac_oldworld_osx_partition(BlockBackend *blk, bool *has_classic)
 {
     uint8_t buf[512];
     uint32_t map_blocks = 1;
-    int osx_part = 0;
+    int osx_part = 0, loader_part = 0;
+    bool rhapsody_ufs = false;
     uint32_t i;
 
     if (blk_pread(blk, 0, sizeof(buf), buf, 0) < 0 || memcmp(buf, "ER", 2)) {
@@ -301,19 +302,39 @@ static int mac_oldworld_osx_partition(BlockBackend *blk, bool *has_classic)
     }
     for (i = 1; i <= map_blocks && i < 64; i++) {
         bool osx = false;
+        const char *type = (const char *)buf + 48;
 
         if (blk_pread(blk, (uint64_t)i * 512, sizeof(buf), buf, 0) < 0 ||
             memcmp(buf, "PM", 2)) {
             break;
         }
         map_blocks = ldl_be_p(buf + 4);
-        if (strncmp((char *)buf + 48, "Apple_HFS", 9)) {
+        /*
+         * Rhapsody (Mac OS X Server 1.x) has no HFS+ system volume: it
+         * boots from an Apple_Loader partition ("SecondaryLoader") that
+         * sits beside its Apple_Rhapsody_UFS root. Mac OS 9's Startup
+         * Disk panel points boot-device at that loader partition.
+         */
+        if (!strncmp(type, "Apple_Loader", 32)) {
+            if (!loader_part) {
+                loader_part = i;
+            }
+            continue;
+        }
+        if (!strncmp(type, "Apple_Rhapsody_UFS", 32)) {
+            rhapsody_ufs = true;
+            continue;
+        }
+        if (strncmp(type, "Apple_HFS", 9)) {
             continue;
         }
         mac_oldworld_volume_systems(blk, ldl_be_p(buf + 8), &osx, has_classic);
         if (osx && !osx_part) {
             osx_part = i;
         }
+    }
+    if (!osx_part && loader_part && rhapsody_ufs) {
+        return loader_part;
     }
     return osx_part;
 }
@@ -397,7 +418,8 @@ static void mac_oldworld_pick_startup_device(Notifier *notifier, void *data)
     g_autofree char *device = g_strdup_printf("ide%d/@%d:%d", osx_drive / 2,
                                               osx_drive % 2, osx_part);
     info_report("NVRAM: no disk this ROM can start on its own, but %s holds "
-                "Mac OS X -- pointing a fresh NVRAM at it", device);
+                "Mac OS X (or Mac OS X Server 1.x) -- pointing a fresh NVRAM "
+                "at it", device);
     pmac_oldworld_nvram_set_osx_startup(nvram, device);
 }
 
