@@ -193,13 +193,16 @@ struct AWACSState {
      * sounds and swaps buffers on that interrupt, so completing a
      * descriptor instantly makes it mispace the swaps and the sound
      * comes out chopped into fragments. Hold each descriptor's
-     * completion until its samples would have finished playing (minus a
-     * small lookahead so the next buffer arrives before the FIFO
-     * underruns).
+     * completion until its samples would have finished playing; the
+     * playout cushion above keeps the FIFO fed across the hand-over.
      */
     QEMUTimer *out_complete_timer;
     DBDMA_io *pending_out_io;
-    int64_t play_deadline_ns;
+    uint32_t pending_out_len;
+    hwaddr pending_addr;         /* guest address of the descriptor data */
+    uint32_t pending_ppos;       /* bytes of it already pushed to out_fifo */
+    int64_t pending_t_start_ns;  /* read clock origin, see awacs.c */
+    int64_t last_end_ns;         /* where the previous command's audio ended */
 };
 
 void awacs_register_dma(AWACSState *s, void *dbdma);

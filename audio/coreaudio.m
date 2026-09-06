@@ -32,6 +32,7 @@
 #include "qemu/audio.h"
 #include "qom/object.h"
 #include "audio_int.h"
+#include "trace.h"
 
 #define TYPE_AUDIO_COREAUDIO "audio-coreaudio"
 OBJECT_DECLARE_SIMPLE_TYPE(AudioCoreaudio, AUDIO_COREAUDIO)
@@ -49,6 +50,15 @@ typedef struct coreaudioVoiceOut {
     UInt32 device_frame_size;
     AudioDeviceIOProcID ioprocid;
     bool enabled;
+    /*
+     * Diagnostics: how many IOProc cycles found too little data and
+     * played silence (a host-side glitch the guest cannot see).
+     * Counted on the CoreAudio thread, reported from the main-thread
+     * buffer_get_free path via the coreaudio_out_underrun trace.
+     */
+    uint32_t underruns;
+    uint32_t underruns_reported;
+    uint32_t underrun_pending_frames;
 } CoreaudioVoiceOut;
 
 typedef struct coreaudioVoiceIn {
@@ -380,7 +390,26 @@ static int coreaudio_voice_out_buf_unlock(CoreaudioVoiceOut *core,
         coreaudio_voice_out_buf_unlock(core, "coreaudio_" #name);     \
         return ret;                                                   \
     }
-COREAUDIO_WRAPPER_FUNC(buffer_get_free, size_t, (HWVoiceOut *hw), (hw))
+static size_t coreaudio_buffer_get_free(HWVoiceOut *hw)
+{
+    CoreaudioVoiceOut *core = (CoreaudioVoiceOut *)hw;
+    size_t ret;
+
+    if (coreaudio_voice_out_buf_lock(core, "coreaudio_buffer_get_free")) {
+        return 0;
+    }
+
+    if (core->underruns != core->underruns_reported) {
+        trace_coreaudio_out_underrun(core->underruns,
+                                     core->underrun_pending_frames,
+                                     core->device_frame_size);
+        core->underruns_reported = core->underruns;
+    }
+    ret = audio_generic_buffer_get_free(hw);
+
+    coreaudio_voice_out_buf_unlock(core, "coreaudio_buffer_get_free");
+    return ret;
+}
 COREAUDIO_WRAPPER_FUNC(get_buffer_out, void *, (HWVoiceOut *hw, size_t *size),
                        (hw, size))
 COREAUDIO_WRAPPER_FUNC(put_buffer_out, size_t,
@@ -431,6 +460,8 @@ static OSStatus out_device_ioproc(
      * piece of the last sound repeating forever" after every alert.
      */
     if (pending_frames < frame_size) {
+        core->underruns++;
+        core->underrun_pending_frames = pending_frames;
         memset(out, 0, outOutputData->mBuffers[0].mDataByteSize);
         inInputTime = 0;
         coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(empty)");

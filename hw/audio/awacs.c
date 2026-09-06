@@ -125,10 +125,13 @@ static void awacs_write_silence(AWACSState *s, int avail)
     }
 }
 
+static void awacs_pull_pending(AWACSState *s, int64_t now);
+
 static void awacs_audio_callback(void *opaque, int avail)
 {
     AWACSState *s = AWACS(opaque);
 
+    awacs_pull_pending(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     trace_awacs_cb(avail, s->out_fifo_count,
                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
@@ -222,34 +225,34 @@ static void awacs_open_voice(AWACSState *s, int sample_rate)
 #define AWACS_DMA_IN_CHANNEL 9
 
 /*
- * Fire each paced DBDMA-out completion this many ns before the point
- * where the descriptor's audio would *start* playing (i.e. the
- * effective lookahead is one descriptor duration plus this margin).
- * Sustained playback pacing comes from the accumulating
- * play_deadline_ns; this only bounds how far ahead of real playback
- * the guest may run.
+ * DMA-out model: each descriptor gets a read clock. Its data is read
+ * from guest memory at the sample rate from t_start -- the position a
+ * real DBDMA engine feeding a real codec would have reached -- and it
+ * completes when that clock reaches its end. Reading at playback pace
+ * is not an optimisation, it is the contract classic Mac OS relies on:
+ * Mac OS 9.2's Sound Manager restarts the channel on a 16 KB buffer and
+ * only then mixes into it, a few ms ahead of where the DMA pointer can
+ * be. Copying the buffer at arm time (as an earlier version did) read
+ * 16 KB of zeros every cycle; the stream was gapless, real-time and
+ * completely silent (measured: 185 s of zeros after the chime).
  *
- * Completing ahead of a descriptor's playback *start* (not just its
- * end) matters for the ROM boot chime: the ROM arms the whole 404 KB
- * chime chain (13 x 32 KB descriptors, 186 ms each) and then reuses
- * part of the buffer (zeroes 0x8100..0x9277, measured ~12 ms later
- * even CPU-throttled to real-hardware speed), so descriptor data must
- * be snapshotted essentially at arm time -- which only happens once
- * the previous descriptor's completion lets the DBDMA engine advance.
- * With duration-plus-margin lookahead the first chime completion fires
- * immediately and every descriptor is read well before the guest
- * touches it (verified byte-identical to the DingusPPC-matched
- * reference capture).
+ * The ROM's boot chime used to look like a counter-example -- the ROM
+ * appeared to zero the head of the chime's second descriptor ~12 ms
+ * after arming the chain, so that descriptor had to be copied early.
+ * It was not: the ROM spins on the channel's STATUS register until
+ * ACTIVE drops (810 k reads during one chime), and mac_dbdma reported
+ * ACTIVE clear while a device transfer was in flight, so the ROM saw
+ * the chime "finish" 12 ms in and reused the RAM. With ACTIVE reported
+ * truthfully for a busy transfer (io->device_busy) the ROM waits for
+ * the real end, and a purely lazy read yields the byte-identical chime.
  *
- * Keeping the margin itself small matters for the Sound Manager,
- * which streams via ~1 ms descriptors: while the accumulated deadline
- * is still inside the lookahead window completions fire instantly,
- * and the guest's stream clock races ahead of real time exactly like
- * the old always-instant behavior (measured: 20-60 ms onset dropouts
- * with a flat 200 ms window). A ~30 ms margin engages pacing almost
- * immediately, well above one VBL service period.
+ * A stop (RUN cleared) halts in place: nothing the clock has not
+ * reached is ever read. A restart within AWACS_RESUME_GRACE_NS
+ * continues the clock where the previous command's audio ended, so the
+ * guest's interrupt-to-restart latency (~1 ms here, tens of us on
+ * hardware) does not open a hole in the audio every buffer.
  */
-#define AWACS_COMPLETE_MARGIN_NS (30 * 1000 * 1000)
+#define AWACS_RESUME_GRACE_NS (5 * 1000 * 1000)
 
 /*
  * DBDMA channel callback: the ROM's startup chime (and any other sound
@@ -270,12 +273,13 @@ static void awacs_open_voice(AWACSState *s, int sample_rate)
  * interrupt/branch handling) instead of leaving it stuck -- fixing this
  * generically for any unregistered channel, not just this one.
  */
+static void awacs_out_complete(void *opaque);
+static int64_t awacs_byte_rate(AWACSState *s);
+static void awacs_read_guest(AWACSState *s, hwaddr addr, uint32_t len);
+
 static void awacs_dma_rw(DBDMA_io *io)
 {
     AWACSState *s = AWACS(io->opaque);
-    uint8_t buf[4096];
-    hwaddr addr = io->addr;
-    int remaining = io->len;
 
     /* Deferred rate changes (see pending_rate in awacs.h) apply when
      * stream data actually arrives -- any leftover previous-stream
@@ -291,106 +295,216 @@ static void awacs_dma_rw(DBDMA_io *io)
     trace_awacs_dma_out(io->addr, io->len, s->cur_sample_rate,
                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
-    /*
-     * A single descriptor's req_count can be up to 0x8000+ bytes (a
-     * real chime's descriptors are ~32KB each, confirmed live) -- far
-     * more than fits in one `buf`. An earlier version of this function
-     * only ever read the first sizeof(buf) bytes and then completed
-     * the WHOLE descriptor regardless, silently discarding the rest:
-     * verified to cut the real chime down to ~53KB of the ~404KB a
-     * real ROM actually requests (confirmed byte-for-byte against
-     * DingusPPC's own captured chime audio, which is the real,
-     * complete-duration reference). Loop over the full transfer here
-     * instead, only completing the descriptor once all of it has
-     * actually been consumed.
-     */
-    while (remaining > 0) {
-        int len = MIN(remaining, (int)sizeof(buf));
-
-        if (io->is_dma_out) {
-            int i;
-
-            dma_memory_read(&address_space_memory, addr, buf, len,
-                            MEMTXATTRS_UNSPECIFIED);
-
-            /* Raw digital samples are 16-bit big-endian on real
-             * hardware (DingusPPC's sound_out_callback reads each one
-             * via READ_WORD_BE_A); the backend was opened with
-             * big_endian = false, so convert to host order before
-             * writing. */
-            for (i = 0; i + 1 < len; i += 2) {
-                uint16_t sample;
-                memcpy(&sample, &buf[i], 2);
-                sample = be16_to_cpu(sample);
-                memcpy(&buf[i], &sample, 2);
-            }
-            awacs_fifo_push(s, buf, len & ~1);
-        }
-
-        addr += len;
-        remaining -= len;
+    if (!io->is_dma_out) {
+        io->len = 0;
+        io->dma_end(io);
+        return;
     }
 
-    /*
-     * Pace completion to real playback time (see the field comment on
-     * out_complete_timer). Compute when this descriptor's audio will
-     * have finished playing, accumulating across back-to-back
-     * descriptors; fire the completion a small lookahead before that so
-     * the guest's next buffer arrives before the FIFO underruns. Only
-     * one DBDMA-out descriptor is ever in flight (io->processing gates
-     * the channel), so a single pending slot suffices.
-     */
     {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        int frames = io->len / AWACS_FRAME_BYTES;
-        int rate = s->cur_sample_rate ? s->cur_sample_rate : 44100;
-        int64_t dur_ns = (int64_t)frames * NANOSECONDS_PER_SECOND / rate;
+        int64_t byte_rate = awacs_byte_rate(s);
+        int64_t dur_ns = (int64_t)io->len * NANOSECONDS_PER_SECOND / byte_rate;
         int64_t fire_ns;
 
-        if (s->play_deadline_ns < now) {
-            s->play_deadline_ns = now;   /* buffer had drained/underran */
-        }
-        s->play_deadline_ns += dur_ns;
-
-        fire_ns = s->play_deadline_ns - dur_ns - AWACS_COMPLETE_MARGIN_NS;
-        if (fire_ns < now) {
-            fire_ns = now;
-        }
         s->pending_out_io = io;
+        io->device_busy = true;      /* STATUS shows ACTIVE while paced */
+        s->pending_out_len = io->len;
+        s->pending_addr = io->addr;
+        s->pending_ppos = 0;
+        /* Continue the previous command's clock: a chained descriptor
+         * starts when its predecessor ends, and a restart within the
+         * grace period picks up where the stopped command's audio
+         * ended. Anything later is a fresh stream starting now. */
+        if (s->last_end_ns && now - s->last_end_ns < AWACS_RESUME_GRACE_NS) {
+            s->pending_t_start_ns = s->last_end_ns;
+        } else {
+            s->pending_t_start_ns = now;
+        }
+        fire_ns = s->pending_t_start_ns + dur_ns;
+        trace_awacs_dma_pace(io->len, dur_ns,
+                             s->pending_t_start_ns + dur_ns - now,
+                             MAX(fire_ns - now, 0), s->out_fifo_count);
+        if (fire_ns <= now) {
+            awacs_out_complete(s);
+            return;
+        }
         timer_mod(s->out_complete_timer, fire_ns);
     }
 }
 
-/* Fire a descriptor's DBDMA completion once its audio has (nearly)
- * finished playing -- see awacs_dma_rw(). */
+static int64_t awacs_byte_rate(AWACSState *s)
+{
+    int rate = s->cur_sample_rate ? s->cur_sample_rate : 44100;
+
+    return (int64_t)rate * AWACS_FRAME_BYTES;
+}
+
+/* Bytes of the in-flight descriptor its read clock has reached by now. */
+static uint32_t awacs_pending_vpos(AWACSState *s, int64_t now)
+{
+    int64_t elapsed = now - s->pending_t_start_ns;
+    int64_t bytes;
+
+    if (elapsed <= 0) {
+        return 0;
+    }
+    bytes = elapsed * awacs_byte_rate(s) / NANOSECONDS_PER_SECOND;
+    bytes -= bytes % AWACS_FRAME_BYTES;
+    return MIN(bytes, s->pending_out_len);
+}
+
+/*
+ * Bytes of the in-flight descriptor not yet transferred. This is what a
+ * DBDMA FLUSH writes back as resCount -- classic Mac OS's Sound Manager
+ * polls playback position exactly that way (set Flush, read the
+ * descriptor's resCount), and Mac OS X's driver does the same once per
+ * ring lap.
+ */
+static uint32_t awacs_pending_remaining(AWACSState *s, int64_t now)
+{
+    return s->pending_out_len - awacs_pending_vpos(s, now);
+}
+
+/* Read [addr, addr+len) of guest memory as big-endian samples into the FIFO. */
+static void awacs_read_guest(AWACSState *s, hwaddr addr, uint32_t len)
+{
+    uint8_t buf[4096];
+
+    while (len > 0) {
+        int chunk = MIN(len, sizeof(buf));
+        int i;
+
+        dma_memory_read(&address_space_memory, addr, buf, chunk,
+                        MEMTXATTRS_UNSPECIFIED);
+        /* Samples are 16-bit big-endian in memory; the voice was opened
+         * host-endian, so convert. */
+        for (i = 0; i + 1 < chunk; i += 2) {
+            uint16_t v;
+            memcpy(&v, &buf[i], 2);
+            v = be16_to_cpu(v);
+            memcpy(&buf[i], &v, 2);
+        }
+        awacs_fifo_push(s, buf, chunk & ~1);
+        addr += chunk;
+        len -= chunk;
+    }
+}
+
+/* Bring a lazily-read descriptor's FIFO contribution up to its clock. */
+static void awacs_pull_pending(AWACSState *s, int64_t now)
+{
+    uint32_t vpos;
+
+    if (!s->pending_out_io) {
+        return;
+    }
+    vpos = awacs_pending_vpos(s, now);
+    if (vpos > s->pending_ppos) {
+        awacs_read_guest(s, s->pending_addr + s->pending_ppos,
+                         vpos - s->pending_ppos);
+        s->pending_ppos = vpos;
+    }
+}
+
 static void awacs_out_complete(void *opaque)
 {
     AWACSState *s = opaque;
     DBDMA_io *io = s->pending_out_io;
+    DBDMA_channel *ch;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (io) {
-        trace_awacs_out_complete_fire(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-        s->pending_out_io = NULL;
-        io->dma_end(io);
+    if (!io) {
+        return;
     }
+    s->pending_out_io = NULL;
+    ch = io->channel;
+    /*
+     * The guest may have stopped, reset or reprogrammed the channel
+     * since this descriptor was paced (a stop clears io.processing; a
+     * reset clears the whole register block). Completing into that
+     * would write descriptor status wherever the command pointer now
+     * points and could chain into the guest's fresh program.
+     */
+    if (!(ch->regs[DBDMA_STATUS] & RUN) || !ch->io.processing) {
+        trace_awacs_out_complete_drop(ch->regs[DBDMA_STATUS],
+                                      ch->io.processing);
+        return;
+    }
+    if (s->pending_ppos < s->pending_out_len) {
+        /* Completion at its clock's end: take the tail now. */
+        awacs_read_guest(s, s->pending_addr + s->pending_ppos,
+                         s->pending_out_len - s->pending_ppos);
+        s->pending_ppos = s->pending_out_len;
+    }
+    s->last_end_ns = s->pending_t_start_ns +
+                     (int64_t)s->pending_out_len * NANOSECONDS_PER_SECOND /
+                     awacs_byte_rate(s);
+    trace_awacs_out_complete_fire(now);
+    io->len = 0;                     /* fully transferred: resCount 0 */
+    io->dma_end(io);
 }
 
+/*
+ * DBDMA calls this from a CONTROL write that sets FLUSH, clears RUN or
+ * sets PAUSE (and from channel reset). What the guest is asking for
+ * differs, and the distinction is audible:
+ *
+ * FLUSH (and PAUSE) with the channel still running is a position
+ * query, not an abort. Real hardware writes the current command's
+ * xferStatus/resCount back and carries on transferring. Mac OS 9.2's
+ * Sound Manager issues one ~10 ms after arming every 16 KB buffer;
+ * Mac OS X's driver issues one per ring lap. An earlier version of this
+ * function answered every flush by completing the in-flight descriptor
+ * instead -- so 9.2 saw each buffer "finish" instantly, queued the
+ * next, and streamed a whole song into the FIFO in a tenth of a second
+ * (measured: 48 s of audio in 0.13 s, 31 MB dropped on FIFO overflow,
+ * only sporadic fragments audible), while OS X replayed 6-12 ms of
+ * ring every lap. Here the descriptor's residual is snapshotted into
+ * io->len, which mac_dbdma writes back as resCount, and the paced
+ * completion stays armed.
+ *
+ * RUN cleared is a stop, and a DBDMA stop halts the channel IN PLACE:
+ * the current command stays current (CMDPTR still names it) and is
+ * neither completed nor advanced -- no interrupt, no branch, no
+ * write-back unless FLUSH was set too. Mac OS 9.2 depends on that: its
+ * interrupt handler stops the channel while buffer B is under way,
+ * works out from the channel where the DMA got to and re-arms from
+ * there. An earlier version completed the stopped command and advanced
+ * past it, so the pointer named the command after B and the handler
+ * re-armed the previous pair -- buffer A, which the guest never fills --
+ * on every cycle (measured: A read lazily over its full 93 ms was still
+ * all zeros; 100+ s of zeros delivered while the song sat in B).
+ */
 static void awacs_dma_flush(DBDMA_io *io)
 {
     AWACSState *s = AWACS(io->opaque);
+    DBDMA_channel *ch = io->channel;
+    uint16_t mask = ch->regs[DBDMA_CONTROL] >> 16;
+    uint16_t value = ch->regs[DBDMA_CONTROL] & 0xffff;
+    bool stopping = (mask & RUN) && !(value & RUN);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t remaining = 0;
 
-    /*
-     * The channel is being flushed or stopped. If a paced completion
-     * is still pending, fire it now: leaving the timer armed would let
-     * dma_end() run later against a channel the guest may have stopped
-     * or reprogrammed. Already-buffered FIFO audio is left to drain
-     * naturally.
-     */
-    trace_awacs_dma_flush(!!s->pending_out_io, s->out_fifo_count,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (s->pending_out_io) {
+        remaining = awacs_pending_remaining(s, now);
+        io->len = remaining;
+    }
+    trace_awacs_dma_flush(!!s->pending_out_io, s->out_fifo_count, stopping,
+                          remaining, now);
+    if (!stopping) {
+        return;
+    }
+    if (s->pending_out_io) {
+        /* The audio that did go out ends here; a prompt restart
+         * continues from this point. Halted in place: mac_dbdma clears
+         * io.processing for a stop itself; the command is not completed
+         * and nothing beyond the clock was ever read. */
+        s->last_end_ns = s->pending_t_start_ns +
+                         (int64_t)s->pending_ppos * NANOSECONDS_PER_SECOND /
+                         awacs_byte_rate(s);
         timer_del(s->out_complete_timer);
-        awacs_out_complete(s);
+        s->pending_out_io = NULL;
     }
 }
 
@@ -582,7 +696,11 @@ static void awacs_reset(DeviceState *dev)
     s->out_fifo_rptr = 0;
     s->out_fifo_wptr = 0;
     s->out_fifo_count = 0;
-    s->play_deadline_ns = 0;
+    s->pending_out_len = 0;
+    s->pending_ppos = 0;
+    s->pending_addr = 0;
+    s->pending_t_start_ns = 0;
+    s->last_end_ns = 0;
     if (s->out_complete_timer) {
         timer_del(s->out_complete_timer);
     }

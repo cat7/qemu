@@ -46,6 +46,14 @@ struct DBDMA_io {
     /* DMA is in progress, don't start another one */
     bool processing;
     /*
+     * Set by a device that is genuinely transferring the command it
+     * holds (a paced audio stream), as opposed to holding it parked
+     * until an external event arrives (a receive descriptor waiting
+     * for a packet). Decides whether STATUS reads report ACTIVE while
+     * io.processing is set -- see dbdma_read().
+     */
+    bool device_busy;
+    /*
      * Host-monotonic time this transfer was handed to the device
      * (start_output/start_input), for the dbdma_io_latency trace in
      * dbdma_end(). Diagnostics only -- guest-visible completion latency
@@ -238,6 +246,18 @@ typedef struct DBDMA_channel {
      * channel reset.
      */
     int sync_continue_count;
+    /*
+     * Set while a CONTROL write that takes the channel out of ACTIVE
+     * (RUN cleared or PAUSE set) is running the device flush callback.
+     * A completion delivered from inside that callback must not chain
+     * into the next command: the status image still shows RUN|ACTIVE
+     * at that point, so the synchronous-continuation path would start
+     * a fresh device transfer on a channel the guest is stopping.
+     */
+    bool stopping;
+    /* dbdma_read trace de-duplication: poll loops log once per change. */
+    int last_read_reg;
+    uint32_t last_read_value;
 } DBDMA_channel;
 
 struct DBDMAState {

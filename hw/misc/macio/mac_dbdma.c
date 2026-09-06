@@ -352,6 +352,9 @@ static void channel_run(DBDMA_channel *ch);
  */
 static bool dbdma_should_continue_sync(DBDMA_channel *ch)
 {
+    if (ch->stopping) {
+        return false;
+    }
     if (!((ch->regs[DBDMA_STATUS] & RUN) && (ch->regs[DBDMA_STATUS] & ACTIVE))) {
         return false;
     }
@@ -423,6 +426,7 @@ static void start_output(DBDMA_channel *ch, int key, uint32_t addr,
     ch->io.dma_end = dbdma_end;
     ch->io.is_dma_out = 1;
     ch->io.processing = true;
+    ch->io.device_busy = false;
     ch->io.start_ns = g_get_monotonic_time() * 1000;
     if (ch->rw) {
         ch->rw(&ch->io);
@@ -450,6 +454,7 @@ static void start_input(DBDMA_channel *ch, int key, uint32_t addr,
     ch->io.dma_end = dbdma_end;
     ch->io.is_dma_out = 0;
     ch->io.processing = true;
+    ch->io.device_busy = false;
     ch->io.start_ns = g_get_monotonic_time() * 1000;
     if (ch->rw) {
         ch->rw(&ch->io);
@@ -922,7 +927,19 @@ static void dbdma_control_write(DBDMA_channel *ch)
      * both on FLUSH commands and when stopping the channel for safety.
      */
     if (do_flush && ch->flush) {
+        /*
+         * While the channel is being taken out of ACTIVE, a completion
+         * the device delivers from inside its flush callback must end
+         * with that command: the status image is only updated below,
+         * so dbdma_end() would otherwise see RUN|ACTIVE and run the
+         * next command synchronously, starting a device transfer the
+         * guest never gets to see stop (observed with Mac OS X's audio
+         * engine on g3beige: the extra transfer's samples played after
+         * the stop and the ring restarted out of phase).
+         */
+        ch->stopping = !(status & ACTIVE);
         ch->flush(&ch->io);
+        ch->stopping = false;
     }
 
     /*
@@ -1096,7 +1113,7 @@ mask_active_if_processing:
          * the channel free for a new descriptor and never attempts a
          * real send.
          */
-        if (ch->io.processing) {
+        if (ch->io.processing && !ch->io.device_busy) {
             value &= ~ACTIVE;
         }
         break;
@@ -1127,6 +1144,11 @@ mask_active_if_processing:
     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
                     (uint32_t)addr >> DBDMA_CHANNEL_SHIFT, reg);
 
+    if (reg != ch->last_read_reg || value != ch->last_read_value) {
+        trace_dbdma_read(channel, reg, value);
+        ch->last_read_reg = reg;
+        ch->last_read_value = value;
+    }
     return value;
 }
 
