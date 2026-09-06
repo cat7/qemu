@@ -397,16 +397,15 @@ void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr)
 /*
  * Point a pristine Old World NVRAM at a Mac OS X startup device.
  *
- * The ROM's own "/AAPL,ROM" boot scan only ever finds a classic Mac OS
- * system, and Old World Open Firmware cannot read HFS+ at all, so a
- * machine whose only disk holds Mac OS X reaches the flashing question
- * mark and stops. On real hardware you escape that by booting Mac OS 9
- * once: its Startup Disk control panel writes an explicit boot-device
- * AND an nvramrc that patches OF's mac-parts package so it can load
- * BootX, patches mac-io's decode-unit so the unit address in that path
- * parses, and releases the low memory BootX needs. Both halves are
- * required -- either one alone gets as far as switching the video mode
- * and then dies with the CPU at address 0 (measured, 2026-09-06).
+ * A machine whose only disk holds Mac OS X reaches the flashing question
+ * mark and stops: with the default boot-device "/AAPL,ROM" the ROM's own
+ * boot scan finds nothing (measured: a fresh NVRAM, and a fresh NVRAM
+ * plus a working nvramrc with boot-device left at /AAPL,ROM, both sit
+ * at the flashing floppy), and an explicit boot-device alone gets as far as
+ * the video-mode switch and then dies with the CPU at address 0. On real
+ * hardware you escape that by booting Mac OS 9 once: its Startup Disk
+ * control panel writes an explicit boot-device AND an nvramrc, and that
+ * nvramrc is what this shim stands in for.
  *
  * A guest that has never run Mac OS 9 has no way to get that written,
  * so do for it what the control panel would: when the partition is
@@ -424,43 +423,46 @@ void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr)
 static const char oldworld_osx_boot_command[] = "0 bootr ";
 
 /*
- * The shim itself. Three jobs, and every one of them was proven
- * necessary by dropping it and watching the boot die (2026-09-06):
+ * The shim itself. Two jobs, each shown necessary by removing it from
+ * the working shim and watching the boot fail on a Mac OS X 10.0 volume
+ * (2026-09-06, with the full shim booting to the desktop on the same
+ * binary as the control):
  *
- *  - mac-parts: Old World OF cannot read HFS+, so its partition package
- *    is branch-patched until it can load BootX off the volume. Without
- *    this the boot reaches the video-mode switch and the CPU ends at 0.
- *  - mac-io decode-unit: makes the "@0" unit address in a boot path like
- *    "ide0/@0:6" parse as hex. Without it the path does not resolve and
- *    the boot dies the same way.
- *  - qmem/qargs: release the low memory BootX loads into, stop OF
- *    reinstalling its interrupt vectors over it, and give /chosen the
- *    empty "machargs" property the kernel looks for.
+ *  - mac-io decode-unit: redefined to parse one hex number. Without it
+ *    (arm F5) the boot reaches the video-mode switch and ends with the
+ *    CPU at address 0. The reading that this is what lets the "@0" in a
+ *    boot path like "ide0/@0:6" resolve comes from the word's name and
+ *    from published OF documentation, not from watching OF.
+ *  - qmem/qargs: release two low memory ranges, make OF's
+ *    install-interrupt-vectors a no-op, and give /chosen an empty
+ *    "machargs" property. Without them (arm G2, ": bootr boot ;") the
+ *    screen never leaves 640x480 black and the CPU idles in real mode
+ *    (MSR 0x40) around 0x4095xx. Which of the three parts matters, and
+ *    why, was not separated.
  *
- * This is our own Forth, written against the behaviour above and tested
- * on a Mac OS X 10.0 volume, which it boots to the desktop in ~90 s.
- * Apple's own control panel writes a longer script for the same job,
- * with key-map polling for the boot-time modifier keys and a retry loop;
- * none of that is reproduced here.
+ * Not in the shim: Apple's Startup Disk script also branch-patches the
+ * /packages/mac-parts package. Removing that block from our working shim
+ * (arm G1) still boots the 10.0 volume to the desktop in ~90 s, the same
+ * as with it, so it is left out. The 10.0 disk's HFS wrapper holds no
+ * copy of BootX, so how OF loads BootX from the wrapped HFS+ volume
+ * without it is not known; the earlier claim that "Old World OF cannot
+ * read HFS+" came from web documentation and is not supported by this
+ * measurement. Only 10.0 was tried.
+ *
+ * This is our own Forth, tested on a Mac OS X 10.0 volume, which it
+ * boots to the desktop in ~90 s. Apple's script is longer: key-map
+ * polling for the boot-time modifier keys and a retry loop; none of
+ * that is reproduced here.
  */
 static const char oldworld_osx_boot_shim[] =
     "hex\r"
     ": qE device-end ;\r"
-    ": qL BLpatch ;\r"
     ": qR BRpatch ;\r"
     ": qprop 0 to my-self property ;\r"
     ": qargs \" \" encode-string \" machargs\" \" /chosen\" find-device "
         "qprop qE ;\r"
     ": qmem ['] install-interrupt-vectors ['] noop qR\r"
     "0 4000 release-mem 8000 2000 release-mem ;\r"
-    "dev /packages/mac-parts\r"
-    ": qM 7F00 - 4 ;\r"
-    "' my-init-program 34 + ' qM qL\r"
-    "' load-partition dup\r"
-    "80 + ' 2drop qL\r"
-    "104 + ' 0 qL\r"
-    "' load 15C + ' 0 qL\r"
-    "qE\r"
     "dev mac-io\r"
     ": decode-unit parse-1hex ;\r"
     "qE\r"

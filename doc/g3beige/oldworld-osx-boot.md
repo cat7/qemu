@@ -12,28 +12,45 @@ immediately on a machine whose NVRAM has been used before.
 
 ## Why
 
-Two independent reasons, and both have to be fixed for a boot:
+Two things are measured, and one older explanation is withdrawn:
 
-1. **The ROM's own boot scan only finds classic Mac OS.** A fresh NVRAM
-   has `boot-device` = `/AAPL,ROM`, which means "ROM, you decide", and
-   what the ROM decides with is a search for a bootable classic System.
-   A Mac OS X volume is blessed in `finderInfo[5]`, with nothing classic
-   on it, so the scan passes it by. Installing the shim below does *not*
-   change this: the scan is in ROM and never consults `nvramrc` (arm F4).
+1. **The ROM's own boot scan does not find the Mac OS X volume.** A
+   fresh NVRAM has `boot-device` = `/AAPL,ROM`, which means "ROM, you
+   decide". With that setting the machine sits at the flashing floppy
+   (arm A), and installing the shim below without changing
+   `boot-device` does not help (arm F4): whatever the ROM's scan looks
+   for, an `nvramrc` does not change it. The description of that scan
+   as "a search for a classic System" comes from published
+   documentation, not from observing the ROM; what is observed is that it passes a Mac
+   OS X volume by and finds a classic one (the 9.2 and 8.5.1 disks boot
+   from `/AAPL,ROM`).
 
-2. **Old World Open Firmware cannot read HFS+.** Even pointed straight
-   at the volume it cannot load BootX, because its `mac-parts` package
-   predates HFS+.
+2. **An explicit `boot-device` alone is not enough.** Pointed straight
+   at the volume (arm D) the boot switches video mode and then dies with
+   the CPU at address 0. An `nvramrc` shim is needed as well; what it
+   has to contain is the next section.
+
+Withdrawn: the earlier text said "Old World Open Firmware cannot read
+HFS+, so it cannot load BootX without a patched `mac-parts`". That came
+from web documentation. Arm G1 below boots to the desktop with no
+`mac-parts` patch at all, and the disk's HFS wrapper carries no copy of
+BootX (its root holds only System, Finder, Desktop DB/DF and a ReadMe),
+so how this ROM's OF loads BootX from the wrapped HFS+ volume is not
+known from here. It is not, on this evidence, "cannot".
 
 On real hardware you never see this, because you install Mac OS X from
 Mac OS 9, and Mac OS 9's Startup Disk control panel writes *both* an
-explicit `boot-device` path and an `nvramrc` that patches Open Firmware
-until it can read the volume. Move an OS-X-only disk into a G3 whose
-PRAM was never set up, and that machine will not boot it either. This is
-also why zapping PRAM on a working Old World OS X machine breaks it
-until you re-select the startup disk, and most of what XPostFacto does.
+explicit `boot-device` path and an `nvramrc`. Move an OS-X-only disk
+into a G3 whose PRAM was never set up, and that machine will not boot
+it either. This is also why zapping PRAM on a working Old World OS X
+machine breaks it until you re-select the startup disk, and most of
+what XPostFacto does.
 
 ## What the shim has to do
+
+All arms boot the same 10.0 overlay, headless, with a screendump and a
+NIP/MSR sample every 45 s. "Desktop" is the Finder with the Dock;
+"NIP 0" is the CPU at address 0 in real mode (MSR 0x40).
 
 | arm | NVRAM | result |
 |---|---|---|
@@ -47,21 +64,36 @@ until you re-select the startup disk, and most of what XPostFacto does.
 | F5 | explicit path + both, no `decode-unit` patch | NIP 0 |
 | E | the machine's own working NVRAM, path repointed | 10.0 desktop, ~3.5 min |
 | F3 | same, rebuilt from a fresh template | 10.0 desktop |
-| **F6** | **explicit path + our own shim** | **10.0 desktop, ~90 s** |
+| F6 | explicit path + our own shim, all three blocks | 10.0 desktop, ~90 s |
+| F6c | F6 re-run as the control for G1/G2, committed wording (`bootr`) | 10.0 desktop at 90 s |
+| **G1** | **F6c minus the `mac-parts` block** | **10.0 desktop at 90 s** |
+| **G2** | **F6c minus `qmem`/`qargs` (`: bootr boot ;`)** | **fails: 640x480 black, MSR 0x40, NIP cycling 0x4095xx–0x4097xx** |
 
-So three things are jointly required, and any one missing lands in the
-same place:
+Screendumps: `osx10-ab/{F6c,G1,G2}/at-*.png` in the job's tmp folder
+(`F6c/at-90.png`, `G1/at-90.png` are the desktop; `G2/at-45.png` and
+`at-90.png` are 972-byte black frames).
 
-- `mac-parts` branch-patched so OF can load BootX from HFS+;
-- `mac-io`'s `decode-unit` patched to parse hex, or the `@0` in a path
-  like `ide0/@0:6` does not resolve;
-- the low memory BootX loads into released, OF stopped from reinstalling
-  its interrupt vectors over it, and an empty `machargs` on `/chosen`.
+So two things are jointly required, and that is what the shim contains:
+
+- `mac-io`'s `decode-unit` redefined as `parse-1hex` (F5 fails without
+  it; the reading that this is what makes the `@0` in `ide0/@0:6`
+  resolve comes from the word's name and published OF documentation,
+  not from observing OF);
+- the `qmem`/`qargs` half: two low memory ranges released,
+  `install-interrupt-vectors` made a no-op, and an empty `machargs` on
+  `/chosen` (G2 fails without it; which of the three parts matters was
+  not separated).
+
+Not required on this disk, and no longer in the shim: the `mac-parts`
+branch patches (G1 boots without them, same timing as with). Only a
+10.0 volume was tried; a volume this does not hold for would show up as
+arm D's failure, video mode switch then NIP 0, and would be the case to
+re-test with the block restored.
 
 The shim in `hw/nvram/mac_nvram.c` is our own Forth doing exactly those
-three jobs. Apple's is longer: it also polls the key map for the
-boot-time modifier keys and retries the boot thirty times. None of that
-is reproduced.
+two jobs. Apple's is longer: it patches `mac-parts`, polls the key map
+for the boot-time modifier keys and retries the boot thirty times. None
+of that is reproduced.
 
 ## What QEMU now does
 
