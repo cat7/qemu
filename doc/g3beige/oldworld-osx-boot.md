@@ -69,15 +69,55 @@ At machine init, `mac_oldworld_pick_startup_device()` looks at the IDE
 drives, but **only** when the OF partition is still exactly the default
 we stamped (valid, `/AAPL,ROM`, no `nvramrc`). It walks each disk's
 Apple partition map, and for every `Apple_HFS*` partition reads the
-volume header — hopping through the HFS wrapper when there is one — to
-see what it is blessed for: `finderInfo[3]` is a Mac OS 8/9 System
-Folder, `finderInfo[5]` a Mac OS X one.
+volume's own header to see what it is blessed for:
+
+- **HFS Plus** (reached through the HFS wrapper when there is one):
+  `finderInfo[0]` is the folder the ROM starts from, `finderInfo[3]` a
+  Mac OS 8/9 System Folder, `finderInfo[5]` a Mac OS X one (TN1150). The
+  volume counts as *classic* when `[3] != 0`, or when `[0] != 0` and
+  `[0] != [5]`; it counts as *Mac OS X* when `[5] != 0`. A volume
+  blessed only for Mac OS X reads exactly `[0] == [5]` with `[3] == 0`.
+- **Plain HFS** (MDB signature `BD`, no `H+` embed): the MDB's
+  `drFndrInfo[0]`, at byte 92 (0x5C) of the MDB, is the blessed System
+  Folder. Non-zero counts as *classic*; plain HFS never holds Mac OS X.
+
+Why the compound HFS Plus rule and not `[3]` alone: `9.0.4.img` in this
+project is a classic-only disk blessed with `[0] = 29, [3] = 0, [5] = 0`.
+A `[3]`-only test calls that "no classic system" and, next to a Mac OS X
+disk, would have pointed NVRAM at Mac OS X where the ROM would have
+booted 9.0.4. Every disk the rule was checked against (2026-09-06):
+
+| disk | volume | `[0]` | `[3]` | `[5]` | classic | OS X |
+|---|---|---|---|---|---|---|
+| 8.1-G3.img | HFS+ | 24 | 24 | 0 | yes | no |
+| 9.0.4.img | HFS+ | 29 | 0 | 0 | yes | no |
+| 9.1, 9.2-G3, 9.2-G4, 9.2-pristine, 9.2.1, 9.2.2 | HFS+ | 30 | 30 | 0 | yes | no |
+| 10.0.img | HFS+ | 1317 | 0 | 1317 | no | yes |
+| 10.1.img | HFS+ | 1633 | 0 | 1633 | no | yes |
+| 10.2.img | HFS+ | 2595 | 0 | 2595 | no | yes |
+| 10.3.img | HFS+ | 2380 | 0 | 2380 | no | yes |
+| 10.4.img | HFS+ | 3321 | 0 | 3321 | no | yes |
+| 10.5.img | HFS+ | 149 | 149 | 149 | yes | yes |
+| 8.5.1.img | plain HFS | drFndrInfo[0] = 26 | | | yes | no |
+| aux/system7.1, 7.5.3, 8.1 | plain HFS | drFndrInfo[0] = 18 | | | yes | no |
+| aux/system8.0 | plain HFS | drFndrInfo[0] = 127 | | | yes | no |
+
+The drFndrInfo offset was verified, not taken from the layout table: the
+five plain-HFS images above read their blessed ID at 0x5C and zeros at
+0x6C, and TN1150 places `drEmbedSigWord` at 0x7C, which is exactly where
+a 32-byte `drFndrInfo` starting at 0x5C ends (the 0x6C read on the
+wrapped disks lands on `'H+'` and the embed extent, which is why an
+earlier read at 0x6C "saw zeros"). Every HFS wrapper on the disks above
+reads `drFndrInfo[0] = 2`, its own root: TN1150 says the wrapper carries
+"a System file containing the minimum code to locate and mount the
+embedded HFS Plus volume", which is what that blessing is for. The
+wrapper is therefore looked *through* and never counted itself.
 
 - Any disk carrying a classic system: do nothing. The ROM can boot it,
   and its scan order stays the user's business.
 - Otherwise, the first Mac OS X volume found becomes the startup device:
   NVRAM gets `boot-device` = `ideN/@M:P`, the shim as `nvramrc`,
-  `boot-command` = `bootosx`, and `use-nvramrc?` set. It says so on
+  `boot-command` = `0 bootr `, and `use-nvramrc?` set. It says so on
   stderr when it does this.
 
 Once the guest writes its own NVRAM — which Mac OS 9 will, the first
@@ -87,6 +127,18 @@ default, and none of this runs again.
 The partition numbering matches what Apple's own control panel produces:
 this machine's saved NVRAM for a 10.2 disk reads `ide1/@1:9`, and our
 scan independently picks partition 9 on that disk.
+
+### Limits
+
+- Only the IDE drives are scanned. SCSI (MESH) disks are not looked at.
+- The partition map is read assuming 512-byte blocks. A CD image whose
+  Apple partition map uses 2048-byte blocks (most `.iso` files in this
+  project, e.g. `iso/9.0.4.iso`) is not detected: the reads land on the
+  wrong sectors and count as "nothing". Such a CD neither becomes the
+  startup device nor counts as a classic system; the ROM's own handling
+  of it is unchanged.
+- A disk with no driver descriptor block (`ER`) at block 0 — this
+  project's `Server1.2v3.img` — is likewise "nothing".
 
 ## The NVRAM format, for anyone editing it by hand
 

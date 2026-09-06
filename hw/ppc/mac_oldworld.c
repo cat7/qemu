@@ -229,29 +229,43 @@ static uint8_t *g3beige_spd_data_generate(uint64_t ram_size,
  * overwritten again (see pmac_format_nvram_partition_oldworld()).
  */
 /*
- * What can this volume start? Reads the HFS+ volume header (hopping
- * through an HFS wrapper if there is one) and looks at the two blessed
- * directory IDs Apple defines in Technote 1150: finderInfo[3] is the
- * Mac OS 8/9 System Folder, finderInfo[5] the Mac OS X one. Verified
- * against three of this project's disks -- a 9.2 install reports only
- * [3], a 10.0 and a 10.2 install only [5].
+ * What can this volume start? Reads the volume's own header and looks at
+ * the blessed directory IDs Apple defines: on an HFS Plus volume
+ * (reached through its HFS wrapper when there is one) finderInfo[0] is
+ * the folder the ROM starts from, finderInfo[3] a Mac OS 8/9 System
+ * Folder and finderInfo[5] a Mac OS X one (Technote 1150); on a plain
+ * HFS volume the MDB's drFndrInfo[0] is the blessed System Folder
+ * (Inside Macintosh: Files, MDB layout).
+ *
+ * A volume counts as classic-bootable when finderInfo[3] is set, or when
+ * finderInfo[0] is set and does not equal finderInfo[5]: a volume blessed
+ * only for Mac OS X reads [0] == [5] with [3] == 0, while one blessed by
+ * an older system may carry only [0]. Checked against this project's
+ * disks (2026-09-06): the 9.2 install reads [0] = [3] = 30, [5] = 0; the
+ * 10.0 and 10.2 installs read [0] = [5] with [3] = 0; five plain HFS
+ * installs (7.1, 7.5.3, 8.0, 8.1, 8.5.1) read a non-zero drFndrInfo[0]
+ * at MDB byte 92; and every HFS wrapper reads drFndrInfo[0] = 2, its
+ * own root, which is why the wrapper is looked through, not at.
  */
 static void mac_oldworld_volume_systems(BlockBackend *blk, uint64_t part_start,
                                         bool *has_osx, bool *has_classic)
 {
     uint8_t vh[512];
     uint64_t base = part_start * 512;
+    uint32_t blessed, classic, osx;
 
     if (blk_pread(blk, base + 1024, sizeof(vh), vh, 0) < 0) {
         return;
     }
-    if (!memcmp(vh, "BD", 2)) {              /* HFS wrapper around an HFS+ */
+    if (!memcmp(vh, "BD", 2)) {              /* HFS: wrapper or plain */
         uint32_t al_size = ldl_be_p(vh + 20);
         uint16_t al_start = lduw_be_p(vh + 28);
         uint16_t embed = lduw_be_p(vh + 126);
 
         if (memcmp(vh + 124, "H+", 2) || !al_size) {
-            return;                          /* a plain HFS volume */
+            /* plain HFS: drFndrInfo[0] is the blessed System Folder */
+            *has_classic |= ldl_be_p(vh + 92) != 0;
+            return;
         }
         base += (uint64_t)al_start * 512 + (uint64_t)embed * al_size;
         if (blk_pread(blk, base + 1024, sizeof(vh), vh, 0) < 0) {
@@ -261,8 +275,11 @@ static void mac_oldworld_volume_systems(BlockBackend *blk, uint64_t part_start,
     if (memcmp(vh, "H+", 2) && memcmp(vh, "HX", 2)) {
         return;
     }
-    *has_osx |= ldl_be_p(vh + 80 + 5 * 4) != 0;
-    *has_classic |= ldl_be_p(vh + 80 + 3 * 4) != 0;
+    blessed = ldl_be_p(vh + 80 + 0 * 4);
+    classic = ldl_be_p(vh + 80 + 3 * 4);
+    osx = ldl_be_p(vh + 80 + 5 * 4);
+    *has_osx |= osx != 0;
+    *has_classic |= classic != 0 || (blessed != 0 && blessed != osx);
 }
 
 /*
@@ -311,6 +328,12 @@ static int mac_oldworld_osx_partition(BlockBackend *blk, bool *has_classic)
  * Anything else is left alone: a disk the ROM can boot by itself, a
  * guest that has since written its own NVRAM, an NVRAM image the user
  * supplied.
+ *
+ * Limits: only the IDE drives are looked at -- SCSI (MESH) disks are not
+ * scanned. The partition map is read assuming 512-byte blocks; a CD
+ * image whose Apple partition map uses 2048-byte blocks is therefore not
+ * detected (its reads land on the wrong sectors and count as "nothing"),
+ * so such a CD neither becomes the startup device nor counts as classic.
  */
 static void mac_oldworld_pick_startup_device(Object *macio, DriveInfo **hd,
                                              int n)
