@@ -402,6 +402,21 @@ wait:
 
     if (dbdma_should_continue_sync(ch)) {
         channel_run(ch);
+    } else {
+        /*
+         * Not continuing inline -- burst limit reached, channel being
+         * stopped, or no longer RUN|ACTIVE. Hand the channel back to the
+         * bottom-half as the original code always did: DBDMA_run() only
+         * runs channels that are still RUN|ACTIVE, so a stopped one is
+         * left alone, but a running one that merely hit the burst limit
+         * MUST be resumed from here. Without this kick it sat dead until
+         * an unrelated CONTROL write on any channel happened to run the
+         * bottom-half -- measured on Mac OS X 10.2's audio ring (725 us
+         * descriptors): the 4096-command burst limit stalled the ring
+         * every 2.97 s for 17-43 ms until the next IDE write, heard as a
+         * glitch at 3 s, 6 s, ... and, once the cushion was gone, garbling.
+         */
+        DBDMA_kick(dbdma_from_ch(ch));
     }
 }
 
@@ -505,6 +520,21 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
      */
     if (dbdma_should_continue_sync(ch)) {
         channel_run(ch);
+    } else {
+        /*
+         * Not continuing inline -- burst limit reached, channel being
+         * stopped, or no longer RUN|ACTIVE. Hand the channel back to the
+         * bottom-half as the original code always did: DBDMA_run() only
+         * runs channels that are still RUN|ACTIVE, so a stopped one is
+         * left alone, but a running one that merely hit the burst limit
+         * MUST be resumed from here. Without this kick it sat dead until
+         * an unrelated CONTROL write on any channel happened to run the
+         * bottom-half -- measured on Mac OS X 10.2's audio ring (725 us
+         * descriptors): the 4096-command burst limit stalled the ring
+         * every 2.97 s for 17-43 ms until the next IDE write, heard as a
+         * glitch at 3 s, 6 s, ... and, once the cushion was gone, garbling.
+         */
+        DBDMA_kick(dbdma_from_ch(ch));
     }
 }
 
@@ -545,6 +575,21 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
     /* See the matching comment in load_word(). */
     if (dbdma_should_continue_sync(ch)) {
         channel_run(ch);
+    } else {
+        /*
+         * Not continuing inline -- burst limit reached, channel being
+         * stopped, or no longer RUN|ACTIVE. Hand the channel back to the
+         * bottom-half as the original code always did: DBDMA_run() only
+         * runs channels that are still RUN|ACTIVE, so a stopped one is
+         * left alone, but a running one that merely hit the burst limit
+         * MUST be resumed from here. Without this kick it sat dead until
+         * an unrelated CONTROL write on any channel happened to run the
+         * bottom-half -- measured on Mac OS X 10.2's audio ring (725 us
+         * descriptors): the 4096-command burst limit stalled the ring
+         * every 2.97 s for 17-43 ms until the next IDE write, heard as a
+         * glitch at 3 s, 6 s, ... and, once the cushion was gone, garbling.
+         */
+        DBDMA_kick(dbdma_from_ch(ch));
     }
 }
 
@@ -604,6 +649,21 @@ static void nop(DBDMA_channel *ch)
     /* See the matching comment in load_word(). */
     if (dbdma_should_continue_sync(ch)) {
         channel_run(ch);
+    } else {
+        /*
+         * Not continuing inline -- burst limit reached, channel being
+         * stopped, or no longer RUN|ACTIVE. Hand the channel back to the
+         * bottom-half as the original code always did: DBDMA_run() only
+         * runs channels that are still RUN|ACTIVE, so a stopped one is
+         * left alone, but a running one that merely hit the burst limit
+         * MUST be resumed from here. Without this kick it sat dead until
+         * an unrelated CONTROL write on any channel happened to run the
+         * bottom-half -- measured on Mac OS X 10.2's audio ring (725 us
+         * descriptors): the 4096-command burst limit stalled the ring
+         * every 2.97 s for 17-43 ms until the next IDE write, heard as a
+         * glitch at 3 s, 6 s, ... and, once the cushion was gone, garbling.
+         */
+        DBDMA_kick(dbdma_from_ch(ch));
     }
 }
 
