@@ -343,6 +343,37 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
     }
 #else
+    /*
+     * Hosts without ppoll() (macOS, win32) only have millisecond poll
+     * timeouts, and qemu_timeout_ns_to_ms() rounds UP, so every
+     * QEMU_CLOCK_VIRTUAL timer -- the guest's decrementer and VIA timers
+     * included -- fires up to 1 ms late, ~0.5 ms on average. A guest that
+     * re-arms a one-shot timer relative to when its interrupt actually
+     * arrived accumulates that lateness on every period: measured on
+     * g3beige/Mac OS 9.2, whose Time Manager programs the decrementer at
+     * ~1 kHz, QuickTime's clock ran at about half real time (and its
+     * audio feed starved for seconds at a stretch) while the tick-counted
+     * wall clock stayed correct. Sleep the sub-millisecond remainder with
+     * nanosleep() instead of rounding it up to a whole millisecond.
+     */
+    if (timeout > 0 && !getenv("QEMU_LEGACY_POLL")) {   /* EXPERIMENT toggle */
+        int64_t ms = timeout / 1000000LL;
+        int64_t rem = timeout - ms * 1000000LL;
+        int ret;
+
+        if (ms > 0) {
+            ret = g_poll(fds, nfds, ms > INT32_MAX ? INT32_MAX : (gint)ms);
+            if (ret != 0 || rem == 0) {
+                return ret;
+            }
+        }
+        if (rem > 0) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = rem };
+
+            nanosleep(&ts, NULL);
+        }
+        return g_poll(fds, nfds, 0);
+    }
     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
 #endif
 }
