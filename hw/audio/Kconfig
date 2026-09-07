@@ -57,6 +57,7 @@ config AWACS
 config TDA7433
     bool
     depends on I2C
+    select AWACS
 
 config VIRTIO_SND
     bool

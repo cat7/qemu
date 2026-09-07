@@ -38,6 +38,9 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/audio/awacs.h"
+#include "hw/core/qdev-properties.h"
+#include "trace.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "qom/object.h"
@@ -54,7 +57,57 @@ struct TDA7433State {
     uint8_t sub_addr;
     bool auto_inc;
     int pos;
+
+    /* the codec whose output this processor sits behind (may be NULL) */
+    AWACSState *codec;
 };
+
+/*
+ * Speaker attenuator code (bits 0-4) in dB: 1 dB steps to -24 dB, then a
+ * non-linear tail up to -37.5 dB (ST TDA7433 datasheet, table for
+ * sub-addresses 3-6). Bit 5 mutes the channel outright.
+ */
+static double tda7433_atten_db(uint8_t code)
+{
+    static const double tail[] = { 25.5, 27, 28.5, 30, 32, 34.5, 37.5 };
+
+    code &= 0x1f;
+    return code <= 24 ? code : tail[code - 25];
+}
+
+/*
+ * Translate the register file into what the codec's backend voice needs.
+ * Register map (ST TDA7433 datasheet; Apple's awacs_OWhw.h names in
+ * brackets): 0 = input selector [kInFuncReg] -- bits 1:0 = 01 selects
+ * IN1, the only input wired to the codec (Apple's "mute bit" 0x02 turns
+ * this into 11, "no input"); 1 = master gain [kVolReg], +32 dB minus the
+ * register value, 0x20 = 0 dB, 0x6f = -79 dB; 2 = bass/treble (flat at
+ * 0xff, not modelled); 3/5 = left/right internal speaker attenuators
+ * [kLFAttnReg/kRFAttnReg]; 4/6 = left/right rear jack, which this machine
+ * never senses anything on. Mac OS 9 drives the slider through register
+ * 1, Mac OS X through registers 3-6; the ROM sets register 1 from the
+ * PRAM volume for the chime.
+ */
+static void tda7433_apply(TDA7433State *s)
+{
+    bool mute = (s->regs[0] & 0x3) != 0x1;
+    double master_db = (int)(s->regs[1] & 0x7f) - 32;   /* attenuation */
+    double left_db = master_db + tda7433_atten_db(s->regs[3]);
+    double right_db = master_db + tda7433_atten_db(s->regs[5]);
+
+    if ((s->regs[3] & 0x20) && (s->regs[5] & 0x20)) {
+        mute = true;
+    } else if (s->regs[3] & 0x20) {
+        left_db = 120;
+    } else if (s->regs[5] & 0x20) {
+        right_db = 120;
+    }
+
+    trace_tda7433_apply((int)(left_db * 10), (int)(right_db * 10), mute);
+    if (s->codec) {
+        awacs_set_processor(s->codec, left_db, right_db, mute);
+    }
+}
 
 static bool tda7433_send_subaddress(TDA7433State *s, uint8_t data)
 {
@@ -63,6 +116,7 @@ static bool tda7433_send_subaddress(TDA7433State *s, uint8_t data)
     }
     s->sub_addr = data & 0xf;
     s->auto_inc = !!(data & 0x10);
+    trace_tda7433_subaddr(s->sub_addr, s->auto_inc);
     return true;
 }
 
@@ -80,6 +134,7 @@ static uint8_t tda7433_recv(I2CSlave *i2c)
 {
     TDA7433State *s = TDA7433(i2c);
 
+    trace_tda7433_read(s->sub_addr, s->regs[s->sub_addr]);
     return s->regs[s->sub_addr];
 }
 
@@ -96,7 +151,9 @@ static int tda7433_send(I2CSlave *i2c, uint8_t data)
         return -1;
     }
 
+    trace_tda7433_write(s->sub_addr, data);
     s->regs[s->sub_addr] = data;
+    tda7433_apply(s);
     if (s->auto_inc) {
         s->sub_addr++;
     }
@@ -111,6 +168,8 @@ static void tda7433_reset(DeviceState *dev)
     s->sub_addr = 0;
     s->auto_inc = false;
     s->pos = 0;
+    /* input selector 0 = IN2, which nothing drives: silent until programmed */
+    tda7433_apply(s);
 }
 
 static const VMStateDescription vmstate_tda7433 = {
@@ -126,11 +185,16 @@ static const VMStateDescription vmstate_tda7433 = {
     }
 };
 
+static const Property tda7433_properties[] = {
+    DEFINE_PROP_LINK("codec", TDA7433State, codec, TYPE_AWACS, AWACSState *),
+};
+
 static void tda7433_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     I2CSlaveClass *isc = I2C_SLAVE_CLASS(oc);
 
+    device_class_set_props(dc, tda7433_properties);
     dc->vmsd = &vmstate_tda7433;
     device_class_set_legacy_reset(dc, tda7433_reset);
     isc->event = tda7433_event;

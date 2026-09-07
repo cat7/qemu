@@ -803,7 +803,15 @@ static void ppc_heathrow_init(MachineState *machine)
      * presence probe NAKs, contributing to the factory-diagnostics
      * serial-console fallback described above.
      */
-    i2c_slave_create_simple(CUDA(dev)->i2c_bus, "tda7433", 0x45);
+    {
+        I2CSlave *tda = i2c_slave_new("tda7433", 0x45);
+
+        /* it sits behind the codec's output: master volume/balance/mute */
+        object_property_set_link(OBJECT(tda), "codec",
+                                 object_resolve_path_component(macio, "awacs"),
+                                 &error_abort);
+        i2c_slave_realize_and_unref(tda, CUDA(dev)->i2c_bus, &error_fatal);
+    }
 
     dev = qdev_new(TYPE_ADB_KEYBOARD);
     qdev_realize_and_unref(dev, adb_bus, &error_fatal);

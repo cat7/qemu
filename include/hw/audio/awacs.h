@@ -100,6 +100,14 @@ struct AWACSState {
      * CODEC_STATUS into readback mode for the register in bits 1-3.
      */
     uint32_t codec_regs[8];
+    /*
+     * Attenuation applied downstream of the codec by the board's TDA7433
+     * audio processor (master volume, balance, speaker attenuators,
+     * mute), in dB per channel; set through awacs_set_processor().
+     */
+    double proc_att_left_db;
+    double proc_att_right_db;
+    bool proc_mute;
     uint32_t clip_count;
     uint32_t byte_swap;
 
@@ -222,5 +230,9 @@ struct AWACSState {
 };
 
 void awacs_register_dma(AWACSState *s, void *dbdma);
+
+/* Called by the TDA7433 audio processor model when its registers change. */
+void awacs_set_processor(AWACSState *s, double left_db, double right_db,
+                         bool mute);
 
 #endif /* HW_AUDIO_AWACS_H */

@@ -28,6 +28,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "hw/audio/awacs.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/ppc/mac_dbdma.h"
@@ -208,13 +209,31 @@ static void awacs_update_volume(AWACSState *s)
      * the chime has finished, while Mac OS 9.0.4 and 9.2 keep bit 7 set
      * for as long as they play music through the speaker.
      */
-    bool mute = s->codec_regs[1] & 0x200;
+    bool mute = (s->codec_regs[1] & 0x200) || s->proc_mute;
+    /*
+     * The codec's 16 attenuation steps are 1.5 dB each; the TDA7433 behind
+     * it adds its own dB attenuation. Fold both into one linear gain.
+     */
+    double ldb = (15 - left) * 1.5 + s->proc_att_left_db;
+    double rdb = (15 - right) * 1.5 + s->proc_att_right_db;
+    int lgain = MIN(255, (int)(255.0 * pow(10.0, -ldb / 20.0) + 0.5));
+    int rgain = MIN(255, (int)(255.0 * pow(10.0, -rdb / 20.0) + 0.5));
 
-    trace_awacs_volume(mute, left, right);
+    trace_awacs_volume(mute, left, right, (int)(s->proc_att_left_db * 10),
+                       (int)(s->proc_att_right_db * 10), s->proc_mute,
+                       lgain, rgain);
     if (s->voice) {
-        audio_be_set_volume_out_lr(s->audio_be, s->voice, mute,
-                                   left * 255 / 15, right * 255 / 15);
+        audio_be_set_volume_out_lr(s->audio_be, s->voice, mute, lgain, rgain);
     }
+}
+
+void awacs_set_processor(AWACSState *s, double left_db, double right_db,
+                         bool mute)
+{
+    s->proc_att_left_db = left_db;
+    s->proc_att_right_db = right_db;
+    s->proc_mute = mute;
+    awacs_update_volume(s);
 }
 
 static void awacs_open_voice(AWACSState *s, int sample_rate)

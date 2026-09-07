@@ -62,10 +62,16 @@ virtio_snd_pcm_stream_flush(uint32_t stream) "flushing stream %"PRIu32
 virtio_snd_handle_tx_xfer(void) "tx queue callback called"
 virtio_snd_handle_rx_xfer(void) "rx queue callback called"
 
+# tda7433.c
+tda7433_subaddr(uint8_t sub, bool auto_inc) "subaddress %u auto-increment %d"
+tda7433_write(uint8_t reg, uint8_t val) "reg %u = 0x%02x"
+tda7433_read(uint8_t reg, uint8_t val) "reg %u -> 0x%02x"
+tda7433_apply(int left_ddb, int right_ddb, bool mute) "attenuation L=%d/10dB R=%d/10dB mute=%d"
+
 # awacs.c
 awacs_set_rate(int sr_id, int rate) "sr_id=%d rate=%d"
 awacs_codec_write(unsigned reg, uint32_t value) "codec reg %u = 0x%03x"
-awacs_volume(bool mute, int left, int right) "speaker path mute=%d left=%d/15 right=%d/15"
+awacs_volume(bool mute, int left, int right, int pl, int pr, bool pm, int lg, int rg) "mute=%d codec left=%d/15 right=%d/15 processor att L=%d/10dB R=%d/10dB mute=%d -> gain %d/%d of 255"
 awacs_open_voice(int rate) "rate=%d"
 awacs_dma_out(uint64_t addr, int len, int rate, int64_t now_ns) "addr=0x%"PRIx64" len=%d rate=%d now=%"PRId64
 awacs_out_complete_fire(int64_t now_ns) "now=%"PRId64

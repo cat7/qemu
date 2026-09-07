@@ -588,6 +588,10 @@ static bool cuda_cmd_get_set_iic(CUDAState *s,
     }
 
     i2c_end_transfer(s->i2c_bus);
+    trace_cuda_iic(addr, is_recv, is_recv ? *out_len : in_len - 1,
+                   is_recv ? out_data[0] : (in_len > 1 ? in_data[1] : 0),
+                   is_recv ? out_data[1] : (in_len > 2 ? in_data[2] : 0),
+                   is_recv ? out_data[2] : (in_len > 3 ? in_data[3] : 0));
     return true;
 }
 
@@ -650,6 +654,10 @@ static bool cuda_cmd_combined_format_iic(CUDAState *s,
     }
 
     i2c_end_transfer(s->i2c_bus);
+    trace_cuda_iic_combined(addr, sub_addr, is_recv,
+                            is_recv ? *out_len : in_len - 3,
+                            is_recv ? out_data[0] : (in_len > 3 ? in_data[3] : 0),
+                            is_recv ? out_data[1] : (in_len > 4 ? in_data[4] : 0));
     return true;
 }
 
