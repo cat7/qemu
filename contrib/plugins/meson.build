@@ -23,6 +23,7 @@ contrib_plugins = [
 'traps.c',
 'uftrace.c',
 'zdivwatch.c',
+'pulse.c',
 ]
 
 if host_os != 'windows'

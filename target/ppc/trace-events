@@ -37,3 +37,6 @@ ppc_excp_fp_ignore(void) "Ignore floating point exception"
 ppc_excp_inval(uint64_t nip) "Invalid instruction at 0x%" PRIx64
 ppc_excp_trap(uint64_t nip) "TRAP program exception at 0x%" PRIx64
 ppc_excp_print(const char *excp) "%s exception"
+
+# mmu_helper.c
+ppc_store_bat(char type, char half, uint32_t nr, uint64_t old, uint64_t value) "%cBAT%c%u 0x%08" PRIx64 " -> 0x%08" PRIx64

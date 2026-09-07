@@ -1032,7 +1032,13 @@ void cpu_ppc_store_decr(CPUPPCState *env, target_ulong value)
 static void cpu_ppc_decr_cb(void *opaque)
 {
     PowerPCCPU *cpu = opaque;
+    ppc_tb_t *tb_env = cpu->env.tb_env;
 
+    /* How late the host delivered this decrementer expiry (decr_next is
+     * the programmed deadline in timebase ticks). */
+    trace_ppc_decr_late(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                        tb_to_ns_round_up(tb_env->decr_freq,
+                                          tb_env->decr_next));
     cpu_ppc_decr_excp(cpu);
 }
 

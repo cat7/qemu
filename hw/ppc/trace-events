@@ -121,6 +121,7 @@ ppc_tb_store(uint64_t tb, uint64_t offset) "tb 0x%016" PRIx64 " offset 0x%08" PR
 
 ppc_decr_load(uint64_t tb) "decr 0x%016" PRIx64
 ppc_decr_excp(const char *action) "%s decrementer"
+ppc_decr_late(int64_t late_ns) "decrementer expiry delivered late_ns=%" PRId64
 ppc_decr_store(uint32_t nr_bits, uint64_t decr, uint64_t value) "%d-bit 0x%016" PRIx64 " => 0x%016" PRIx64
 
 ppc4xx_fit(uint32_t ir, uint64_t tcr, uint64_t tsr) "ir %d TCR 0x%" PRIx64 " TSR 0x%" PRIx64
