@@ -199,12 +199,15 @@ struct AWACSState {
      * playout cushion above keeps the FIFO fed across the hand-over.
      */
     QEMUTimer *out_complete_timer;
+    QEMUTimer *pull_timer;          /* fine-grained lazy read, see awacs.c */
+    uint32_t frame_count_lag_us;    /* FRAME_COUNT reported this far behind */
     DBDMA_io *pending_out_io;
     uint32_t pending_out_len;
     hwaddr pending_addr;         /* guest address of the descriptor data */
     uint32_t pending_ppos;       /* bytes of it already pushed to out_fifo */
     int64_t pending_t_start_ns;  /* read clock origin, see awacs.c */
     int64_t last_end_ns;         /* where the previous command's audio ended */
+    bool in_complete;            /* arming from inside our own completion */
 };
 
 void awacs_register_dma(AWACSState *s, void *dbdma);

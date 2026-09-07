@@ -253,6 +253,31 @@ static void awacs_open_voice(AWACSState *s, int sample_rate)
  * hardware) does not open a hole in the audio every buffer.
  */
 #define AWACS_RESUME_GRACE_NS (5 * 1000 * 1000)
+/*
+ * A descriptor armed from inside our own completion is the chain's next
+ * link and inherits the clock no matter how late the host delivered
+ * that completion: the DMA engine it models never loses time. Without
+ * this, every main-loop stall beyond the grace (15-50 ms spikes, about
+ * one a second on this host) re-based the clock to "now" and the stream
+ * fell behind real time for good -- measured 0.984x on Mac OS X's
+ * free-running ring, draining the cushion within ~40 s and then
+ * underrunning every 90 ms (heard as garbling). The catch-up after a
+ * stall is bounded so a long pause (a debugger, a suspended host) does
+ * not turn into a burst.
+ */
+#define AWACS_MAX_CATCHUP_NS (200 * 1000 * 1000)
+
+/*
+ * How often the pending descriptor's data is pulled from guest memory.
+ * The backend callback alone runs every ~10 ms with host jitter to
+ * ~20 ms, so a pull there reads bytes up to that long after the read
+ * clock passed them. Mac OS X's audio engine erases its ring behind
+ * the play head with only a small margin: a late read lands on freshly
+ * erased zeros (heard as garbling that sets in once the engine's clock
+ * model has settled, ~30 s into a song). Real hardware reads every byte
+ * at its moment; 2 ms is the closest cheap approximation.
+ */
+#define AWACS_PULL_PERIOD_NS (2 * 1000 * 1000)
 
 /*
  * DBDMA channel callback: the ROM's startup chime (and any other sound
@@ -316,8 +341,9 @@ static void awacs_dma_rw(DBDMA_io *io)
          * starts when its predecessor ends, and a restart within the
          * grace period picks up where the stopped command's audio
          * ended. Anything later is a fresh stream starting now. */
-        if (s->last_end_ns && now - s->last_end_ns < AWACS_RESUME_GRACE_NS) {
-            s->pending_t_start_ns = s->last_end_ns;
+        if (s->last_end_ns &&
+            (s->in_complete || now - s->last_end_ns < AWACS_RESUME_GRACE_NS)) {
+            s->pending_t_start_ns = MAX(s->last_end_ns, now - AWACS_MAX_CATCHUP_NS);
         } else {
             s->pending_t_start_ns = now;
         }
@@ -330,6 +356,7 @@ static void awacs_dma_rw(DBDMA_io *io)
             return;
         }
         timer_mod(s->out_complete_timer, fire_ns);
+        timer_mod(s->pull_timer, now + AWACS_PULL_PERIOD_NS);
     }
 }
 
@@ -407,6 +434,17 @@ static void awacs_pull_pending(AWACSState *s, int64_t now)
     }
 }
 
+static void awacs_pull_tick(void *opaque)
+{
+    AWACSState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    awacs_pull_pending(s, now);
+    if (s->pending_out_io) {
+        timer_mod(s->pull_timer, now + AWACS_PULL_PERIOD_NS);
+    }
+}
+
 static void awacs_out_complete(void *opaque)
 {
     AWACSState *s = opaque;
@@ -442,7 +480,9 @@ static void awacs_out_complete(void *opaque)
                      awacs_byte_rate(s);
     trace_awacs_out_complete_fire(now);
     io->len = 0;                     /* fully transferred: resCount 0 */
+    s->in_complete = true;
     io->dma_end(io);
+    s->in_complete = false;
 }
 
 /*
@@ -572,6 +612,14 @@ static uint32_t awacs_frame_count(AWACSState *s)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int rate = s->cur_sample_rate ? s->cur_sample_rate : 44100;
     int64_t elapsed = now - s->frame_count_base_ns;
+
+    /* Report the counter a little behind the read clock so a guest that
+     * erases its ring behind the counter (Mac OS X's audio engine) never
+     * erases what the DMA has not read yet. */
+    elapsed -= (int64_t)s->frame_count_lag_us * 1000;
+    if (elapsed < 0) {
+        elapsed = 0;
+    }
 
     /* Experiment knob (frame-count-divisor): 0 freezes the counter at
      * its written value (DingusPPC behaviour), N counts at rate/N. */
@@ -707,8 +755,12 @@ static void awacs_reset(DeviceState *dev)
     s->pending_addr = 0;
     s->pending_t_start_ns = 0;
     s->last_end_ns = 0;
+    s->in_complete = false;
     if (s->out_complete_timer) {
         timer_del(s->out_complete_timer);
+    }
+    if (s->pull_timer) {
+        timer_del(s->pull_timer);
     }
     s->pending_out_io = NULL;
 }
@@ -748,6 +800,7 @@ static void awacs_realize(DeviceState *dev, Error **errp)
     }
     s->out_complete_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                          awacs_out_complete, s);
+    s->pull_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, awacs_pull_tick, s);
 }
 
 static void awacs_unrealize(DeviceState *dev)
@@ -757,6 +810,10 @@ static void awacs_unrealize(DeviceState *dev)
     if (s->out_complete_timer) {
         timer_free(s->out_complete_timer);
         s->out_complete_timer = NULL;
+    }
+    if (s->pull_timer) {
+        timer_free(s->pull_timer);
+        s->pull_timer = NULL;
     }
     if (s->voice) {
         audio_be_close_out(s->audio_be, s->voice);
@@ -783,6 +840,7 @@ static const Property awacs_properties[] = {
     DEFINE_PROP_STRING("dumpfile", AWACSState, dump_path),
     DEFINE_PROP_UINT32("frame-count-divisor", AWACSState, frame_count_divisor, 1),
     DEFINE_PROP_UINT32("frame-count-multiplier", AWACSState, frame_count_multiplier, 1),
+    DEFINE_PROP_UINT32("frame-count-lag-us", AWACSState, frame_count_lag_us, 5000),
     DEFINE_AUDIO_PROPERTIES(AWACSState, audio_be),
 };
 

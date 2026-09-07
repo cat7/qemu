@@ -26,6 +26,28 @@ static qemu_plugin_u64 insns;
 static uint64_t tbs, flushes, ints;
 static uint64_t vec[32];
 static FILE *out_fp, *pcs_fp;
+static bool lowmem;              /* also sample classic Mac OS low-memory globals */
+static uint32_t lm_ticks, lm_time;  /* latest samples (read on a vCPU thread) */
+static int64_t lm_last_us;
+
+/* Classic Mac OS low-memory globals (physical, mapped 1:1): Ticks at 0x16A
+ * counts the 60.15 Hz system tick interrupt -- the cooperative scheduler's
+ * heartbeat; Time at 0x20C is the seconds clock. */
+/* Mac OS 9 maps the 68K low-memory page at LOGICAL 0, not physical 0, so
+ * read through the current vCPU's translation; when that fails (MMU off at
+ * this instant) keep the previous sample by returning 0 to the caller,
+ * which only stores nonzero values. */
+static uint32_t rd_lowmem32(uint64_t va)
+{
+    GByteArray *b = g_byte_array_new();
+    uint32_t v = 0;
+
+    if (qemu_plugin_read_memory_vaddr(va, b, 4) && b->len == 4) {
+        v = (b->data[0] << 24) | (b->data[1] << 16) | (b->data[2] << 8) | b->data[3];
+    }
+    g_byte_array_free(b, TRUE);
+    return v;
+}
 static volatile int stopping;
 static GThread *thread;
 
@@ -104,6 +126,23 @@ static void report_pcs(void)
 static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *udata)
 {
     __atomic_fetch_add(&tbs, 1, __ATOMIC_RELAXED);
+    if (lowmem) {
+        /* Guest memory may only be read from a vCPU context; translation
+         * happens thousands of times a second, so sample here. */
+        int64_t now = g_get_monotonic_time();
+
+        if (now - lm_last_us >= 200000) {
+            uint32_t tk = rd_lowmem32(0x16a), tm = rd_lowmem32(0x20c);
+
+            lm_last_us = now;
+            if (tk) {
+                __atomic_store_n(&lm_ticks, tk, __ATOMIC_RELAXED);
+            }
+            if (tm) {
+                __atomic_store_n(&lm_time, tm, __ATOMIC_RELAXED);
+            }
+        }
+    }
     if (g_hash_table_size(unresolved)) {
         size_t n = qemu_plugin_tb_n_insns(tb), i;
 
@@ -161,7 +200,8 @@ static void emit(uint64_t *prev, gboolean header)
     gchar *ts = g_date_time_format_iso8601(dt);
 
     if (header) {
-        fprintf(out_fp, "time,insns,tbs,flushes,dsi,isi,align,prog,fpu,dec,ext,sc,trace,other_exc,interrupts\n");
+        fprintf(out_fp, "time,insns,tbs,flushes,dsi,isi,align,prog,fpu,dec,ext,sc,trace,other_exc,interrupts%s\n",
+                lowmem ? ",ticks,mactime" : "");
     }
     cur[0] = qemu_plugin_u64_sum(insns);
     cur[1] = rd(&tbs); cur[2] = rd(&flushes);
@@ -180,6 +220,10 @@ static void emit(uint64_t *prev, gboolean header)
     for (i = 0; i < 14; i++) {
         fprintf(out_fp, ",%" PRIu64, cur[i] - prev[i]);
         prev[i] = cur[i];
+    }
+    if (lowmem) {
+        fprintf(out_fp, ",%u,%u", __atomic_load_n(&lm_ticks, __ATOMIC_RELAXED),
+                __atomic_load_n(&lm_time, __ATOMIC_RELAXED));
     }
     fputc('\n', out_fp);
     fflush(out_fp);
@@ -225,6 +269,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 
     out_fp = stderr;
     for (i = 0; i < argc; i++) {
+        if (g_strcmp0(argv[i], "lowmem=1") == 0 || g_strcmp0(argv[i], "lowmem=on") == 0) {
+            lowmem = true;
+            continue;
+        }
         if (g_str_has_prefix(argv[i], "out=")) {
             gchar *pcs_path = g_strconcat(argv[i] + 4, ".pcs.txt", NULL);
 

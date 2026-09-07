@@ -495,6 +495,7 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
 
     dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len,
                     MEMTXATTRS_UNSPECIFIED);
+    trace_dbdma_load_word(ch->channel, addr, len, le32_to_cpu(current->cmd_dep));
 
     /* Unmet wait parks the channel -- see the comment above nop(). */
     if (conditional_wait(ch)) {
@@ -554,6 +555,7 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
         return;
     }
 
+    trace_dbdma_store_word(ch->channel, addr, len, le32_to_cpu(current->cmd_dep));
     dma_memory_write(&address_space_memory, addr, &current->cmd_dep, len,
                      MEMTXATTRS_UNSPECIFIED);
 

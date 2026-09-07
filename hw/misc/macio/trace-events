@@ -48,6 +48,8 @@ dbdma_write(int channel, int reg, uint64_t value) "channel=0x%x reg=0x%x value=0
 dbdma_read(int channel, int reg, uint64_t value) "channel=0x%x reg=0x%x value=0x%"PRIx64" (repeats of the same read are not logged)"
 dbdma_control_write_done(int channel, uint32_t status) "channel=0x%x new_status=0x%08x"
 dbdma_channel_run(int channel, uint16_t command) "channel=0x%x command=0x%04x"
+dbdma_load_word(int channel, uint32_t addr, int len, uint32_t value) "channel=0x%x LOAD_QUAD addr=0x%08x len=%d value=0x%08x"
+dbdma_store_word(int channel, uint32_t addr, int len, uint32_t value) "channel=0x%x STORE_QUAD addr=0x%08x len=%d value=0x%08x"
 
 # mac_dbdma.c
 dbdma_io_latency(int channel, int64_t ns, int is_last) "ch=%d latency=%"PRId64"ns last=%d"

@@ -162,6 +162,20 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
      * invalidated here twice -- once for the old value, once for the
      * new -- of which one side is always the disabled BAT.
      */
+    if (getenv("QEMU_LEGACY_BAT")) {           /* EXPERIMENT A/B toggle */
+        target_ulong page, end;
+
+        base = BATu & ~0x0001FFFF;
+        end = base + mask + 0x00020000;
+        if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
+            tlb_flush(cs);
+            return;
+        }
+        for (page = base; page != end; page += TARGET_PAGE_SIZE) {
+            tlb_flush_page(cs, page);
+        }
+        return;
+    }
     if (!(BATu & 0x3)) {
         return;
     }
