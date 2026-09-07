@@ -89,6 +89,17 @@ struct AWACSState {
 
     uint32_t sound_ctrl;
     uint32_t codec_ctrl;
+    /*
+     * Codec register shadows (CODEC_CTRL writes: bits 12-14 select the
+     * register, bits 0-11 carry its value, in the true little-endian
+     * register view). Register 1 bit 9 mutes the internal speaker path
+     * and bit 7 the headphone path; register 4 holds the speaker
+     * attenuation (left in bits 6-9, right in bits 0-3, 0 = loudest,
+     * 15 = quietest); register 2 is the headphone/line path, which this
+     * machine model never senses as connected. Register 7 bit 0 puts
+     * CODEC_STATUS into readback mode for the register in bits 1-3.
+     */
+    uint32_t codec_regs[8];
     uint32_t clip_count;
     uint32_t byte_swap;
 

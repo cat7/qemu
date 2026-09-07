@@ -64,6 +64,8 @@ virtio_snd_handle_rx_xfer(void) "rx queue callback called"
 
 # awacs.c
 awacs_set_rate(int sr_id, int rate) "sr_id=%d rate=%d"
+awacs_codec_write(unsigned reg, uint32_t value) "codec reg %u = 0x%03x"
+awacs_volume(bool mute, int left, int right) "speaker path mute=%d left=%d/15 right=%d/15"
 awacs_open_voice(int rate) "rate=%d"
 awacs_dma_out(uint64_t addr, int len, int rate, int64_t now_ns) "addr=0x%"PRIx64" len=%d rate=%d now=%"PRId64
 awacs_out_complete_fire(int64_t now_ns) "now=%"PRId64

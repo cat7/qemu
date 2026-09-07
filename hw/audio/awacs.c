@@ -196,6 +196,27 @@ static void awacs_audio_callback(void *opaque, int avail)
     }
 }
 
+/* Apply the codec's speaker path (attenuation + mute) to the host voice. */
+static void awacs_update_volume(AWACSState *s)
+{
+    uint32_t att = s->codec_regs[4];
+    int left = 0xf - ((att >> 6) & 0xf);
+    int right = 0xf - (att & 0xf);
+    /*
+     * Register 1 bit 9 mutes the speaker path, bit 7 the headphone path.
+     * Determined from the guests themselves: the ROM sets both only after
+     * the chime has finished, while Mac OS 9.0.4 and 9.2 keep bit 7 set
+     * for as long as they play music through the speaker.
+     */
+    bool mute = s->codec_regs[1] & 0x200;
+
+    trace_awacs_volume(mute, left, right);
+    if (s->voice) {
+        audio_be_set_volume_out_lr(s->audio_be, s->voice, mute,
+                                   left * 255 / 15, right * 255 / 15);
+    }
+}
+
 static void awacs_open_voice(AWACSState *s, int sample_rate)
 {
     struct audsettings as = {
@@ -210,6 +231,7 @@ static void awacs_open_voice(AWACSState *s, int sample_rate)
     s->voice = audio_be_open_out(s->audio_be, s->voice, "awacs.out", s,
                                  awacs_audio_callback, &as);
     audio_be_set_active_out(s->audio_be, s->voice, true);
+    awacs_update_volume(s);
 }
 
 /*
@@ -651,6 +673,19 @@ static uint64_t awacs_read_internal(AWACSState *s, uint32_t reg, hwaddr addr)
     case AWACS_CODEC_CTRL:
         return s->codec_ctrl;
     case AWACS_CODEC_STATUS:
+        /*
+         * Screamer readback: with register 7 bit 0 set, the status
+         * register echoes the codec register selected by bits 1-3
+         * instead of the status word. Mac OS 9.0.4 probes registers
+         * 0,1,2,4,5,6 this way around every alert and every volume
+         * change, and gives up on the codec if the echo is missing.
+         * Same raw (byte-reversed) view as the status word below.
+         */
+        if (s->codec_regs[7] & 1) {
+            unsigned sel = (s->codec_regs[7] >> 1) & 7;
+
+            return bswap32(s->codec_regs[sel] & 0xfff);
+        }
         return (AWACS_STATUS_AVAILABLE << 8) |
                (AWACS_MAKER_CRYSTAL << 16) |
                (AWACS_REV_SCREAMER << 20);
@@ -702,6 +737,17 @@ static void awacs_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case AWACS_CODEC_CTRL:
         s->codec_ctrl = val;
+        {
+            uint32_t ctrl = bswap32((uint32_t)val);
+            unsigned reg = (ctrl >> 12) & 7;
+
+            /* register 1 bit 2 (recalibrate) is self-clearing */
+            s->codec_regs[reg] = ctrl & (reg == 1 ? 0xffb : 0xfff);
+            trace_awacs_codec_write(reg, ctrl & 0xfff);
+            if (reg == 1 || reg == 4) {
+                awacs_update_volume(s);
+            }
+        }
         break;
     case AWACS_CODEC_STATUS:
         /* read-only on real hardware */
@@ -739,6 +785,7 @@ static void awacs_reset(DeviceState *dev)
 
     s->sound_ctrl = 0;
     s->codec_ctrl = 0;
+    memset(s->codec_regs, 0, sizeof(s->codec_regs));
     s->clip_count = 0;
     s->byte_swap = 0;
     s->frame_count_base_val = 0;
@@ -840,7 +887,13 @@ static const Property awacs_properties[] = {
     DEFINE_PROP_STRING("dumpfile", AWACSState, dump_path),
     DEFINE_PROP_UINT32("frame-count-divisor", AWACSState, frame_count_divisor, 1),
     DEFINE_PROP_UINT32("frame-count-multiplier", AWACSState, frame_count_multiplier, 1),
-    DEFINE_PROP_UINT32("frame-count-lag-us", AWACSState, frame_count_lag_us, 5000),
+    /*
+     * Default 0: Mac OS 9.0.4's Sound Manager plays alerts through 2 KB
+     * (11.6 ms) ping-pong buffers and samples FRAME_COUNT at each buffer
+     * completion; a 5 ms lag made it read ~300 frames where 516 had
+     * played and it aborted every alert after the second buffer.
+     */
+    DEFINE_PROP_UINT32("frame-count-lag-us", AWACSState, frame_count_lag_us, 0),
     DEFINE_AUDIO_PROPERTIES(AWACSState, audio_be),
 };
 
