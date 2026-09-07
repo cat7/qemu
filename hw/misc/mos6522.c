@@ -510,10 +510,33 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t val;
     int ctrl;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /*
+     * Set when the lazy catch-up below is what raised a timer flag during
+     * THIS read. A T1C-L/T2C-L read clears that timer's flag on a real
+     * 6522, but on real silicon the flag was set at the expiry instant
+     * and the IRQ line asserted right then, so an interrupt-enabled CPU
+     * took the interrupt before it could issue the read. Here the flag
+     * is only being set now, inside the read; letting the same access
+     * clear it again would set-and-clear it invisibly, mark the arm as
+     * fired, and lose the interrupt for good. Measured on Mac OS 9.2:
+     * its Time Manager arms 15-25 count (20-30 us) T2 one-shots whose
+     * expiry lands inside the ISR's own tail under TCG, ~2% of them were
+     * lost this way, and each loss parked the whole Time Manager queue
+     * for 100-1000 ms (ticks ran at 48/s instead of 60, QuickTime's
+     * clock ran slow, its audio feed starved for seconds at a time).
+     */
+    bool lazy_t1 = false, lazy_t2 = false;
 
     if (now >= s->timers[0].next_irq_time && !s->timers[0].fired) {
         mos6522_timer1_update(s, &s->timers[0], now);
         s->ifr |= T1_INT;
+        lazy_t1 = true;
+        /* Deliver it now, exactly as the expiry would have: raise the
+         * line so the PIC latches an event. Only some register cases
+         * below update the line; a read of any other register (Cuda's
+         * port B, the shift register) would otherwise leave the flag set
+         * with no interrupt, and the next reload would clear it unseen. */
+        mos6522_update_irq(s);
         /*
          * One delivery per period. The update above armed the next
          * period, which owes its own interrupt in continuous mode; in
@@ -547,6 +570,8 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
          */
         s->timers[1].fired = true;
         s->ifr |= T2_INT;
+        lazy_t2 = true;
+        mos6522_update_irq(s);      /* see the T1 case above */
     }
     switch (addr) {
     case VIA_REG_B:
@@ -578,7 +603,9 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case VIA_REG_T1CL:
         val = mos6522_t1_probe_read(s) & 0xff;
-        s->ifr &= ~T1_INT;
+        if (!lazy_t1) {
+            s->ifr &= ~T1_INT;
+        }
         mos6522_update_irq(s);
         break;
     case VIA_REG_T1CH:
@@ -594,7 +621,9 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case VIA_REG_T2CL:
         val = get_counter(s, &s->timers[1]) & 0xff;
-        s->ifr &= ~T2_INT;
+        if (!lazy_t2) {
+            s->ifr &= ~T2_INT;
+        }
         mos6522_update_irq(s);
         break;
     case VIA_REG_T2CH:
