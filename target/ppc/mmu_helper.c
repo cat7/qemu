@@ -32,6 +32,7 @@
 #include "qemu/error-report.h"
 #include "qemu/qemu-print.h"
 #include "internal.h"
+#include "trace.h"
 #include "mmu-book3s-v3.h"
 #include "mmu-radix64.h"
 #include "mmu-booke.h"
@@ -150,24 +151,30 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
                                      target_ulong mask)
 {
     CPUState *cs = env_cpu(env);
-    target_ulong base, end, page;
+    target_ulong base, len;
 
-    base = BATu & ~0x0001FFFF;
-    end = base + mask + 0x00020000;
-    if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
-        /* Flushing 1024 4K pages is slower than a complete flush */
-        qemu_log_mask(CPU_LOG_MMU, "Flush all BATs\n");
-        tlb_flush(cs);
-        qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
+    /*
+     * A BAT with both Vs and Vp clear never produced a translation, so
+     * nothing can be cached through it: skip. This matters more than it
+     * looks. Mac OS 9's nanokernel toggles two BATs (a 4 MB block over
+     * the ROM and a 1 MB block over itself) on and off around every 68K
+     * emulator trap, ~125 times a second, and each toggle write is
+     * invalidated here twice -- once for the old value, once for the
+     * new -- of which one side is always the disabled BAT.
+     */
+    if (!(BATu & 0x3)) {
         return;
     }
-    qemu_log_mask(CPU_LOG_MMU, "Flush BAT from " TARGET_FMT_lx
-                  " to " TARGET_FMT_lx " (" TARGET_FMT_lx ")\n",
-                  base, end, mask);
-    for (page = base; page != end; page += TARGET_PAGE_SIZE) {
-        tlb_flush_page(cs, page);
-    }
-    qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
+    base = BATu & ~0x0001FFFF;
+    len = mask + 0x00020000;
+    /*
+     * Let the core choose between per-page eviction and a whole-index
+     * flush. The old per-page loop here ran up to 1024 tlb_flush_page()
+     * calls (each with its own victim-TLB and jump-cache work) for a
+     * 4 MB BAT, and measured as 55-60% of all vCPU time under Mac OS 9.
+     */
+    tlb_flush_range_by_mmuidx(cs, base, len, (1 << NB_MMU_MODES) - 1,
+                              TARGET_PAGE_BITS);
 }
 #endif
 
@@ -181,6 +188,7 @@ static inline void dump_store_bat(CPUPPCState *env, char ID, int ul, int nr,
 
 void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
 {
+    trace_ppc_store_bat('I', 'u', nr, env->IBAT[0][nr], value);
     target_ulong mask;
 
     dump_store_bat(env, 'I', 0, nr, value);
@@ -208,12 +216,14 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
 
 void helper_store_ibatl(CPUPPCState *env, uint32_t nr, target_ulong value)
 {
+    trace_ppc_store_bat('I', 'l', nr, env->IBAT[1][nr], value);
     dump_store_bat(env, 'I', 1, nr, value);
     env->IBAT[1][nr] = value;
 }
 
 void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
 {
+    trace_ppc_store_bat('D', 'u', nr, env->DBAT[0][nr], value);
     target_ulong mask;
 
     dump_store_bat(env, 'D', 0, nr, value);
@@ -241,6 +251,7 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
 
 void helper_store_dbatl(CPUPPCState *env, uint32_t nr, target_ulong value)
 {
+    trace_ppc_store_bat('D', 'l', nr, env->DBAT[1][nr], value);
     dump_store_bat(env, 'D', 1, nr, value);
     env->DBAT[1][nr] = value;
 }
