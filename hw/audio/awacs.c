@@ -573,8 +573,14 @@ static uint32_t awacs_frame_count(AWACSState *s)
     int rate = s->cur_sample_rate ? s->cur_sample_rate : 44100;
     int64_t elapsed = now - s->frame_count_base_ns;
 
+    /* Experiment knob (frame-count-divisor): 0 freezes the counter at
+     * its written value (DingusPPC behaviour), N counts at rate/N. */
+    if (s->frame_count_divisor == 0) {
+        return s->frame_count_base_val;
+    }
     return s->frame_count_base_val +
-           (uint32_t)(elapsed * rate / NANOSECONDS_PER_SECOND);
+           (uint32_t)(elapsed * rate * s->frame_count_multiplier /
+                      s->frame_count_divisor / NANOSECONDS_PER_SECOND);
 }
 
 static uint64_t awacs_read_internal(AWACSState *s, uint32_t reg, hwaddr addr);
@@ -775,6 +781,8 @@ static const VMStateDescription vmstate_awacs = {
 
 static const Property awacs_properties[] = {
     DEFINE_PROP_STRING("dumpfile", AWACSState, dump_path),
+    DEFINE_PROP_UINT32("frame-count-divisor", AWACSState, frame_count_divisor, 1),
+    DEFINE_PROP_UINT32("frame-count-multiplier", AWACSState, frame_count_multiplier, 1),
     DEFINE_AUDIO_PROPERTIES(AWACSState, audio_be),
 };
 

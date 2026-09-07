@@ -105,6 +105,8 @@ struct AWACSState {
      */
     uint32_t frame_count_base_val;
     int64_t frame_count_base_ns;
+    uint32_t frame_count_divisor;   /* 1 = real rate; 2 = half; 0 = frozen */
+    uint32_t frame_count_multiplier; /* experiment knob: 2 = double rate */
 
     /*
      * Rotating single-bit "device status" value the audio-in DBDMA
