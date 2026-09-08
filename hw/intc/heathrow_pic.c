@@ -102,6 +102,39 @@ static void heathrow_update_irq(HeathrowState *s)
     }
 }
 
+/*
+ * Read/modify one of the two 32-bit registers below through an access of
+ * any width and alignment: byte 0 of the register lives at its base
+ * address (this region is little-endian) and bytes past its end read as
+ * zero and absorb writes. extract32()/deposit32() cannot be used here --
+ * they assert on a four-byte access that starts part-way into the
+ * register, which a guest is free to make.
+ */
+static uint64_t reg_read_part(uint32_t reg, hwaddr off, unsigned size)
+{
+    uint64_t val = 0;
+    unsigned i;
+
+    for (i = 0; i < size && off + i < 4; i++) {
+        val |= (uint64_t)((reg >> ((off + i) * 8)) & 0xff) << (i * 8);
+    }
+    return val;
+}
+
+static uint32_t reg_write_part(uint32_t reg, hwaddr off, unsigned size,
+                               uint64_t val)
+{
+    unsigned i;
+
+    for (i = 0; i < size && off + i < 4; i++) {
+        unsigned shift = (off + i) * 8;
+
+        reg &= ~(0xffU << shift);
+        reg |= (uint32_t)((val >> (i * 8)) & 0xff) << shift;
+    }
+    return reg;
+}
+
 static void heathrow_write(void *opaque, hwaddr addr,
                            uint64_t value, unsigned size)
 {
@@ -111,8 +144,7 @@ static void heathrow_write(void *opaque, hwaddr addr,
 
     if ((addr & 0xffc) == 0x38) {
         trace_heathrow_feat_ctrl_write(value);
-        s->feat_ctrl = deposit32(s->feat_ctrl, (addr & 3) * 8, size * 8,
-                                 value);
+        s->feat_ctrl = reg_write_part(s->feat_ctrl, addr & 3, size, value);
         return;
     }
 
@@ -220,12 +252,12 @@ static uint64_t heathrow_read(void *opaque, hwaddr addr,
      */
     if ((addr & 0xffc) == 0x38) {
         trace_heathrow_feat_ctrl_read(s->feat_ctrl);
-        return extract32(s->feat_ctrl, (addr & 3) * 8, size * 8);
+        return reg_read_part(s->feat_ctrl, addr & 3, size);
     }
 
     if ((addr & 0xffc) == 0x34) {
         trace_heathrow_ohare_id_read(s->ohare_id);
-        return extract32(s->ohare_id, (addr & 3) * 8, size * 8);
+        return reg_read_part(s->ohare_id, addr & 3, size);
     }
 
     n = ((addr & 0xfff) - 0x10) >> 4;
