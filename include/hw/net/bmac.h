@@ -148,10 +148,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(BMACState, BMAC)
 #define BMAC_RXCV           0x6e0   /* RX Code Violation */
 
 /* Hash Table Registers */
-#define BMAC_BHASH3         0x700   /* Hash bits 63-48 */
-#define BMAC_BHASH2         0x710   /* Hash bits 47-32 */
-#define BMAC_BHASH1         0x720   /* Hash bits 31-16 */
-#define BMAC_BHASH0         0x730   /* Hash bits 15-0 */
+#define BMAC_BHASH3         0x700   /* Hash bits 15-0  (driver's mask[0]) */
+#define BMAC_BHASH2         0x710   /* Hash bits 31-16 (driver's mask[1]) */
+#define BMAC_BHASH1         0x720   /* Hash bits 47-32 (driver's mask[2]) */
+#define BMAC_BHASH0         0x730   /* Hash bits 63-48 (driver's mask[3]) */
 
 /* Number of 16-bit registers (space / 0x10) */
 #define BMAC_NUM_REGS       0x80

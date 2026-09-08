@@ -411,10 +411,27 @@ static void bmac_update_mac_from_regs(BMACState *s)
     s->mac_addr[5] = madd2 & 0xff;
 }
 
+/*
+ * The chip picks a hash bucket with the top six bits of the Ethernet CRC of
+ * the destination address: a reflected CRC-32 started at ~0 and taken as it
+ * stands, with no final inversion. That is exactly net_crc32_le(), and what
+ * the drivers compute when they decide which bit to set (Linux's bmac.c:
+ * "crc32(~0, addr, ETH_ALEN) >> 26"; the kernel's crc32() has no final
+ * inversion either). The other Sun/Apple chips in QEMU -- sunhme, sungem,
+ * pcnet -- all index the same way.
+ *
+ * This used to be written with zlib's crc32(), which inverts at both ends
+ * of the calculation itself, so the "~" here was undoing an inversion zlib
+ * had already applied and the result was a CRC started at 0 instead of ~0:
+ * a different number for every address. Multicast then landed in whatever
+ * bucket that produced, never the one the driver had set, and everything
+ * carried over multicast -- AppleTalk, and the multicast that name and
+ * service browsing rely on -- was dropped while broadcast (DHCP, ARP) and
+ * ordinary unicast went on working.
+ */
 static int bmac_hash_index(const uint8_t *mac)
 {
-    uint32_t crc = crc32(~0, mac, 6);
-    return (~crc >> 26) & 0x3f; /* top 6 bits of inverted CRC */
+    return (net_crc32_le(mac, ETH_ALEN) >> 26) & 0x3f;
 }
 
 static bool bmac_hash_filter_match(BMACState *s, const uint8_t *mac)
@@ -770,22 +787,22 @@ static void bmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case BMAC_BHASH2:
     case BMAC_BHASH3:
         /*
-         * BHASH0 (bits 15-0) sits at the HIGHEST address (0x730) and
-         * BHASH3 (bits 63-48) at the LOWEST (0x700) -- addresses count
-         * down as significance goes up. hash_table[] is indexed the
-         * other way (index 0 = bits 15-0, per bmac_hash_index()'s
-         * hash_table[idx>>4]), so the reference point for this
-         * computation must be BMAC_BHASH0 (the highest address, mapping
-         * to the lowest index), not BMAC_BHASH3. Using BMAC_BHASH3 here
-         * only produced a correct (zero) index for BHASH3 itself --
-         * addr is unsigned (hwaddr), so BMAC_BHASH3 - addr underflows
-         * for BHASH0/1/2 into a huge wrapped index, corrupting memory
-         * far outside the 4-entry hash_table[] array. This meant only
-         * 16 of the real 64 hash-filter bits (BHASH3's) were ever
-         * actually landing in hash_table[] correctly -- a likely cause
-         * of multicast traffic silently not matching the filter.
+         * Which register holds which end of the 64-bit filter is the
+         * opposite of what the names suggest: the driver writes hash bits
+         * 15-0 to BHASH3, at the LOWEST address (0x700), and bits 63-48 to
+         * BHASH0 at the highest (0x730). Linux's bmac.c says so in as many
+         * words: it writes hash_table_mask[0], commented "bits 15 - 0", to
+         * BHASH3, and its bmac.h gives BHASH3 the same 0x700 this device
+         * uses.
+         *
+         * hash_table[] runs the natural way round (index 0 = bits 15-0,
+         * per bmac_hash_index()'s hash_table[idx >> 4]), so the address to
+         * count from is BHASH3, the lowest. Counting down from BHASH0
+         * instead stored all four words back to front, which put every
+         * multicast bit the driver set 48 bits away from where it was
+         * looked up.
          */
-        s->hash_table[(BMAC_BHASH0 - addr) / 0x10] = val;
+        s->hash_table[(addr - BMAC_BHASH3) / 0x10] = val;
         s->regs[REG_INDEX(addr)] = val;
         return;
 
