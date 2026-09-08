@@ -661,22 +661,11 @@ static uint32_t awacs_frame_count(AWACSState *s)
     int rate = s->cur_sample_rate ? s->cur_sample_rate : 44100;
     int64_t elapsed = now - s->frame_count_base_ns;
 
-    /* Report the counter a little behind the read clock so a guest that
-     * erases its ring behind the counter (Mac OS X's audio engine) never
-     * erases what the DMA has not read yet. */
-    elapsed -= (int64_t)s->frame_count_lag_us * 1000;
     if (elapsed < 0) {
         elapsed = 0;
     }
-
-    /* Experiment knob (frame-count-divisor): 0 freezes the counter at
-     * its written value (DingusPPC behaviour), N counts at rate/N. */
-    if (s->frame_count_divisor == 0) {
-        return s->frame_count_base_val;
-    }
     return s->frame_count_base_val +
-           (uint32_t)(elapsed * rate * s->frame_count_multiplier /
-                      s->frame_count_divisor / NANOSECONDS_PER_SECOND);
+           (uint32_t)(elapsed * rate / NANOSECONDS_PER_SECOND);
 }
 
 static uint64_t awacs_read_internal(AWACSState *s, uint32_t reg, hwaddr addr);
@@ -911,15 +900,6 @@ static const VMStateDescription vmstate_awacs = {
 
 static const Property awacs_properties[] = {
     DEFINE_PROP_STRING("dumpfile", AWACSState, dump_path),
-    DEFINE_PROP_UINT32("frame-count-divisor", AWACSState, frame_count_divisor, 1),
-    DEFINE_PROP_UINT32("frame-count-multiplier", AWACSState, frame_count_multiplier, 1),
-    /*
-     * Default 0: Mac OS 9.0.4's Sound Manager plays alerts through 2 KB
-     * (11.6 ms) ping-pong buffers and samples FRAME_COUNT at each buffer
-     * completion; a 5 ms lag made it read ~300 frames where 516 had
-     * played and it aborted every alert after the second buffer.
-     */
-    DEFINE_PROP_UINT32("frame-count-lag-us", AWACSState, frame_count_lag_us, 0),
     DEFINE_AUDIO_PROPERTIES(AWACSState, audio_be),
 };
 

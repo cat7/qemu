@@ -127,8 +127,6 @@ struct AWACSState {
      */
     uint32_t frame_count_base_val;
     int64_t frame_count_base_ns;
-    uint32_t frame_count_divisor;   /* 1 = real rate; 2 = half; 0 = frozen */
-    uint32_t frame_count_multiplier; /* experiment knob: 2 = double rate */
 
     /*
      * Rotating single-bit "device status" value the audio-in DBDMA
@@ -222,7 +220,6 @@ struct AWACSState {
      */
     QEMUTimer *out_complete_timer;
     QEMUTimer *pull_timer;          /* fine-grained lazy read, see awacs.c */
-    uint32_t frame_count_lag_us;    /* FRAME_COUNT reported this far behind */
     DBDMA_io *pending_out_io;
     uint32_t pending_out_len;
     hwaddr pending_addr;         /* guest address of the descriptor data */
