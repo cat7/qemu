@@ -109,13 +109,14 @@ static void heathrow_write(void *opaque, hwaddr addr,
     HeathrowPICState *pic;
     unsigned int n;
 
-    if ((addr & 0xfff) == 0x38) {
+    if ((addr & 0xffc) == 0x38) {
         trace_heathrow_feat_ctrl_write(value);
-        s->feat_ctrl = value;
+        s->feat_ctrl = deposit32(s->feat_ctrl, (addr & 3) * 8, size * 8,
+                                 value);
         return;
     }
 
-    if ((addr & 0xfff) == 0x34) {
+    if ((addr & 0xffc) == 0x34) {
         /*
          * Read-only board-strapped ID register on real silicon; writes
          * are ignored (matches DingusPPC's MacIoTwo, which only logs
@@ -208,14 +209,23 @@ static uint64_t heathrow_read(void *opaque, hwaddr addr,
     unsigned int n;
     uint32_t value;
 
-    if ((addr & 0xfff) == 0x38) {
+    /*
+     * The ID and feature-control registers are 32 bits wide and real
+     * guests do read parts of them: Mac OS 9's sound port handler takes
+     * a single byte from ID+1 and tests bit 4 there to decide whether
+     * this board has four or five sound inputs. Decode the whole
+     * four-byte window, not just its first address, or such a read
+     * falls through to the interrupt-controller decode below and
+     * answers 0. This region is little-endian, so byte 0 is the LSB.
+     */
+    if ((addr & 0xffc) == 0x38) {
         trace_heathrow_feat_ctrl_read(s->feat_ctrl);
-        return s->feat_ctrl;
+        return extract32(s->feat_ctrl, (addr & 3) * 8, size * 8);
     }
 
-    if ((addr & 0xfff) == 0x34) {
+    if ((addr & 0xffc) == 0x34) {
         trace_heathrow_ohare_id_read(s->ohare_id);
-        return s->ohare_id;
+        return extract32(s->ohare_id, (addr & 3) * 8, size * 8);
     }
 
     n = ((addr & 0xfff) - 0x10) >> 4;
