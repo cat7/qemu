@@ -204,10 +204,17 @@ static void awacs_update_volume(AWACSState *s)
     int left = 0xf - ((att >> 6) & 0xf);
     int right = 0xf - (att & 0xf);
     /*
-     * Register 1 bit 9 mutes the speaker path, bit 7 the headphone path.
-     * Determined from the guests themselves: the ROM sets both only after
-     * the chime has finished, while Mac OS 9.0.4 and 9.2 keep bit 7 set
-     * for as long as they play music through the speaker.
+     * Codec register 1 bit 7 mutes the codec's own speaker output (C) and
+     * bit 9 its headphone output (A) -- the names are Apple's, from
+     * Linux sound/ppc/awacs.h (MASK_CMUTE / MASK_AMUTE). On this board
+     * the speaker is NOT driven by output C: the guests keep bit 7 set
+     * and feed output A through the TDA7433 audio processor instead
+     * (Apple's own AppleOWScreamerAudio says as much for the Beige G3 --
+     * "passes sound right through to be later controlled by the SGS
+     * audio processor" -- and sets the parallel-output enable, bit 11,
+     * which the ROM and Mac OS 9 both do here). So bit 9 is the mute
+     * that silences this machine; decoding bit 7 as "the" mute, as a
+     * codec-only model would, silences everything the guests play.
      */
     bool mute = (s->codec_regs[1] & 0x200) || s->proc_mute;
     /*

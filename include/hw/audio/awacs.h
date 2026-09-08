@@ -92,12 +92,15 @@ struct AWACSState {
     /*
      * Codec register shadows (CODEC_CTRL writes: bits 12-14 select the
      * register, bits 0-11 carry its value, in the true little-endian
-     * register view). Register 1 bit 9 mutes the internal speaker path
-     * and bit 7 the headphone path; register 4 holds the speaker
-     * attenuation (left in bits 6-9, right in bits 0-3, 0 = loudest,
-     * 15 = quietest); register 2 is the headphone/line path, which this
-     * machine model never senses as connected. Register 7 bit 0 puts
-     * CODEC_STATUS into readback mode for the register in bits 1-3.
+     * register view). Register 1 bit 7 mutes codec output C (speaker)
+     * and bit 9 output A (headphone), per Linux sound/ppc/awacs.h; on
+     * this board output A is the one that reaches the speaker, through
+     * the TDA7433 (see awacs_update_volume). Register 2 holds output
+     * A's attenuation and register 4 output C's, left in bits 6-9 and
+     * right in bits 0-3, 0 = loudest and 15 = quietest; the guests
+     * always write the two registers with the same value. Register 7
+     * bit 0 puts CODEC_STATUS into readback mode for the register
+     * selected by bits 1-3.
      */
     uint32_t codec_regs[8];
     /*
