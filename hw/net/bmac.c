@@ -787,22 +787,25 @@ static void bmac_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case BMAC_BHASH2:
     case BMAC_BHASH3:
         /*
-         * Which register holds which end of the 64-bit filter is the
-         * opposite of what the names suggest: the driver writes hash bits
-         * 15-0 to BHASH3, at the LOWEST address (0x700), and bits 63-48 to
-         * BHASH0 at the highest (0x730). Linux's bmac.c says so in as many
-         * words: it writes hash_table_mask[0], commented "bits 15 - 0", to
-         * BHASH3, and its bmac.h gives BHASH3 the same 0x700 this device
-         * uses.
+         * BHASH0 sits at the HIGHEST address (0x730) and BHASH3 at the
+         * lowest (0x700), and the significance runs the same way: the
+         * register at 0x700 carries hash bits 63-48, 0x730 carries 15-0.
+         * hash_table[] is indexed the natural way (entry 0 = bits 15-0,
+         * per bmac_hash_index()'s hash_table[idx >> 4]), so counting down
+         * from BHASH0 is what pairs them up.
          *
-         * hash_table[] runs the natural way round (index 0 = bits 15-0,
-         * per bmac_hash_index()'s hash_table[idx >> 4]), so the address to
-         * count from is BHASH3, the lowest. Counting down from BHASH0
-         * instead stored all four words back to front, which put every
-         * multicast bit the driver set 48 bits away from where it was
-         * looked up.
+         * Measured, not deduced: with AppleTalk switched on in a Mac OS
+         * 9.2 guest, the driver writes 0x2040 to 0x700. Bit 13 there is
+         * hash index 61, which is 09:00:07:ff:ff:ff, the AppleTalk
+         * broadcast; bit 6 is index 54, which is 01:00:5e:00:00:01, the
+         * IP all-hosts group TCP/IP had already registered. Both only
+         * come out right if 0x700 holds indices 48-63.
+         *
+         * (Linux's bmac.c comments its four writes the other way round --
+         * BHASH3 as "bits 15 - 0" -- which is what this code briefly
+         * followed. The guest driver's own writes settle it.)
          */
-        s->hash_table[(addr - BMAC_BHASH3) / 0x10] = val;
+        s->hash_table[(BMAC_BHASH0 - addr) / 0x10] = val;
         s->regs[REG_INDEX(addr)] = val;
         return;
 
