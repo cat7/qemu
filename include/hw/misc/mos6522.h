@@ -184,6 +184,17 @@ struct MOS6522State {
     /* a CPU-speed probe answer, served across both T1 byte reads */
     bool t1_probe_pending;
     unsigned int t1_probe_value;
+
+    /* deliver T2 expiries on the vCPU thread (see mos6522_timer2()) */
+    bool t2_irq_on_vcpu;
+    /*
+     * Length of the guest's current "query run": consecutive T2C-L /
+     * T2C-H / IFR reads with no other VIA access in between. A due T2
+     * expiry is not made visible between accesses inside a run; t2_retry
+     * re-attempts a held delivery. See mos6522_t2_may_deliver().
+     */
+    unsigned t2_counter_run;
+    QEMUTimer *t2_retry;
 };
 
 #define TYPE_MOS6522 "mos6522"

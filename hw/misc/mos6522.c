@@ -26,6 +26,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/cpu.h"
 #include "hw/misc/mos6522.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -419,10 +420,124 @@ static void mos6522_timer1(void *opaque)
     mos6522_update_irq(s);
 }
 
+/*
+ * May a due T2 expiry be made visible right now?
+ *
+ * Mac OS reads the 16-bit T2 counter with interrupts masked, in a ROM
+ * routine (0xffc347e0 in the G3 ROM) that tests IFR.T2 first, skips the
+ * T2C-L read when the flag is set or the high byte is zero, and re-reads
+ * T2C-L/T2C-H until they agree. On real hardware that is watertight:
+ * with the high byte nonzero the counter cannot reach zero within the
+ * few instructions of the loop, so the loop never clears a flag that
+ * was raised after its IFR test. Under TCG the vCPU can be parked for
+ * milliseconds between two of those instructions (BQL held by the main
+ * loop: display updates, block completions, monitor commands), the
+ * time-based counter wraps meanwhile, and an expiry delivered inside the
+ * loop -- by whichever thread -- is wiped by the next T2C-L read before
+ * anything observes it. Measured on Mac OS 8.5 and 9.2: the Time Manager
+ * stopped re-arming T2, Ticks froze, the guest "hung" with keys still
+ * typed and the clock dead. So an expiry is held while the guest is in a
+ * run of consecutive counter reads and delivered at the next other VIA
+ * access (the routine's own IFR test on its next call, the interrupt
+ * dispatcher, the ADB poll...). No cap on the run length: under a stall
+ * storm the routine's consistency loop legitimately spins for dozens of
+ * reads (measured: 19). The only escapes are an IFR read, where the
+ * guest sees the flag in the value it gets, and a 50 ms overdue bound
+ * for a guest that goes quiet right after a query.
+ */
+#define T2_HOLD_MAX_NS       (50 * SCALE_MS)
+#define T2_RETRY_NS          (200 * SCALE_US)
+
+static void mos6522_timer2_deliver(CPUState *cs, run_on_cpu_data data);
+
+static bool mos6522_t2_may_deliver(MOS6522State *s)
+{
+    int64_t overdue;
+
+    if (!s->t2_irq_on_vcpu) {
+        return true;
+    }
+    if (s->t2_counter_run == 0) {
+        return true;
+    }
+    /*
+     * Held too long: the guest went quiet right after a query, or is
+     * doing nothing but short query runs. Virtual time also passes while
+     * the vCPU is parked, so this bound must be well above any stall.
+     */
+    overdue = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->timers[1].next_irq_time;
+    return overdue > T2_HOLD_MAX_NS;
+}
+
+static void mos6522_t2_retry(void *opaque)
+{
+    MOS6522State *s = opaque;
+
+    if (!s->timers[1].fired && first_cpu) {
+        async_run_on_cpu(first_cpu, mos6522_timer2_deliver,
+                         RUN_ON_CPU_HOST_PTR(s));
+    }
+}
+
+static void mos6522_timer2_deliver(CPUState *cs, run_on_cpu_data data)
+{
+    MOS6522State *s = data.host_ptr;
+    MOS6522Timer *ti = &s->timers[1];
+
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /* Runs on the vCPU thread, BQL held, between two guest instructions. */
+    if (ti->fired) {
+        return;
+    }
+    if (now < ti->next_irq_time) {
+        /*
+         * Stale: queued for an expiry the guest has since consumed (the
+         * lazy path delivered it, the guest acked and re-armed). A flag
+         * now would be premature for the new arm, and marking it fired
+         * would make the real expiry get skipped. The new arm's timer
+         * delivers it.
+         */
+        return;
+    }
+    if (!mos6522_t2_may_deliver(s)) {
+        timer_mod(s->t2_retry, now + T2_RETRY_NS);
+        return;
+    }
+    ti->fired = true;
+    s->ifr |= T2_INT;
+    mos6522_update_irq(s);
+}
+
 static void mos6522_timer2(void *opaque)
 {
     MOS6522State *s = opaque;
     MOS6522Timer *ti = &s->timers[1];
+
+    /*
+     * Deliver on the vCPU thread, at an instruction boundary. This
+     * callback runs on the main loop, which only gets the BQL while the
+     * vCPU is parked waiting for it -- and the vCPU parks at MMIO
+     * accesses. Raising the flag here therefore lands "inside" whatever
+     * VIA access the guest is in the middle of, most often one of its
+     * T2 counter reads, and by 6522 rules the T2C-L half of that read
+     * then clears the flag before the CPU can recognise the interrupt.
+     * Measured (Mac OS 8.5 and 9.2, event ring): the Time Manager's
+     * expiry vanished exactly that way, nothing re-armed T2, and the
+     * guest's Ticks stopped for good (the "VM on" / IE freezes: keys
+     * still typed, clock dead). On real hardware the expiry is not
+     * correlated with the CPU's accesses and the interrupt is taken
+     * before the next instruction. Queuing the delivery on the vCPU
+     * gives exactly that: the parked access completes first, the flag
+     * and the line rise at the next instruction boundary, and the
+     * interrupt is taken there. The lazy catch-up in mos6522_read()
+     * may deliver first; the fired token keeps it to one delivery.
+     */
+    if (s->t2_irq_on_vcpu && !ti->fired && first_cpu) {
+        async_run_on_cpu(first_cpu, mos6522_timer2_deliver,
+                         RUN_ON_CPU_HOST_PTR(s));
+        return;
+    }
 
     /*
      * Unlike T1, real 6522 hardware's T2 (in its only mode relevant here,
@@ -470,6 +585,18 @@ static void mos6522_t2_irq_catch_up(void *opaque)
 
     if (now < s->timers[1].next_irq_time || (s->ifr & T2_INT) ||
         s->timers[1].fired) {
+        return;
+    }
+    if (!mos6522_t2_may_deliver(s)) {
+        /*
+         * Same counter-run rule as the other delivery paths: this is
+         * called from the paced vCPU at an arbitrary instruction
+         * boundary, which can be inside the masked counter-read routine
+         * (measured: it was, and the routine's next T2C-L read wiped the
+         * flag). The next VIA access or the retry timer delivers it.
+         */
+        timer_mod(s->t2_retry,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + T2_RETRY_NS);
         return;
     }
     s->timers[1].fired = true;
@@ -546,7 +673,21 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
          */
         s->timers[0].fired = (s->acr & T1MODE) != T1MODE_CONT;
     }
-    if (now >= s->timers[1].next_irq_time && !s->timers[1].fired) {
+    /*
+     * A "query run": consecutive T2C-L / T2C-H / IFR reads with nothing
+     * else in between -- the shape of the masked counter-read routine
+     * (T2CH, IFR, T2CL, T2CH, ...). Deliveries between accesses are held
+     * inside a run (see mos6522_t2_may_deliver()); a delivery inside an
+     * IFR read is always fine, the guest sees the flag in the value.
+     */
+    if (addr == VIA_REG_T2CL || addr == VIA_REG_T2CH || addr == VIA_REG_IFR) {
+        s->t2_counter_run++;
+    } else {
+        s->t2_counter_run = 0;
+    }
+    if (now >= s->timers[1].next_irq_time && !s->timers[1].fired &&
+        (addr == VIA_REG_IFR || mos6522_t2_may_deliver(s))) {
+        /* See mos6522_t2_may_deliver() for the counter-run rule. */
         /*
          * T2 is one-shot (see mos6522_timer2()) -- unlike T1, do not
          * call mos6522_timer2_update() here, or this lazy catch-up
@@ -665,6 +806,7 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     int ctrl;
 
     trace_mos6522_write(addr, mos6522_reg_names[addr], val);
+    s->t2_counter_run = 0;
 
     switch (addr) {
     case VIA_REG_B:
@@ -762,6 +904,7 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 
             trace_mos6522_t2_oneshot(s->timers[1].latch, s->ier, s->acr,
                                      countdown, governed);
+        } else {
         }
         break;
     case VIA_REG_SR:
@@ -1023,6 +1166,7 @@ static void mos6522_init(Object *obj)
 
     s->timers[0].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mos6522_timer1, s);
     s->timers[1].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mos6522_timer2, s);
+    s->t2_retry = timer_new_ns(QEMU_CLOCK_VIRTUAL, mos6522_t2_retry, s);
 
     qdev_init_gpio_in(DEVICE(obj), mos6522_set_irq, VIA_NUM_INTS);
 }
@@ -1037,6 +1181,7 @@ static void mos6522_finalize(Object *obj)
 
 static const Property mos6522_properties[] = {
     DEFINE_PROP_UINT64("frequency", MOS6522State, frequency, 0),
+    DEFINE_PROP_BOOL("t2-irq-on-vcpu", MOS6522State, t2_irq_on_vcpu, true),
 };
 
 static void mos6522_class_init(ObjectClass *oc, const void *data)
