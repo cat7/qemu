@@ -894,6 +894,9 @@ static void bmac_reset(DeviceState *dev)
     s->mii_reg_addr = 0;
     s->mii_read_data = 0;
 
+    /* A half-assembled TX frame must not survive a reset. */
+    s->tx_frame_len = 0;
+
     bmac_srom_reset(s);
 
     /*
@@ -1007,15 +1010,50 @@ static void bmac_tx_dma_rw(DBDMA_io *io)
         uint16_t xifc = s->regs[REG_INDEX(BMAC_XIFC)];
         bool loopback = (xifc & (XIFC_LBCK | XIFC_MIILB)) != 0;
 
-        trace_bmac_tx_send(io->len, loopback);
-        if (loopback) {
-            bmac_receive(qemu_get_queue(s->nic), buf, io->len);
+        /*
+         * One Ethernet frame is not one DBDMA command. The driver
+         * describes a frame with OUTPUT_MORE for every piece but the
+         * last, and OUTPUT_LAST for the one that ends it -- Mac OS X's
+         * driver routinely sends a 1442-byte packet as a 34-byte header
+         * piece plus a 1408-byte body. Sending each piece as its own
+         * frame put a 34-byte runt and a headerless 1408-byte frame on
+         * the wire, so anything larger than one descriptor's worth left
+         * this machine as garbage: DNS and the TCP handshake fit in one
+         * piece and worked, while a browser's request arrived at the
+         * server incomplete and timed out there.
+         *
+         * So collect the pieces and transmit on the one that says it is
+         * the last.
+         */
+        if (s->tx_frame_len + io->len <= (int)sizeof(s->tx_frame)) {
+            memcpy(s->tx_frame + s->tx_frame_len, buf, io->len);
+            s->tx_frame_len += io->len;
         } else {
-            qemu_send_packet(qemu_get_queue(s->nic), buf, io->len);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bmac: TX frame longer than %zu bytes, dropped\n",
+                          sizeof(s->tx_frame));
+            s->tx_frame_len = 0;
+            io->len = 0;
+            if (io->dma_end) {
+                io->dma_end(io);
+            }
+            return;
+        }
+
+        if (io->is_last) {
+            trace_bmac_tx_send(s->tx_frame_len, loopback);
+            if (loopback) {
+                bmac_receive(qemu_get_queue(s->nic), s->tx_frame,
+                             s->tx_frame_len);
+            } else {
+                qemu_send_packet(qemu_get_queue(s->nic), s->tx_frame,
+                                 s->tx_frame_len);
+            }
+            s->tx_frame_len = 0;
+            bmac_set_status(s, BMAC_INT_TXDONE);
         }
 
         io->len = 0;
-        bmac_set_status(s, BMAC_INT_TXDONE);
     } else {
         io->len = 0;
     }

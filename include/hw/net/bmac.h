@@ -215,6 +215,15 @@ struct BMACState {
 
     bool link_up;
 
+    /*
+     * TX frame under assembly. The driver may hand one Ethernet frame
+     * over as several DBDMA commands (OUTPUT_MORE... OUTPUT_LAST), so
+     * the pieces are collected here and sent as one frame when the last
+     * arrives. See bmac_tx_dma_rw().
+     */
+    uint8_t tx_frame[BMAC_MAX_PACKET];
+    int tx_frame_len;
+
     /* RX DMA state: parameters saved while waiting for a packet */
     bool rx_dma_waiting;
     uint64_t rx_dma_addr;
