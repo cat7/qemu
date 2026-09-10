@@ -281,6 +281,7 @@ static void screamerspk_callback(void *opaque, int free_b)
     ScreamerState *s = opaque;
     DBDMA_io *io = &s->io;
     int samples, generated;
+    size_t written;
 
     if (free_b == 0) {
         return;
@@ -293,8 +294,25 @@ static void screamerspk_callback(void *opaque, int free_b)
     samples = MIN(s->samples, free_b >> s->shift);
     generated = MIN(samples, s->wpos - s->rpos);
 
-    audio_be_write(s->be, s->voice, s->mixbuf + (uintptr_t)(s->rpos << s->shift),
-              generated << s->shift);
+    /*
+     * Advance by what the backend ACCEPTED, never by what we offered.
+     * audio_be_write() routinely takes less than it is given -- its own
+     * buffer is only a few kilobytes and drains at playback speed, so a
+     * short accept is the normal case, not an edge case. Discarding the
+     * remainder loses those samples, and losing a number of bytes that
+     * is not a whole multiple of the 4-byte stereo frame desynchronises
+     * the interleaved stream permanently: every later 16-bit sample is
+     * split across two output samples, so the channels swap and the
+     * seams crackle. hw/audio/awacs.c carries the same guard and the
+     * same reasoning; this device was written without it and Mac OS X
+     * 10.2 plays with its channels reversed and crackles worse the
+     * longer it runs.
+     */
+    written = audio_be_write(s->be, s->voice,
+                             s->mixbuf + (uintptr_t)(s->rpos << s->shift),
+                             generated << s->shift);
+    written -= written % (1 << s->shift);
+    generated = written >> s->shift;
 
     SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
 
