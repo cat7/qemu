@@ -85,12 +85,45 @@
  * 9.0.4 paces its mixer and eraser off this register and stopped
  * filling its buffers after the first one.
  */
+/*
+ * Three behaviours, selectable, because which one a given Mac OS wants is
+ * an open question and getting it wrong hangs the guest before the
+ * desktop -- a free-running counter reads ~4,000,000 by the time the
+ * sound driver initialises, where the legacy one read 0, and both 9.0.4
+ * and 9.2 then spin forever waiting for the RX DBDMA channel's ACTIVE
+ * bit to clear.
+ *
+ *   legacy  what mcayland's WIP did: advanced by whatever the host audio
+ *           backend consumed, in the output callback. Not a sample clock,
+ *           but it is what 9.2 boots and plays with today. The default,
+ *           so this device cannot break a working guest.
+ *   gated   counts only while the output engine is actually running, from
+ *           zero. Reads 0 at boot exactly as legacy does, then advances at
+ *           the sample rate while audio flows.
+ *   clock   free-running off the virtual clock from reset, as
+ *           hw/audio/awacs.c and KeyLargo's I2S counter do.
+ *
+ * Select with -global screamer.frame-count=gated|clock|legacy.
+ */
+#define SCREAMER_FC_LEGACY  0
+#define SCREAMER_FC_GATED   1
+#define SCREAMER_FC_CLOCK   2
+
 static uint32_t screamer_frame_count(ScreamerState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int rate = s->rate ? s->rate : 44100;
-    int64_t elapsed = now - s->frame_count_base_ns - SCREAMER_COUNT_LAG_NS;
+    int64_t elapsed;
 
+    if (s->frame_count_mode == SCREAMER_FC_LEGACY) {
+        return s->regs[FRAME_CNT_REG];
+    }
+
+    if (s->frame_count_mode == SCREAMER_FC_GATED && !s->frame_count_running) {
+        return s->frame_count_base_val;
+    }
+
+    elapsed = now - s->frame_count_base_ns - SCREAMER_COUNT_LAG_NS;
     if (elapsed < 0) {
         elapsed = 0;
     }
@@ -99,10 +132,27 @@ static uint32_t screamer_frame_count(ScreamerState *s)
            (uint32_t)(elapsed * rate / NANOSECONDS_PER_SECOND);
 }
 
+/* Start/stop the gated counter, banking what it has counted so far. */
+static void screamer_frame_count_run(ScreamerState *s, bool running)
+{
+    if (s->frame_count_mode != SCREAMER_FC_GATED ||
+        running == s->frame_count_running) {
+        return;
+    }
+
+    if (running) {
+        s->frame_count_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    } else {
+        s->frame_count_base_val = screamer_frame_count(s);
+    }
+    s->frame_count_running = running;
+}
+
 static void screamer_frame_count_rebase(ScreamerState *s, uint32_t val)
 {
     s->frame_count_base_val = val;
     s->frame_count_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->regs[FRAME_CNT_REG] = val;
 }
 
 /* Audio */
@@ -134,6 +184,9 @@ static void pmac_screamer_tx_transfer(ScreamerState *s)
 static void pmac_screamer_tx(DBDMA_io *io)
 {
     ScreamerState *s = io->opaque;
+
+    /* In gated mode the counter reads zero until audio actually starts. */
+    screamer_frame_count_run(s, true);
 
     SCREAMER_DPRINTF("DMA TX transfer: addr %" HWADDR_PRIx
                      " len: %x\n", io->addr, io->len);
@@ -245,6 +298,9 @@ static void screamerspk_callback(void *opaque, int free_b)
 
     SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
 
+    /* Legacy mode reports this; the other modes compute from the clock. */
+    s->regs[FRAME_CNT_REG] += generated;
+
     s->rpos += generated;
     if (s->rpos < s->wpos) {
         return;
@@ -328,6 +384,19 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
 
     if (!audio_be_check(&s->be, errp)) {
         return;
+    }
+
+    s->frame_count_mode = SCREAMER_FC_LEGACY;
+    if (s->frame_count_mode_str) {
+        if (!strcmp(s->frame_count_mode_str, "gated")) {
+            s->frame_count_mode = SCREAMER_FC_GATED;
+        } else if (!strcmp(s->frame_count_mode_str, "clock")) {
+            s->frame_count_mode = SCREAMER_FC_CLOCK;
+        } else if (strcmp(s->frame_count_mode_str, "legacy")) {
+            error_setg(errp, "screamer: frame-count must be "
+                       "legacy, gated or clock");
+            return;
+        }
     }
 
     s->rate = 44100;
@@ -510,6 +579,7 @@ static void screamer_initfn(Object *obj)
 
 static const Property screamer_properties[] = {
     DEFINE_AUDIO_PROPERTIES(ScreamerState, be),
+    DEFINE_PROP_STRING("frame-count", ScreamerState, frame_count_mode_str),
 };
 
 static void screamer_class_init(ObjectClass *oc, const void *data)
