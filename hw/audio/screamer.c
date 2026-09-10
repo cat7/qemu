@@ -368,8 +368,20 @@ static void screamer_update_settings(ScreamerState *s)
 static void screamer_update_volume(ScreamerState *s)
 {
     uint8_t muted = s->codec_ctrl_regs[0x1] & 0x80 ? 1 : 0;
-    uint8_t att_left = (s->codec_ctrl_regs[0x4] & 0xf);
-    uint8_t att_right = (s->codec_ctrl_regs[0x4] & 0x3c0) >> 6;
+    /*
+     * Bits 6-9 attenuate the LEFT channel and bits 0-3 the RIGHT, not the
+     * other way round. Measured from the guest's own writes: dragging Mac
+     * OS X 10.2's balance slider hard left makes it write 0x00f to codec
+     * registers 2 and 4 -- maximum attenuation in bits 0-3 -- because
+     * panning left is done by silencing the right channel. Hard right
+     * writes 0x3c0. Reading the fields the other way made the balance
+     * control work backwards: ask for left, hear right.
+     *
+     * hw/audio/awacs.c in the g3beige tree, which drives the same codec
+     * family and is known good, decodes it this way too.
+     */
+    uint8_t att_left = (s->codec_ctrl_regs[0x4] & 0x3c0) >> 6;
+    uint8_t att_right = (s->codec_ctrl_regs[0x4] & 0xf);
 
     SCREAMER_DPRINTF("setting mute: %d, attenuation L: %d R: %d\n",
                      muted, att_left, att_right);
