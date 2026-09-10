@@ -58,6 +58,9 @@ struct ScreamerState {
     uint32_t bpos;
     uint32_t ppos;
     uint32_t rate;
+    /* Free-running frame counter; see screamer_frame_count(). */
+    int64_t frame_count_base_ns;
+    uint32_t frame_count_base_val;
     DBDMA_io io;
 
     uint32_t regs[6];

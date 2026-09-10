@@ -61,6 +61,50 @@
 #define CODEC_STAT_AWACS_REVISION          0x3000
 #define CODEC_STAT_MASK_VALID              (0x1 << 22)
 
+/*
+ * How far the reported frame counter trails real time.
+ *
+ * The guest's whole position model hangs off this counter: Mac OS reads
+ * it to decide what has already been played, erases the ring up to it,
+ * and mixes a little way ahead of it. Delivery to the host backend
+ * jitters around the main loop, so the counter has to sit far enough in
+ * the past that the eraser can never overtake what we have actually
+ * handed over -- otherwise the guest zeroes buffers we have not played
+ * yet and the sound stops after the first chunk, which is exactly what
+ * Mac OS 9.0.4 did here. KeyLargo's I2S counter carries the same
+ * constant for the same reason.
+ */
+#define SCREAMER_COUNT_LAG_NS   (20 * 1000 * 1000)
+
+/*
+ * A real Screamer counts frames off the audio clock, continuously,
+ * whether or not anyone is listening. Deriving it instead from what the
+ * host audio backend happened to consume (the old `+= generated` in the
+ * output callback) made it advance in host-buffer-sized lumps of ~23 ms,
+ * and only when that callback ran: not a sample clock at all. Mac OS
+ * 9.0.4 paces its mixer and eraser off this register and stopped
+ * filling its buffers after the first one.
+ */
+static uint32_t screamer_frame_count(ScreamerState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int rate = s->rate ? s->rate : 44100;
+    int64_t elapsed = now - s->frame_count_base_ns - SCREAMER_COUNT_LAG_NS;
+
+    if (elapsed < 0) {
+        elapsed = 0;
+    }
+
+    return s->frame_count_base_val +
+           (uint32_t)(elapsed * rate / NANOSECONDS_PER_SECOND);
+}
+
+static void screamer_frame_count_rebase(ScreamerState *s, uint32_t val)
+{
+    s->frame_count_base_val = val;
+    s->frame_count_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
 /* Audio */
 static const char *s_spk = "screamer";
 
@@ -201,7 +245,6 @@ static void screamerspk_callback(void *opaque, int free_b)
 
     SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
 
-    s->regs[FRAME_CNT_REG] += generated;
     s->rpos += generated;
     if (s->rpos < s->wpos) {
         return;
@@ -270,6 +313,7 @@ static void screamer_reset(DeviceState *dev)
     memset(&s->io, 0, sizeof(DBDMA_io));
 
     s->rate = 44100;
+    screamer_frame_count_rebase(s, 0);
     screamer_update_settings(s);
 
     s->bpos = 0;
@@ -287,11 +331,15 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
     }
 
     s->rate = 44100;
+    screamer_frame_count_rebase(s, 0);
     screamer_update_settings(s);
 }
 
 static void screamer_control_write(ScreamerState *s, uint32_t val)
 {
+    uint32_t old_rate = s->rate;
+    uint32_t count_now = screamer_frame_count(s);
+
     SCREAMER_DPRINTF("%s: val %" PRId32 "\n", __func__, val);
 
     /* Basic rate selection */
@@ -323,6 +371,10 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
     }
 
     SCREAMER_DPRINTF("basic rate: %d\n", s->rate);
+    if (s->rate != old_rate) {
+        /* Keep the counter continuous across a rate change. */
+        screamer_frame_count_rebase(s, count_now);
+    }
     screamer_update_settings(s);
 
     s->regs[0] = val;
@@ -376,8 +428,10 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case CLIP_CNT_REG:
     case BYTE_SWAP_REG:
-    case FRAME_CNT_REG:
         val = s->regs[addr];
+        break;
+    case FRAME_CNT_REG:
+        val = screamer_frame_count(s);
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
@@ -416,6 +470,10 @@ static void screamer_write(void *opaque, hwaddr addr,
     case CLIP_CNT_REG:
     case BYTE_SWAP_REG:
         s->regs[addr] = val & 0xffffffff;
+        break;
+    case FRAME_CNT_REG:
+        /* Writing it sets the count; it keeps running from there. */
+        screamer_frame_count_rebase(s, val & 0xffffffff);
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
