@@ -59,7 +59,7 @@
 
 #define CODEC_STAT_MANUFACTURER_CRYSTAL    0x100
 #define CODEC_STAT_AWACS_REVISION          0x3000
-#define CODEC_STAT_MASK_VALID              (0x1 << 22) 
+#define CODEC_STAT_MASK_VALID              (0x1 << 22)
 
 /* Audio */
 static const char *s_spk = "screamer";
@@ -143,7 +143,7 @@ static void pmac_screamer_rx(DBDMA_io *io)
 
     //ScreamerState *s = io->opaque;
     DBDMA_channel *ch = io->channel;
-        
+
     /* FIXME: stop channel after updating with status to stop MacOS 9 freezing */
     ch->regs[DBDMA_STATUS] &= ~RUN;
 
@@ -200,7 +200,7 @@ static void screamerspk_callback(void *opaque, int free_b)
               generated << s->shift);
 
     SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
-    
+
     s->regs[FRAME_CNT_REG] += generated;
     s->rpos += generated;
     if (s->rpos < s->wpos) {
@@ -264,7 +264,7 @@ static void screamer_update_volume(ScreamerState *s)
 static void screamer_reset(DeviceState *dev)
 {
     ScreamerState *s = SCREAMER(dev);
-    
+
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->codec_ctrl_regs, 0, sizeof(s->codec_ctrl_regs));
     memset(&s->io, 0, sizeof(DBDMA_io));
@@ -293,7 +293,7 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
 static void screamer_control_write(ScreamerState *s, uint32_t val)
 {
     SCREAMER_DPRINTF("%s: val %" PRId32 "\n", __func__, val);
-        
+
     /* Basic rate selection */
     switch ((val & 0x700) >> 8) {
     case 0x00:
@@ -324,7 +324,7 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
 
     SCREAMER_DPRINTF("basic rate: %d\n", s->rate);
     screamer_update_settings(s);
-    
+
     s->regs[0] = val;
 }
 
@@ -335,7 +335,7 @@ static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
     switch (addr) {
     case 0x1:
         /* Clear recalibrate if set */
-        val = val & ~CODEC_CTRL1_RECALIBRATE;    
+        val = val & ~CODEC_CTRL1_RECALIBRATE;
 
         /* Update volume in case mute set */
         screamer_update_volume(s);
@@ -346,7 +346,7 @@ static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
         screamer_update_volume(s);
         break;
     }
-    
+
     s->codec_ctrl_regs[addr] = val;
 }
 
