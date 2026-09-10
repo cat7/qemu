@@ -64,6 +64,12 @@ struct ScreamerState {
     bool frame_count_running;
     uint8_t frame_count_mode;
     char *frame_count_mode_str;
+
+    /* Paced DBDMA completion; see screamer_arm_completion(). */
+    QEMUTimer *out_complete_timer;
+    DBDMA_io *pending_out_io;
+    int64_t play_deadline_ns;
+    uint32_t io_frames;
     DBDMA_io io;
 
     uint32_t regs[6];

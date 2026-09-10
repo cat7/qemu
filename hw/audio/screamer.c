@@ -127,6 +127,46 @@ static void screamer_frame_count_rebase(ScreamerState *s, uint32_t val)
 /* Audio */
 static const char *s_spk = "screamer";
 
+/* How far ahead of real playback the guest may run. */
+#define SCREAMER_COMPLETE_MARGIN_NS (30 * 1000 * 1000)
+
+static void screamer_out_complete(void *opaque)
+{
+    ScreamerState *s = opaque;
+    DBDMA_io *io = s->pending_out_io;
+
+    if (io) {
+        s->pending_out_io = NULL;
+        io->dma_end(io);
+    }
+}
+
+/*
+ * Complete the descriptor when its audio has nearly finished playing
+ * rather than when its bytes have been copied, so the guest is paced by
+ * real time and cannot outrun the backend.
+ */
+static void screamer_arm_completion(ScreamerState *s, DBDMA_io *io)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int rate = s->rate ? s->rate : 44100;
+    int64_t dur_ns = (int64_t)s->io_frames * NANOSECONDS_PER_SECOND / rate;
+    int64_t fire_ns;
+
+    if (s->play_deadline_ns < now) {
+        s->play_deadline_ns = now;
+    }
+    s->play_deadline_ns += dur_ns;
+
+    fire_ns = s->play_deadline_ns - dur_ns - SCREAMER_COMPLETE_MARGIN_NS;
+    if (fire_ns < now) {
+        fire_ns = now;
+    }
+
+    s->pending_out_io = io;
+    timer_mod(s->out_complete_timer, fire_ns);
+}
+
 static void pmac_screamer_tx_transfer(ScreamerState *s)
 {
     DBDMA_io *io = &s->io;
@@ -142,11 +182,12 @@ static void pmac_screamer_tx_transfer(ScreamerState *s)
     io->addr += (samples << s->shift);
     io->len -= (samples << s->shift);
     s->wpos += samples;
+    s->io_frames += samples;
 
     /* Continue DBDMA if we have completed the transfer, otherwise defer */
     if (io->len == 0) {
         SCREAMER_DPRINTF("-> End of transfer\n");
-        io->dma_end(io);
+        screamer_arm_completion(s, io);
     }
 }
 
@@ -160,6 +201,7 @@ static void pmac_screamer_tx(DBDMA_io *io)
     SCREAMER_DPRINTF("DMA TX transfer: addr %" HWADDR_PRIx
                      " len: %x\n", io->addr, io->len);
 
+    s->io_frames = 0;
     memcpy(&s->io, io, sizeof(DBDMA_io));
     //if (s->wpos + (s->io.len >> s->shift) > s->samples) {
     //    return;
@@ -170,11 +212,18 @@ static void pmac_screamer_tx(DBDMA_io *io)
 
 static void pmac_screamer_tx_flush(DBDMA_io *io)
 {
+    ScreamerState *s = io->opaque;
     DBDMA_channel *ch = io->channel;
     dbdma_cmd *current = &ch->current;
     uint16_t cmd;
 
     SCREAMER_DPRINTF("DMA TX flush!\n");
+
+    if (s->pending_out_io) {
+        timer_del(s->out_complete_timer);
+        screamer_out_complete(s);
+    }
+
 #if 0
     cmd = le16_to_cpu(current->command) & COMMAND_MASK;
     if (cmd == OUTPUT_MORE || cmd == OUTPUT_LAST ||
@@ -351,6 +400,13 @@ static void screamer_reset(DeviceState *dev)
     screamer_frame_count_rebase(s, 0);
     screamer_update_settings(s);
 
+    if (s->out_complete_timer) {
+        timer_del(s->out_complete_timer);
+    }
+    s->pending_out_io = NULL;
+    s->play_deadline_ns = 0;
+    s->io_frames = 0;
+
     s->bpos = 0;
     s->ppos = 0;
 
@@ -364,6 +420,9 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
     if (!audio_be_check(&s->be, errp)) {
         return;
     }
+
+    s->out_complete_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         screamer_out_complete, s);
 
     s->frame_count_mode = SCREAMER_FC_LEGACY;
     if (s->frame_count_mode_str) {
