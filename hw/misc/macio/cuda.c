@@ -200,12 +200,37 @@ static void cuda_send_packet_to_host(CUDAState *s,
     cuda_delay_set_sr_int(s);
 }
 
+/*
+ * The real Cuda is a single-threaded microcontroller: it emits an
+ * unsolicited packet (ADB autopoll data) only from its idle loop, never
+ * in the middle of a transaction. Sending one unconditionally from the
+ * timer callback overwrites data_in underneath a read the guest is still
+ * draining, which slips the byte framing of the packet in flight --
+ * motion deltas get consumed as button/status bytes and packet
+ * boundaries smear together. That is the "phantom clicks and cursor
+ * jumps" input corruption.
+ *
+ * Skipping is safe: the mouse and keyboard deltas keep accumulating in
+ * the ADB device and go out on the next poll. DingusPPC's
+ * ViaCuda::autopoll_handler() gates on the same condition.
+ */
+static bool cuda_unsolicited_busy(CUDAState *s)
+{
+    MOS6522State *ms = MOS6522(&s->mos6522_cuda);
+
+    return !(ms->b & TIP) || s->data_in_index < s->data_in_size;
+}
+
 static void cuda_adb_poll(void *opaque)
 {
     CUDAState *s = opaque;
     ADBBusState *adb_bus = &s->adb_bus;
     uint8_t obuf[ADB_MAX_OUT_LEN + 2];
     int olen;
+
+    if (cuda_unsolicited_busy(s)) {
+        return;
+    }
 
     olen = adb_poll(adb_bus, obuf + 2, adb_bus->autopoll_mask);
     if (olen > 0) {
