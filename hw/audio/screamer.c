@@ -62,48 +62,17 @@
 #define CODEC_STAT_MASK_VALID              (0x1 << 22)
 
 /*
- * How far the reported frame counter trails real time.
- *
- * The guest's whole position model hangs off this counter: Mac OS reads
- * it to decide what has already been played, erases the ring up to it,
- * and mixes a little way ahead of it. Delivery to the host backend
- * jitters around the main loop, so the counter has to sit far enough in
- * the past that the eraser can never overtake what we have actually
- * handed over -- otherwise the guest zeroes buffers we have not played
- * yet and the sound stops after the first chunk, which is exactly what
- * Mac OS 9.0.4 did here. KeyLargo's I2S counter carries the same
- * constant for the same reason.
+ * The reported count trails real time, so the guest's eraser cannot
+ * overtake what has actually been handed to the backend.
  */
 #define SCREAMER_COUNT_LAG_NS   (20 * 1000 * 1000)
 
 /*
- * A real Screamer counts frames off the audio clock, continuously,
- * whether or not anyone is listening. Deriving it instead from what the
- * host audio backend happened to consume (the old `+= generated` in the
- * output callback) made it advance in host-buffer-sized lumps of ~23 ms,
- * and only when that callback ran: not a sample clock at all. Mac OS
- * 9.0.4 paces its mixer and eraser off this register and stopped
- * filling its buffers after the first one.
- */
-/*
- * Three behaviours, selectable, because which one a given Mac OS wants is
- * an open question and getting it wrong hangs the guest before the
- * desktop -- a free-running counter reads ~4,000,000 by the time the
- * sound driver initialises, where the legacy one read 0, and both 9.0.4
- * and 9.2 then spin forever waiting for the RX DBDMA channel's ACTIVE
- * bit to clear.
- *
- *   legacy  what mcayland's WIP did: advanced by whatever the host audio
- *           backend consumed, in the output callback. Not a sample clock,
- *           but it is what 9.2 boots and plays with today. The default,
- *           so this device cannot break a working guest.
- *   gated   counts only while the output engine is actually running, from
- *           zero. Reads 0 at boot exactly as legacy does, then advances at
- *           the sample rate while audio flows.
- *   clock   free-running off the virtual clock from reset, as
- *           hw/audio/awacs.c and KeyLargo's I2S counter do.
- *
- * Select with -global screamer.frame-count=gated|clock|legacy.
+ * Frame counter behaviour, selected by the frame-count property:
+ *   legacy  advances in the output callback by what the backend consumed
+ *   gated   zero until the first DMA transfer, then counts at the sample rate
+ *   clock   free-running from reset at the sample rate
+ * Only legacy is known to boot Mac OS 9.
  */
 #define SCREAMER_FC_LEGACY  0
 #define SCREAMER_FC_GATED   1
@@ -185,7 +154,7 @@ static void pmac_screamer_tx(DBDMA_io *io)
 {
     ScreamerState *s = io->opaque;
 
-    /* In gated mode the counter reads zero until audio actually starts. */
+    /* Gated mode starts counting here. */
     screamer_frame_count_run(s, true);
 
     SCREAMER_DPRINTF("DMA TX transfer: addr %" HWADDR_PRIx
@@ -295,18 +264,9 @@ static void screamerspk_callback(void *opaque, int free_b)
     generated = MIN(samples, s->wpos - s->rpos);
 
     /*
-     * Advance by what the backend ACCEPTED, never by what we offered.
-     * audio_be_write() routinely takes less than it is given -- its own
-     * buffer is only a few kilobytes and drains at playback speed, so a
-     * short accept is the normal case, not an edge case. Discarding the
-     * remainder loses those samples, and losing a number of bytes that
-     * is not a whole multiple of the 4-byte stereo frame desynchronises
-     * the interleaved stream permanently: every later 16-bit sample is
-     * split across two output samples, so the channels swap and the
-     * seams crackle. hw/audio/awacs.c carries the same guard and the
-     * same reasoning; this device was written without it and Mac OS X
-     * 10.2 plays with its channels reversed and crackles worse the
-     * longer it runs.
+     * The backend may accept less than it is offered. Advance only by
+     * what it took, and only by whole frames: a partial-frame advance
+     * desynchronises the interleaved stream.
      */
     written = audio_be_write(s->be, s->voice,
                              s->mixbuf + (uintptr_t)(s->rpos << s->shift),
@@ -316,7 +276,7 @@ static void screamerspk_callback(void *opaque, int free_b)
 
     SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
 
-    /* Legacy mode reports this; the other modes compute from the clock. */
+    /* Reported by legacy mode only. */
     s->regs[FRAME_CNT_REG] += generated;
 
     s->rpos += generated;
@@ -368,18 +328,7 @@ static void screamer_update_settings(ScreamerState *s)
 static void screamer_update_volume(ScreamerState *s)
 {
     uint8_t muted = s->codec_ctrl_regs[0x1] & 0x80 ? 1 : 0;
-    /*
-     * Bits 6-9 attenuate the LEFT channel and bits 0-3 the RIGHT, not the
-     * other way round. Measured from the guest's own writes: dragging Mac
-     * OS X 10.2's balance slider hard left makes it write 0x00f to codec
-     * registers 2 and 4 -- maximum attenuation in bits 0-3 -- because
-     * panning left is done by silencing the right channel. Hard right
-     * writes 0x3c0. Reading the fields the other way made the balance
-     * control work backwards: ask for left, hear right.
-     *
-     * hw/audio/awacs.c in the g3beige tree, which drives the same codec
-     * family and is known good, decodes it this way too.
-     */
+    /* Bits 6-9 attenuate the left channel, bits 0-3 the right. */
     uint8_t att_left = (s->codec_ctrl_regs[0x4] & 0x3c0) >> 6;
     uint8_t att_right = (s->codec_ctrl_regs[0x4] & 0xf);
 
