@@ -413,6 +413,13 @@ static void ppc_core99_init(MachineState *machine)
     has_adb = (core99_machine->via_config == CORE99_VIA_CONFIG_CUDA ||
                core99_machine->via_config == CORE99_VIA_CONFIG_PMU_ADB);
 
+    /* Secondary CPUs are released through the KeyLargo GPIOs, PMU only. */
+    if (machine->smp.cpus > 1 && !has_pmu) {
+        error_report("mac99: -smp %u needs via=pmu or via=pmu-adb",
+                     machine->smp.cpus);
+        exit(1);
+    }
+
     /* init basic PC hardware */
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
 
