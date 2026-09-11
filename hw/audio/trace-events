@@ -47,6 +47,7 @@ asc_update_irq(int irq, int a, int b) "set IRQ to %d (A: 0x%x B: 0x%x)"
 screamer_out(int free_b, uint32_t written, uint32_t level) "free=%d written=%u level=%u"
 screamer_margin_rebuild(int64_t idle_ns, uint32_t level) "idle=%" PRId64 " level=%u"
 screamer_fetch_slip(uint64_t due, uint64_t fetched) "due=%" PRIu64 " fetched=%" PRIu64
+screamer_starved(uint64_t fetched, uint32_t level) "fetched=%" PRIu64 " level=%u"
 screamer_codec_write(int reg, uint64_t val) "reg=%d val=0x%" PRIx64
 screamer_volume(int mute, int att_left, int att_right) "mute=%d att_l=%d att_r=%d"
 

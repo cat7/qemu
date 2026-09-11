@@ -236,6 +236,10 @@ static void screamer_fetch(ScreamerState *s)
         s->io.dma_end(&s->io);
     }
 
+    if (!s->io_busy) {
+        /* LOCAL PROBE: nothing left to fetch; the guest must queue more */
+        trace_screamer_starved(s->fetched, screamer_ring_level(s));
+    }
     if (s->io_busy) {
         int64_t next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                        SCREAMER_FETCH_TICK_NS;
