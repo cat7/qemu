@@ -48,12 +48,12 @@ struct ScreamerState {
 
     AudioBackend *be;
     SWVoiceOut *voice;
-    uint8_t *mixbuf;
-    int samples;
     int shift;
 
-    uint32_t wpos;
-    uint32_t rpos;
+    /* Frames fetched from DBDMA, not yet handed to the backend. */
+    uint8_t *ring;
+    uint32_t ring_r;
+    uint32_t ring_w;
 
     uint32_t bpos;
     uint32_t ppos;
@@ -65,12 +65,16 @@ struct ScreamerState {
     uint8_t frame_count_mode;
     char *frame_count_mode_str;
 
-    /* Paced DBDMA completion; see screamer_arm_completion(). */
-    QEMUTimer *out_complete_timer;
-    DBDMA_io *pending_out_io;
-    int64_t play_deadline_ns;
-    uint32_t io_frames;
+    /* Sample-clock paced fetch; see screamer_fetch(). */
+    QEMUTimer *fetch_timer;
     DBDMA_io io;
+    bool io_busy;
+    bool fetching;
+    int64_t fetch_t0_ns;
+    uint64_t fetched;
+    int64_t drained_ns;
+    int64_t out_start_ns;
+    bool out_running;
 
     uint32_t regs[6];
     uint32_t codec_ctrl_regs[8];

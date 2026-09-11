@@ -127,73 +127,108 @@ static void screamer_frame_count_rebase(ScreamerState *s, uint32_t val)
 /* Audio */
 static const char *s_spk = "screamer";
 
-/* How far ahead of real playback the guest may run. */
-#define SCREAMER_COMPLETE_MARGIN_NS (30 * 1000 * 1000)
+/* Fetch ring, in frames; a power of two. */
+#define SCREAMER_RING_FRAMES    16384
+#define SCREAMER_FRAME_BYTES    4
 
-static void screamer_out_complete(void *opaque)
+/* Fetch granularity, and how far ahead of the sample clock a fetch runs. */
+#define SCREAMER_FETCH_TICK_NS  (1000 * 1000)
+#define SCREAMER_FETCH_LEAD_NS  (1000 * 1000)
+
+/* A fetch further behind the sample clock than this restarts the clock. */
+#define SCREAMER_FETCH_SLIP_NS  (10 * 1000 * 1000)
+
+/* Output latency added at stream start. */
+#define SCREAMER_PREROLL_NS     (40 * 1000 * 1000)
+
+/* Idle time after which the next descriptor starts a new stream. */
+#define SCREAMER_IDLE_NS        (50 * 1000 * 1000)
+
+static uint32_t screamer_ring_level(ScreamerState *s)
 {
-    ScreamerState *s = opaque;
-    DBDMA_io *io = s->pending_out_io;
+    return s->ring_w - s->ring_r;
+}
 
-    if (io) {
-        s->pending_out_io = NULL;
-        io->dma_end(io);
+static void screamer_ring_put(ScreamerState *s, hwaddr addr, uint32_t frames)
+{
+    uint32_t pos = s->ring_w & (SCREAMER_RING_FRAMES - 1);
+    uint32_t n = MIN(frames, SCREAMER_RING_FRAMES - pos);
+
+    dma_memory_read(&address_space_memory, addr,
+                    s->ring + pos * SCREAMER_FRAME_BYTES,
+                    n * SCREAMER_FRAME_BYTES, MEMTXATTRS_UNSPECIFIED);
+    if (frames > n) {
+        dma_memory_read(&address_space_memory, addr + n * SCREAMER_FRAME_BYTES,
+                        s->ring, (frames - n) * SCREAMER_FRAME_BYTES,
+                        MEMTXATTRS_UNSPECIFIED);
     }
+    s->ring_w += frames;
 }
 
 /*
- * Complete the descriptor when its audio has nearly finished playing
- * rather than when its bytes have been copied, so the guest is paced by
- * real time and cannot outrun the backend.
+ * Fetch descriptor data no earlier than the codec consumes it and
+ * complete each descriptor once its last frame is fetched, as the DBDMA
+ * engine does. Output latency is added after the fetch, never by
+ * reading guest buffers ahead of time.
  */
-static void screamer_arm_completion(ScreamerState *s, DBDMA_io *io)
+static void screamer_fetch(ScreamerState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    int rate = s->rate ? s->rate : 44100;
-    int64_t dur_ns = (int64_t)s->io_frames * NANOSECONDS_PER_SECOND / rate;
-    int64_t fire_ns;
+    int64_t rate = s->rate ? s->rate : 44100;
+    int64_t now, since;
+    uint64_t due;
+    uint32_t frames;
 
-    if (s->play_deadline_ns < now) {
-        s->play_deadline_ns = now;
+    if (s->fetching) {
+        return;
     }
-    s->play_deadline_ns += dur_ns;
+    s->fetching = true;
 
-    fire_ns = s->play_deadline_ns - dur_ns - SCREAMER_COMPLETE_MARGIN_NS;
-    if (fire_ns < now) {
-        fire_ns = now;
+    while (s->io_busy) {
+        now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        since = now + SCREAMER_FETCH_LEAD_NS - s->fetch_t0_ns;
+        due = since > 0 ? since * rate / NANOSECONDS_PER_SECOND : 0;
+
+        if (due > s->fetched + SCREAMER_FETCH_SLIP_NS * rate /
+                               NANOSECONDS_PER_SECOND) {
+            /* Behind the clock: restart it here rather than burst. */
+            s->fetch_t0_ns = now + SCREAMER_FETCH_LEAD_NS -
+                             (int64_t)(s->fetched * NANOSECONDS_PER_SECOND / rate);
+            due = s->fetched;
+        }
+
+        frames = MIN(due - MIN(due, s->fetched), s->io.len / SCREAMER_FRAME_BYTES);
+        frames = MIN(frames, SCREAMER_RING_FRAMES - screamer_ring_level(s));
+        if (frames) {
+            screamer_ring_put(s, s->io.addr, frames);
+            s->io.addr += frames * SCREAMER_FRAME_BYTES;
+            s->io.len -= frames * SCREAMER_FRAME_BYTES;
+            s->fetched += frames;
+        }
+
+        if (s->io.len >= SCREAMER_FRAME_BYTES) {
+            break;
+        }
+
+        s->io_busy = false;
+        s->io.dma_end(&s->io);
     }
 
-    s->pending_out_io = io;
-    timer_mod(s->out_complete_timer, fire_ns);
+    if (s->io_busy) {
+        timer_mod(s->fetch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                  SCREAMER_FETCH_TICK_NS);
+    }
+    s->fetching = false;
 }
 
-static void pmac_screamer_tx_transfer(ScreamerState *s)
+static void screamer_fetch_timer(void *opaque)
 {
-    DBDMA_io *io = &s->io;
-    int samples;
-
-    samples = MIN(io->len >> s->shift, s->samples - s->wpos);
-    dma_memory_read(&address_space_memory, io->addr,
-                    &s->mixbuf[s->wpos << s->shift], samples << s->shift,
-                    MEMTXATTRS_UNSPECIFIED);
-
-    SCREAMER_DPRINTF("DMA actually transferred 0x%x, wpos is %d\n", samples << s->shift, s->wpos);
-
-    io->addr += (samples << s->shift);
-    io->len -= (samples << s->shift);
-    s->wpos += samples;
-    s->io_frames += samples;
-
-    /* Continue DBDMA if we have completed the transfer, otherwise defer */
-    if (io->len == 0) {
-        SCREAMER_DPRINTF("-> End of transfer\n");
-        screamer_arm_completion(s, io);
-    }
+    screamer_fetch(opaque);
 }
 
 static void pmac_screamer_tx(DBDMA_io *io)
 {
     ScreamerState *s = io->opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* Gated mode starts counting here. */
     screamer_frame_count_run(s, true);
@@ -201,28 +236,25 @@ static void pmac_screamer_tx(DBDMA_io *io)
     SCREAMER_DPRINTF("DMA TX transfer: addr %" HWADDR_PRIx
                      " len: %x\n", io->addr, io->len);
 
-    s->io_frames = 0;
-    memcpy(&s->io, io, sizeof(DBDMA_io));
-    //if (s->wpos + (s->io.len >> s->shift) > s->samples) {
-    //    return;
-    //}
+    if (!s->out_running && !screamer_ring_level(s) &&
+        now - s->drained_ns >= SCREAMER_IDLE_NS) {
+        s->fetch_t0_ns = now;
+        s->fetched = 0;
+        s->out_start_ns = now + SCREAMER_PREROLL_NS;
+    }
 
-    pmac_screamer_tx_transfer(s);
+    memcpy(&s->io, io, sizeof(DBDMA_io));
+    s->io_busy = true;
+    screamer_fetch(s);
 }
 
 static void pmac_screamer_tx_flush(DBDMA_io *io)
 {
-    ScreamerState *s = io->opaque;
     DBDMA_channel *ch = io->channel;
     dbdma_cmd *current = &ch->current;
     uint16_t cmd;
 
     SCREAMER_DPRINTF("DMA TX flush!\n");
-
-    if (s->pending_out_io) {
-        timer_del(s->out_complete_timer);
-        screamer_out_complete(s);
-    }
 
 #if 0
     cmd = le16_to_cpu(current->command) & COMMAND_MASK;
@@ -297,62 +329,46 @@ void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, i
 static void screamerspk_callback(void *opaque, int free_b)
 {
     ScreamerState *s = opaque;
-    DBDMA_io *io = &s->io;
-    int samples, generated;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t level, pos, n, generated = 0;
     size_t written;
 
-    if (free_b == 0) {
-        return;
+    level = screamer_ring_level(s);
+    if (!s->out_running) {
+        if (!level || now < s->out_start_ns) {
+            return;
+        }
+        s->out_running = true;
     }
-
-    if (s->wpos - s->rpos == 0) {
-        return;
-    }
-
-    samples = MIN(s->samples, free_b >> s->shift);
-    generated = MIN(samples, s->wpos - s->rpos);
 
     /*
      * The backend may accept less than it is offered. Advance only by
      * what it took, and only by whole frames: a partial-frame advance
      * desynchronises the interleaved stream.
      */
-    written = audio_be_write(s->be, s->voice,
-                             s->mixbuf + (uintptr_t)(s->rpos << s->shift),
-                             generated << s->shift);
-    written -= written % (1 << s->shift);
-    generated = written >> s->shift;
-
-    SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
+    while (level && free_b >= SCREAMER_FRAME_BYTES) {
+        pos = s->ring_r & (SCREAMER_RING_FRAMES - 1);
+        n = MIN(level, SCREAMER_RING_FRAMES - pos);
+        n = MIN(n, free_b / SCREAMER_FRAME_BYTES);
+        written = audio_be_write(s->be, s->voice,
+                                 s->ring + pos * SCREAMER_FRAME_BYTES,
+                                 n * SCREAMER_FRAME_BYTES);
+        written /= SCREAMER_FRAME_BYTES;
+        s->ring_r += written;
+        generated += written;
+        level -= written;
+        free_b -= written * SCREAMER_FRAME_BYTES;
+        if (written < n) {
+            break;
+        }
+    }
 
     /* Reported by legacy mode only. */
     s->regs[FRAME_CNT_REG] += generated;
 
-    s->rpos += generated;
-    if (s->rpos < s->wpos) {
-        return;
-    }
-
-    s->wpos = 0;
-    s->rpos = 0;
-
-    if (io->len) {
-        DBDMA_channel *ch = io->channel;
-        uint32_t status = ch->regs[DBDMA_STATUS];
-
-        SCREAMER_DPRINTF("Continue deferred transfer\n");
-
-        /* Disable channel so we only complete the current transfer */
-        ch->regs[DBDMA_STATUS] &= ~RUN;
-
-        /* Perform deferred transfer */
-        pmac_screamer_tx_transfer(s);
-
-        /* Re-enable channel */
-        ch->regs[DBDMA_STATUS] = status;
-
-        /* Kick channel to continue */
-        DBDMA_kick(container_of(ch, DBDMAState, channels[ch->channel]));
+    if (!level && !s->io_busy) {
+        s->out_running = false;
+        s->drained_ns = now;
     }
 }
 
@@ -368,8 +384,6 @@ static void screamer_update_settings(ScreamerState *s)
     }
 
     s->shift = 2;
-    s->samples = audio_be_get_buffer_size_out(s->be, s->voice) >> s->shift;
-    s->mixbuf = g_malloc0(s->samples << s->shift);
 
     audio_be_set_active_out(s->be, s->voice, true);
 }
@@ -400,12 +414,16 @@ static void screamer_reset(DeviceState *dev)
     screamer_frame_count_rebase(s, 0);
     screamer_update_settings(s);
 
-    if (s->out_complete_timer) {
-        timer_del(s->out_complete_timer);
+    if (s->fetch_timer) {
+        timer_del(s->fetch_timer);
     }
-    s->pending_out_io = NULL;
-    s->play_deadline_ns = 0;
-    s->io_frames = 0;
+    s->io_busy = false;
+    s->fetching = false;
+    s->fetched = 0;
+    s->ring_r = 0;
+    s->ring_w = 0;
+    s->out_running = false;
+    s->drained_ns = INT64_MIN / 2;
 
     s->bpos = 0;
     s->ppos = 0;
@@ -421,8 +439,9 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
         return;
     }
 
-    s->out_complete_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                         screamer_out_complete, s);
+    s->fetch_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, screamer_fetch_timer, s);
+    s->ring = g_malloc0(SCREAMER_RING_FRAMES * SCREAMER_FRAME_BYTES);
+    s->drained_ns = INT64_MIN / 2;
 
     s->frame_count_mode = SCREAMER_FC_LEGACY;
     if (s->frame_count_mode_str) {
