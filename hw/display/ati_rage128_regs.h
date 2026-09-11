@@ -964,6 +964,7 @@
 #define R128_FLUSH_7                  0x171c
 #define R128_PC_GUI_CTLSTAT           0x1748
 #define R128_SETUP_CNTL               0x1bc4
+#define R128_TEXTURE_ST_DIRECT        (1u << 9)   /* s,t are s/w, t/w */
 #define R128_WINDOW_XY_OFFSET         0x1bcc
 #define R128_DRAW_LINE_POINT          0x1bd0
 #define R128_SETUP_CNTL_PM4           0x1bd4

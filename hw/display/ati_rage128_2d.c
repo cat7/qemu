@@ -1626,14 +1626,18 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     }
     /*
      * Perspective-correct s/t: interpolate s/w, t/w and 1/w linearly
-     * in screen space and divide per pixel. A vertex without a usable
-     * 1/w (absent from the format, non-positive, non-finite) or the
-     * unit's PERSPECTIVE_DISABLE drops the triangle to affine (all
+     * in screen space and divide per pixel. With SETUP_CNTL's
+     * TEXTURE_ST_DIRECT the vertex s,t already are s/w and t/w (Mac OS
+     * RAVE); otherwise they are multiplied by 1/w here. A vertex without
+     * a usable 1/w (absent from the format, non-positive, non-finite) or
+     * the unit's PERSPECTIVE_DISABLE drops the triangle to affine (all
      * weights 1).
      */
     if (textured) {
         bool affine = s->regs[R128_PRIM_TEX_CNTL_C >> 2] &
                       R128_TEX_PERSPECTIVE_DISABLE;
+        bool direct = s->regs[R128_SETUP_CNTL >> 2] &
+                      R128_TEXTURE_ST_DIRECT;
 
         for (i = 0; i < 3; i++) {
             if (!isfinite(q[i]) || q[i] <= 0.0) {
@@ -1641,11 +1645,14 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             }
         }
         for (i = 0; i < 3; i++) {
+            double k = direct ? 1.0 : q[i];
+
             if (affine) {
                 q[i] = 1.0;
+                k = 1.0;
             }
-            sq[i] = ati_rage128_3d_csan(v[i].s) * q[i];
-            tq[i] = ati_rage128_3d_csan(v[i].t) * q[i];
+            sq[i] = ati_rage128_3d_csan(v[i].s) * k;
+            tq[i] = ati_rage128_3d_csan(v[i].t) * k;
         }
     }
     for (i = 0; i < 3; i++) {
