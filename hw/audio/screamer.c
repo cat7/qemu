@@ -69,7 +69,7 @@
 
 /*
  * Frame counter behaviour, selected by the frame-count property:
- *   legacy  advances in the output callback by what the backend consumed
+ *   legacy  advances by the frames fetched from DBDMA
  *   gated   zero until the first DMA transfer, then counts at the sample rate
  *   clock   free-running from reset at the sample rate
  * Only legacy is known to boot Mac OS 9.
@@ -203,6 +203,8 @@ static void screamer_fetch(ScreamerState *s)
             s->io.addr += frames * SCREAMER_FRAME_BYTES;
             s->io.len -= frames * SCREAMER_FRAME_BYTES;
             s->fetched += frames;
+            /* Legacy count: frames consumed by the codec, as fetched. */
+            s->regs[FRAME_CNT_REG] += frames;
         }
 
         if (s->io.len >= SCREAMER_FRAME_BYTES) {
@@ -330,7 +332,7 @@ static void screamerspk_callback(void *opaque, int free_b)
 {
     ScreamerState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint32_t level, pos, n, generated = 0;
+    uint32_t level, pos, n;
     size_t written;
 
     level = screamer_ring_level(s);
@@ -355,16 +357,12 @@ static void screamerspk_callback(void *opaque, int free_b)
                                  n * SCREAMER_FRAME_BYTES);
         written /= SCREAMER_FRAME_BYTES;
         s->ring_r += written;
-        generated += written;
         level -= written;
         free_b -= written * SCREAMER_FRAME_BYTES;
         if (written < n) {
             break;
         }
     }
-
-    /* Reported by legacy mode only. */
-    s->regs[FRAME_CNT_REG] += generated;
 
     if (!level && !s->io_busy) {
         s->out_running = false;
