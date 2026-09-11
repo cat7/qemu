@@ -2213,6 +2213,50 @@ static uint32_t ati_rage128_card_read32(ATIRage128State *s, uint32_t addr,
     }
 }
 
+/*
+ * Read @dwords consecutive dwords starting at card address @addr with
+ * the same addressing as ati_rage128_card_read32(), one GART lookup and
+ * one DMA per page instead of two DMAs per dword.
+ */
+static void ati_rage128_card_read_block(ATIRage128State *s, uint32_t addr,
+                                        uint32_t *buf, uint32_t dwords,
+                                        bool gart)
+{
+    uint32_t gart_base = s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu;
+
+    while (dwords) {
+        uint32_t n = MIN(dwords, (0x1000 - (addr & 0xfff)) / 4);
+        uint32_t idx, entry, page, i;
+
+        if (!n || (!gart && addr + 4 <= ATI_RAGE128_VRAM_SIZE) ||
+            (addr & 3)) {
+            /* VRAM, or anything unusual: dword by dword */
+            *buf++ = ati_rage128_card_read32(s, addr, gart);
+            addr += 4;
+            dwords--;
+            continue;
+        }
+        idx = (addr >> 12) & (R128_PCIGART_TABLE_ENTRIES - 1);
+        page = 0;
+        if (gart_base) {
+            pci_dma_read(PCI_DEVICE(s), gart_base + idx * 4, &entry,
+                         sizeof(entry));
+            page = le32_to_cpu(entry) & ~0xfffu;
+        }
+        if (page) {
+            pci_dma_read(PCI_DEVICE(s), page | (addr & 0xfff), buf, n * 4);
+            for (i = 0; i < n; i++) {
+                buf[i] = le32_to_cpu(buf[i]);
+            }
+        } else {
+            memset(buf, 0, n * 4);
+        }
+        buf += n;
+        addr += n * 4;
+        dwords -= n;
+    }
+}
+
 static uint32_t ati_rage128_pm4_read_ring(ATIRage128State *s)
 {
     bool gart = s->pm4_buffer_addr & R128_AGP_OFFSET_FLAG;
@@ -3031,11 +3075,15 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
         /* bogus size -- a real IB is at most a few KB */
         return;
     }
-    for (i = 0; i < dwords; i++) {
-        uint32_t val = ati_rage128_card_read32(s, offset + i * 4, gart);
+    for (i = 0; i < dwords; ) {
+        uint32_t chunk[1024];
+        uint32_t n = MIN(dwords - i, ARRAY_SIZE(chunk)), j;
 
-        trace_ati_rage128_pm4_ib_dword(i, val);
-        ati_rage128_pm4_parse(s, &parser, val);
+        ati_rage128_card_read_block(s, offset + i * 4, chunk, n, gart);
+        for (j = 0; j < n; j++, i++) {
+            trace_ati_rage128_pm4_ib_dword(i, chunk[j]);
+            ati_rage128_pm4_parse(s, &parser, chunk[j]);
+        }
     }
 }
 
