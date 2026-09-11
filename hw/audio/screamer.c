@@ -538,8 +538,10 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case CODEC_STAT_REG:
         if (s->codec_ctrl_regs[7] & 1) {
-            /* Read back mode */
-            val = s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0xe];
+            /* Read back mode: register in bits 1-3, data in bits 4-15 */
+            val = (s->codec_ctrl_regs[(s->codec_ctrl_regs[7] & 0xe) >> 1] &
+                   0xfff) << 4;
+            val |= CODEC_STAT_MASK_VALID;
         } else {
             /* Return status register */
             val = s->regs[addr] & ~0xff00;
