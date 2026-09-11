@@ -1714,8 +1714,38 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         double sy = py + 0.5;
         uint32_t drow = dst_offset + (uint32_t)py * dst_stride;
         uint32_t zrow = z_offset + (uint32_t)py * z_stride;
+        int rowlo = minx, rowhi = maxx;
 
-        for (px = minx; px <= maxx; px++) {
+        /*
+         * The row's span, from each edge's zero crossing along it. Only
+         * pixels this excludes are skipped -- inside the span every pixel
+         * takes the same edge test as before, so what is painted does not
+         * change. Widened by one pixel each side to stay clear of the
+         * boundary case the solve itself could round the wrong way.
+         */
+        for (i = 0; i < 3; i++) {
+            double wx0 = ea[i] * (rowlo + 0.5 - x[(i + 1) % 3]) +
+                         eb[i] * (sy - y[(i + 1) % 3]);
+
+            if (ea[i] > 0.0) {
+                if (wx0 < 0.0) {
+                    rowlo += (int)(-wx0 / ea[i]);
+                }
+            } else if (ea[i] < 0.0) {
+                if (wx0 >= 0.0) {
+                    rowhi = MIN(rowhi, rowlo + (int)(wx0 / -ea[i]) + 1);
+                } else {
+                    rowhi = rowlo - 1;      /* outside at the row's start */
+                }
+            } else if (wx0 < 0.0) {
+                rowhi = rowlo - 1;          /* edge constant along the row */
+            }
+            rowlo = MAX(rowlo, minx);
+        }
+        rowlo = MAX(rowlo - 1, minx);
+        rowhi = MIN(rowhi + 1, maxx);
+
+        for (px = rowlo; px <= rowhi; px++) {
             double sx = px + 0.5;
             double w[3], w0, w1, w2, zd;
             double rgb[3], alpha;
