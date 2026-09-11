@@ -138,7 +138,7 @@ static const char *s_spk = "screamer";
 /* A fetch further behind the sample clock than this restarts the clock. */
 #define SCREAMER_FETCH_SLIP_NS  (10 * 1000 * 1000)
 
-/* Output latency added at stream start. */
+/* Output latency when the backend does not report its buffer size. */
 #define SCREAMER_PREROLL_NS     (40 * 1000 * 1000)
 
 /* Idle time after which the next descriptor starts a new stream. */
@@ -182,6 +182,18 @@ static void screamer_fetch(ScreamerState *s)
         return;
     }
     s->fetching = true;
+
+    /*
+     * Nothing fetched for longer than the output margin: the backend has
+     * run dry. Rebuild the margin before resuming, or the rest of the
+     * stream plays with none.
+     */
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->out_running && now - s->fetch_last_ns > s->preroll_ns) {
+        s->out_running = false;
+        s->out_start_ns = now + s->preroll_ns;
+    }
+    s->fetch_last_ns = now;
 
     while (s->io_busy) {
         now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -242,7 +254,7 @@ static void pmac_screamer_tx(DBDMA_io *io)
         now - s->drained_ns >= SCREAMER_IDLE_NS) {
         s->fetch_t0_ns = now;
         s->fetched = 0;
-        s->out_start_ns = now + SCREAMER_PREROLL_NS;
+        s->out_start_ns = now + s->preroll_ns;
     }
 
     memcpy(&s->io, io, sizeof(DBDMA_io));
@@ -382,6 +394,14 @@ static void screamer_update_settings(ScreamerState *s)
     }
 
     s->shift = 2;
+
+    /* Output margin: three quarters of what the backend buffers. */
+    s->preroll_ns = (int64_t)audio_be_get_buffer_size_out(s->be, s->voice) /
+                    SCREAMER_FRAME_BYTES * 3 / 4 * NANOSECONDS_PER_SECOND /
+                    s->rate;
+    if (!s->preroll_ns) {
+        s->preroll_ns = SCREAMER_PREROLL_NS;
+    }
 
     audio_be_set_active_out(s->be, s->voice, true);
 }

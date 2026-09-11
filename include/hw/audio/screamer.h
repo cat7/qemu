@@ -74,6 +74,8 @@ struct ScreamerState {
     uint64_t fetched;
     int64_t drained_ns;
     int64_t out_start_ns;
+    int64_t fetch_last_ns;
+    int64_t preroll_ns;
     bool out_running;
 
     uint32_t regs[6];
