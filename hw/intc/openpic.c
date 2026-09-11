@@ -44,6 +44,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
+#include "hw/intc/intc.h"
 
 /* #define DEBUG_OPENPIC */
 
@@ -1639,15 +1640,57 @@ static const Property openpic_properties[] = {
     DEFINE_PROP_UINT32("nb_cpus", OpenPICState, nb_cpus, 1),
 };
 
+static void openpic_print_queue(OpenPICState *opp, GString *buf,
+                                const char *name, IRQQueue *q)
+{
+    int irq;
+
+    g_string_append_printf(buf, " %s:", name);
+    for (irq = find_first_bit(q->queue, opp->max_irq); irq < opp->max_irq;
+         irq = find_next_bit(q->queue, opp->max_irq, irq + 1)) {
+        g_string_append_printf(buf, " %d(p%d)", irq,
+                               IVPR_PRIORITY(opp->src[irq].ivpr));
+    }
+}
+
+static void openpic_print_info(InterruptStatsProvider *obj, GString *buf)
+{
+    OpenPICState *opp = OPENPIC(obj);
+    unsigned i;
+
+    for (i = 0; i < opp->nb_cpus; i++) {
+        IRQDest *dst = &opp->dst[i];
+
+        g_string_append_printf(buf, "openpic cpu%u ctpr %d", i, dst->ctpr);
+        openpic_print_queue(opp, buf, "raised", &dst->raised);
+        openpic_print_queue(opp, buf, "servicing", &dst->servicing);
+        g_string_append_c(buf, '\n');
+    }
+    for (i = 0; i < opp->max_irq; i++) {
+        IRQSource *src = &opp->src[i];
+        bool ipi = i >= opp->irq_ipi0 && i < opp->irq_ipi0 + OPENPIC_MAX_IPI;
+
+        if (!ipi && !src->pending && !(src->ivpr & IVPR_ACTIVITY_MASK)) {
+            continue;
+        }
+        g_string_append_printf(buf, "openpic irq %u%s ivpr %08x destmask %x "
+                               "pending %d last_cpu %d level %d\n", i,
+                               ipi ? " (ipi)" : "", src->ivpr, src->destmask,
+                               src->pending, src->last_cpu, src->level);
+    }
+}
+
 static void openpic_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
+    InterruptStatsProviderClass *ic = INTERRUPT_STATS_PROVIDER_CLASS(oc);
 
     dc->realize = openpic_realize;
     device_class_set_props(dc, openpic_properties);
     device_class_set_legacy_reset(dc, openpic_reset);
     dc->vmsd = &vmstate_openpic;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+    ic->print_info = openpic_print_info;
 }
 
 static const TypeInfo openpic_info = {
@@ -1656,6 +1699,10 @@ static const TypeInfo openpic_info = {
     .instance_size = sizeof(OpenPICState),
     .instance_init = openpic_init,
     .class_init    = openpic_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { TYPE_INTERRUPT_STATS_PROVIDER },
+        { }
+    },
 };
 
 static void openpic_register_types(void)
