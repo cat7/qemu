@@ -538,6 +538,7 @@ static bool ati_rage128_update_display(void *opaque)
     bool valid, blanked, redraw;
     uint64_t fb_len;
 
+    ati_rage128_2d_flush_dirty(s);
     snap = ati_rage128_take_dirty(s);
     ati_rage128_get_mode(s, &mode);
     valid = ati_rage128_mode_valid(s, &mode);
@@ -3110,8 +3111,8 @@ static uint64_t ati_rage128_mmio_read(void *opaque, hwaddr addr,
     return val;
 }
 
-static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
-                                   unsigned size)
+static void ati_rage128_mmio_write_one(void *opaque, hwaddr addr,
+                                       uint64_t data, unsigned size)
 {
     ATIRage128State *s = opaque;
     uint32_t base = addr & 0x3ffc;
@@ -3163,6 +3164,14 @@ static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     ati_rage128_reg_write32(s, base, val);
 }
 
+
+/* Engine work done by this write becomes visible to the display at once. */
+static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
+                                   unsigned size)
+{
+    ati_rage128_mmio_write_one(opaque, addr, data, size);
+    ati_rage128_2d_flush_dirty(opaque);
+}
 static const MemoryRegionOps ati_rage128_mmio_ops = {
     .read = ati_rage128_mmio_read,
     .write = ati_rage128_mmio_write,
@@ -3652,6 +3661,9 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
                        ATI_RAGE128_APER_SIZE);
     memory_region_init_ram(&s->vram, obj, "ati-rage128-vram",
                            ATI_RAGE128_VRAM_SIZE, &error_fatal);
+    s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
+    s->dirty_lo = UINT32_MAX;
+    s->dirty_hi = 0;
     /*
      * Needed by ati_rage128_scan_vram_activity() to auto-detect the
      * real live framebuffer when CRTC1 never describes it (see that

@@ -54,7 +54,7 @@ static uint32_t ati_rage128_2d_read_pixel(ATIRage128State *s, uint32_t offset,
                                           uint32_t stride, int x, int y,
                                           int bpp)
 {
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint8_t *vram = s->vram_ptr;
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
 
     if (x < 0 || y < 0 || addr + bpp / 8 > ATI_RAGE128_VRAM_SIZE) {
@@ -79,7 +79,7 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
                                        uint32_t stride, int x, int y, int bpp,
                                        uint32_t color)
 {
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint8_t *vram = s->vram_ptr;
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
 
     if (x < 0 || y < 0 || addr + bpp / 8 > ATI_RAGE128_VRAM_SIZE) {
@@ -111,9 +111,23 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
      * refreshes it until an unrelated CPU store happens to dirty the
      * same scan block -- observed live as white Finder windows whose
      * icons only appear when clicked, and a Mac OS 9 menu bar that is
-     * never painted.
+     * never painted. The range is collected here and marked in one go
+     * by ati_rage128_2d_flush_dirty(): marking it per pixel dominated
+     * large blits.
      */
-    memory_region_set_dirty(&s->vram, addr & ~7ull, 8);
+    s->dirty_lo = MIN(s->dirty_lo, addr);
+    s->dirty_hi = MAX(s->dirty_hi, addr + bpp / 8);
+}
+
+void ati_rage128_2d_flush_dirty(ATIRage128State *s)
+{
+    if (s->dirty_hi > s->dirty_lo) {
+        uint64_t lo = s->dirty_lo & ~7ull;
+
+        memory_region_set_dirty(&s->vram, lo, s->dirty_hi - lo);
+    }
+    s->dirty_lo = UINT32_MAX;
+    s->dirty_hi = 0;
 }
 
 static uint32_t ati_rage128_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,

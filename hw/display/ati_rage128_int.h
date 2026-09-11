@@ -113,6 +113,9 @@ struct ATIRage128State {
 
     MemoryRegion aper;        /* BAR0: 64MB aperture container */
     MemoryRegion vram;        /* 16MB of real VRAM at aperture offset 0 */
+    uint8_t *vram_ptr;        /* host pointer to vram, fixed after realize */
+    uint32_t dirty_lo;        /* VRAM range drawn by the engine, not yet */
+    uint32_t dirty_hi;        /* marked dirty; see ati_rage128_2d_flush_dirty */
     MemoryRegion vram_aper1;  /* alias of VRAM in the aperture's top half */
     MemoryRegion mmio;        /* BAR2: 16KB register file */
     MemoryRegion io;          /* BAR1: 256-byte I/O register window */
@@ -465,6 +468,7 @@ void ati_rage128_audit_reg_write(ATIRage128State *s, uint32_t base);
 
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
+void ati_rage128_2d_flush_dirty(ATIRage128State *s);
 void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt);
 void ati_rage128_2d_scale_regs(ATIRage128State *s);
 bool ati_rage128_host_data_flush(ATIRage128State *s);
