@@ -510,22 +510,17 @@ static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
 {
     //SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
 
-    switch (addr) {
-    case 0x1:
+    if (addr == 0x1) {
         /* Clear recalibrate if set */
         val = val & ~CODEC_CTRL1_RECALIBRATE;
-
-        /* Update volume in case mute set */
-        screamer_update_volume(s);
-        break;
-
-    case 0x4:
-        /* Speaker attenuation */
-        screamer_update_volume(s);
-        break;
     }
 
     s->codec_ctrl_regs[addr] = val;
+
+    /* Mute and speaker attenuation */
+    if (addr == 0x1 || addr == 0x4) {
+        screamer_update_volume(s);
+    }
 }
 
 static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
