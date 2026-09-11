@@ -810,6 +810,7 @@
 /* GUI_STAT */
 #define R128_GUI_FIFOCNT_MASK        0xfff      /* [11:0], default 0x40 free */
 #define R128_GUI_ACTIVE              (1u << 31)
+#define R128_PM4_BUSY                (1u << 16) /* PM4_STAT */
 
 /* I2C_CNTL_0 (undocumented; XFree86 r128_reg.h layout) */
 #define R128_I2C_DONE                (1 << 0)

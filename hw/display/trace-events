@@ -148,6 +148,9 @@ ati_mm_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%
 ati_mm_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s <- 0x%"PRIx64
 
 # ati_rage128.c
+ati_rage128_engine_submit(int job, uint32_t a, uint32_t b) "job %d 0x%x 0x%x"
+ati_rage128_engine_retire(void) ""
+ati_rage128_engine_drain(uint32_t reg, int write, int64_t us) "reg 0x%04x write %d waited %" PRId64 " us"
 ati_rage128_reg_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s -> 0x%"PRIx64
 ati_rage128_reg_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s <- 0x%"PRIx64
 ati_rage128_unk_read(unsigned int size, uint64_t addr, uint64_t val) "UNKNOWN %u 0x%"PRIx64" -> 0x%"PRIx64

@@ -30,6 +30,9 @@
 #include "qapi/error.h"
 #include "system/memory.h"
 #include "ui/console.h"
+#include "qemu/main-loop.h"
+#include "qemu/thread.h"
+#include "system/qtest.h"
 #include "qom/object.h"
 #include "hw/i2c/i2c.h"
 
@@ -528,6 +531,138 @@ static DirtyBitmapSnapshot *ati_rage128_take_dirty(ATIRage128State *s)
 
 static void ati_rage128_cursor_update(ATIRage128State *s);
 static void ati_rage128_cursor_apply(ATIRage128State *s);
+static void ati_rage128_update_irq(ATIRage128State *s);
+
+/*
+ * Engine work (command streams, blits) can run for milliseconds. It runs
+ * without the BQL so the main loop and the other vCPUs keep going; other
+ * accesses to the device wait for it (ati_rage128_engine_wait). IRQ and
+ * cursor updates it causes are applied once the BQL is back.
+ */
+static __thread int ati_rage128_engine_depth;
+static __thread bool ati_rage128_engine_unlocked;
+
+static void ati_rage128_engine_wait(ATIRage128State *s);
+
+static void ati_rage128_engine_enter(ATIRage128State *s)
+{
+    if (ati_rage128_engine_depth++ || !bql_locked()) {
+        return;
+    }
+    /* one engine: queued jobs and other vCPUs' sections finish first */
+    ati_rage128_engine_wait(s);
+    s->engine_sync = true;
+    s->engine_busy = true;
+    qemu_event_reset(&s->engine_idle);
+    ati_rage128_engine_unlocked = true;
+    bql_unlock();
+}
+
+/* Engine idle again: apply what it deferred. Called with the BQL. */
+static void ati_rage128_engine_settle(ATIRage128State *s)
+{
+    if (s->fifo_stage_n) {
+        /* a synchronous section ended with FIFO dwords staged behind it */
+        qemu_bh_schedule(s->engine_bh);
+    } else {
+        s->engine_busy = false;
+    }
+    /* waiters re-check busy, the queue and engine_sync */
+    qemu_event_set(&s->engine_idle);
+    if (qatomic_xchg(&s->irq_deferred, false)) {
+        ati_rage128_update_irq(s);
+    }
+    if (qatomic_xchg(&s->cursor_deferred, false)) {
+        ati_rage128_cursor_update(s);
+    }
+}
+
+static void ati_rage128_engine_exit(ATIRage128State *s)
+{
+    if (--ati_rage128_engine_depth || !ati_rage128_engine_unlocked) {
+        return;
+    }
+    ati_rage128_engine_unlocked = false;
+    bql_lock();
+    s->engine_sync = false;
+    ati_rage128_engine_settle(s);
+}
+
+/*
+ * Retire asynchronous jobs the worker has finished: apply what they
+ * deferred, and settle once none is left. Called with the BQL.
+ */
+static void ati_rage128_engine_complete(ATIRage128State *s)
+{
+    uint64_t done = qatomic_load_acquire(&s->engine_jobs_done);
+
+    if (done == s->engine_jobs_retired) {
+        return;
+    }
+    s->engine_jobs_retired = done;
+    trace_ati_rage128_engine_retire();
+    if (done == s->engine_jobs_submitted && !s->fifo_stage_n) {
+        ati_rage128_engine_settle(s);
+        return;
+    }
+    if (qatomic_xchg(&s->irq_deferred, false)) {
+        ati_rage128_update_irq(s);
+    }
+    if (qatomic_xchg(&s->cursor_deferred, false)) {
+        ati_rage128_cursor_update(s);
+    }
+}
+
+static bool ati_rage128_engine_jobs_pending(ATIRage128State *s)
+{
+    return s->engine_jobs_submitted != s->engine_jobs_retired;
+}
+
+/* Wait until at most @limit jobs are outstanding, the BQL released. */
+static void ati_rage128_engine_wait_jobs(ATIRage128State *s, uint64_t limit)
+{
+    while (s->engine_jobs_submitted - s->engine_jobs_retired > limit) {
+        qemu_event_reset(&s->engine_done);
+        ati_rage128_engine_complete(s);
+        if (s->engine_jobs_submitted - s->engine_jobs_retired <= limit) {
+            break;
+        }
+        bql_unlock();
+        qemu_event_wait(&s->engine_done);
+        bql_lock();
+        ati_rage128_engine_complete(s);
+    }
+}
+
+static void ati_rage128_fifo_flush(ATIRage128State *s);
+
+static void ati_rage128_engine_wait(ATIRage128State *s)
+{
+    while (s->engine_busy) {
+        ati_rage128_fifo_flush(s);
+        if (ati_rage128_engine_jobs_pending(s)) {
+            ati_rage128_engine_wait_jobs(s, 0);
+            continue;
+        }
+        bql_unlock();
+        qemu_event_wait(&s->engine_idle);
+        bql_lock();
+    }
+}
+
+/* A register access that has to wait for the engine. */
+static void ati_rage128_engine_wait_reg(ATIRage128State *s, uint32_t reg,
+                                        bool write)
+{
+    int64_t t0;
+
+    if (!s->engine_busy) {
+        return;
+    }
+    t0 = get_clock();
+    ati_rage128_engine_wait(s);
+    trace_ati_rage128_engine_drain(reg, write, (get_clock() - t0) / 1000);
+}
 
 static bool ati_rage128_update_display(void *opaque)
 {
@@ -538,7 +673,9 @@ static bool ati_rage128_update_display(void *opaque)
     bool valid, blanked, redraw;
     uint64_t fb_len;
 
-    ati_rage128_2d_flush_dirty(s);
+    if (!s->engine_busy) {
+        ati_rage128_2d_flush_dirty(s);
+    }
     snap = ati_rage128_take_dirty(s);
     ati_rage128_get_mode(s, &mode);
     valid = ati_rage128_mode_valid(s, &mode);
@@ -752,9 +889,15 @@ static const GraphicHwOps ati_rage128_gfx_ops = {
 
 static void ati_rage128_update_irq(ATIRage128State *s)
 {
-    uint32_t pending = s->regs[R128_GEN_INT_STATUS >> 2] &
-                       s->regs[R128_GEN_INT_CNTL >> 2] &
-                       R128_GEN_INT_ACK_MASK;
+    uint32_t pending;
+
+    if (!bql_locked()) {
+        qatomic_set(&s->irq_deferred, true);
+        return;
+    }
+    pending = s->regs[R128_GEN_INT_STATUS >> 2] &
+              s->regs[R128_GEN_INT_CNTL >> 2] &
+              R128_GEN_INT_ACK_MASK;
 
     pci_set_irq(PCI_DEVICE(s), pending != 0);
 }
@@ -1225,6 +1368,9 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
          * matches the Linux driver's r128_do_cce_idle() check.
          */
         val = 192;
+        if (s->engine_busy) {
+            val |= R128_PM4_BUSY | R128_GUI_ACTIVE;
+        }
         break;
     case R128_PM4_BUFFER_OFFSET:
         val = s->pm4_buffer_addr;
@@ -1291,8 +1437,11 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         val = s->regs[base >> 2] & 0x3fffffff;
         break;
     case R128_GUI_STAT:
-        /* engine idle, all 64 command FIFO entries free */
+        /* all 64 command FIFO entries free; active while jobs run */
         val = 0x40;
+        if (s->engine_busy) {
+            val |= R128_GUI_ACTIVE;
+        }
         break;
     case R128_DST_OFFSET:
         val = s->dst_offset_reg;
@@ -1430,6 +1579,205 @@ static void ati_rage128_pm4_run(ATIRage128State *s);
 static void ati_rage128_pm4_fifo_push(ATIRage128State *s, uint32_t val);
 static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
                                      uint32_t dwords);
+
+/*
+ * Asynchronous engine. A command-stream kick (ring, indirect buffer,
+ * bus-master table) is handed to a worker thread and the register write
+ * returns at once, as the chip's command processor runs alongside the
+ * CPU; further kicks queue behind it. Any other access to the device
+ * first waits for the queue to drain (ati_rage128_engine_wait), so the
+ * guest always sees work complete in order, except the status registers,
+ * which report the engine busy as the chip does, and the command FIFO,
+ * whose dwords are queued behind the jobs (ati_rage128_fifo_stage). The
+ * worker never takes the BQL; what it defers is applied by whoever
+ * retires the job under the BQL, a waiting vCPU or engine_bh.
+ */
+enum {
+    ATI_RAGE128_JOB_NONE,
+    ATI_RAGE128_JOB_RING,
+    ATI_RAGE128_JOB_INDIRECT,
+    ATI_RAGE128_JOB_BM,
+    ATI_RAGE128_JOB_FIFO,
+};
+
+static void ati_rage128_engine_run_job(ATIRage128State *s, int job,
+                                       uint32_t a, uint32_t b)
+{
+    switch (job) {
+    case ATI_RAGE128_JOB_RING:
+        ati_rage128_pm4_run(s);
+        break;
+    case ATI_RAGE128_JOB_INDIRECT:
+        ati_rage128_pm4_indirect(s, a, b);
+        break;
+    case ATI_RAGE128_JOB_BM:
+        ati_rage128_bm_gui_run(s, a);
+        break;
+    case ATI_RAGE128_JOB_FIFO:
+    {
+        const uint32_t *d = &s->fifo_batch[a * ATI_RAGE128_FIFO_BATCH];
+        uint32_t i;
+
+        for (i = 0; i < b; i++) {
+            ati_rage128_pm4_fifo_push(s, d[i]);
+        }
+        break;
+    }
+    }
+}
+
+static void *ati_rage128_engine_thread(void *opaque)
+{
+    ATIRage128State *s = opaque;
+    uint64_t taken = 0;
+
+    qemu_mutex_lock(&s->engine_lock);
+    for (;;) {
+        ATIRage128Job j;
+
+        while (taken == s->engine_jobs_submitted && !s->engine_quit) {
+            qemu_cond_wait(&s->engine_cond, &s->engine_lock);
+        }
+        if (s->engine_quit) {
+            break;
+        }
+        j = s->engine_queue[taken % ATI_RAGE128_JOB_QUEUE];
+        taken++;
+        qemu_mutex_unlock(&s->engine_lock);
+
+        ati_rage128_engine_depth = 1;
+        ati_rage128_engine_run_job(s, j.job, j.a, j.b);
+        ati_rage128_engine_depth = 0;
+        ati_rage128_2d_flush_dirty(s);
+
+        qemu_mutex_lock(&s->engine_lock);
+        qatomic_store_release(&s->engine_jobs_done, taken);
+        qemu_event_set(&s->engine_done);
+        qemu_bh_schedule(s->engine_bh);
+    }
+    qemu_mutex_unlock(&s->engine_lock);
+    return NULL;
+}
+
+static void ati_rage128_fifo_queue(ATIRage128State *s);
+
+static void ati_rage128_engine_bh(void *opaque)
+{
+    ATIRage128State *s = opaque;
+
+    ati_rage128_engine_complete(s);
+    /* never block the main loop: a full queue schedules this again */
+    if (s->fifo_stage_n && !s->engine_sync &&
+        s->engine_jobs_submitted - s->engine_jobs_retired <
+        ATI_RAGE128_JOB_QUEUE) {
+        ati_rage128_fifo_queue(s);
+    }
+}
+
+static bool ati_rage128_engine_async(ATIRage128State *s)
+{
+    return (s->engine_async == ON_OFF_AUTO_ON ||
+            (s->engine_async == ON_OFF_AUTO_AUTO && !qtest_enabled())) &&
+           bql_locked() && !ati_rage128_engine_depth;
+}
+
+/* Wait for a free queue slot and no synchronous section, the BQL released. */
+static void ati_rage128_engine_reserve(ATIRage128State *s)
+{
+    for (;;) {
+        if (s->engine_sync) {
+            bql_unlock();
+            qemu_event_wait(&s->engine_idle);
+            bql_lock();
+        } else if (s->engine_jobs_submitted - s->engine_jobs_retired >=
+                   ATI_RAGE128_JOB_QUEUE) {
+            ati_rage128_engine_wait_jobs(s, ATI_RAGE128_JOB_QUEUE - 1);
+        } else {
+            break;
+        }
+    }
+}
+
+/* Put a job in the reserved slot. */
+static void ati_rage128_engine_enqueue(ATIRage128State *s, int job,
+                                       uint32_t a, uint32_t b)
+{
+    s->engine_busy = true;
+    qemu_event_reset(&s->engine_idle);
+    trace_ati_rage128_engine_submit(job, a, b);
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_queue[s->engine_jobs_submitted % ATI_RAGE128_JOB_QUEUE] =
+        (ATIRage128Job) { job, a, b };
+    s->engine_jobs_submitted++;
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+}
+
+/* Hand the staged FIFO dwords to the reserved slot. */
+static void ati_rage128_fifo_queue(ATIRage128State *s)
+{
+    uint32_t slot = s->engine_jobs_submitted % ATI_RAGE128_JOB_QUEUE;
+    uint32_t n = s->fifo_stage_n;
+
+    memcpy(&s->fifo_batch[slot * ATI_RAGE128_FIFO_BATCH], s->fifo_stage,
+           n * sizeof(uint32_t));
+    s->fifo_stage_n = 0;
+    ati_rage128_engine_enqueue(s, ATI_RAGE128_JOB_FIFO, slot, n);
+}
+
+/* Queue the staged FIFO dwords as one job. Called with the BQL. */
+static void ati_rage128_fifo_flush(ATIRage128State *s)
+{
+    if (!s->fifo_stage_n) {
+        return;
+    }
+    ati_rage128_engine_reserve(s);
+    /* another vCPU may have queued them while the BQL was released */
+    if (s->fifo_stage_n) {
+        ati_rage128_fifo_queue(s);
+    }
+}
+
+/*
+ * A command FIFO dword written while jobs are outstanding goes behind
+ * them instead of waiting for them. Returns false when it is to be
+ * parsed at once.
+ */
+static bool ati_rage128_fifo_stage(ATIRage128State *s, uint32_t val)
+{
+    if (!ati_rage128_engine_async(s) ||
+        (!s->engine_busy && !s->fifo_stage_n)) {
+        return false;
+    }
+    if (s->fifo_stage_n == ATI_RAGE128_FIFO_BATCH) {
+        ati_rage128_fifo_flush(s);
+        if (!s->engine_busy && !s->fifo_stage_n) {
+            return false;
+        }
+    }
+    if (!s->fifo_stage_n) {
+        qemu_bh_schedule(s->engine_bh);
+    }
+    s->fifo_stage[s->fifo_stage_n++] = val;
+    return true;
+}
+
+/*
+ * Queue a job for the worker, behind any staged FIFO dwords, waiting
+ * only for a free slot. Returns false when the caller must run it itself:
+ * asynchronous mode off, qtest, or already inside a job.
+ */
+static bool ati_rage128_engine_submit(ATIRage128State *s, int job,
+                                      uint32_t a, uint32_t b)
+{
+    if (!ati_rage128_engine_async(s)) {
+        return false;
+    }
+    ati_rage128_fifo_flush(s);
+    ati_rage128_engine_reserve(s);
+    ati_rage128_engine_enqueue(s, job, a, b);
+    return true;
+}
 
 /*
  * Re-derive the effective 2D pitch/offset and scissors from the register
@@ -1674,7 +2022,11 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_BM_GUI_TABLE:
         s->regs[base >> 2] = val;
-        ati_rage128_bm_gui_run(s, val);
+        if (!ati_rage128_engine_submit(s, ATI_RAGE128_JOB_BM, val, 0)) {
+            ati_rage128_engine_enter(s);
+            ati_rage128_bm_gui_run(s, val);
+            ati_rage128_engine_exit(s);
+        }
         break;
     case R128_PM4_BUFFER_OFFSET:
         s->pm4_buffer_addr = val;
@@ -1708,14 +2060,25 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_PM4_BUFFER_DL_WPTR:
         s->pm4_wptr = val & ~R128_PM4_BUFFER_DL_DONE;
         /* bit31 (DL_DONE) is a flush marker -- either way, consume */
-        ati_rage128_pm4_run(s);
+        if (!ati_rage128_engine_submit(s, ATI_RAGE128_JOB_RING, 0, 0)) {
+            ati_rage128_engine_enter(s);
+            ati_rage128_pm4_run(s);
+            ati_rage128_engine_exit(s);
+        }
         break;
     case R128_PM4_IW_INDOFF:
         s->regs[base >> 2] = val;
         break;
     case R128_PM4_IW_INDSIZE:
         s->regs[base >> 2] = val;
-        ati_rage128_pm4_indirect(s, s->regs[R128_PM4_IW_INDOFF >> 2], val);
+        if (!ati_rage128_engine_submit(s, ATI_RAGE128_JOB_INDIRECT,
+                                       s->regs[R128_PM4_IW_INDOFF >> 2],
+                                       val)) {
+            ati_rage128_engine_enter(s);
+            ati_rage128_pm4_indirect(s, s->regs[R128_PM4_IW_INDOFF >> 2],
+                                     val);
+            ati_rage128_engine_exit(s);
+        }
         break;
     case R128_PM4_MICROCODE_ADDR:
         s->pm4_ucode_waddr = val & (R128_PM4_MICROCODE_WORDS - 1);
@@ -1745,7 +2108,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
          * the HOST_DATA stream that followed (menu bar restore, window
          * icons, drag save-behind) was thrown away.
          */
-        ati_rage128_pm4_fifo_push(s, val);
+        if (!ati_rage128_fifo_stage(s, val)) {
+            ati_rage128_pm4_fifo_push(s, val);
+        }
         break;
     case R128_DST_OFFSET:
         s->dst_offset_reg = val & 0xfffffff0;
@@ -1758,7 +2123,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_DST_WIDTH:
         s->dst_width = val & 0x3fff;
+        ati_rage128_engine_enter(s);
         ati_rage128_2d_blt(s);
+        ati_rage128_engine_exit(s);
         break;
     case R128_DST_HEIGHT:
         s->dst_height = val & 0x3fff;
@@ -1799,7 +2166,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_DST_HEIGHT_WIDTH:
         s->dst_width = val & 0x3fff;
         s->dst_height = (val >> 16) & 0x3fff;
+        ati_rage128_engine_enter(s);
         ati_rage128_2d_blt(s);
+        ati_rage128_engine_exit(s);
         break;
     case R128_SCALE_DST_HEIGHT_WIDTH:
         /* the register-programmed scaler's kick: parameters were stored
@@ -1847,7 +2216,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_DST_WIDTH_X:
         s->dst_x = val & 0x3fff;
         s->dst_width = (val >> 16) & 0x3fff;
+        ati_rage128_engine_enter(s);
         ati_rage128_2d_blt(s);
+        ati_rage128_engine_exit(s);
         break;
     case R128_SRC_X_Y:
         s->src_y = val & 0x3fff;
@@ -1860,7 +2231,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_DST_WIDTH_HEIGHT:
         s->dst_height = val & 0x3fff;
         s->dst_width = (val >> 16) & 0x3fff;
+        ati_rage128_engine_enter(s);
         ati_rage128_2d_blt(s);
+        ati_rage128_engine_exit(s);
         break;
     case R128_DST_HEIGHT_Y:
         s->dst_y = val & 0x3fff;
@@ -3417,7 +3790,27 @@ static uint64_t ati_rage128_mmio_read(void *opaque, hwaddr addr,
 {
     ATIRage128State *s = opaque;
     uint32_t base = addr & 0x3ffc;
-    uint32_t val = ati_rage128_reg_read32(s, base);
+    uint32_t val;
+
+    /*
+     * Registers the guest polls while the engine runs: the status pair,
+     * the interrupt pair (read in the interrupt handler) and the GUI
+     * scratch registers, which drivers use as engine-progress fences.
+     * Draining the queue for those would turn every poll into a stall of
+     * the whole queue -- Mac OS 9's interrupt handler alone read
+     * GEN_INT_STATUS 23000 times in one session. They report what the
+     * jobs done so far have left behind, as the chip does.
+     */
+    if (base == R128_GUI_STAT || base == R128_PM4_STAT ||
+        base == R128_PM4_BUFFER_DL_RPTR ||
+        base == R128_GEN_INT_STATUS || base == R128_GEN_INT_CNTL ||
+        (base == R128_GUI_SCRATCH_REG0 || base == R128_GUI_SCRATCH_REG1)) {
+        ati_rage128_fifo_flush(s);
+        ati_rage128_engine_complete(s);
+    } else {
+        ati_rage128_engine_wait_reg(s, base, false);
+    }
+    val = ati_rage128_reg_read32(s, base);
 
     val = extract32(val, (addr & 3) * 8, size * 8);
     if (ati_rage128_reg_name(base)[0] == '?') {
@@ -3487,8 +3880,20 @@ static void ati_rage128_mmio_write_one(void *opaque, hwaddr addr,
 static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
                                    unsigned size)
 {
-    ati_rage128_mmio_write_one(opaque, addr, data, size);
-    ati_rage128_2d_flush_dirty(opaque);
+    ATIRage128State *s = opaque;
+    uint32_t base = addr & 0x3ffc;
+
+    /* kicks queue behind running jobs; everything else waits for them */
+    if (base != R128_PM4_IW_INDOFF && base != R128_PM4_IW_INDSIZE &&
+        base != R128_PM4_BUFFER_DL_WPTR &&
+        base != R128_GEN_INT_STATUS && base != R128_GEN_INT_CNTL &&
+        (base < R128_PM4_FIFO_DATA_EVEN || base > R128_PM4_FIFO_APER_END)) {
+        ati_rage128_engine_wait_reg(s, base, true);
+    }
+    ati_rage128_mmio_write_one(s, addr, data, size);
+    if (!s->engine_busy) {
+        ati_rage128_2d_flush_dirty(s);
+    }
 }
 static const MemoryRegionOps ati_rage128_mmio_ops = {
     .read = ati_rage128_mmio_read,
@@ -3680,6 +4085,19 @@ static const MemoryRegionOps ati_rage128_aper1_ops = {
 static void ati_rage128_reset_hold(Object *obj, ResetType type)
 {
     ATIRage128State *s = ATI_RAGE128(obj);
+
+    /* the worker never needs the BQL, so waiting here cannot deadlock */
+    s->fifo_stage_n = 0;
+    while (ati_rage128_engine_jobs_pending(s)) {
+        qemu_event_reset(&s->engine_done);
+        ati_rage128_engine_complete(s);
+        if (ati_rage128_engine_jobs_pending(s)) {
+            qemu_event_wait(&s->engine_done);
+        }
+    }
+    if (s->engine_busy && !s->engine_sync) {
+        ati_rage128_engine_settle(s);
+    }
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
@@ -3891,6 +4309,10 @@ static void ati_rage128_cursor_timer(void *opaque)
  */
 static void ati_rage128_cursor_update(ATIRage128State *s)
 {
+    if (!bql_locked()) {
+        qatomic_set(&s->cursor_deferred, true);
+        return;
+    }
     if (!s->cursor_timer) {
         ati_rage128_cursor_apply(s);
         return;
@@ -3980,6 +4402,16 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
     memory_region_init_ram(&s->vram, obj, "ati-rage128-vram",
                            ATI_RAGE128_VRAM_SIZE, &error_fatal);
     s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
+    qemu_event_init(&s->engine_idle, true);
+    qemu_event_init(&s->engine_done, false);
+    qemu_mutex_init(&s->engine_lock);
+    qemu_cond_init(&s->engine_cond);
+    s->engine_bh = qemu_bh_new(ati_rage128_engine_bh, s);
+    s->fifo_stage = g_new(uint32_t, ATI_RAGE128_FIFO_BATCH);
+    s->fifo_batch = g_new(uint32_t, ATI_RAGE128_JOB_QUEUE *
+                                    ATI_RAGE128_FIFO_BATCH);
+    qemu_thread_create(&s->engine_thread, "ati-rage128-engine",
+                       ati_rage128_engine_thread, s, QEMU_THREAD_JOINABLE);
     s->dirty_lo = UINT32_MAX;
     s->dirty_hi = 0;
     /*
@@ -4047,6 +4479,14 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
      */
     memory_region_init_io(&s->io, obj, &ati_rage128_mmio_ops, s,
                           "ati-rage128-io", ATI_RAGE128_IO_SIZE);
+    /*
+     * Engine waits release the BQL inside the handlers; accesses from
+     * other vCPUs then enter and wait their turn instead of failing.
+     */
+    s->mmio.disable_reentrancy_guard = true;
+    s->io.disable_reentrancy_guard = true;
+    s->vram_aper1.disable_reentrancy_guard = true;
+    s->vram_watch.disable_reentrancy_guard = true;
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_PREFETCH, &s->aper);
@@ -4122,6 +4562,15 @@ static void ati_rage128_exit(PCIDevice *dev)
 {
     ATIRage128State *s = ATI_RAGE128(dev);
 
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_quit = true;
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+    qemu_thread_join(&s->engine_thread);
+    qemu_bh_delete(s->engine_bh);
+    g_free(s->fifo_stage);
+    g_free(s->fifo_batch);
+
     timer_free(s->vblank_timer);
     timer_free(s->vblank_end_timer);
     timer_free(s->cursor_timer);
@@ -4156,6 +4605,9 @@ static const Property ati_rage128_properties[] = {
     DEFINE_PROP_UINT32("fillwatch-size", ATIRage128State, fillwatch_size, 0),
     DEFINE_PROP_BOOL("monitor-connected", ATIRage128State,
                      monitor_connected, true),
+    /* command-stream kicks on a worker thread; auto = on except qtest */
+    DEFINE_PROP_ON_OFF_AUTO("async-engine", ATIRage128State, engine_async,
+                            ON_OFF_AUTO_AUTO),
     DEFINE_EDID_PROPERTIES(ATIRage128State, edid_info),
 };
 
