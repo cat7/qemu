@@ -131,9 +131,14 @@ static const char *s_spk = "screamer";
 #define SCREAMER_RING_FRAMES    16384
 #define SCREAMER_FRAME_BYTES    4
 
-/* Fetch granularity, and how far ahead of the sample clock a fetch runs. */
+/*
+ * Fetch granularity, and where a fetch runs relative to the sample
+ * clock. Mac OS X writes only 45 frames ahead of the position it derives
+ * from the ring-wrap interrupt, so fetching trails the clock slightly
+ * rather than reading ahead of it.
+ */
 #define SCREAMER_FETCH_TICK_NS  (1000 * 1000)
-#define SCREAMER_FETCH_LEAD_NS  (1000 * 1000)
+#define SCREAMER_FETCH_LEAD_NS  (-2 * 1000 * 1000)
 
 /* A fetch further behind the sample clock than this restarts the clock. */
 #define SCREAMER_FETCH_SLIP_NS  (10 * 1000 * 1000)
@@ -228,8 +233,17 @@ static void screamer_fetch(ScreamerState *s)
     }
 
     if (s->io_busy) {
-        timer_mod(s->fetch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                  SCREAMER_FETCH_TICK_NS);
+        int64_t next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                       SCREAMER_FETCH_TICK_NS;
+        /* Complete the descriptor at its own time, not on a tick boundary. */
+        int64_t end = s->fetch_t0_ns - SCREAMER_FETCH_LEAD_NS +
+                      (int64_t)((s->fetched + s->io.len / SCREAMER_FRAME_BYTES) *
+                                NANOSECONDS_PER_SECOND / rate);
+
+        if (screamer_ring_level(s) >= SCREAMER_RING_FRAMES) {
+            end = next;         /* stalled on a full ring: just poll */
+        }
+        timer_mod(s->fetch_timer, MIN(next, end));
     }
     s->fetching = false;
 }
