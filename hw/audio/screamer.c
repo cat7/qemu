@@ -35,6 +35,7 @@
 #include "qemu/typedefs.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "trace.h"
 
 /* debug screamer */
 //#define DEBUG_SCREAMER
@@ -195,6 +196,8 @@ static void screamer_fetch(ScreamerState *s)
      */
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     if (s->out_running && now - s->fetch_last_ns > s->preroll_ns) {
+        trace_screamer_margin_rebuild(now - s->fetch_last_ns,
+                                      screamer_ring_level(s));
         s->out_running = false;
         s->out_start_ns = now + s->preroll_ns;
     }
@@ -208,6 +211,7 @@ static void screamer_fetch(ScreamerState *s)
         if (due > s->fetched + SCREAMER_FETCH_SLIP_NS * rate /
                                NANOSECONDS_PER_SECOND) {
             /* Behind the clock: restart it here rather than burst. */
+            trace_screamer_fetch_slip(due, s->fetched);
             s->fetch_t0_ns = now + SCREAMER_FETCH_LEAD_NS -
                              (int64_t)(s->fetched * NANOSECONDS_PER_SECOND / rate);
             due = s->fetched;
@@ -358,7 +362,8 @@ static void screamerspk_callback(void *opaque, int free_b)
 {
     ScreamerState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint32_t level, pos, n;
+    uint32_t level, pos, n, written_total = 0;
+    int free_in = free_b;
     size_t written;
 
     level = screamer_ring_level(s);
@@ -383,12 +388,15 @@ static void screamerspk_callback(void *opaque, int free_b)
                                  n * SCREAMER_FRAME_BYTES);
         written /= SCREAMER_FRAME_BYTES;
         s->ring_r += written;
+        written_total += written;
         level -= written;
         free_b -= written * SCREAMER_FRAME_BYTES;
         if (written < n) {
             break;
         }
     }
+
+    trace_screamer_out(free_in, written_total, level);
 
     if (!level && !s->io_busy) {
         s->out_running = false;
@@ -429,6 +437,7 @@ static void screamer_update_volume(ScreamerState *s)
 
     SCREAMER_DPRINTF("setting mute: %d, attenuation L: %d R: %d\n",
                      muted, att_left, att_right);
+    trace_screamer_volume(muted, att_left, att_right);
 
     audio_be_set_volume_out_lr(s->be, s->voice, muted, (0xf - att_left) << 4,
                           (0xf - att_right) << 4);
@@ -540,6 +549,7 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
 
 static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
 {
+    trace_screamer_codec_write(addr, val);
     //SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
 
     if (addr == 0x1) {
