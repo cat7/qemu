@@ -550,8 +550,19 @@
 #define R128_INPUT_FACTOR_CONST_ALPHA 3
 #define R128_INPUT_FACTOR_INT_COLOR  4
 #define R128_INPUT_FACTOR_INT_ALPHA  5
+/*
+ * PRIM_TEXTURE_COMBINE_CNTL_C's alpha function (r128_reg.h 1338-1352)
+ * decides what the unit's alpha output is, and so what the blender takes
+ * as its source alpha. DIS leaves the vertex alpha alone, COPY takes the
+ * alpha factor (normally the texel's), MODULATE multiplies the two.
+ * Mac OS 9's RAVE driver writes MODULATE, Mac OS X's OpenGL driver COPY.
+ */
 #define R128_COMB_ALPHA_SHIFT        14
 #define R128_COMB_ALPHA_MASK         15
+#define R128_COMB_ALPHA_DIS          0
+#define R128_COMB_ALPHA_COPY         1
+#define R128_COMB_ALPHA_COPY_INP     2
+#define R128_COMB_ALPHA_MODULATE     3
 #define R128_ALPHA_FACTOR_SHIFT      18
 #define R128_ALPHA_FACTOR_MASK       15
 #define R128_ALPHA_FACTOR_TEX_ALPHA  6

@@ -1264,6 +1264,42 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     return true;
 }
 
+/*
+ * The blender's source alpha. PRIM_TEXTURE_COMBINE_CNTL_C carries both
+ * the alpha function (COMB_ALPHA) and the factor it works on
+ * (ALPHA_FACTOR: 6 the texel's alpha, 7 its inverse). @ta is the texel
+ * alpha, @va the vertex alpha.
+ */
+static unsigned ati_rage128_3d_src_alpha(uint32_t comb, uint32_t tex_cntl,
+                                         bool textured, unsigned ta,
+                                         unsigned va)
+{
+    unsigned fn = (comb >> R128_COMB_ALPHA_SHIFT) & R128_COMB_ALPHA_MASK;
+    unsigned factor = (comb >> R128_ALPHA_FACTOR_SHIFT) &
+                      R128_ALPHA_FACTOR_MASK;
+    unsigned fa;
+
+    if (!textured) {
+        return va;
+    }
+    fa = factor == R128_ALPHA_FACTOR_NTEX_ALPHA ? 255 - ta : ta;
+
+    switch (fn) {
+    case R128_COMB_ALPHA_COPY:
+    case R128_COMB_ALPHA_COPY_INP:
+        return fa;
+    case R128_COMB_ALPHA_MODULATE:
+        /*
+         * Both sources multiplied. RAVE's opaque geometry reaches here
+         * with a zero texel alpha and relies on ALPHA_IN_TEX to say the
+         * texel's alpha is not meant to be used at all.
+         */
+        return (tex_cntl & R128_ALPHA_IN_TEX) ? fa * va / 255 : va;
+    default:                                    /* DIS and anything else */
+        return va;
+    }
+}
+
 /* one texel index through the unit's addressing mode; n is a power of 2 */
 static inline int ati_rage128_tex_wrap(int i, int n, unsigned mode,
                                        bool *border)
@@ -1609,6 +1645,7 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     double ea[3], eb[3];
     bool tl[3];
     int sc_left, sc_top, sc_right, sc_bottom;
+    uint32_t texel;
     int minx, maxx, miny, maxy, px, py, i;
 
     if (dt != 3 && dt != 4 && dt != 6) {
@@ -1949,14 +1986,15 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             rgb[2] = w0 * b[0] + w1 * b[1] + w2 * b[2];
             alpha = w0 * a[0] + w1 * a[1] + w2 * a[2];
             vtx_a8 = ati_rage128_3d_col8(alpha);
+            texel = 0;
             if (textured) {
                 double qi = w0 * q[0] + w1 * q[1] + w2 * q[2];
                 double si = (w0 * sq[0] + w1 * sq[1] + w2 * sq[2]) / qi;
                 double ti = (w0 * tq[0] + w1 * tq[1] + w2 * tq[2]) / qi;
 
-                ati_rage128_tex_combine(comb,
-                                        ati_rage128_tex_sample(&tex, si, ti),
-                                        const_color, rgb, &alpha);
+                texel = ati_rage128_tex_sample(&tex, si, ti);
+                ati_rage128_tex_combine(comb, texel, const_color, rgb,
+                                        &alpha);
             }
             if (fogged) {
                 double fi = w0 * fg[0] + w1 * fg[1] + w2 * fg[2];
@@ -1982,15 +2020,19 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                                    ati_rage128_vram_ld(vram, daddr, bpp));
                 unsigned sc[4] = { b8, g8, r8, a8 };
                 /*
-                 * TEX_CNTL_C's ALPHA_IN_TEX says whether the texel's
-                 * alpha reaches the blender; without it the vertex alpha
-                 * does. Mac OS RAVE leaves the bit clear for opaque
-                 * geometry, whose textures carry a zero alpha channel --
-                 * taking that as source alpha would blend the whole scene
-                 * into the background -- and sets it for the cut-outs.
+                 * The texture unit's alpha function decides what the
+                 * blender's source alpha is. Mac OS 9's RAVE driver
+                 * writes MODULATE and leaves ALPHA_IN_TEX clear for
+                 * opaque geometry, whose textures carry a zero alpha
+                 * channel; Mac OS X's OpenGL driver writes COPY, where
+                 * the texel's alpha stands on its own -- reading the
+                 * vertex alpha there painted Chessmaster 9000's 3D board
+                 * with a zero source alpha, so every triangle blended
+                 * away to the cleared background.
                  */
-                unsigned sa = (textured && (tex_cntl & R128_ALPHA_IN_TEX))
-                              ? a8 : vtx_a8;
+                unsigned sa = ati_rage128_3d_src_alpha(comb, tex_cntl,
+                                                       textured,
+                                                       texel >> 24, vtx_a8);
                 unsigned oc[4];
                 int k, shift;
 
