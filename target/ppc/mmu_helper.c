@@ -175,6 +175,33 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
 }
 #endif
 
+/*
+ * With the hash MMU a BAT change asks for one whole-TLB flush at the next
+ * context synchronisation, which must follow the change anyway, instead of
+ * invalidating its ranges page by page: Mac OS 9's nanokernel turns BATs on
+ * and off on every address space switch, ~500 times a second, and the page
+ * loop costs 71-74% of the guest CPU at an idle Finder (25% with this).
+ * The same deferral helper_store_sr() already uses.
+ *
+ * Unrelated but easy to blame on this: Mac OS 9 on -smp 2 freezes under
+ * load (its Ticks stop while the kernel, both decrementers and every
+ * device interrupt keep running). It does that with this change reverted
+ * too -- seen seconds into a 3D game on a build without it -- so it is a
+ * guest problem, not a stale mapping; run Mac OS 9 on one CPU, which it
+ * loses nothing by. Mac OS X is unaffected, including on -smp 4.
+ */
+static bool bat_flush_lazily(CPUPPCState *env, target_ulong old,
+                             target_ulong value)
+{
+    if (env->mmu_model != POWERPC_MMU_32B) {
+        return false;
+    }
+    if ((old | value) & (BATU32_VS | BATU32_VP)) {
+        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+    }
+    return true;
+}
+
 static inline void dump_store_bat(CPUPPCState *env, char ID, int ul, int nr,
                                   target_ulong value)
 {
@@ -189,10 +216,14 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
 
     dump_store_bat(env, 'I', 0, nr, value);
     if (env->IBAT[0][nr] != value) {
+        bool lazy = bat_flush_lazily(env, env->IBAT[0][nr], value);
+
         /* the old mapping's size is the old value's block length */
         mask = (env->IBAT[0][nr] << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        if (!lazy) {
+            do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        }
 #endif
         mask = (value << 15) & 0x0FFE0000UL;
         /*
@@ -205,7 +236,9 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->IBAT[1][nr] = (env->IBAT[1][nr] & 0x0000007B) |
             (env->IBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        if (!lazy) {
+            do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        }
 #else
         tlb_flush(env_cpu(env));
 #endif
@@ -224,6 +257,8 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
 
     dump_store_bat(env, 'D', 0, nr, value);
     if (env->DBAT[0][nr] != value) {
+        bool lazy = bat_flush_lazily(env, env->DBAT[0][nr], value);
+
         /*
          * When storing valid upper BAT, mask BEPI and BRPN and
          * invalidate all TLBs covered by this BAT
@@ -231,7 +266,9 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         /* the old mapping's size is the old value's block length */
         mask = (env->DBAT[0][nr] << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        if (!lazy) {
+            do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        }
 #endif
         mask = (value << 15) & 0x0FFE0000UL;
         mask = (value << 15) & 0x0FFE0000UL;
@@ -240,7 +277,9 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->DBAT[1][nr] = (env->DBAT[1][nr] & 0x0000007B) |
             (env->DBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        if (!lazy) {
+            do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        }
 #else
         tlb_flush(env_cpu(env));
 #endif
