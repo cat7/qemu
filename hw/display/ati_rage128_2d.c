@@ -1734,6 +1734,10 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     pixmask = bpp >= 32 ? 0xffffffffu : (1u << bpp) - 1;
     wmask = s->dp_write_mask & pixmask;
 
+    trace_ati_rage128_3d_state(tex_cntl, misc,
+                               s->regs[R128_PRIM_TEXTURE_COMBINE_CNTL_C >> 2],
+                               s->regs[R128_PRIM_TEX_CNTL_C >> 2],
+                               blend, textured);
     trace_ati_rage128_3d_tri((int)x[0], (int)y[0], (int)x[1], (int)y[1],
                              (int)x[2], (int)y[2],
                              ati_rage128_3d_col8(a[0]) << 24 |
