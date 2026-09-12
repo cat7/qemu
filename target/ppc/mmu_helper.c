@@ -152,6 +152,10 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     CPUState *cs = env_cpu(env);
     target_ulong base, end, page;
 
+    if (!(BATu & (BATU32_VS | BATU32_VP))) {
+        /* an invalid BAT translates nothing, so nothing of it is cached */
+        return;
+    }
     base = BATu & ~0x0001FFFF;
     end = base + mask + 0x00020000;
     if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
@@ -185,10 +189,12 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
 
     dump_store_bat(env, 'I', 0, nr, value);
     if (env->IBAT[0][nr] != value) {
-        mask = (value << 15) & 0x0FFE0000UL;
+        /* the old mapping's size is the old value's block length */
+        mask = (env->IBAT[0][nr] << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
         do_invalidate_BAT(env, env->IBAT[0][nr], mask);
 #endif
+        mask = (value << 15) & 0x0FFE0000UL;
         /*
          * When storing valid upper BAT, mask BEPI and BRPN and
          * invalidate all TLBs covered by this BAT
@@ -222,10 +228,12 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
          * When storing valid upper BAT, mask BEPI and BRPN and
          * invalidate all TLBs covered by this BAT
          */
-        mask = (value << 15) & 0x0FFE0000UL;
+        /* the old mapping's size is the old value's block length */
+        mask = (env->DBAT[0][nr] << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
         do_invalidate_BAT(env, env->DBAT[0][nr], mask);
 #endif
+        mask = (value << 15) & 0x0FFE0000UL;
         mask = (value << 15) & 0x0FFE0000UL;
         env->DBAT[0][nr] = (value & 0x00001FFFUL) |
             (value & ~0x0001FFFFUL & ~mask);
