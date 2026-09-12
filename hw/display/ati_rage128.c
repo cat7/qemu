@@ -650,6 +650,31 @@ static void ati_rage128_engine_wait(ATIRage128State *s)
     }
 }
 
+/*
+ * Registers the command engine reads or writes: the drawing context and
+ * GUI block, and the PM4 command processor. An access to one of those has
+ * to see the queued jobs' effects, so it waits; everything else -- CRTC,
+ * DAC, interrupt, configuration -- does not, because the engine never
+ * touches it. Waiting for those turned each of Mac OS 9's per-frame
+ * interrupt-handler polls into a queue drain (0x090c: 41,889 reads,
+ * 275 s of waiting in one session; GEN_INT_STATUS 23,000 in another).
+ *
+ * The status registers, the GUI scratch pair drivers use as engine
+ * fences, and the ring read pointer live in those ranges but must report
+ * progress without waiting, as the chip does.
+ */
+static bool ati_rage128_engine_reg(uint32_t base)
+{
+    if (base == R128_GUI_STAT || base == R128_PM4_STAT ||
+        base == R128_PM4_BUFFER_DL_RPTR ||
+        base == R128_GUI_SCRATCH_REG0 || base == R128_GUI_SCRATCH_REG1) {
+        return false;
+    }
+    return (base >= R128_PM4_BUFFER_OFFSET && base <= R128_PM4_MICROCODE_ADDR) ||
+           (base >= R128_PM4_FIFO_DATA_EVEN && base <= R128_PM4_FIFO_APER_END) ||
+           base >= 0x1400;
+}
+
 /* A register access that has to wait for the engine. */
 static void ati_rage128_engine_wait_reg(ATIRage128State *s, uint32_t reg,
                                         bool write)
@@ -3792,23 +3817,11 @@ static uint64_t ati_rage128_mmio_read(void *opaque, hwaddr addr,
     uint32_t base = addr & 0x3ffc;
     uint32_t val;
 
-    /*
-     * Registers the guest polls while the engine runs: the status pair,
-     * the interrupt pair (read in the interrupt handler) and the GUI
-     * scratch registers, which drivers use as engine-progress fences.
-     * Draining the queue for those would turn every poll into a stall of
-     * the whole queue -- Mac OS 9's interrupt handler alone read
-     * GEN_INT_STATUS 23000 times in one session. They report what the
-     * jobs done so far have left behind, as the chip does.
-     */
-    if (base == R128_GUI_STAT || base == R128_PM4_STAT ||
-        base == R128_PM4_BUFFER_DL_RPTR ||
-        base == R128_GEN_INT_STATUS || base == R128_GEN_INT_CNTL ||
-        (base == R128_GUI_SCRATCH_REG0 || base == R128_GUI_SCRATCH_REG1)) {
+    if (ati_rage128_engine_reg(base)) {
+        ati_rage128_engine_wait_reg(s, base, false);
+    } else {
         ati_rage128_fifo_flush(s);
         ati_rage128_engine_complete(s);
-    } else {
-        ati_rage128_engine_wait_reg(s, base, false);
     }
     val = ati_rage128_reg_read32(s, base);
 
@@ -3884,9 +3897,9 @@ static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     uint32_t base = addr & 0x3ffc;
 
     /* kicks queue behind running jobs; everything else waits for them */
-    if (base != R128_PM4_IW_INDOFF && base != R128_PM4_IW_INDSIZE &&
+    if (ati_rage128_engine_reg(base) &&
+        base != R128_PM4_IW_INDOFF && base != R128_PM4_IW_INDSIZE &&
         base != R128_PM4_BUFFER_DL_WPTR &&
-        base != R128_GEN_INT_STATUS && base != R128_GEN_INT_CNTL &&
         (base < R128_PM4_FIFO_DATA_EVEN || base > R128_PM4_FIFO_APER_END)) {
         ati_rage128_engine_wait_reg(s, base, true);
     }
