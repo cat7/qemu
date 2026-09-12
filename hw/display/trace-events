@@ -196,6 +196,7 @@ ati_rage128_3d_indx_prim(uint32_t offset, uint32_t size, uint32_t format, uint32
 ati_rage128_3d_state(uint32_t tex_cntl, uint32_t misc, uint32_t comb, uint32_t prim_tex, int blend, int textured) "tex_cntl=0x%08x misc=0x%08x comb=0x%08x prim_tex=0x%08x blend=%d textured=%d"
 ati_rage128_3d_tri(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t argb) "tri (%d,%d)-(%d,%d)-(%d,%d) argb[0]=0x%08x"
 ati_rage128_3d_unsupported(const char *what, uint32_t val) "3d draw skipped: %s 0x%x"
+ati_rage128_3d_lod(int lod, unsigned levels, unsigned w, unsigned h, uint32_t base) "mip level %d of %u -> %ux%u at 0x%x"
 ati_rage128_3d_tex(uint32_t raw, uint32_t base, unsigned w, unsigned h, unsigned dt, uint32_t cntl, uint32_t comb) "tex raw=0x%08x base=0x%x %ux%u dt=%u cntl=0x%08x comb=0x%08x"
 ati_rage128_ctx_write(const char *name, uint32_t reg, uint32_t val) "2D context: %s (0x%03x) <- 0x%08x"
 ati_rage128_hostdata_hdr(uint32_t gmc, unsigned nhdr, uint32_t last, uint32_t count) "HOSTDATA_BLT gmc=0x%08x header %u dwords: count dword %u vs %u payload"

@@ -1173,7 +1173,29 @@ typedef struct ATIRage128Tex {
     unsigned clamp_s, clamp_t;    /* R128_TEX_CLAMP_* */
     bool linear;                  /* bilinear (MAG_BLEND_LINEAR) */
     uint32_t border;              /* PRIM_TEXTURE_BORDER_COLOR_C, ARGB */
+    unsigned l2w, l2h;            /* log2 of the base level's size */
+    unsigned levels;              /* mip levels the slots describe, >= 1 */
 } ATIRage128Tex;
+
+/*
+ * Select mip level @lod of @base, in place. The slots run one per log2
+ * size, so the level whose width is 2^n lives in PRIM_TEX_n_OFFSET_C
+ * (measured live: a 256x256 chain filled slots 8 down to 0 with
+ * 0x579f00, 0x5b9f00, 0x5c9f00 ... 0x5cf460). Levels are packed tight,
+ * so each one's pitch is its own width.
+ */
+static void ati_rage128_tex_level(ATIRage128State *s, ATIRage128Tex *t,
+                                  const ATIRage128Tex *base, unsigned lod)
+{
+    unsigned l2w = base->l2w - lod, l2h;
+
+    *t = *base;
+    l2h = base->l2h > lod ? base->l2h - lod : 0;
+    t->base = s->regs[R128_PRIM_TEX_OFFSET_C(l2w) >> 2] & R128_TEX_OFFSET_MASK;
+    t->w = 1u << l2w;
+    t->h = 1u << l2h;
+    t->pitch = t->w * t->bypp;
+}
 
 static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
 {
@@ -1220,10 +1242,21 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     t->linear = cntl & R128_MAG_BLEND_LINEAR;
     t->border = s->regs[R128_PRIM_TEXTURE_BORDER_COLOR_C >> 2];
     t->vram = memory_region_get_ram_ptr(&s->vram);
+    t->l2w = l2w;
+    t->l2h = l2h;
+    t->levels = 1;
     if (!(cntl & R128_MIP_MAP_DISABLE)) {
-        /* only the base level is sampled; the driver never enables this */
-        trace_ati_rage128_3d_unsupported("mip-mapping (base level used)",
-                                         cntl);
+        /*
+         * Mac OS X's OpenGL driver fills only the levels a minified draw
+         * can select and leaves the base level of a 256x256 texture
+         * unwritten, so sampling level 0 unconditionally paints black.
+         * Count the levels whose slot the guest actually programmed.
+         */
+        while (t->levels <= l2w &&
+               (s->regs[R128_PRIM_TEX_OFFSET_C(l2w - t->levels) >> 2] &
+                R128_TEX_OFFSET_MASK) < ATI_RAGE128_VRAM_SIZE) {
+            t->levels++;
+        }
     }
     trace_ati_rage128_3d_tex(s->regs[R128_PRIM_TEX_OFFSET_C(l2w) >> 2],
                              t->base, t->w, t->h, t->dt, cntl,
@@ -1661,6 +1694,32 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         v[1] = v[2];
         v[2] = t;
         area = -area;
+    }
+    if (textured && tex.levels > 1) {
+        /*
+         * One level for the whole triangle, from how many texels it
+         * covers per pixel: the texel-space area over the screen area,
+         * square-rooted, is the edge length ratio, and its log2 is the
+         * level. Enough to pick the level the driver uploaded; real
+         * silicon evaluates this per pixel and blends between levels.
+         */
+        double ta = fabs(((double)v[1].s - v[0].s) * ((double)v[2].t - v[0].t)
+                       - ((double)v[1].t - v[0].t) * ((double)v[2].s - v[0].s))
+                    * tex.w * tex.h;
+        ATIRage128Tex base = tex;
+        int lod = 0;
+
+        if (ta > 0.0) {
+            lod = (int)floor(0.5 * log2(ta / area) + 0.5);
+        }
+        if (lod < 0) {
+            lod = 0;
+        }
+        if (lod > (int)tex.levels - 1) {
+            lod = tex.levels - 1;
+        }
+        ati_rage128_tex_level(s, &tex, &base, lod);
+        trace_ati_rage128_3d_lod(lod, tex.levels, tex.w, tex.h, tex.base);
     }
     for (i = 0; i < 3; i++) {
         x[i] = v[i].x;
