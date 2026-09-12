@@ -467,6 +467,7 @@
 #define R128_FOG_ENABLE              (1 << 7)
 #define R128_DITHER_ENABLE           (1 << 8)
 #define R128_ALPHA_ENABLE            (1 << 9)
+#define R128_ALPHA_IN_TEX            (1 << 13)  /* else the vertex alpha */
 #define R128_ALPHA_TEST_ENABLE       (1 << 10)
 /*
  * Alpha test function (r128_reg.h 1139-1147, listed under SCALE_3D_CNTL

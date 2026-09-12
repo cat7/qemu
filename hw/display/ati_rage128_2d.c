@@ -1780,7 +1780,7 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             double sx = px + 0.5;
             double w[3], w0, w1, w2, zd;
             double rgb[3], alpha;
-            unsigned r8, g8, b8, a8;
+            unsigned r8, g8, b8, a8, vtx_a8;
             uint32_t pix, daddr = drow + (uint32_t)px * bypp;
 
             for (i = 0; i < 3; i++) {
@@ -1854,6 +1854,7 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             rgb[1] = w0 * g[0] + w1 * g[1] + w2 * g[2];
             rgb[2] = w0 * b[0] + w1 * b[1] + w2 * b[2];
             alpha = w0 * a[0] + w1 * a[1] + w2 * a[2];
+            vtx_a8 = ati_rage128_3d_col8(alpha);
             if (textured) {
                 double qi = w0 * q[0] + w1 * q[1] + w2 * q[2];
                 double si = (w0 * sq[0] + w1 * sq[1] + w2 * sq[2]) / qi;
@@ -1886,6 +1887,16 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                 uint32_t dst = ati_rage128_3d_dst_argb(dt,
                                    ati_rage128_vram_ld(vram, daddr, bpp));
                 unsigned sc[4] = { b8, g8, r8, a8 };
+                /*
+                 * TEX_CNTL_C's ALPHA_IN_TEX says whether the texel's
+                 * alpha reaches the blender; without it the vertex alpha
+                 * does. Mac OS RAVE leaves the bit clear for opaque
+                 * geometry, whose textures carry a zero alpha channel --
+                 * taking that as source alpha would blend the whole scene
+                 * into the background -- and sets it for the cut-outs.
+                 */
+                unsigned sa = (textured && (tex_cntl & R128_ALPHA_IN_TEX))
+                              ? a8 : vtx_a8;
                 unsigned oc[4];
                 int k, shift;
 
@@ -1893,10 +1904,10 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                     int dc = (dst >> shift) & 0xff;
                     int val = ((int)sc[k] *
                                ati_rage128_blend_factor(src_factor, sc[k],
-                                                        a8, dc, dst >> 24) +
+                                                        sa, dc, dst >> 24) +
                                dc *
                                ati_rage128_blend_factor(dst_factor, sc[k],
-                                                        a8, dc, dst >> 24) +
+                                                        sa, dc, dst >> 24) +
                                127) / 255;
 
                     oc[k] = MIN(val, 255);
