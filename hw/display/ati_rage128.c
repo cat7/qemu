@@ -3253,8 +3253,9 @@ static void ati_rage128_3d_trace_vert(const ATIRage128PM4Parser *p)
  * Decode the gathered vertex dwords into an ATIRage128Vertex. Same
  * VC_FORMAT offset walk as ati_rage128_3d_trace_vert above (one float
  * per component on the FPU path); rhw and the primary s/t are carried
- * for the texture unit, specular, fog and the second s/t pair are
- * stepped over -- fog and the secondary texture are later steps. A
+ * for the texture unit along with the fog float; specular and the
+ * second s/t pair are stepped over -- the secondary texture is a later
+ * step. A
  * vertex with no diffuse fields comes out solid white. Non-finite
  * floats are stored as-is; the rasterizer rejects the triangle
  * (per-triangle, so a poisoned vertex does not desync a strip's
@@ -3272,6 +3273,7 @@ static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
     v->rhw = 1.0f;
     v->b = v->g = v->r = v->a = 1.0f;
     v->s = v->t = 0.0f;
+    v->fog = 1.0f;
     if (fmt & R128_VC_FRMT_RHW) {
         v->rhw = ati_rage128_vc_f32(p->p3_vtx[o]);
         o++;
@@ -3302,7 +3304,12 @@ static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
         }
     }
     o += (fmt & R128_VC_FRMT_SPEC_BGR) ? 3 : 0;
-    o += !!(fmt & R128_VC_FRMT_SPEC_F);
+    if (fmt & R128_VC_FRMT_SPEC_F) {
+        if (o < ARRAY_SIZE(p->p3_vtx)) {
+            v->fog = ati_rage128_vc_f32(p->p3_vtx[o]);
+        }
+        o++;
+    }
     o += !!(fmt & R128_VC_FRMT_SPEC_FRGB);
     if ((fmt & R128_VC_FRMT_S_T) && o + 1 < ARRAY_SIZE(p->p3_vtx)) {
         v->s = ati_rage128_vc_f32(p->p3_vtx[o]);

@@ -97,6 +97,7 @@ typedef struct ATIRage128Vertex {
     float rhw;               /* 1/w, 1.0 when the format carries none */
     float b, g, r, a;
     float s, t;              /* primary texture coordinates, 0 if absent */
+    float fog;               /* SPEC_F: 1 = unfogged, 0 = the fog colour */
 } ATIRage128Vertex;
 
 #define R128_HOSTDATA_HDR_MAX   (1 + 5 + 5)

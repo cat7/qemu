@@ -1561,6 +1561,8 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     ATIRage128Vertex v[3];
     double x[3], y[3], z[3], r[3], g[3], b[3], a[3];
     double q[3], sq[3], tq[3];                  /* 1/w, s/w, t/w */
+    double fg[3], fog_r = 0, fog_g = 0, fog_b = 0;
+    bool fogged;
     double area, bx0, bx1, by0, by1;
     /* edge i runs vertex (i+1)%3 -> (i+2)%3; w_i is vertex i's weight */
     double ea[3], eb[3];
@@ -1593,6 +1595,15 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         blend = false;                          /* identity */
     }
 
+    fogged = tex_cntl & R128_FOG_ENABLE;
+    if (fogged) {
+        uint32_t fc = s->regs[R128_FOG_COLOR_C >> 2];
+
+        fog_r = ((fc >> 16) & 0xff) / 255.0;
+        fog_g = ((fc >> 8) & 0xff) / 255.0;
+        fog_b = (fc & 0xff) / 255.0;
+    }
+
     v[0] = vin[0];
     v[1] = vin[1];
     v[2] = vin[2];
@@ -1623,6 +1634,15 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         b[i] = ati_rage128_3d_csan(v[i].b);
         a[i] = ati_rage128_3d_csan(v[i].a);
         q[i] = v[i].rhw;
+        /*
+         * SPEC_F, the setup engine's fog factor: 1 leaves the pixel
+         * alone, 0 replaces it with FOG_COLOR_C. Nanosaur sends 1 near
+         * the camera and ~0.2 at the far plane, and clears the frame to
+         * the fog colour, so without this its distance haze is a hard
+         * edge between terrain and a flat block of colour.
+         */
+        fg[i] = ati_rage128_3d_csan(v[i].fog);
+        fg[i] = fg[i] < 0.0 ? 0.0 : fg[i] > 1.0 ? 1.0 : fg[i];
     }
     /*
      * Perspective-correct s/t: interpolate s/w, t/w and 1/w linearly
@@ -1831,6 +1851,13 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                 ati_rage128_tex_combine(comb,
                                         ati_rage128_tex_sample(&tex, si, ti),
                                         const_color, rgb, &alpha);
+            }
+            if (fogged) {
+                double fi = w0 * fg[0] + w1 * fg[1] + w2 * fg[2];
+
+                rgb[0] = fi * rgb[0] + (1.0 - fi) * fog_r;
+                rgb[1] = fi * rgb[1] + (1.0 - fi) * fog_g;
+                rgb[2] = fi * rgb[2] + (1.0 - fi) * fog_b;
             }
             r8 = ati_rage128_3d_col8(rgb[0]);
             g8 = ati_rage128_3d_col8(rgb[1]);
