@@ -1541,8 +1541,9 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     uint32_t comb = s->regs[R128_PRIM_TEXTURE_COMBINE_CNTL_C >> 2];
     uint32_t const_color = s->regs[R128_CONSTANT_COLOR_C >> 2];
     uint32_t z_offset = s->regs[R128_Z_OFFSET_C >> 2] & 0xfffffff0;
-    uint32_t z_stride = (s->regs[R128_Z_PITCH_C >> 2] & R128_Z_PITCH_MASK)
-                        * 16;                   /* 8 px units, 16-bit Z */
+    uint32_t z_pitch = s->regs[R128_Z_PITCH_C >> 2] & R128_Z_PITCH_MASK;
+    unsigned z_bypp, z_bits;
+    uint32_t z_max, z_stride;
     bool z_test = tex_cntl & R128_Z_ENABLE;
     bool z_write = tex_cntl & R128_Z_WRITE_ENABLE;
     bool textured = tex_cntl & R128_TEXMAP_ENABLE;
@@ -1585,12 +1586,37 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     if (!dst_stride || dst_offset >= ATI_RAGE128_VRAM_SIZE) {
         return;
     }
-    if ((z_test || z_write) &&
-        (zsten & R128_Z_PIX_WIDTH_MASK) != R128_Z_PIX_WIDTH_16) {
-        /* only the 16-bit Z buffer the corpus uses is modeled */
+    /*
+     * Z pixel width: 16-bit in a halfword, 24- and 32-bit in a word (the
+     * 24-bit form leaves the top byte to the stencil, which is not
+     * modelled, so a write preserves it). Mac OS 9's RAVE driver picks
+     * 16-bit, Mac OS X's OpenGL driver 24-bit.
+     */
+    switch (zsten & R128_Z_PIX_WIDTH_MASK) {
+    case R128_Z_PIX_WIDTH_16:
+        z_bits = 16;
+        z_bypp = 2;
+        z_max = 0xffff;
+        break;
+    case R128_Z_PIX_WIDTH_24:
+        z_bits = 32;
+        z_bypp = 4;
+        z_max = 0xffffff;
+        break;
+    case R128_Z_PIX_WIDTH_32:
+        z_bits = 32;
+        z_bypp = 4;
+        z_max = 0xffffffff;
+        break;
+    default:
         trace_ati_rage128_3d_unsupported("z pix width", zsten);
+        z_bits = 16;
+        z_bypp = 2;
+        z_max = 0xffff;
         z_test = z_write = false;
+        break;
     }
+    z_stride = z_pitch * 8 * z_bypp;            /* pitch is in 8-px units */
     if ((z_test || z_write) && !z_stride) {
         z_test = z_write = false;
     }
@@ -1801,18 +1827,18 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             w2 = w[2] / area;
 
             if (z_test || z_write) {
-                unsigned z16;
+                uint32_t zval, zaddr = zrow + (uint32_t)px * z_bypp;
 
                 zd = w0 * z[0] + w1 * z[1] + w2 * z[2];
-                z16 = zd <= 0.0 ? 0 : zd >= 1.0 ? 65535
-                      : (unsigned)(zd * 65535.0 + 0.5);
+                zval = zd <= 0.0 ? 0 : zd >= 1.0 ? z_max
+                       : (uint32_t)(zd * (double)z_max + 0.5);
                 if (z_test) {
                     /*
                      * an out-of-VRAM Z address reads back 0 (and the
                      * write below is dropped): safe, deterministic
                      */
-                    uint32_t zold = ati_rage128_vram_ld(vram, zrow +
-                                                        (uint32_t)px * 2, 16);
+                    uint32_t zold = ati_rage128_vram_ld(vram, zaddr,
+                                                        z_bits) & z_max;
                     bool pass;
 
                     switch (zsten & R128_Z_TEST_MASK) {
@@ -1820,22 +1846,22 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                         pass = false;
                         break;
                     case R128_Z_TEST_LESS:
-                        pass = z16 < zold;
+                        pass = zval < zold;
                         break;
                     case R128_Z_TEST_LESSEQUAL:
-                        pass = z16 <= zold;
+                        pass = zval <= zold;
                         break;
                     case R128_Z_TEST_EQUAL:
-                        pass = z16 == zold;
+                        pass = zval == zold;
                         break;
                     case R128_Z_TEST_GREATEREQUAL:
-                        pass = z16 >= zold;
+                        pass = zval >= zold;
                         break;
                     case R128_Z_TEST_GREATER:
-                        pass = z16 > zold;
+                        pass = zval > zold;
                         break;
                     case R128_Z_TEST_NEQUAL:
-                        pass = z16 != zold;
+                        pass = zval != zold;
                         break;
                     default:                    /* R128_Z_TEST_ALWAYS */
                         pass = true;
@@ -1846,10 +1872,15 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                     }
                 }
                 if (z_write) {
-                    uint32_t zaddr = zrow + (uint32_t)px * 2;
+                    uint32_t out = zval;
 
-                    if (ati_rage128_vram_st(vram, zaddr, 16, z16)) {
-                        ati_rage128_span_add(&zspan, zaddr, 2);
+                    if (z_max != 0xffffffff && z_bits == 32) {
+                        /* keep the stencil byte above a 24-bit depth */
+                        out |= ati_rage128_vram_ld(vram, zaddr, z_bits) &
+                               ~z_max;
+                    }
+                    if (ati_rage128_vram_st(vram, zaddr, z_bits, out)) {
+                        ati_rage128_span_add(&zspan, zaddr, z_bypp);
                     }
                 }
             }
