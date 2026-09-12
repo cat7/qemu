@@ -1547,6 +1547,13 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     bool z_write = tex_cntl & R128_Z_WRITE_ENABLE;
     bool textured = tex_cntl & R128_TEXMAP_ENABLE;
     bool alpha_test = tex_cntl & R128_ALPHA_TEST_ENABLE;
+    /*
+     * The blend factors are the control: Mac OS RAVE drivers program
+     * ONE / INVSRCALPHA and never set TEX_CNTL_C's ALPHA_ENABLE, and
+     * Nanosaur's foliage cut-outs come out opaque if that bit is
+     * required. A never-programmed pair (ZERO/ZERO) and the pass-through
+     * pair (ONE/ZERO) both mean no blending.
+     */
     bool blend = tex_cntl & R128_ALPHA_ENABLE;
     unsigned src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) &
                           R128_ALPHA_BLEND_MASK;
@@ -1590,9 +1597,13 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     if (textured && !ati_rage128_tex_setup(s, &tex)) {
         textured = false;                       /* traced; draw Gouraud */
     }
-    if (blend && src_factor == R128_ALPHA_BLEND_ONE &&
+    if (!(src_factor == R128_ALPHA_BLEND_ZERO &&
+          dst_factor == R128_ALPHA_BLEND_ZERO)) {
+        blend = true;
+    }
+    if (src_factor == R128_ALPHA_BLEND_ONE &&
         dst_factor == R128_ALPHA_BLEND_ZERO) {
-        blend = false;                          /* identity */
+        blend = false;                          /* pass-through */
     }
 
     fogged = tex_cntl & R128_FOG_ENABLE;
