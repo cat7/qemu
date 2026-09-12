@@ -671,20 +671,32 @@
 #define R128_ROP3_WHITENESS          0x00ff0000
 
 /*
- * GUI bus mastering (RRG-G04500-C 3.34 "GUI Bus Mastering Registers" is
- * a stub in the manual itself -- literally "<No description>" with no
- * register table, confirmed against the actual PDF page, not a text
- * extraction gap). Only BM_QUEUE_FREE_STATUS (0xA14), BM_ABORT (0xA88)
- * and the BM_CHUNK_0_VAL name (revision-history mention only) are
- * documented anywhere in it, and this smoke test doesn't touch any of
- * them. BM_GUI_TABLE's offset and the descriptor format are
- * reverse-engineered from a live capture of the real OEM Mac FCode's
- * post-CRTC-bringup bus-master smoke test (2026-08-02): it writes an 8
- * byte sentinel to system RAM, points a one-entry descriptor table at
- * it via this register, then reads back GUI_SCRATCH_REG0/1 expecting
- * the sentinel to have landed there -- see ati_rage128_bm_gui_run().
+ * GUI bus mastering. RRG-G04500-C 3.34 is a stub in the manual itself
+ * ("<No description>"); the block is specified in the "Rage 128 VR/GL
+ * Register Reference Supplement" (1999), "Rage 128 Bus Master
+ * Registers".
+ *
+ * Each channel -- GUI, the four VIP buffers, video capture -- is armed
+ * by one register holding {trigger 3:0, table address 31:4}. The table
+ * is a list of 16-byte descriptors: frame-buffer offset, system memory
+ * address, command, reserved. BM_GUI is 0x0a80; 0x0a50 is VIP buffer
+ * 3, and reading it as the GUI trigger made Mac OS X's writes walk a
+ * descriptor list that was never one.
  */
-#define R128_BM_GUI_TABLE            0x0a50
+#define R128_BM_FRAME_BUF_OFFSET     0x0a00
+#define R128_BM_SYSTEM_MEM_ADDR      0x0a04
+#define R128_BM_COMMAND              0x0a08
+#define R128_BM_QUEUE_STATUS         0x0a10
+#define R128_BM_VIP3_BUF             0x0a50
+#define R128_BM_GUI                  0x0a80
+#define R128_BM_ABORT                0x0a88
+/* BM_COMMAND fields */
+#define R128_BM_BYTE_COUNT_MASK      0x1fffff   /* [20:0] */
+#define R128_BM_TRANSFER_DEST_REGS   (1u << 28)
+#define R128_BM_FRAME_OFFSET_HOLD    (1u << 30)
+#define R128_BM_END_OF_LIST          (1u << 31)
+/* BM_GUI fields */
+#define R128_BM_TABLE_ADDR_MASK      0xfffffff0u
 #define R128_BM_CHUNK_0_VAL          0x0a18
 
 /* PCI config space read-only mirror */

@@ -354,6 +354,8 @@ struct ATIRage128State {
      */
     ATIRage128PM4Parser pm4_fifo;
 
+    bool bm_running;      /* GUI bus master walking a table */
+
     /*
      * 2D GUI (destination datapath) engine state -- ported from the
      * real upstream `ati-vga` device (hw/display/ati.c/ati_2d.c), not

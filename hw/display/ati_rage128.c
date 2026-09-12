@@ -1,4 +1,17 @@
 /*
+ * GUI bus master: walk the descriptor list at the given guest-physical
+ * address. Each entry is 16 bytes, little-endian: frame-buffer offset,
+ * system memory address, command, reserved (Rage 128 VR/GL Register
+ * Reference Supplement, "Rage 128 Bus Master Registers"). BM_COMMAND
+ * carries the byte count in [20:0], "hold the frame-buffer offset" at
+ * bit 30 and end-of-list at bit 31.
+ *
+ * Only the register destination (TRANSFER_DEST) is modelled, which is
+ * what the OEM Mac FCode's post-CRTC-bringup smoke test uses: it writes
+ * an 8 byte sentinel to system RAM, points a one-entry list at it and
+ * reads GUI_SCRATCH_REG0/1 back.
+ */
+/*
  * QEMU ATI Rage 128 Pro emulation
  *
  * See ati_rage128.h for background. Milestone scope: correct PCI
@@ -1604,8 +1617,6 @@ static void ati_rage128_pm4_run(ATIRage128State *s);
 static void ati_rage128_pm4_fifo_push(ATIRage128State *s, uint32_t val);
 static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
                                      uint32_t dwords);
-static void ati_rage128_pm4_reg_write(ATIRage128State *s, uint32_t base,
-                                      uint32_t val);
 
 /*
  * Asynchronous engine. A command-stream kick (ring, indirect buffer,
@@ -1862,10 +1873,50 @@ static void ati_rage128_resolve_gui_context(ATIRage128State *s)
     }
 }
 
+/*
+ * Registers a type-0/type-1 packet may not load. These configure the
+ * chip on the host bus side and the guest programs them through MMIO;
+ * a stream that writes them is a mis-framed stream.
+ *
+ * Without this such a packet is unrecoverable rather than merely
+ * wrong. Captured on Chessmaster 9000's 3D board under Mac OS X 10.4:
+ * 6 ms after the last triangle a type-0 packet marched the whole
+ * register file in address order, and the dword that landed on
+ * PCI_GART_PAGE moved the GART base from 0x06ea3000 to 0xa6427000 --
+ * outside the guest's RAM, so every later command fetch read zeros.
+ * All 517 remaining indirect buffers came back empty and the driver's
+ * own recovery, which runs through the stream, could not execute.
+ *
+ * The list is by register, not by range: the address map does not
+ * separate the two sides. PM4_IW_INDOFF/INDSIZE dispatch an indirect
+ * buffer and PC_NGUI_CTLSTAT flushes the cache, all three low-numbered
+ * and all three loaded by the stream in normal operation.
+ */
+static bool ati_rage128_stream_may_write(uint32_t base)
+{
+    switch (base) {
+    case R128_BUS_CNTL:
+    case R128_BUS_CNTL1:
+    case R128_CONFIG_CNTL:
+    case R128_CONFIG_APER_SIZE:
+    case R128_GEN_RESET_CNTL:
+    case R128_PCI_GART_PAGE:
+        return false;
+    default:
+        return true;
+    }
+}
+
 static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                                     uint32_t val)
 {
     ati_rage128_audit_reg_write(s, base);
+
+    if (ati_rage128_engine_depth && !ati_rage128_stream_may_write(base)) {
+        trace_ati_rage128_pm4_reg_blocked(base, ati_rage128_reg_name(base),
+                                          val);
+        return;
+    }
 
     /*
      * Diagnostic: the 2D source/destination context. Mac OS X programs
@@ -2047,11 +2098,12 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
             s->pm4_wptr = 0;
         }
         break;
-    case R128_BM_GUI_TABLE:
+    case R128_BM_GUI:
         s->regs[base >> 2] = val;
-        if (!ati_rage128_engine_submit(s, ATI_RAGE128_JOB_BM, val, 0)) {
+        if (!ati_rage128_engine_submit(s, ATI_RAGE128_JOB_BM,
+                                       val & R128_BM_TABLE_ADDR_MASK, 0)) {
             ati_rage128_engine_enter(s);
-            ati_rage128_bm_gui_run(s, val);
+            ati_rage128_bm_gui_run(s, val & R128_BM_TABLE_ADDR_MASK);
             ati_rage128_engine_exit(s);
         }
         break;
@@ -2519,7 +2571,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
  * address. Each 12-byte, little-endian entry is {dest register offset,
  * source system-memory address, control}; control's low 16 bits are a
  * byte count and bit 31 is END_OF_LIST (both inferred from the smoke
- * test -- see the comment on R128_BM_GUI_TABLE in ati_rage128_regs.h).
+ * test -- see the comment on R128_BM_GUI in ati_rage128_regs.h).
  * The transfer completes synchronously, one dword at a time through the
  * normal register-write path so a descriptor can target any register
  * exactly as if the driver had written it directly via MM_INDEX/DATA.
@@ -2530,8 +2582,17 @@ static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
     dma_addr_t desc = table;
     int entry;
 
+    /*
+     * A descriptor whose register run reaches BM_GUI_TABLE would start
+     * the walk again from whatever it just wrote there.
+     */
+    if (s->bm_running) {
+        return;
+    }
+    s->bm_running = true;
+
     for (entry = 0; entry < 4096; entry++) {
-        uint32_t d[3];
+        uint32_t d[4];
         uint32_t reg_off, sysaddr, ctrl, count;
 
         if (pci_dma_read(pci, desc, d, sizeof(d)) != MEMTX_OK) {
@@ -2540,10 +2601,10 @@ static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
         reg_off = le32_to_cpu(d[0]);
         sysaddr = le32_to_cpu(d[1]);
         ctrl = le32_to_cpu(d[2]);
-        count = ctrl & 0xffff;
+        count = ctrl & R128_BM_BYTE_COUNT_MASK;
         trace_ati_rage128_bm_desc(reg_off, sysaddr, ctrl);
 
-        while (count >= 4) {
+        while ((ctrl & R128_BM_TRANSFER_DEST_REGS) && count >= 4) {
             uint32_t word;
 
             if (pci_dma_read(pci, sysaddr, &word, 4) != MEMTX_OK) {
@@ -2551,16 +2612,19 @@ static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
             }
             ati_rage128_reg_write32(s, reg_off & 0x3ffc, le32_to_cpu(word));
             sysaddr += 4;
-            reg_off += 4;
+            if (!(ctrl & R128_BM_FRAME_OFFSET_HOLD)) {
+                reg_off += 4;
+            }
             count -= 4;
         }
 
-        if (ctrl & (1u << 31)) {
+        if (ctrl & R128_BM_END_OF_LIST) {
             break;
         }
-        desc += 12;
+        desc += 16;
     }
 
+    s->bm_running = false;
     s->regs[R128_GEN_INT_STATUS >> 2] |= R128_BUSMASTER_EOL_INT;
     ati_rage128_update_irq(s);
 }
@@ -2754,7 +2818,7 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
             for (i = 0; i < count; i++) {
                 uint32_t data = ati_rage128_pm4_read_ring(s);
 
-                ati_rage128_pm4_reg_write(s, reg & 0x3ffc, data);
+                ati_rage128_reg_write32(s, reg & 0x3ffc, data);
                 if (!one_reg) {
                     reg += 4;
                 }
@@ -2768,8 +2832,8 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
             uint32_t data1 = ati_rage128_pm4_read_ring(s);
             uint32_t data2 = ati_rage128_pm4_read_ring(s);
 
-            ati_rage128_pm4_reg_write(s, reg1 & 0x3ffc, data1);
-            ati_rage128_pm4_reg_write(s, reg2 & 0x3ffc, data2);
+            ati_rage128_reg_write32(s, reg1 & 0x3ffc, data1);
+            ati_rage128_reg_write32(s, reg2 & 0x3ffc, data2);
             break;
         }
         case 2:
@@ -3374,50 +3438,6 @@ static void ati_rage128_3d_prim_vertex(ATIRage128State *s,
  * being pulled from VRAM, so the state (in-flight packet type/count/
  * running register) has to live across calls instead of a loop index.
  */
-/*
- * Registers a type-0/type-1 packet may not load. These configure the
- * chip on the host bus side and the guest programs them through MMIO;
- * a stream that writes them is a mis-framed stream.
- *
- * Without this such a packet is unrecoverable rather than merely
- * wrong. Captured on Chessmaster 9000's 3D board under Mac OS X 10.4:
- * 6 ms after the last triangle a type-0 packet marched the whole
- * register file in address order, and the dword that landed on
- * PCI_GART_PAGE moved the GART base from 0x06ea3000 to 0xa6427000 --
- * outside the guest's RAM, so every later command fetch read zeros.
- * All 517 remaining indirect buffers came back empty and the driver's
- * own recovery, which runs through the stream, could not execute.
- *
- * The list is by register, not by range: the address map does not
- * separate the two sides. PM4_IW_INDOFF/INDSIZE dispatch an indirect
- * buffer and PC_NGUI_CTLSTAT flushes the cache, all three low-numbered
- * and all three loaded by the stream in normal operation.
- */
-static bool ati_rage128_pm4_may_write(uint32_t base)
-{
-    switch (base) {
-    case R128_BUS_CNTL:
-    case R128_BUS_CNTL1:
-    case R128_CONFIG_CNTL:
-    case R128_CONFIG_APER_SIZE:
-    case R128_GEN_RESET_CNTL:
-    case R128_PCI_GART_PAGE:
-        return false;
-    default:
-        return true;
-    }
-}
-
-static void ati_rage128_pm4_reg_write(ATIRage128State *s, uint32_t base,
-                                      uint32_t val)
-{
-    if (!ati_rage128_pm4_may_write(base)) {
-        trace_ati_rage128_pm4_reg_blocked(base, ati_rage128_reg_name(base),
-                                          val);
-        return;
-    }
-    ati_rage128_reg_write32(s, base, val);
-}
 
 static void ati_rage128_pm4_parse(ATIRage128State *s,
                                   ATIRage128PM4Parser *p, uint32_t val)
@@ -3466,7 +3486,7 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
     case 0:
         trace_ati_rage128_pm4_reg(p->reg & 0x3ffc,
                                   ati_rage128_reg_name(p->reg & 0x3ffc), val);
-        ati_rage128_pm4_reg_write(s, p->reg & 0x3ffc, val);
+        ati_rage128_reg_write32(s, p->reg & 0x3ffc, val);
         if (!p->one_reg) {
             p->reg += 4;
         }
@@ -3475,11 +3495,11 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
         if (p->remaining == 2) {
             trace_ati_rage128_pm4_reg(p->p1_reg1 & 0x3ffc,
                 ati_rage128_reg_name(p->p1_reg1 & 0x3ffc), val);
-            ati_rage128_pm4_reg_write(s, p->p1_reg1 & 0x3ffc, val);
+            ati_rage128_reg_write32(s, p->p1_reg1 & 0x3ffc, val);
         } else {
             trace_ati_rage128_pm4_reg(p->p1_reg2 & 0x3ffc,
                 ati_rage128_reg_name(p->p1_reg2 & 0x3ffc), val);
-            ati_rage128_pm4_reg_write(s, p->p1_reg2 & 0x3ffc, val);
+            ati_rage128_reg_write32(s, p->p1_reg2 & 0x3ffc, val);
         }
         break;
     case 3:
