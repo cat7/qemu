@@ -640,6 +640,22 @@ static int ati_rage128_blend_factor(unsigned f, int sc, int sa, int dc,
     }
 }
 
+/*
+ * Combine the two weighted terms. @s and @d are the source and
+ * destination channels already multiplied by their factors, still on the
+ * 0..255*255 scale, so the two divide down together. The NCLAMP variants
+ * keep the low 8 bits of the true result rather than saturating.
+ */
+static unsigned ati_rage128_blend_comb(unsigned fcn, int s, int d)
+{
+    int v = ((fcn >= R128_ALPHA_COMB_SUB_CLAMP ? s - d : s + d) + 127) / 255;
+
+    if (fcn & 1) {                              /* the NCLAMP variants */
+        return v & 0xff;
+    }
+    return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
 /* Read a destination pixel as 8-bit ARGB regardless of surface depth. */
 static uint32_t ati_rage128_dst_to_argb(uint32_t px, int bpp)
 {
@@ -676,6 +692,7 @@ typedef struct ATIRage128ScaleOp {
     int bpp;
     int sc_left, sc_top, sc_right, sc_bottom;
     unsigned src_factor, dst_factor;  /* R128_ALPHA_BLEND_* */
+    unsigned comb_fcn;                /* R128_ALPHA_COMB_* */
 } ATIRage128ScaleOp;
 
 /*
@@ -762,13 +779,13 @@ static void ati_rage128_2d_scale_run(ATIRage128State *s,
                 out = 0;
                 for (c = 0, shift = 0; c < 4; c++, shift += 8) {
                     int sc = (src >> shift) & 0xff, dc = (dst >> shift) & 0xff;
-                    int v = (sc * ati_rage128_blend_factor(op->src_factor, sc,
-                                                           sa, dc, da) +
-                             dc * ati_rage128_blend_factor(op->dst_factor, sc,
-                                                           sa, dc, da) +
-                             127) / 255;
+                    int sv = sc * ati_rage128_blend_factor(op->src_factor, sc,
+                                                           sa, dc, da);
+                    int dv = dc * ati_rage128_blend_factor(op->dst_factor, sc,
+                                                           sa, dc, da);
 
-                    out |= (uint32_t)MIN(v, 255) << shift;
+                    out |= (uint32_t)ati_rage128_blend_comb(op->comb_fcn,
+                                                            sv, dv) << shift;
                 }
                 out = ati_rage128_argb_to_dst(out, op->bpp);
             }
@@ -868,6 +885,7 @@ void ati_rage128_2d_scale_regs(ATIRage128State *s)
     op.dst_stride = s->dst_pitch * op.bpp;
     op.src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) & R128_ALPHA_BLEND_MASK;
     op.dst_factor = (misc >> R128_ALPHA_BLEND_DST_SHIFT) & R128_ALPHA_BLEND_MASK;
+    op.comb_fcn = (misc >> R128_ALPHA_COMB_FCN_SHIFT) & R128_ALPHA_COMB_FCN_MASK;
     ati_rage128_2d_scale_run(s, &op);
 }
 
@@ -1658,6 +1676,8 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                           R128_ALPHA_BLEND_MASK;
     unsigned dst_factor = (misc >> R128_ALPHA_BLEND_DST_SHIFT) &
                           R128_ALPHA_BLEND_MASK;
+    unsigned comb_fcn = (misc >> R128_ALPHA_COMB_FCN_SHIFT) &
+                        R128_ALPHA_COMB_FCN_MASK;
     ATIRage128Tex tex;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     unsigned bypp = bpp / 8;
@@ -2119,15 +2139,14 @@ have_texel:
 
                 for (k = 0, shift = 0; k < 4; k++, shift += 8) {
                     int dc = (dst >> shift) & 0xff;
-                    int val = ((int)sc[k] *
-                               ati_rage128_blend_factor(src_factor, sc[k],
-                                                        sa, dc, dst >> 24) +
-                               dc *
-                               ati_rage128_blend_factor(dst_factor, sc[k],
-                                                        sa, dc, dst >> 24) +
-                               127) / 255;
+                    int sv = (int)sc[k] *
+                             ati_rage128_blend_factor(src_factor, sc[k],
+                                                      sa, dc, dst >> 24);
+                    int dv = dc *
+                             ati_rage128_blend_factor(dst_factor, sc[k],
+                                                      sa, dc, dst >> 24);
 
-                    oc[k] = MIN(val, 255);
+                    oc[k] = ati_rage128_blend_comb(comb_fcn, sv, dv);
                 }
                 b8 = oc[0];
                 g8 = oc[1];

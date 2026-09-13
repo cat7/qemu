@@ -967,6 +967,20 @@
 #define R128_ALPHA_BLEND_SRC_SHIFT    16
 #define R128_ALPHA_BLEND_DST_SHIFT    20
 #define R128_ALPHA_BLEND_MASK         0xf
+/*
+ * How the two weighted terms are combined (r128_reg.h 1112-1116, same
+ * bits in SCALE_3D_CNTL and MISC_3D_STATE_CNTL_REG). Mesa's
+ * r128UpdateAlphaMode maps GL_FUNC_ADD to ADD_CLAMP and
+ * GL_FUNC_SUBTRACT to SUB_SRC_DST_CLAMP; NCLAMP keeps the low 8 bits
+ * instead of saturating. 0 is the reset value, so a guest that never
+ * writes the field gets the clamped add.
+ */
+#define R128_ALPHA_COMB_FCN_SHIFT     12
+#define R128_ALPHA_COMB_FCN_MASK      0x3
+#define R128_ALPHA_COMB_ADD_CLAMP     0
+#define R128_ALPHA_COMB_ADD_NCLAMP    1
+#define R128_ALPHA_COMB_SUB_CLAMP     2
+#define R128_ALPHA_COMB_SUB_NCLAMP    3
 #define R128_ALPHA_BLEND_ZERO         0
 #define R128_ALPHA_BLEND_ONE          1
 #define R128_ALPHA_BLEND_SRCCOLOR     2
