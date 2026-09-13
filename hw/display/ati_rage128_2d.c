@@ -1518,11 +1518,12 @@ static void ati_rage128_tex_combine(uint32_t comb, uint32_t texel,
     for (i = 0; i < 3; i++) {
         switch (fcn) {
         case R128_COMB_DIS:
-        case R128_COMB_COPY_INP:
-            rgb[i] = in[i];
-            break;
         case R128_COMB_COPY:
+            /* C = Ct: the factor alone (Mesa r128_texstate.c's comments) */
             rgb[i] = fc[i];
+            break;
+        case R128_COMB_COPY_INP:
+            rgb[i] = in[i];                     /* C = Cf */
             break;
         case R128_COMB_MODULATE2X:
             rgb[i] = 2.0 * fc[i] * in[i];
