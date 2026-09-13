@@ -1173,7 +1173,8 @@ typedef struct ATIRage128Tex {
     unsigned clamp_s, clamp_t;    /* R128_TEX_CLAMP_* */
     bool linear;                  /* bilinear (MAG_BLEND_LINEAR) */
     uint32_t border;              /* PRIM_TEXTURE_BORDER_COLOR_C, ARGB */
-    unsigned l2w, l2h;            /* log2 of the base level's size */
+    unsigned l2w, l2h;            /* log2 of the base level's width/height */
+    unsigned slot;                /* PRIM_TEX_OFFSET_C slot of the base level */
     unsigned levels;              /* mip levels the slots describe, >= 1 */
 } ATIRage128Tex;
 
@@ -1187,11 +1188,12 @@ typedef struct ATIRage128Tex {
 static void ati_rage128_tex_level(ATIRage128State *s, ATIRage128Tex *t,
                                   const ATIRage128Tex *base, unsigned lod)
 {
-    unsigned l2w = base->l2w - lod, l2h;
+    unsigned l2w = base->l2w > lod ? base->l2w - lod : 0;
+    unsigned l2h = base->l2h > lod ? base->l2h - lod : 0;
 
     *t = *base;
-    l2h = base->l2h > lod ? base->l2h - lod : 0;
-    t->base = s->regs[R128_PRIM_TEX_OFFSET_C(l2w) >> 2] & R128_TEX_OFFSET_MASK;
+    t->base = s->regs[R128_PRIM_TEX_OFFSET_C(base->slot - lod) >> 2] &
+              R128_TEX_OFFSET_MASK;
     t->w = 1u << l2w;
     t->h = 1u << l2h;
     t->pitch = t->w * t->bypp;
@@ -1201,9 +1203,25 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
 {
     uint32_t cntl = s->regs[R128_PRIM_TEX_CNTL_C >> 2];
     uint32_t sp = s->regs[R128_TEX_SIZE_PITCH_C >> 2];
-    unsigned l2w = (sp >> R128_TEX_SIZE_SHIFT) & R128_TEX_LOG2_MASK;
-    unsigned l2h = (sp >> R128_TEX_HEIGHT_SHIFT) & R128_TEX_LOG2_MASK;
+    /*
+     * TEX_SIZE_PITCH_C, as Mesa's r128 driver packs it
+     * (r128_texstate.c): PITCH is log2 of the base level's WIDTH, SIZE
+     * is log2 of max(width, height), HEIGHT is log2 of the height, and
+     * MIN_SIZE is log2 of the smallest level present. The number of
+     * levels is SIZE - MIN_SIZE + 1, and r128_texmem.c files them
+     * backwards -- tex_offset[numLevels - 1 - level] -- so the base
+     * level lives in slot SIZE - MIN_SIZE, not in slot log2(width).
+     * They coincide only for a chain that runs down to 1x1, which is
+     * why reading the width out of SIZE and the slot out of it too went
+     * unnoticed: Mac OS 9's RAVE driver sets MIP_MAP_DISABLE, and that
+     * path writes every slot with the same address.
+     */
     unsigned l2p = (sp >> R128_TEX_PITCH_SHIFT) & R128_TEX_LOG2_MASK;
+    unsigned l2sz = (sp >> R128_TEX_SIZE_SHIFT) & R128_TEX_LOG2_MASK;
+    unsigned l2h = (sp >> R128_TEX_HEIGHT_SHIFT) & R128_TEX_LOG2_MASK;
+    unsigned l2min = (sp >> R128_TEX_MIN_SIZE_SHIFT) & R128_TEX_LOG2_MASK;
+    unsigned l2w = l2p;
+    unsigned slot = l2sz > l2min ? l2sz - l2min : 0;
 
     t->dt = (cntl & R128_TEX_DATATYPE_MASK) >> R128_TEX_DATATYPE_SHIFT;
     switch (t->dt) {
@@ -1223,7 +1241,7 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
         trace_ati_rage128_3d_unsupported("texture datatype", cntl);
         return false;
     }
-    if (l2w > 10) {
+    if (l2w > 10 || slot > 10) {
         /* no offset slot past PRIM_TEX_10_OFFSET_C */
         trace_ati_rage128_3d_unsupported("texture size", sp);
         return false;
@@ -1231,7 +1249,7 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     t->w = 1u << l2w;
     t->h = 1u << l2h;
     t->pitch = (1u << l2p) * t->bypp;
-    t->base = s->regs[R128_PRIM_TEX_OFFSET_C(l2w) >> 2] &
+    t->base = s->regs[R128_PRIM_TEX_OFFSET_C(slot) >> 2] &
               R128_TEX_OFFSET_MASK;
     if (t->base >= ATI_RAGE128_VRAM_SIZE) {
         trace_ati_rage128_3d_unsupported("texture offset", t->base);
@@ -1244,6 +1262,7 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     t->vram = memory_region_get_ram_ptr(&s->vram);
     t->l2w = l2w;
     t->l2h = l2h;
+    t->slot = slot;
     t->levels = 1;
     if (!(cntl & R128_MIP_MAP_DISABLE)) {
         /*
@@ -1252,13 +1271,9 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
          * unwritten, so sampling level 0 unconditionally paints black.
          * Count the levels whose slot the guest actually programmed.
          */
-        while (t->levels <= l2w &&
-               (s->regs[R128_PRIM_TEX_OFFSET_C(l2w - t->levels) >> 2] &
-                R128_TEX_OFFSET_MASK) < ATI_RAGE128_VRAM_SIZE) {
-            t->levels++;
-        }
+        t->levels = slot + 1;
     }
-    trace_ati_rage128_3d_tex(s->regs[R128_PRIM_TEX_OFFSET_C(l2w) >> 2],
+    trace_ati_rage128_3d_tex(s->regs[R128_PRIM_TEX_OFFSET_C(slot) >> 2],
                              t->base, t->w, t->h, t->dt, cntl,
                              s->regs[R128_PRIM_TEXTURE_COMBINE_CNTL_C >> 2]);
     return true;
