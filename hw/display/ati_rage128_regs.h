@@ -974,6 +974,8 @@
  * register written, as for the mach64's scaler). Captured live from
  * OS X 10.3 on 2026-08-18. Bit layouts as in xf86-video-r128's
  * r128_reg.h; the RRG lists these registers but documents no fields.
+ * The same path carries OS X 10.4's QuickTime video: 4:2:2 frames from
+ * VRAM to the front buffer, with TEX_CNTL's ALPHA_ENABLE clear.
  */
 #define R128_SCALE_SRC_HEIGHT_WIDTH   0x1994
 #define R128_SCALE_OFFSET_0           0x1998

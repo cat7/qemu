@@ -875,9 +875,25 @@ void ati_rage128_2d_scale_regs(ATIRage128State *s)
     op.y_inc = s->regs[R128_SCALE_Y_INC >> 2] >> 4;
     op.dst_off = s->dst_offset;
     op.dst_stride = s->dst_pitch * op.bpp;
-    op.src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) & R128_ALPHA_BLEND_MASK;
-    op.dst_factor = (misc >> R128_ALPHA_BLEND_DST_SHIFT) & R128_ALPHA_BLEND_MASK;
-    op.comb_fcn = (misc >> R128_ALPHA_COMB_FCN_SHIFT) & R128_ALPHA_COMB_FCN_MASK;
+    /*
+     * TEX_CNTL's ALPHA_ENABLE gates the blender here, as TEX_CNTL_C's
+     * does for the 3D path; the factors are not the control. Mac OS X
+     * scales its alpha pointer with the bit set and SRCALPHA /
+     * INVSRCALPHA, and its 4:2:2 video frames with the bit clear and
+     * whatever the factor fields hold -- ZERO / ZERO, which blended
+     * every frame to black.
+     */
+    if (s->regs[R128_TEX_CNTL >> 2] & R128_ALPHA_ENABLE) {
+        op.src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) &
+                        R128_ALPHA_BLEND_MASK;
+        op.dst_factor = (misc >> R128_ALPHA_BLEND_DST_SHIFT) &
+                        R128_ALPHA_BLEND_MASK;
+        op.comb_fcn = (misc >> R128_ALPHA_COMB_FCN_SHIFT) &
+                      R128_ALPHA_COMB_FCN_MASK;
+    } else {
+        op.src_factor = R128_ALPHA_BLEND_ONE;
+        op.dst_factor = R128_ALPHA_BLEND_ZERO;
+    }
     ati_rage128_2d_scale_run(s, &op);
 }
 
