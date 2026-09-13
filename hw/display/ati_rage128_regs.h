@@ -469,6 +469,7 @@
 #define R128_ALPHA_ENABLE            (1 << 9)
 #define R128_ALPHA_IN_TEX            (1 << 13)  /* else the vertex alpha */
 #define R128_ALPHA_TEST_ENABLE       (1 << 10)
+#define R128_SPEC_LIGHT_ENABLE       (1 << 11)  /* add the secondary colour */
 /*
  * Alpha test function (r128_reg.h 1139-1147, listed under SCALE_3D_CNTL
  * with the note that MISC_3D_STATE_CNTL_REG bits 26:16 carry the same

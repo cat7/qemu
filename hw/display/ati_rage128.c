@@ -3340,6 +3340,7 @@ static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
     v->b = v->g = v->r = v->a = 1.0f;
     v->s = v->t = 0.0f;
     v->fog = 1.0f;
+    v->sb = v->sg = v->sr = 0.0f;
     if (fmt & R128_VC_FRMT_RHW) {
         v->rhw = ati_rage128_vc_f32(p->p3_vtx[o]);
         o++;
@@ -3369,7 +3370,14 @@ static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
             o++;
         }
     }
-    o += (fmt & R128_VC_FRMT_SPEC_BGR) ? 3 : 0;
+    if (fmt & R128_VC_FRMT_SPEC_BGR) {
+        if (o + 2 < ARRAY_SIZE(p->p3_vtx)) {
+            v->sb = ati_rage128_vc_f32(p->p3_vtx[o]);
+            v->sg = ati_rage128_vc_f32(p->p3_vtx[o + 1]);
+            v->sr = ati_rage128_vc_f32(p->p3_vtx[o + 2]);
+        }
+        o += 3;
+    }
     if (fmt & R128_VC_FRMT_SPEC_F) {
         if (o < ARRAY_SIZE(p->p3_vtx)) {
             v->fog = ati_rage128_vc_f32(p->p3_vtx[o]);

@@ -1688,6 +1688,8 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     double x[3], y[3], z[3], r[3], g[3], b[3], a[3];
     double q[3], sq[3], tq[3];                  /* 1/w, s/w, t/w */
     double fg[3], fog_r = 0, fog_g = 0, fog_b = 0;
+    double sr[3], sg[3], sb[3];
+    bool specular;
     bool fogged;
     double area, bx0, bx1, by0, by1;
     /* edge i runs vertex (i+1)%3 -> (i+2)%3; w_i is vertex i's weight */
@@ -1753,6 +1755,20 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         dst_factor == R128_ALPHA_BLEND_ZERO) {
         blend = false;                          /* pass-through */
     }
+
+    /*
+     * SPEC_LIGHT_ENABLE: the secondary (specular) colour the vertex
+     * carries in SPEC_BGR is added to the fragment after texturing and
+     * before fog -- OpenGL's GL_SEPARATE_SPECULAR_COLOR. Neither the
+     * RRG nor the busmaster supplement describes the field beyond its
+     * name, and Mesa never sets it (r128_state.c falls back to software
+     * for separate specular), but Mac OS X's driver leans on it:
+     * decoding cm19.log's 54,062 state changes, Chessmaster 9000 sets
+     * bit 11 on 81.9% of its draws and 90% of its vertices arrive as
+     * vc_format 0x97, which carries SPEC_BGR. Dropping it renders every
+     * lit surface flat.
+     */
+    specular = tex_cntl & R128_SPEC_LIGHT_ENABLE;
 
     fogged = tex_cntl & R128_FOG_ENABLE;
     if (fogged) {
@@ -1821,6 +1837,9 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
          */
         fg[i] = ati_rage128_3d_csan(v[i].fog);
         fg[i] = fg[i] < 0.0 ? 0.0 : fg[i] > 1.0 ? 1.0 : fg[i];
+        sr[i] = ati_rage128_3d_csan(v[i].sr);
+        sg[i] = ati_rage128_3d_csan(v[i].sg);
+        sb[i] = ati_rage128_3d_csan(v[i].sb);
     }
     /*
      * Perspective-correct s/t: interpolate s/w, t/w and 1/w linearly
@@ -2096,6 +2115,15 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
 have_texel:
                 ati_rage128_tex_combine(comb, texel, const_color, rgb,
                                         &alpha);
+            }
+            if (specular) {
+                /* the sum is clamped before fog, as GL specifies */
+                rgb[0] = MIN(rgb[0] + w0 * sr[0] + w1 * sr[1] + w2 * sr[2],
+                             1.0);
+                rgb[1] = MIN(rgb[1] + w0 * sg[0] + w1 * sg[1] + w2 * sg[2],
+                             1.0);
+                rgb[2] = MIN(rgb[2] + w0 * sb[0] + w1 * sb[1] + w2 * sb[2],
+                             1.0);
             }
             if (fogged) {
                 double fi = w0 * fg[0] + w1 * fg[1] + w2 * fg[2];
