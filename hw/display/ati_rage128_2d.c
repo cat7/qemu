@@ -403,7 +403,6 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     int height = s->dst_height;
     uint32_t dst_stride, src_stride;
     int sc_left, sc_top, sc_right, sc_bottom;
-    unsigned blt_paint = 0, blt_srcnz = 0;   /* LOCAL PROBE */
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     unsigned bypp = bpp / 8;
     ATIRage128DirtySpan span = ATI_RAGE128_DIRTY_SPAN_INIT;
@@ -531,18 +530,11 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
                 result = (result & wmask) | (dst_pixel & ~wmask);
             }
             if (ati_rage128_vram_st(vram, daddr, bpp, result)) {
-                blt_paint++;
-                if (src_pixel) {
-                    blt_srcnz++;
-                }
                 ati_rage128_span_add(&span, daddr, bypp);
             }
         }
         ati_rage128_span_flush(s, &span);
     }
-    trace_ati_rage128_blt_pixels(s->src_offset, s->dst_offset, width, height,
-                                 src_stride, dst_stride, blt_paint,
-                                 blt_srcnz);
 }
 
 
@@ -1308,6 +1300,37 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
 }
 
 /*
+ * The eight comparison codes, shared by Z_TEST and STENCIL_TEST: the
+ * incoming value @a against the value already in the buffer @b.
+ */
+static bool ati_rage128_3d_cmp(unsigned func, uint32_t a, uint32_t b)
+{
+    switch (func) {
+    case 0:  return false;                      /* NEVER */
+    case 1:  return a < b;                      /* LESS */
+    case 2:  return a <= b;                     /* LESSEQUAL */
+    case 3:  return a == b;                     /* EQUAL */
+    case 4:  return a >= b;                     /* GREATEREQUAL */
+    case 5:  return a > b;                      /* GREATER */
+    case 6:  return a != b;                     /* NEQUAL */
+    default: return true;                       /* ALWAYS */
+    }
+}
+
+/* one stencil operation on the 8-bit stencil value; INC/DEC saturate */
+static unsigned ati_rage128_stencil_op(unsigned op, unsigned old, unsigned ref)
+{
+    switch (op) {
+    case R128_STENCIL_OP_ZERO:    return 0;
+    case R128_STENCIL_OP_REPLACE: return ref & 0xff;
+    case R128_STENCIL_OP_INC:     return old < 0xff ? old + 1 : 0xff;
+    case R128_STENCIL_OP_DEC:     return old > 0 ? old - 1 : 0;
+    case R128_STENCIL_OP_INV:     return ~old & 0xff;
+    default:                      return old;   /* KEEP */
+    }
+}
+
+/*
  * The blender's source alpha. PRIM_TEXTURE_COMBINE_CNTL_C carries both
  * the alpha function (COMB_ALPHA) and the factor it works on
  * (ALPHA_FACTOR: 6 the texel's alpha, 7 its inverse). @ta is the texel
@@ -1661,6 +1684,24 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     unsigned z_bypp, z_bits;
     uint32_t z_max, z_stride;
     bool z_test = tex_cntl & R128_Z_ENABLE;
+    /*
+     * Stencil lives in the top byte of the 32-bit Z word, so it exists
+     * only under Z_PIX_WIDTH_24; the enable bit is checked against that
+     * below, once the depth width is known.
+     */
+    bool stencil = tex_cntl & R128_STENCIL_ENABLE;
+    uint32_t sten_rm = s->regs[R128_STEN_REF_MASK_C >> 2];
+    unsigned sten_ref = (sten_rm >> R128_STEN_REFERENCE_SHIFT) & 0xff;
+    unsigned sten_mask = (sten_rm >> R128_STEN_MASK_SHIFT) & 0xff;
+    unsigned sten_wmask = (sten_rm >> R128_STEN_WRITE_MASK_SHIFT) & 0xff;
+    unsigned sten_func = (zsten & R128_STENCIL_TEST_MASK) >>
+                         R128_STENCIL_TEST_SHIFT;
+    unsigned sten_sfail = (zsten >> R128_STENCIL_SFAIL_SHIFT) &
+                          R128_STENCIL_OP_MASK;
+    unsigned sten_zpass = (zsten >> R128_STENCIL_ZPASS_SHIFT) &
+                          R128_STENCIL_OP_MASK;
+    unsigned sten_zfail = (zsten >> R128_STENCIL_ZFAIL_SHIFT) &
+                          R128_STENCIL_OP_MASK;
     bool z_write = tex_cntl & R128_Z_WRITE_ENABLE;
     bool textured = tex_cntl & R128_TEXMAP_ENABLE;
     bool alpha_test = tex_cntl & R128_ALPHA_TEST_ENABLE;
@@ -1740,9 +1781,12 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         z_test = z_write = false;
         break;
     }
+    if (z_bits != 32 || z_max != 0x00ffffff) {
+        stencil = false;                        /* no stencil byte */
+    }
     z_stride = z_pitch * 8 * z_bypp;            /* pitch is in 8-px units */
-    if ((z_test || z_write) && !z_stride) {
-        z_test = z_write = false;
+    if ((z_test || z_write || stencil) && !z_stride) {
+        z_test = z_write = stencil = false;
     }
     if (textured && !ati_rage128_tex_setup(s, &tex)) {
         textured = false;                       /* traced; draw Gouraud */
@@ -1993,62 +2037,53 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             w1 = w[1] / area;
             w2 = w[2] / area;
 
-            if (z_test || z_write) {
+            if (z_test || z_write || stencil) {
                 uint32_t zval, zaddr = zrow + (uint32_t)px * z_bypp;
 
                 zd = w0 * z[0] + w1 * z[1] + w2 * z[2];
                 zval = zd <= 0.0 ? 0 : zd >= 1.0 ? z_max
                        : (uint32_t)(zd * (double)z_max + 0.5);
-                if (z_test) {
-                    /*
-                     * an out-of-VRAM Z address reads back 0 (and the
-                     * write below is dropped): safe, deterministic
-                     */
-                    uint32_t zold = ati_rage128_vram_ld(vram, zaddr,
-                                                        z_bits) & z_max;
-                    bool pass;
+                /*
+                 * an out-of-VRAM Z address reads back 0 (and the write
+                 * below is dropped): safe, deterministic
+                 */
+                uint32_t zraw = ati_rage128_vram_ld(vram, zaddr, z_bits);
+                uint32_t zout = zraw;
+                bool zpass = true, spass = true;
+                unsigned sold = (zraw >> 24) & 0xff;
 
-                    switch (zsten & R128_Z_TEST_MASK) {
-                    case R128_Z_TEST_NEVER:
-                        pass = false;
-                        break;
-                    case R128_Z_TEST_LESS:
-                        pass = zval < zold;
-                        break;
-                    case R128_Z_TEST_LESSEQUAL:
-                        pass = zval <= zold;
-                        break;
-                    case R128_Z_TEST_EQUAL:
-                        pass = zval == zold;
-                        break;
-                    case R128_Z_TEST_GREATEREQUAL:
-                        pass = zval >= zold;
-                        break;
-                    case R128_Z_TEST_GREATER:
-                        pass = zval > zold;
-                        break;
-                    case R128_Z_TEST_NEQUAL:
-                        pass = zval != zold;
-                        break;
-                    default:                    /* R128_Z_TEST_ALWAYS */
-                        pass = true;
-                        break;
-                    }
-                    if (!pass) {
-                        continue;
-                    }
+                /*
+                 * Stencil is tested BEFORE depth, and its operation is
+                 * applied whether or not the fragment survives -- a
+                 * mask-building pass draws nothing and exists only for
+                 * this side effect.
+                 */
+                if (stencil) {
+                    spass = ati_rage128_3d_cmp(sten_func,
+                                               sten_ref & sten_mask,
+                                               sold & sten_mask);
                 }
-                if (z_write) {
-                    uint32_t out = zval;
+                if (z_test) {
+                    zpass = ati_rage128_3d_cmp((zsten & R128_Z_TEST_MASK) >> 4,
+                                               zval, zraw & z_max);
+                }
+                if (stencil) {
+                    unsigned op = !spass ? sten_sfail
+                                  : zpass ? sten_zpass : sten_zfail;
+                    unsigned snew = ati_rage128_stencil_op(op, sold, sten_ref);
 
-                    if (z_max != 0xffffffff && z_bits == 32) {
-                        /* keep the stencil byte above a 24-bit depth */
-                        out |= ati_rage128_vram_ld(vram, zaddr, z_bits) &
-                               ~z_max;
-                    }
-                    if (ati_rage128_vram_st(vram, zaddr, z_bits, out)) {
-                        ati_rage128_span_add(&zspan, zaddr, z_bypp);
-                    }
+                    snew = (sold & ~sten_wmask) | (snew & sten_wmask);
+                    zout = (zout & 0x00ffffff) | (snew & 0xff) << 24;
+                }
+                if (z_write && spass && zpass) {
+                    zout = (zout & ~z_max) | (zval & z_max);
+                }
+                if (zout != zraw &&
+                    ati_rage128_vram_st(vram, zaddr, z_bits, zout)) {
+                    ati_rage128_span_add(&zspan, zaddr, z_bypp);
+                }
+                if (!spass || !zpass) {
+                    continue;
                 }
             }
 

@@ -448,6 +448,34 @@
 #define R128_Z_TEST_NEQUAL           (6 << 4)
 #define R128_Z_TEST_ALWAYS           (7 << 4)
 #define R128_Z_TEST_MASK             (7 << 4)
+/*
+ * Stencil, all in Z_STEN_CNTL_C beside the depth fields (r128_reg.h
+ * 1204-1229). The comparison codes are the same eight as Z_TEST, so
+ * both tests share one comparator. The three operation fields pick what
+ * happens to the stencil value on stencil-fail, depth-pass and
+ * depth-fail. Mesa never programs any of this -- it has no stencil
+ * support for the r128 -- but Mac OS X's driver does: Chessmaster 9000
+ * runs an ALWAYS/DECR pass that writes no colour to build a mask and
+ * then an EQUAL pass that paints through it, together 35% of its draws.
+ * The buffer is the top byte of the 32-bit Z word, so stencil exists
+ * only under Z_PIX_WIDTH_24.
+ */
+#define R128_STENCIL_TEST_SHIFT      12
+#define R128_STENCIL_TEST_MASK       (7 << 12)
+#define R128_STENCIL_SFAIL_SHIFT     16
+#define R128_STENCIL_ZPASS_SHIFT     20
+#define R128_STENCIL_ZFAIL_SHIFT     24
+#define R128_STENCIL_OP_MASK         7
+#define R128_STENCIL_OP_KEEP         0
+#define R128_STENCIL_OP_ZERO         1
+#define R128_STENCIL_OP_REPLACE      2
+#define R128_STENCIL_OP_INC          3
+#define R128_STENCIL_OP_DEC          4
+#define R128_STENCIL_OP_INV          5
+/* STEN_REF_MASK_C: reference 7:0, compare mask 23:16, write mask 31:24 */
+#define R128_STEN_REFERENCE_SHIFT    0
+#define R128_STEN_MASK_SHIFT         16
+#define R128_STEN_WRITE_MASK_SHIFT   24
 /* Z_PITCH_C: pitch in units of 8 pixels, low 12 bits (bit 16 = tiling) */
 #define R128_Z_PITCH_MASK            0x00000fff
 /*
@@ -463,6 +491,7 @@
 #define R128_Z_ENABLE                (1 << 0)
 #define R128_Z_WRITE_ENABLE          (1 << 1)
 #define R128_TEXMAP_ENABLE           (1 << 4)
+#define R128_STENCIL_ENABLE          (1 << 3)
 #define R128_SEC_TEXMAP_ENABLE       (1 << 5)
 #define R128_FOG_ENABLE              (1 << 7)
 #define R128_DITHER_ENABLE           (1 << 8)
