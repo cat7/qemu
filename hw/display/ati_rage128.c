@@ -3870,8 +3870,16 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
 
     trace_ati_rage128_pm4_indirect(offset, dwords,
         dwords ? ati_rage128_card_read32(s, offset, gart) : 0);
-    if (dwords > 0x10000) {
-        /* bogus size -- a real IB is at most a few KB */
+    /*
+     * INDSIZE is a 23-bit dword count and Mac OS X's driver uses it:
+     * ATIRage128::submit_buffer hands the card one indirect buffer per
+     * texture mip level, unsplit, so level 0 of a 256x256 ARGB8888
+     * texture arrives as a single 0x10060-dword buffer. A 0x10000 cap
+     * here dropped exactly that buffer and nothing else, leaving the
+     * base level of every large texture unwritten while its smaller
+     * levels were perfect.
+     */
+    if (dwords > 0x7fffff) {
         return;
     }
     for (i = 0; i < dwords; ) {
