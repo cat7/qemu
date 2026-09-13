@@ -1300,9 +1300,12 @@ static unsigned ati_rage128_3d_src_alpha(uint32_t comb, uint32_t tex_cntl,
     fa = factor == R128_ALPHA_FACTOR_NTEX_ALPHA ? 255 - ta : ta;
 
     switch (fn) {
+    case R128_COMB_ALPHA_DIS:
     case R128_COMB_ALPHA_COPY:
-    case R128_COMB_ALPHA_COPY_INP:
+        /* A = At: the factor alone (Mesa r128_texstate.c's comments) */
         return fa;
+    case R128_COMB_ALPHA_COPY_INP:
+        return va;                              /* A = Af */
     case R128_COMB_ALPHA_MODULATE:
         /*
          * Both sources multiplied. RAVE's opaque geometry reaches here
@@ -1310,7 +1313,7 @@ static unsigned ati_rage128_3d_src_alpha(uint32_t comb, uint32_t tex_cntl,
          * texel's alpha is not meant to be used at all.
          */
         return (tex_cntl & R128_ALPHA_IN_TEX) ? fa * va / 255 : va;
-    default:                                    /* DIS and anything else */
+    default:
         return va;
     }
 }
