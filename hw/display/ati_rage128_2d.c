@@ -1643,9 +1643,12 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     double area, bx0, bx1, by0, by1;
     /* edge i runs vertex (i+1)%3 -> (i+2)%3; w_i is vertex i's weight */
     double ea[3], eb[3];
+    double dw0 = 0, dw1 = 0, dw2 = 0;   /* barycentric step per pixel in x */
     bool tl[3];
     int sc_left, sc_top, sc_right, sc_bottom;
     uint32_t texel;
+    ATIRage128Tex lvl[11];
+    bool mip = false;
     int minx, maxx, miny, maxy, px, py, i;
 
     if (dt != 3 && dt != 4 && dt != 6) {
@@ -1734,29 +1737,21 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     }
     if (textured && tex.levels > 1) {
         /*
-         * One level for the whole triangle, from how many texels it
-         * covers per pixel: the texel-space area over the screen area,
-         * square-rooted, is the edge length ratio, and its log2 is the
-         * level. Enough to pick the level the driver uploaded; real
-         * silicon evaluates this per pixel and blends between levels.
+         * Build the level table once; the level itself is chosen per
+         * pixel below, from how far the texture coordinates move
+         * between neighbouring pixels. Mac OS X's driver fills only the
+         * levels a minified draw can reach and leaves a big texture's
+         * base level unwritten, so picking one level for a whole
+         * triangle lands on the empty one wherever the triangle spans a
+         * range of depths -- which on a board seen in perspective is
+         * every triangle.
          */
-        double ta = fabs(((double)v[1].s - v[0].s) * ((double)v[2].t - v[0].t)
-                       - ((double)v[1].t - v[0].t) * ((double)v[2].s - v[0].s))
-                    * tex.w * tex.h;
-        ATIRage128Tex base = tex;
-        int lod = 0;
+        unsigned k;
 
-        if (ta > 0.0) {
-            lod = (int)floor(0.5 * log2(ta / area) + 0.5);
+        for (k = 0; k < tex.levels; k++) {
+            ati_rage128_tex_level(s, &lvl[k], &tex, k);
         }
-        if (lod < 0) {
-            lod = 0;
-        }
-        if (lod > (int)tex.levels - 1) {
-            lod = tex.levels - 1;
-        }
-        ati_rage128_tex_level(s, &tex, &base, lod);
-        trace_ati_rage128_3d_lod(lod, tex.levels, tex.w, tex.h, tex.base);
+        mip = true;
     }
     for (i = 0; i < 3; i++) {
         x[i] = v[i].x;
@@ -1814,6 +1809,13 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
 
         ea[i] = -(yb - ya);
         eb[i] = xb - xa;
+        if (i == 0) {
+            dw0 = ea[0] / area;
+        } else if (i == 1) {
+            dw1 = ea[1] / area;
+        } else {
+            dw2 = ea[2] / area;
+        }
         /*
          * Top-left fill rule so a shared edge paints exactly once. In
          * this y-down, positive-area winding a "top" edge is horizontal
@@ -1991,8 +1993,29 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                 double qi = w0 * q[0] + w1 * q[1] + w2 * q[2];
                 double si = (w0 * sq[0] + w1 * sq[1] + w2 * sq[2]) / qi;
                 double ti = (w0 * tq[0] + w1 * tq[1] + w2 * tq[2]) / qi;
+                const ATIRage128Tex *tp = &tex;
 
-                texel = ati_rage128_tex_sample(&tex, si, ti);
+                if (mip) {
+                    /* the same coordinates one pixel to the right */
+                    double n0 = w0 + dw0, n1 = w1 + dw1, n2 = w2 + dw2;
+                    double qn = n0 * q[0] + n1 * q[1] + n2 * q[2];
+                    double ds, dt2;
+                    int lod = 0;
+
+                    ds = ((n0 * sq[0] + n1 * sq[1] + n2 * sq[2]) / qn - si)
+                         * tex.w;
+                    dt2 = ((n0 * tq[0] + n1 * tq[1] + n2 * tq[2]) / qn - ti)
+                          * tex.h;
+                    ds = ds * ds + dt2 * dt2;
+                    if (ds > 1.0) {
+                        lod = (int)(0.5 * log2(ds) + 0.5);
+                    }
+                    if (lod > (int)tex.levels - 1) {
+                        lod = tex.levels - 1;
+                    }
+                    tp = &lvl[lod];
+                }
+                texel = ati_rage128_tex_sample(tp, si, ti);
                 ati_rage128_tex_combine(comb, texel, const_color, rgb,
                                         &alpha);
             }
