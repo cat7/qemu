@@ -403,6 +403,7 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     int height = s->dst_height;
     uint32_t dst_stride, src_stride;
     int sc_left, sc_top, sc_right, sc_bottom;
+    unsigned blt_paint = 0, blt_srcnz = 0;   /* LOCAL PROBE */
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     unsigned bypp = bpp / 8;
     ATIRage128DirtySpan span = ATI_RAGE128_DIRTY_SPAN_INIT;
@@ -530,11 +531,18 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
                 result = (result & wmask) | (dst_pixel & ~wmask);
             }
             if (ati_rage128_vram_st(vram, daddr, bpp, result)) {
+                blt_paint++;
+                if (src_pixel) {
+                    blt_srcnz++;
+                }
                 ati_rage128_span_add(&span, daddr, bypp);
             }
         }
         ati_rage128_span_flush(s, &span);
     }
+    trace_ati_rage128_blt_pixels(s->src_offset, s->dst_offset, width, height,
+                                 src_stride, dst_stride, blt_paint,
+                                 blt_srcnz);
 }
 
 
@@ -1172,6 +1180,7 @@ typedef struct ATIRage128Tex {
     unsigned dt;
     unsigned clamp_s, clamp_t;    /* R128_TEX_CLAMP_* */
     bool linear;                  /* bilinear (MAG_BLEND_LINEAR) */
+    unsigned min_blend;           /* R128_MIN_BLEND_*, the minify filter */
     uint32_t border;              /* PRIM_TEXTURE_BORDER_COLOR_C, ARGB */
     unsigned l2w, l2h;            /* log2 of the base level's width/height */
     unsigned slot;                /* PRIM_TEX_OFFSET_C slot of the base level */
@@ -1258,6 +1267,7 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     t->clamp_s = (cntl >> R128_TEX_CLAMP_S_SHIFT) & R128_TEX_CLAMP_MASK;
     t->clamp_t = (cntl >> R128_TEX_CLAMP_T_SHIFT) & R128_TEX_CLAMP_MASK;
     t->linear = cntl & R128_MAG_BLEND_LINEAR;
+    t->min_blend = (cntl >> R128_MIN_BLEND_SHIFT) & 7;
     t->border = s->regs[R128_PRIM_TEXTURE_BORDER_COLOR_C >> 2];
     t->vram = memory_region_get_ram_ptr(&s->vram);
     t->l2w = l2w;
@@ -1768,6 +1778,7 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
 
         for (k = 0; k < tex.levels; k++) {
             ati_rage128_tex_level(s, &lvl[k], &tex, k);
+            lvl[k].linear = tex.min_blend >= R128_MIN_BLEND_LINMIPNEAREST;
         }
         mip = true;
     }
@@ -2017,8 +2028,8 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                     /* the same coordinates one pixel to the right */
                     double n0 = w0 + dw0, n1 = w1 + dw1, n2 = w2 + dw2;
                     double qn = n0 * q[0] + n1 * q[1] + n2 * q[2];
-                    double ds, dt2;
-                    int lod = 0;
+                    double ds, dt2, lodf = 0.0;
+                    int lod;
 
                     ds = ((n0 * sq[0] + n1 * sq[1] + n2 * sq[2]) / qn - si)
                          * tex.w;
@@ -2026,14 +2037,42 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                           * tex.h;
                     ds = ds * ds + dt2 * dt2;
                     if (ds > 1.0) {
-                        lod = (int)(0.5 * log2(ds) + 0.5);
+                        lodf = 0.5 * log2(ds);
                     }
-                    if (lod > (int)tex.levels - 1) {
-                        lod = tex.levels - 1;
+                    if (lodf > (double)tex.levels - 1) {
+                        lodf = tex.levels - 1;
                     }
-                    tp = &lvl[lod];
+                    lod = (int)lodf;
+                    /*
+                     * MIPLINEAR and LINEARMIPLINEAR blend the two levels
+                     * either side of the fractional level; the others
+                     * take the nearer one.
+                     */
+                    if ((tex.min_blend == R128_MIN_BLEND_MIPLINEAR ||
+                         tex.min_blend == R128_MIN_BLEND_LINMIPLINEAR) &&
+                        lod + 1 < (int)tex.levels) {
+                        unsigned f = (unsigned)((lodf - lod) * 256.0);
+                        uint32_t a = ati_rage128_tex_sample(&lvl[lod], si, ti);
+                        uint32_t b = ati_rage128_tex_sample(&lvl[lod + 1],
+                                                            si, ti);
+                        int k2;
+
+                        texel = 0;
+                        for (k2 = 0; k2 < 4; k2++) {
+                            unsigned sh = k2 * 8;
+                            unsigned ca = (a >> sh) & 0xff;
+                            unsigned cb = (b >> sh) & 0xff;
+
+                            texel |= (((ca * (256 - f) + cb * f) >> 8) & 0xff)
+                                     << sh;
+                        }
+                        goto have_texel;
+                    }
+                    tp = &lvl[(int)(lodf + 0.5) < (int)tex.levels
+                              ? (int)(lodf + 0.5) : (int)tex.levels - 1];
                 }
                 texel = ati_rage128_tex_sample(tp, si, ti);
+have_texel:
                 ati_rage128_tex_combine(comb, texel, const_color, rgb,
                                         &alpha);
             }

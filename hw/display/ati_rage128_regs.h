@@ -497,7 +497,21 @@
  * the Pro driver writes 3 there -- bit 4 is taken as "linear" and the
  * rest of the field ignored.
  */
+#define R128_MIN_BLEND_SHIFT         1
 #define R128_MIN_BLEND_MASK          (7 << 1)
+/*
+ * MIN_BLEND, the minification filter (r128_reg.h 1280-1286). The name's
+ * first half is the filter within a level, the second between levels:
+ * MIPNEAREST is nearest/nearest, MIPLINEAR nearest within and linear
+ * between, LINEARMIPNEAREST the reverse, LINEARMIPLINEAR both --
+ * trilinear, which is what Mac OS X's OpenGL driver asks for.
+ */
+#define R128_MIN_BLEND_NEAREST       0
+#define R128_MIN_BLEND_LINEAR_       1
+#define R128_MIN_BLEND_MIPNEAREST    2
+#define R128_MIN_BLEND_MIPLINEAR     3
+#define R128_MIN_BLEND_LINMIPNEAREST 4
+#define R128_MIN_BLEND_LINMIPLINEAR  5
 #define R128_MAG_BLEND_LINEAR        (1 << 4)
 #define R128_MAG_BLEND_MASK          (7 << 4)
 #define R128_MIP_MAP_DISABLE         (1 << 7)
