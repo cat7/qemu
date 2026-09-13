@@ -1375,11 +1375,13 @@ static unsigned ati_rage128_3d_src_alpha(uint32_t comb, uint32_t tex_cntl,
         return va;                              /* A = Af */
     case R128_COMB_ALPHA_MODULATE:
         /*
-         * Both sources multiplied. RAVE's opaque geometry reaches here
-         * with a zero texel alpha and relies on ALPHA_IN_TEX to say the
-         * texel's alpha is not meant to be used at all.
+         * A = AfAt. TEX_CNTL_C bit 13 selects COMPLETE_A (0) or LSB_A
+         * (1) for the texel alpha; it does not switch the texel alpha
+         * off. RAVE draws the ARGB8888 shadow blob with this function,
+         * SRCALPHA:INVSRCALPHA, bit 13 clear and vertex alpha 1.0, so
+         * reading the vertex alpha here painted the whole quad.
          */
-        return (tex_cntl & R128_ALPHA_IN_TEX) ? fa * va / 255 : va;
+        return fa * va / 255;
     default:
         return va;
     }
