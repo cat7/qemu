@@ -3398,6 +3398,31 @@ static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
  * the area sign -- so a strip keeps no parity and a fan just slides
  * its middle vertex.
  */
+/*
+ * One vertex of a GEN_INDX_PRIM draw, fetched from the vertex buffer the
+ * packet named: @idx * stride dwords past its address, through the same
+ * GART-or-VRAM addressing an indirect buffer uses. Fed to the triangle
+ * accumulator exactly as an inline GEN_PRIM vertex would be.
+ */
+static void ati_rage128_3d_prim_vertex(ATIRage128State *s,
+                                       ATIRage128PM4Parser *p);
+
+static void ati_rage128_3d_buffer_vertex(ATIRage128State *s,
+                                         ATIRage128PM4Parser *p,
+                                         unsigned idx)
+{
+    bool gart = (s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu) != 0;
+    unsigned stride = p->p3_vtx_stride;
+    uint32_t addr;
+
+    if (!stride || stride > ARRAY_SIZE(p->p3_vtx) || idx > 0xffff) {
+        return;
+    }
+    addr = p->p3_params[0] + idx * stride * 4;
+    ati_rage128_card_read_block(s, addr, p->p3_vtx, stride, gart);
+    ati_rage128_3d_prim_vertex(s, p);
+}
+
 static void ati_rage128_3d_prim_vertex(ATIRage128State *s,
                                        ATIRage128PM4Parser *p)
 {
@@ -3795,16 +3820,58 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
             break;
         case R128_PM4_OPCODE_3D_RNDR_GEN_INDX_PRIM:
             /*
-             * Vertex-buffer form (Linux DRM layout): buffer offset and
-             * size, then the same VC_FORMAT/VC_CNTL pair, then indices
-             * when the walk mode says so. Trace-only, as above.
+             * Vertex-buffer form (Linux DRM layout): buffer address and
+             * size, then the same VC_FORMAT/VC_CNTL pair, then 16-bit
+             * indices two per dword (low half first) when the walk mode
+             * is IND, or nothing when it is LIST and the vertices are
+             * taken from the buffer in order. The address is what the
+             * bus master fetches from -- GART-translated system memory
+             * when a GART is configured, exactly like an indirect
+             * buffer. This is how Mac OS X's driver draws every vertex
+             * array (ATIRage128GLDriver FUN_0000e258 emits it for
+             * glDrawElements/glDrawArrays with a 0x16000-byte pageable
+             * vertex buffer the kernel maps into the GART); leaving it
+             * trace-only made all of those draws vanish, and Chessmaster
+             * 9000's pieces with them.
              */
             if (p->p3_param_idx < 4) {
                 p->p3_params[p->p3_param_idx] = val;
-                if (p->p3_param_idx == 3) {
+                if (p->p3_param_idx == 2) {
+                    p->p3_vc_format = val;
+                    p->p3_vtx_stride = ati_rage128_vc_stride(val);
+                } else if (p->p3_param_idx == 3) {
+                    unsigned walk = (val & R128_VC_CNTL_PRIM_WALK_MASK) >>
+                                    R128_VC_CNTL_PRIM_WALK_SHIFT;
+                    unsigned num = val >> R128_VC_CNTL_NUM_SHIFT;
+
+                    p->p3_vc_cntl = val;
+                    p->p3_vtx_count = 0;
                     trace_ati_rage128_3d_indx_prim(p->p3_params[0],
                                                    p->p3_params[1],
                                                    p->p3_params[2], val);
+                    trace_ati_rage128_3d_prim(p->p3_vc_format,
+                                              p->p3_vtx_stride,
+                                              val & R128_VC_CNTL_PRIM_TYPE_MASK,
+                                              walk, num);
+                    if (walk == R128_VC_CNTL_PRIM_WALK_LIST) {
+                        unsigned k;
+
+                        for (k = 0; k < num; k++) {
+                            ati_rage128_3d_buffer_vertex(s, p, k);
+                        }
+                    }
+                }
+            } else if (((p->p3_vc_cntl & R128_VC_CNTL_PRIM_WALK_MASK) >>
+                        R128_VC_CNTL_PRIM_WALK_SHIFT) ==
+                       R128_VC_CNTL_PRIM_WALK_IND) {
+                unsigned num = p->p3_vc_cntl >> R128_VC_CNTL_NUM_SHIFT;
+                unsigned done = (p->p3_param_idx - 4) * 2;
+
+                if (done < num) {
+                    ati_rage128_3d_buffer_vertex(s, p, val & 0xffff);
+                }
+                if (done + 1 < num) {
+                    ati_rage128_3d_buffer_vertex(s, p, val >> 16);
                 }
             }
             p->p3_param_idx++;

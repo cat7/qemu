@@ -1085,6 +1085,9 @@
 #define R128_VC_CNTL_PRIM_TYPE_TRI_STRIP 6
 #define R128_VC_CNTL_PRIM_WALK_MASK   0x00000030
 #define R128_VC_CNTL_PRIM_WALK_SHIFT  4
+#define R128_VC_CNTL_PRIM_WALK_IND    1   /* indices follow in the packet */
+#define R128_VC_CNTL_PRIM_WALK_LIST   2   /* vertices in order from the buffer */
+#define R128_VC_CNTL_PRIM_WALK_RING   3   /* vertices inline (GEN_PRIM) */
 #define R128_VC_CNTL_NUM_SHIFT        16
 
 #endif /* ATI_RAGE128_REGS_H */
