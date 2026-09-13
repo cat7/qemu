@@ -1706,11 +1706,19 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     bool textured = tex_cntl & R128_TEXMAP_ENABLE;
     bool alpha_test = tex_cntl & R128_ALPHA_TEST_ENABLE;
     /*
-     * The blend factors are the control: Mac OS RAVE drivers program
-     * ONE / INVSRCALPHA and never set TEX_CNTL_C's ALPHA_ENABLE, and
-     * Nanosaur's foliage cut-outs come out opaque if that bit is
-     * required. A never-programmed pair (ZERO/ZERO) and the pass-through
-     * pair (ONE/ZERO) both mean no blending.
+     * TEX_CNTL_C's ALPHA_ENABLE gates the blender, and the factors are
+     * NOT the control. Both drivers we can read agree: Mesa's
+     * r128UpdateAlphaMode sets the factors only when GL blending is on
+     * and merely clears this bit to turn it off, and Mac OS X's driver
+     * does the same -- traced live through the OpenGL framework, a
+     * glDisable(GL_BLEND) clears the bit and leaves the previous
+     * factors sitting in MISC_3D_STATE_CNTL_REG.
+     *
+     * Treating the factors as the control instead blends draws that
+     * asked for none: an untextured overlap came out red+green where
+     * the reference renderer gives green, and Chessmaster 9000's
+     * dominant textured draw (ALPHA_ENABLE clear, stale
+     * SRCALPHA/INVSRCALPHA) blended itself into the cleared background.
      */
     bool blend = tex_cntl & R128_ALPHA_ENABLE;
     unsigned src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) &
@@ -1790,10 +1798,6 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     }
     if (textured && !ati_rage128_tex_setup(s, &tex)) {
         textured = false;                       /* traced; draw Gouraud */
-    }
-    if (!(src_factor == R128_ALPHA_BLEND_ZERO &&
-          dst_factor == R128_ALPHA_BLEND_ZERO)) {
-        blend = true;
     }
     if (src_factor == R128_ALPHA_BLEND_ONE &&
         dst_factor == R128_ALPHA_BLEND_ZERO) {
