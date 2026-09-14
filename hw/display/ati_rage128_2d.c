@@ -2059,56 +2059,6 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             w1 = w[1] / area;
             w2 = w[2] / area;
 
-            if (z_test || z_write || stencil) {
-                uint32_t zval, zaddr = zrow + (uint32_t)px * z_bypp;
-
-                zd = w0 * z[0] + w1 * z[1] + w2 * z[2];
-                zval = zd <= 0.0 ? 0 : zd >= 1.0 ? z_max
-                       : (uint32_t)(zd * (double)z_max + 0.5);
-                /*
-                 * an out-of-VRAM Z address reads back 0 (and the write
-                 * below is dropped): safe, deterministic
-                 */
-                uint32_t zraw = ati_rage128_vram_ld(vram, zaddr, z_bits);
-                uint32_t zout = zraw;
-                bool zpass = true, spass = true;
-                unsigned sold = (zraw >> 24) & 0xff;
-
-                /*
-                 * Stencil is tested BEFORE depth, and its operation is
-                 * applied whether or not the fragment survives -- a
-                 * mask-building pass draws nothing and exists only for
-                 * this side effect.
-                 */
-                if (stencil) {
-                    spass = ati_rage128_3d_cmp(sten_func,
-                                               sten_ref & sten_mask,
-                                               sold & sten_mask);
-                }
-                if (z_test) {
-                    zpass = ati_rage128_3d_cmp((zsten & R128_Z_TEST_MASK) >> 4,
-                                               zval, zraw & z_max);
-                }
-                if (stencil) {
-                    unsigned op = !spass ? sten_sfail
-                                  : zpass ? sten_zpass : sten_zfail;
-                    unsigned snew = ati_rage128_stencil_op(op, sold, sten_ref);
-
-                    snew = (sold & ~sten_wmask) | (snew & sten_wmask);
-                    zout = (zout & 0x00ffffff) | (snew & 0xff) << 24;
-                }
-                if (z_write && spass && zpass) {
-                    zout = (zout & ~z_max) | (zval & z_max);
-                }
-                if (zout != zraw &&
-                    ati_rage128_vram_st(vram, zaddr, z_bits, zout)) {
-                    ati_rage128_span_add(&zspan, zaddr, z_bypp);
-                }
-                if (!spass || !zpass) {
-                    continue;
-                }
-            }
-
             rgb[0] = w0 * r[0] + w1 * r[1] + w2 * r[2];
             rgb[1] = w0 * g[0] + w1 * g[1] + w2 * g[2];
             rgb[2] = w0 * b[0] + w1 * b[1] + w2 * b[2];
@@ -2170,8 +2120,66 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                 }
                 texel = ati_rage128_tex_sample(tp, si, ti);
 have_texel:
+                /*
+                 * ALPHA_IN_TEX_LSB_A: the decoded texel alpha's LSB is a
+                 * 1-bit coverage flag; 0 kills the fragment before Z or
+                 * colour, regardless of ALPHA_TEST_ENABLE/ALPHA_ENABLE.
+                 */
+                if ((tex_cntl & R128_ALPHA_IN_TEX) && !(texel >> 24 & 1)) {
+                    continue;
+                }
                 ati_rage128_tex_combine(comb, texel, const_color, rgb,
                                         &alpha);
+            }
+
+            if (z_test || z_write || stencil) {
+                uint32_t zval, zaddr = zrow + (uint32_t)px * z_bypp;
+
+                zd = w0 * z[0] + w1 * z[1] + w2 * z[2];
+                zval = zd <= 0.0 ? 0 : zd >= 1.0 ? z_max
+                       : (uint32_t)(zd * (double)z_max + 0.5);
+                /*
+                 * an out-of-VRAM Z address reads back 0 (and the write
+                 * below is dropped): safe, deterministic
+                 */
+                uint32_t zraw = ati_rage128_vram_ld(vram, zaddr, z_bits);
+                uint32_t zout = zraw;
+                bool zpass = true, spass = true;
+                unsigned sold = (zraw >> 24) & 0xff;
+
+                /*
+                 * Stencil is tested BEFORE depth, and its operation is
+                 * applied whether or not the fragment survives -- a
+                 * mask-building pass draws nothing and exists only for
+                 * this side effect.
+                 */
+                if (stencil) {
+                    spass = ati_rage128_3d_cmp(sten_func,
+                                               sten_ref & sten_mask,
+                                               sold & sten_mask);
+                }
+                if (z_test) {
+                    zpass = ati_rage128_3d_cmp((zsten & R128_Z_TEST_MASK) >> 4,
+                                               zval, zraw & z_max);
+                }
+                if (stencil) {
+                    unsigned op = !spass ? sten_sfail
+                                  : zpass ? sten_zpass : sten_zfail;
+                    unsigned snew = ati_rage128_stencil_op(op, sold, sten_ref);
+
+                    snew = (sold & ~sten_wmask) | (snew & sten_wmask);
+                    zout = (zout & 0x00ffffff) | (snew & 0xff) << 24;
+                }
+                if (z_write && spass && zpass) {
+                    zout = (zout & ~z_max) | (zval & z_max);
+                }
+                if (zout != zraw &&
+                    ati_rage128_vram_st(vram, zaddr, z_bits, zout)) {
+                    ati_rage128_span_add(&zspan, zaddr, z_bypp);
+                }
+                if (!spass || !zpass) {
+                    continue;
+                }
             }
             if (specular) {
                 /* the sum is clamped before fog, as GL specifies */
