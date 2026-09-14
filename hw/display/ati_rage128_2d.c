@@ -1205,6 +1205,16 @@ typedef struct ATIRage128Tex {
     unsigned bypp;
     unsigned dt;
     unsigned clamp_s, clamp_t;    /* R128_TEX_CLAMP_* */
+    /*
+     * Chosen once per texture from dt and the clamp modes, so the texel
+     * loop carries no per-texel switch. That loop's speed turned out to
+     * depend on where the linker put it (a 2.35x swing in tex_fetch
+     * between two builds with a byte-identical 2d.o, traced to layout);
+     * straight-line code takes the branch predictor out of it.
+     */
+    uint32_t (*decode)(const uint8_t *px);       /* texel -> ARGB8888 */
+    int (*wrap_s)(int i, int n, bool *border);
+    int (*wrap_t)(int i, int n, bool *border);
     bool linear;                  /* bilinear (MAG_BLEND_LINEAR) */
     unsigned min_blend;           /* R128_MIN_BLEND_*, the minify filter */
     uint32_t border;              /* PRIM_TEXTURE_BORDER_COLOR_C, ARGB */
@@ -1212,6 +1222,14 @@ typedef struct ATIRage128Tex {
     unsigned slot;                /* PRIM_TEX_OFFSET_C slot of the base level */
     unsigned levels;              /* mip levels the slots describe, >= 1 */
 } ATIRage128Tex;
+
+/* defined with the texel fetch below; chosen per texture in tex_setup */
+static uint32_t ati_rage128_decode_argb1555(const uint8_t *px);
+static uint32_t ati_rage128_decode_rgb565(const uint8_t *px);
+static uint32_t ati_rage128_decode_argb4444(const uint8_t *px);
+static uint32_t ati_rage128_decode_rgb888(const uint8_t *px);
+static uint32_t ati_rage128_decode_argb8888(const uint8_t *px);
+static int (*ati_rage128_wrap_select(unsigned mode))(int, int, bool *);
 
 /*
  * Select mip level @lod of @base, in place. The slots run one per log2
@@ -1261,15 +1279,24 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     t->dt = (cntl & R128_TEX_DATATYPE_MASK) >> R128_TEX_DATATYPE_SHIFT;
     switch (t->dt) {
     case R128_TEX_DATATYPE_ARGB1555:
+        t->bypp = 2;
+        t->decode = ati_rage128_decode_argb1555;
+        break;
     case R128_TEX_DATATYPE_RGB565:
+        t->bypp = 2;
+        t->decode = ati_rage128_decode_rgb565;
+        break;
     case R128_TEX_DATATYPE_ARGB4444:
         t->bypp = 2;
+        t->decode = ati_rage128_decode_argb4444;
         break;
     case R128_TEX_DATATYPE_RGB888:
         t->bypp = 3;
+        t->decode = ati_rage128_decode_rgb888;
         break;
     case R128_TEX_DATATYPE_ARGB8888:
         t->bypp = 4;
+        t->decode = ati_rage128_decode_argb8888;
         break;
     default:
         /* palettised, VQ and YUV textures are not modeled */
@@ -1292,6 +1319,8 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     }
     t->clamp_s = (cntl >> R128_TEX_CLAMP_S_SHIFT) & R128_TEX_CLAMP_MASK;
     t->clamp_t = (cntl >> R128_TEX_CLAMP_T_SHIFT) & R128_TEX_CLAMP_MASK;
+    t->wrap_s = ati_rage128_wrap_select(t->clamp_s);
+    t->wrap_t = ati_rage128_wrap_select(t->clamp_t);
     t->linear = cntl & R128_MAG_BLEND_LINEAR;
     t->min_blend = (cntl >> R128_MIN_BLEND_SHIFT) & 7;
     t->border = s->regs[R128_PRIM_TEXTURE_BORDER_COLOR_C >> 2];
@@ -1387,43 +1416,95 @@ static unsigned ati_rage128_3d_src_alpha(uint32_t comb, uint32_t tex_cntl,
     }
 }
 
-/* one texel index through the unit's addressing mode; n is a power of 2 */
-static inline int ati_rage128_tex_wrap(int i, int n, unsigned mode,
-                                       bool *border)
-{
-    switch (mode) {
-    case R128_TEX_CLAMP_MIRROR:
-    {
-        int m = i & (2 * n - 1);
-
-        return m < n ? m : 2 * n - 1 - m;
-    }
-    case R128_TEX_CLAMP_CLAMP:
-        return i < 0 ? 0 : i >= n ? n - 1 : i;
-    case R128_TEX_CLAMP_BORDER_COLOR:
-        if (i < 0 || i >= n) {
-            *border = true;
-            return 0;
-        }
-        return i;
-    default:                                    /* R128_TEX_CLAMP_WRAP */
-        return i & (n - 1);
-    }
-}
-
 static inline unsigned ati_rage128_tex_x5(unsigned v)
 {
     return (v & 0x1f) << 3 | (v & 0x1f) >> 2;
 }
 
-/* fetch one texel as ARGB8888; out-of-VRAM reads as 0 (transparent black) */
+/*
+ * One texel index through each addressing mode; n is a power of 2.
+ * Selected per texture in ati_rage128_tex_setup.
+ */
+static int ati_rage128_wrap_repeat(int i, int n, bool *border)
+{
+    return i & (n - 1);
+}
+
+static int ati_rage128_wrap_mirror(int i, int n, bool *border)
+{
+    int m = i & (2 * n - 1);
+
+    return m < n ? m : 2 * n - 1 - m;
+}
+
+static int ati_rage128_wrap_clamp(int i, int n, bool *border)
+{
+    return i < 0 ? 0 : i >= n ? n - 1 : i;
+}
+
+static int ati_rage128_wrap_border(int i, int n, bool *border)
+{
+    if (i < 0 || i >= n) {
+        *border = true;
+        return 0;
+    }
+    return i;
+}
+
+static int (*ati_rage128_wrap_select(unsigned mode))(int, int, bool *)
+{
+    switch (mode) {
+    case R128_TEX_CLAMP_MIRROR:       return ati_rage128_wrap_mirror;
+    case R128_TEX_CLAMP_CLAMP:        return ati_rage128_wrap_clamp;
+    case R128_TEX_CLAMP_BORDER_COLOR: return ati_rage128_wrap_border;
+    default:                          return ati_rage128_wrap_repeat;
+    }
+}
+
+/* one texel of each datatype as ARGB8888; selected per texture */
+static uint32_t ati_rage128_decode_argb1555(const uint8_t *px)
+{
+    unsigned p = lduw_le_p(px);
+
+    return (p & 0x8000 ? 0xff000000 : 0) |
+           ati_rage128_tex_x5(p >> 10) << 16 |
+           ati_rage128_tex_x5(p >> 5) << 8 | ati_rage128_tex_x5(p);
+}
+
+static uint32_t ati_rage128_decode_rgb565(const uint8_t *px)
+{
+    unsigned p = lduw_le_p(px);
+
+    return 0xff000000 | ati_rage128_tex_x5(p >> 11) << 16 |
+           ((p >> 5 & 0x3f) << 2 | (p >> 9 & 3)) << 8 |
+           ati_rage128_tex_x5(p);
+}
+
+static uint32_t ati_rage128_decode_argb4444(const uint8_t *px)
+{
+    unsigned p = lduw_le_p(px);
+
+    return (p >> 12 & 0xf) * 0x11 << 24 | (p >> 8 & 0xf) * 0x11 << 16 |
+           (p >> 4 & 0xf) * 0x11 << 8 | (p & 0xf) * 0x11;
+}
+
+static uint32_t ati_rage128_decode_rgb888(const uint8_t *px)
+{
+    return 0xff000000 | (uint32_t)px[2] << 16 | (uint32_t)px[1] << 8 | px[0];
+}
+
+static uint32_t ati_rage128_decode_argb8888(const uint8_t *px)
+{
+    return ldl_le_p(px);
+}
+
 static uint32_t ati_rage128_tex_fetch(const ATIRage128Tex *t, int tx, int ty)
 {
     bool border = false;
     uint32_t addr;
 
-    tx = ati_rage128_tex_wrap(tx, t->w, t->clamp_s, &border);
-    ty = ati_rage128_tex_wrap(ty, t->h, t->clamp_t, &border);
+    tx = t->wrap_s(tx, t->w, &border);
+    ty = t->wrap_t(ty, t->h, &border);
     if (border) {
         return t->border;
     }
@@ -1431,36 +1512,7 @@ static uint32_t ati_rage128_tex_fetch(const ATIRage128Tex *t, int tx, int ty)
     if (addr + t->bypp > ATI_RAGE128_VRAM_SIZE) {
         return 0;
     }
-    switch (t->dt) {
-    case R128_TEX_DATATYPE_ARGB1555:
-    {
-        unsigned p = lduw_le_p(t->vram + addr);
-
-        return (p & 0x8000 ? 0xff000000 : 0) |
-               ati_rage128_tex_x5(p >> 10) << 16 |
-               ati_rage128_tex_x5(p >> 5) << 8 | ati_rage128_tex_x5(p);
-    }
-    case R128_TEX_DATATYPE_RGB565:
-    {
-        unsigned p = lduw_le_p(t->vram + addr);
-
-        return 0xff000000 | ati_rage128_tex_x5(p >> 11) << 16 |
-               ((p >> 5 & 0x3f) << 2 | (p >> 9 & 3)) << 8 |
-               ati_rage128_tex_x5(p);
-    }
-    case R128_TEX_DATATYPE_ARGB4444:
-    {
-        unsigned p = lduw_le_p(t->vram + addr);
-
-        return (p >> 12 & 0xf) * 0x11 << 24 | (p >> 8 & 0xf) * 0x11 << 16 |
-               (p >> 4 & 0xf) * 0x11 << 8 | (p & 0xf) * 0x11;
-    }
-    case R128_TEX_DATATYPE_RGB888:
-        return 0xff000000 | (uint32_t)t->vram[addr + 2] << 16 |
-               (uint32_t)t->vram[addr + 1] << 8 | t->vram[addr];
-    default:                                    /* ARGB8888 */
-        return ldl_le_p(t->vram + addr);
-    }
+    return t->decode(t->vram + addr);
 }
 
 /*
