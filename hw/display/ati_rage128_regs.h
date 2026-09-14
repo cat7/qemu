@@ -496,7 +496,7 @@
 #define R128_FOG_ENABLE              (1 << 7)
 #define R128_DITHER_ENABLE           (1 << 8)
 #define R128_ALPHA_ENABLE            (1 << 9)
-#define R128_ALPHA_IN_TEX            (1 << 13)  /* else the vertex alpha */
+#define R128_ALPHA_IN_TEX            (1 << 13)  /* LSB_A: 1-bit texel alpha, alpha-0 texels are killed */
 #define R128_ALPHA_TEST_ENABLE       (1 << 10)
 #define R128_SPEC_LIGHT_ENABLE       (1 << 11)  /* add the secondary colour */
 /*

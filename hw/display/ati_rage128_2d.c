@@ -1738,6 +1738,97 @@ static uint32_t ati_rage128_3d_dst_argb(unsigned dt, uint32_t px)
     }
 }
 
+/*
+ * Texture one fragment: sample (with the per-pixel mip choice), apply
+ * the LSB_A kill, and combine into @rgb / @alpha. Returns false when the
+ * fragment is killed. Pulled out of the pixel loop so it can run either
+ * before the depth test (LSB_A: the kill must precede Z) or after it
+ * (everything else: a depth-rejected fragment should not fetch texels).
+ */
+static inline bool ati_rage128_3d_texel(const ATIRage128Tex *texp,
+                                        const ATIRage128Tex *lvl, bool mip,
+                                        uint32_t comb, uint32_t const_color,
+                                        uint32_t tex_cntl,
+                                        double w0, double w1, double w2,
+                                        double dw0, double dw1, double dw2,
+                                        const double *q, const double *sq,
+                                        const double *tq,
+                                        double *rgb, double *alphap,
+                                        uint32_t *texelp)
+{
+    const ATIRage128Tex tex = *texp;
+    double alpha = *alphap;
+    uint32_t texel;
+
+    double qi = w0 * q[0] + w1 * q[1] + w2 * q[2];
+    double si = (w0 * sq[0] + w1 * sq[1] + w2 * sq[2]) / qi;
+    double ti = (w0 * tq[0] + w1 * tq[1] + w2 * tq[2]) / qi;
+    const ATIRage128Tex *tp = &tex;
+
+    if (mip) {
+        /* the same coordinates one pixel to the right */
+        double n0 = w0 + dw0, n1 = w1 + dw1, n2 = w2 + dw2;
+        double qn = n0 * q[0] + n1 * q[1] + n2 * q[2];
+        double ds, dt2, lodf = 0.0;
+        int lod;
+
+        ds = ((n0 * sq[0] + n1 * sq[1] + n2 * sq[2]) / qn - si)
+             * tex.w;
+        dt2 = ((n0 * tq[0] + n1 * tq[1] + n2 * tq[2]) / qn - ti)
+              * tex.h;
+        ds = ds * ds + dt2 * dt2;
+        if (ds > 1.0) {
+            lodf = 0.5 * log2(ds);
+        }
+        if (lodf > (double)tex.levels - 1) {
+            lodf = tex.levels - 1;
+        }
+        lod = (int)lodf;
+        /*
+         * MIPLINEAR and LINEARMIPLINEAR blend the two levels
+         * either side of the fractional level; the others
+         * take the nearer one.
+         */
+        if ((tex.min_blend == R128_MIN_BLEND_MIPLINEAR ||
+             tex.min_blend == R128_MIN_BLEND_LINMIPLINEAR) &&
+            lod + 1 < (int)tex.levels) {
+            unsigned f = (unsigned)((lodf - lod) * 256.0);
+            uint32_t a = ati_rage128_tex_sample(&lvl[lod], si, ti);
+            uint32_t b = ati_rage128_tex_sample(&lvl[lod + 1],
+                                                si, ti);
+            int k2;
+
+            texel = 0;
+            for (k2 = 0; k2 < 4; k2++) {
+                unsigned sh = k2 * 8;
+                unsigned ca = (a >> sh) & 0xff;
+                unsigned cb = (b >> sh) & 0xff;
+
+                texel |= (((ca * (256 - f) + cb * f) >> 8) & 0xff)
+                         << sh;
+            }
+            goto have_texel;
+        }
+        tp = &lvl[(int)(lodf + 0.5) < (int)tex.levels
+                  ? (int)(lodf + 0.5) : (int)tex.levels - 1];
+    }
+    texel = ati_rage128_tex_sample(tp, si, ti);
+have_texel:
+    /*
+     * ALPHA_IN_TEX_LSB_A: the decoded texel alpha's LSB is a
+     * 1-bit coverage flag; 0 kills the fragment before Z or
+     * colour, regardless of ALPHA_TEST_ENABLE/ALPHA_ENABLE.
+     */
+    if ((tex_cntl & R128_ALPHA_IN_TEX) && !(texel >> 24 & 1)) {
+        return false;
+    }
+    ati_rage128_tex_combine(comb, texel, const_color, rgb,
+                            &alpha);
+    *alphap = alpha;
+    *texelp = texel;
+    return true;
+}
+
 void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
 {
     unsigned dt = s->dp_datatype & R128_DP_DST_DATATYPE;
@@ -1775,6 +1866,13 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     bool z_write = tex_cntl & R128_Z_WRITE_ENABLE;
     bool textured = tex_cntl & R128_TEXMAP_ENABLE;
     bool alpha_test = tex_cntl & R128_ALPHA_TEST_ENABLE;
+    /*
+     * With ALPHA_IN_TEX_LSB_A the texel decides whether the fragment
+     * exists at all, so it must be sampled before the depth test; for
+     * every other draw the depth test goes first and a rejected fragment
+     * costs no texel fetch.
+     */
+    bool kill_first = tex_cntl & R128_ALPHA_IN_TEX;
     /*
      * TEX_CNTL_C's ALPHA_ENABLE gates the blender, and the factors are
      * NOT the control. Both drivers we can read agree: Mesa's
@@ -2117,71 +2215,11 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             alpha = w0 * a[0] + w1 * a[1] + w2 * a[2];
             vtx_a8 = ati_rage128_3d_col8(alpha);
             texel = 0;
-            if (textured) {
-                double qi = w0 * q[0] + w1 * q[1] + w2 * q[2];
-                double si = (w0 * sq[0] + w1 * sq[1] + w2 * sq[2]) / qi;
-                double ti = (w0 * tq[0] + w1 * tq[1] + w2 * tq[2]) / qi;
-                const ATIRage128Tex *tp = &tex;
-
-                if (mip) {
-                    /* the same coordinates one pixel to the right */
-                    double n0 = w0 + dw0, n1 = w1 + dw1, n2 = w2 + dw2;
-                    double qn = n0 * q[0] + n1 * q[1] + n2 * q[2];
-                    double ds, dt2, lodf = 0.0;
-                    int lod;
-
-                    ds = ((n0 * sq[0] + n1 * sq[1] + n2 * sq[2]) / qn - si)
-                         * tex.w;
-                    dt2 = ((n0 * tq[0] + n1 * tq[1] + n2 * tq[2]) / qn - ti)
-                          * tex.h;
-                    ds = ds * ds + dt2 * dt2;
-                    if (ds > 1.0) {
-                        lodf = 0.5 * log2(ds);
-                    }
-                    if (lodf > (double)tex.levels - 1) {
-                        lodf = tex.levels - 1;
-                    }
-                    lod = (int)lodf;
-                    /*
-                     * MIPLINEAR and LINEARMIPLINEAR blend the two levels
-                     * either side of the fractional level; the others
-                     * take the nearer one.
-                     */
-                    if ((tex.min_blend == R128_MIN_BLEND_MIPLINEAR ||
-                         tex.min_blend == R128_MIN_BLEND_LINMIPLINEAR) &&
-                        lod + 1 < (int)tex.levels) {
-                        unsigned f = (unsigned)((lodf - lod) * 256.0);
-                        uint32_t a = ati_rage128_tex_sample(&lvl[lod], si, ti);
-                        uint32_t b = ati_rage128_tex_sample(&lvl[lod + 1],
-                                                            si, ti);
-                        int k2;
-
-                        texel = 0;
-                        for (k2 = 0; k2 < 4; k2++) {
-                            unsigned sh = k2 * 8;
-                            unsigned ca = (a >> sh) & 0xff;
-                            unsigned cb = (b >> sh) & 0xff;
-
-                            texel |= (((ca * (256 - f) + cb * f) >> 8) & 0xff)
-                                     << sh;
-                        }
-                        goto have_texel;
-                    }
-                    tp = &lvl[(int)(lodf + 0.5) < (int)tex.levels
-                              ? (int)(lodf + 0.5) : (int)tex.levels - 1];
-                }
-                texel = ati_rage128_tex_sample(tp, si, ti);
-have_texel:
-                /*
-                 * ALPHA_IN_TEX_LSB_A: the decoded texel alpha's LSB is a
-                 * 1-bit coverage flag; 0 kills the fragment before Z or
-                 * colour, regardless of ALPHA_TEST_ENABLE/ALPHA_ENABLE.
-                 */
-                if ((tex_cntl & R128_ALPHA_IN_TEX) && !(texel >> 24 & 1)) {
-                    continue;
-                }
-                ati_rage128_tex_combine(comb, texel, const_color, rgb,
-                                        &alpha);
+            if (textured && kill_first &&
+                !ati_rage128_3d_texel(&tex, lvl, mip, comb, const_color,
+                                      tex_cntl, w0, w1, w2, dw0, dw1, dw2,
+                                      q, sq, tq, rgb, &alpha, &texel)) {
+                continue;
             }
 
             if (z_test || z_write || stencil) {
@@ -2232,6 +2270,12 @@ have_texel:
                 if (!spass || !zpass) {
                     continue;
                 }
+            }
+            if (textured && !kill_first &&
+                !ati_rage128_3d_texel(&tex, lvl, mip, comb, const_color,
+                                      tex_cntl, w0, w1, w2, dw0, dw1, dw2,
+                                      q, sq, tq, rgb, &alpha, &texel)) {
+                continue;
             }
             if (specular) {
                 /* the sum is clamped before fog, as GL specifies */
