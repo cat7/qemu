@@ -754,12 +754,12 @@ static void awacs_write(void *opaque, hwaddr addr, uint64_t val,
         s->codec_ctrl = val;
         {
             uint32_t ctrl = bswap32((uint32_t)val);
-            unsigned reg = (ctrl >> 12) & 7;
+            unsigned creg = (ctrl >> 12) & 7;
 
             /* register 1 bit 2 (recalibrate) is self-clearing */
-            s->codec_regs[reg] = ctrl & (reg == 1 ? 0xffb : 0xfff);
-            trace_awacs_codec_write(reg, ctrl & 0xfff);
-            if (reg == 1 || reg == 4) {
+            s->codec_regs[creg] = ctrl & (creg == 1 ? 0xffb : 0xfff);
+            trace_awacs_codec_write(creg, ctrl & 0xfff);
+            if (creg == 1 || creg == 4) {
                 awacs_update_volume(s);
             }
         }
