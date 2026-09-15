@@ -1,4 +1,17 @@
 /*
+ * GUI bus master: walk the descriptor list at the given guest-physical
+ * address. Each entry is 16 bytes, little-endian: frame-buffer offset,
+ * system memory address, command, reserved (Rage 128 VR/GL Register
+ * Reference Supplement, "Rage 128 Bus Master Registers"). BM_COMMAND
+ * carries the byte count in [20:0], "hold the frame-buffer offset" at
+ * bit 30 and end-of-list at bit 31.
+ *
+ * Only the register destination (TRANSFER_DEST) is modelled, which is
+ * what the OEM Mac FCode's post-CRTC-bringup smoke test uses: it writes
+ * an 8 byte sentinel to system RAM, points a one-entry list at it and
+ * reads GUI_SCRATCH_REG0/1 back.
+ */
+/*
  * QEMU ATI Rage 128 Pro emulation
  *
  * See ati_rage128.h for background. Milestone scope: correct PCI
@@ -30,6 +43,9 @@
 #include "qapi/error.h"
 #include "system/memory.h"
 #include "ui/console.h"
+#include "qemu/main-loop.h"
+#include "qemu/thread.h"
+#include "system/qtest.h"
 #include "qom/object.h"
 #include "hw/i2c/i2c.h"
 
@@ -42,27 +58,19 @@
 /*
  * How long the PCI IRQ line stays asserted after a VBLANK/VSYNC raise
  * if the guest never acknowledges GEN_INT_STATUS. Acks deassert the
- * line early (see ati_rage128_update_irq()).
- *
- * Real silicon holds the line until software acks, and on mac99 that is
- * what this device does: measured there (OS 9.1, OpenBIOS, OpenPIC
- * level source), a 1/8-frame pulse lost ~23% of VBLs because the
- * guest's ISR work often outlasted the 2 ms assertion, which was the
- * direct cause of jerky mouse motion (Mac OS moves the hardware cursor
- * from its VBL task).
- *
- * On g3beige it must NOT be held. Nothing acks GEN_INT_STATUS between
- * the card lighting up and the OS driver loading -- the Beige ROM
- * never does, which is also why the onboard mach64 cannot take
- * hold-until-ack (2026-07-28: every variant hung the boot). A held
- * line means every rfi re-enters the interrupt path immediately:
- * profiled live with a rage128 attached and an SDL console, the vCPU
- * sat in helper_rfi -> hreg_store_msr -> ppc_maybe_interrupt taking
- * and dropping the BQL, and boot went from ~2 minutes to well past 4
- * with the Happy Mac barely reached. So this board keeps the short
- * gated pulse it always used; the hold stays a mac99 behaviour.
+ * line early (see ati_rage128_update_irq()). Real silicon holds the
+ * line until software acks; this cap only exists so a bring-up phase
+ * that enables the interrupt without servicing it cannot storm -- the
+ * line always drops before the next blank start so every frame still
+ * yields exactly one fresh edge. Measured live (OS 9.1, OpenBIOS
+ * mac99, OpenPIC level source): with the old 1/8-frame pulse the guest
+ * missed ~23% of VBLs (its ISR/other interrupt work often exceeded
+ * 2 ms, and a level source that goes low before it is taken is simply
+ * lost), which was the direct cause of jerky mouse motion -- Mac OS
+ * moves the hardware cursor from its VBL task.
  */
-#define ATI_RAGE128_VBLANK_IRQ_LEN_NS ATI_RAGE128_VBLANK_LEN_NS
+#define ATI_RAGE128_VBLANK_IRQ_LEN_NS (ATI_RAGE128_VBLANK_PERIOD_NS - \
+                                       ATI_RAGE128_VBLANK_LEN_NS)
 
 /* ---------------------------------------------------------------- */
 /* Display                                                          */
@@ -536,6 +544,163 @@ static DirtyBitmapSnapshot *ati_rage128_take_dirty(ATIRage128State *s)
 
 static void ati_rage128_cursor_update(ATIRage128State *s);
 static void ati_rage128_cursor_apply(ATIRage128State *s);
+static void ati_rage128_update_irq(ATIRage128State *s);
+
+/*
+ * Engine work (command streams, blits) can run for milliseconds. It runs
+ * without the BQL so the main loop and the other vCPUs keep going; other
+ * accesses to the device wait for it (ati_rage128_engine_wait). IRQ and
+ * cursor updates it causes are applied once the BQL is back.
+ */
+static __thread int ati_rage128_engine_depth;
+static __thread bool ati_rage128_engine_unlocked;
+
+static void ati_rage128_engine_wait(ATIRage128State *s);
+
+static void ati_rage128_engine_enter(ATIRage128State *s)
+{
+    if (ati_rage128_engine_depth++ || !bql_locked()) {
+        return;
+    }
+    /* one engine: queued jobs and other vCPUs' sections finish first */
+    ati_rage128_engine_wait(s);
+    s->engine_sync = true;
+    s->engine_busy = true;
+    qemu_event_reset(&s->engine_idle);
+    ati_rage128_engine_unlocked = true;
+    bql_unlock();
+}
+
+/* Engine idle again: apply what it deferred. Called with the BQL. */
+static void ati_rage128_engine_settle(ATIRage128State *s)
+{
+    if (s->fifo_stage_n) {
+        /* a synchronous section ended with FIFO dwords staged behind it */
+        qemu_bh_schedule(s->engine_bh);
+    } else {
+        s->engine_busy = false;
+    }
+    /* waiters re-check busy, the queue and engine_sync */
+    qemu_event_set(&s->engine_idle);
+    if (qatomic_xchg(&s->irq_deferred, false)) {
+        ati_rage128_update_irq(s);
+    }
+    if (qatomic_xchg(&s->cursor_deferred, false)) {
+        ati_rage128_cursor_update(s);
+    }
+}
+
+static void ati_rage128_engine_exit(ATIRage128State *s)
+{
+    if (--ati_rage128_engine_depth || !ati_rage128_engine_unlocked) {
+        return;
+    }
+    ati_rage128_engine_unlocked = false;
+    bql_lock();
+    s->engine_sync = false;
+    ati_rage128_engine_settle(s);
+}
+
+/*
+ * Retire asynchronous jobs the worker has finished: apply what they
+ * deferred, and settle once none is left. Called with the BQL.
+ */
+static void ati_rage128_engine_complete(ATIRage128State *s)
+{
+    uint64_t done = qatomic_load_acquire(&s->engine_jobs_done);
+
+    if (done == s->engine_jobs_retired) {
+        return;
+    }
+    s->engine_jobs_retired = done;
+    trace_ati_rage128_engine_retire();
+    if (done == s->engine_jobs_submitted && !s->fifo_stage_n) {
+        ati_rage128_engine_settle(s);
+        return;
+    }
+    if (qatomic_xchg(&s->irq_deferred, false)) {
+        ati_rage128_update_irq(s);
+    }
+    if (qatomic_xchg(&s->cursor_deferred, false)) {
+        ati_rage128_cursor_update(s);
+    }
+}
+
+static bool ati_rage128_engine_jobs_pending(ATIRage128State *s)
+{
+    return s->engine_jobs_submitted != s->engine_jobs_retired;
+}
+
+/* Wait until at most @limit jobs are outstanding, the BQL released. */
+static void ati_rage128_engine_wait_jobs(ATIRage128State *s, uint64_t limit)
+{
+    while (s->engine_jobs_submitted - s->engine_jobs_retired > limit) {
+        qemu_event_reset(&s->engine_done);
+        ati_rage128_engine_complete(s);
+        if (s->engine_jobs_submitted - s->engine_jobs_retired <= limit) {
+            break;
+        }
+        bql_unlock();
+        qemu_event_wait(&s->engine_done);
+        bql_lock();
+        ati_rage128_engine_complete(s);
+    }
+}
+
+static void ati_rage128_fifo_flush(ATIRage128State *s);
+
+static void ati_rage128_engine_wait(ATIRage128State *s)
+{
+    while (s->engine_busy) {
+        ati_rage128_fifo_flush(s);
+        if (ati_rage128_engine_jobs_pending(s)) {
+            ati_rage128_engine_wait_jobs(s, 0);
+            continue;
+        }
+        bql_unlock();
+        qemu_event_wait(&s->engine_idle);
+        bql_lock();
+    }
+}
+
+/*
+ * Registers the command engine reads or writes: the drawing context and
+ * GUI block, and the PM4 command processor. An access to one of those has
+ * to see the queued jobs' effects, so it waits; everything else -- CRTC,
+ * DAC, interrupt, configuration -- does not, because the engine never
+ * touches it. Waiting for those turned each of Mac OS 9's per-frame
+ * interrupt-handler polls into a queue drain (0x090c: 41,889 reads,
+ * 275 s of waiting in one session; GEN_INT_STATUS 23,000 in another).
+ *
+ * The status registers, the GUI scratch pair drivers use as engine
+ * fences, and the ring read pointer live in those ranges but must report
+ * progress without waiting, as the chip does.
+ */
+static bool ati_rage128_engine_reg(uint32_t base)
+{
+    if (base == R128_GUI_STAT || base == R128_PM4_STAT ||
+        base == R128_PM4_BUFFER_DL_RPTR ||
+        base == R128_GUI_SCRATCH_REG0 || base == R128_GUI_SCRATCH_REG1) {
+        return false;
+    }
+    return (base >= R128_PM4_BUFFER_OFFSET && base <= R128_PM4_MICROCODE_ADDR) ||
+           (base >= R128_PM4_FIFO_DATA_EVEN && base <= R128_PM4_FIFO_APER_END) ||
+           base >= 0x1400;
+}
+
+/* A register access that has to wait for the engine. */
+static void ati_rage128_engine_wait_reg(ATIRage128State *s, uint32_t reg,
+                                        bool write)
+{
+    int64_t t0;
+
+    if (!s->engine_busy) {
+        return;
+    }
+    t0 = get_clock();
+    ati_rage128_engine_wait(s);
+    trace_ati_rage128_engine_drain(reg, write, (get_clock() - t0) / 1000);
+}
 
 static bool ati_rage128_update_display(void *opaque)
 {
@@ -546,6 +711,9 @@ static bool ati_rage128_update_display(void *opaque)
     bool valid, blanked, redraw;
     uint64_t fb_len;
 
+    if (!s->engine_busy) {
+        ati_rage128_2d_flush_dirty(s);
+    }
     snap = ati_rage128_take_dirty(s);
     ati_rage128_get_mode(s, &mode);
     valid = ati_rage128_mode_valid(s, &mode);
@@ -759,9 +927,15 @@ static const GraphicHwOps ati_rage128_gfx_ops = {
 
 static void ati_rage128_update_irq(ATIRage128State *s)
 {
-    uint32_t pending = s->regs[R128_GEN_INT_STATUS >> 2] &
-                       s->regs[R128_GEN_INT_CNTL >> 2] &
-                       R128_GEN_INT_ACK_MASK;
+    uint32_t pending;
+
+    if (!bql_locked()) {
+        qatomic_set(&s->irq_deferred, true);
+        return;
+    }
+    pending = s->regs[R128_GEN_INT_STATUS >> 2] &
+              s->regs[R128_GEN_INT_CNTL >> 2] &
+              R128_GEN_INT_ACK_MASK;
 
     pci_set_irq(PCI_DEVICE(s), pending != 0);
 }
@@ -1232,6 +1406,9 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
          * matches the Linux driver's r128_do_cce_idle() check.
          */
         val = 192;
+        if (s->engine_busy) {
+            val |= R128_PM4_BUSY | R128_GUI_ACTIVE;
+        }
         break;
     case R128_PM4_BUFFER_OFFSET:
         val = s->pm4_buffer_addr;
@@ -1298,8 +1475,11 @@ static uint32_t ati_rage128_reg_read32(ATIRage128State *s, uint32_t base)
         val = s->regs[base >> 2] & 0x3fffffff;
         break;
     case R128_GUI_STAT:
-        /* engine idle, all 64 command FIFO entries free */
+        /* all 64 command FIFO entries free; active while jobs run */
         val = 0x40;
+        if (s->engine_busy) {
+            val |= R128_GUI_ACTIVE;
+        }
         break;
     case R128_DST_OFFSET:
         val = s->dst_offset_reg;
@@ -1439,6 +1619,205 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
                                      uint32_t dwords);
 
 /*
+ * Asynchronous engine. A command-stream kick (ring, indirect buffer,
+ * bus-master table) is handed to a worker thread and the register write
+ * returns at once, as the chip's command processor runs alongside the
+ * CPU; further kicks queue behind it. Any other access to the device
+ * first waits for the queue to drain (ati_rage128_engine_wait), so the
+ * guest always sees work complete in order, except the status registers,
+ * which report the engine busy as the chip does, and the command FIFO,
+ * whose dwords are queued behind the jobs (ati_rage128_fifo_stage). The
+ * worker never takes the BQL; what it defers is applied by whoever
+ * retires the job under the BQL, a waiting vCPU or engine_bh.
+ */
+enum {
+    ATI_RAGE128_JOB_NONE,
+    ATI_RAGE128_JOB_RING,
+    ATI_RAGE128_JOB_INDIRECT,
+    ATI_RAGE128_JOB_BM,
+    ATI_RAGE128_JOB_FIFO,
+};
+
+static void ati_rage128_engine_run_job(ATIRage128State *s, int job,
+                                       uint32_t a, uint32_t b)
+{
+    switch (job) {
+    case ATI_RAGE128_JOB_RING:
+        ati_rage128_pm4_run(s);
+        break;
+    case ATI_RAGE128_JOB_INDIRECT:
+        ati_rage128_pm4_indirect(s, a, b);
+        break;
+    case ATI_RAGE128_JOB_BM:
+        ati_rage128_bm_gui_run(s, a);
+        break;
+    case ATI_RAGE128_JOB_FIFO:
+    {
+        const uint32_t *d = &s->fifo_batch[a * ATI_RAGE128_FIFO_BATCH];
+        uint32_t i;
+
+        for (i = 0; i < b; i++) {
+            ati_rage128_pm4_fifo_push(s, d[i]);
+        }
+        break;
+    }
+    }
+}
+
+static void *ati_rage128_engine_thread(void *opaque)
+{
+    ATIRage128State *s = opaque;
+    uint64_t taken = 0;
+
+    qemu_mutex_lock(&s->engine_lock);
+    for (;;) {
+        ATIRage128Job j;
+
+        while (taken == s->engine_jobs_submitted && !s->engine_quit) {
+            qemu_cond_wait(&s->engine_cond, &s->engine_lock);
+        }
+        if (s->engine_quit) {
+            break;
+        }
+        j = s->engine_queue[taken % ATI_RAGE128_JOB_QUEUE];
+        taken++;
+        qemu_mutex_unlock(&s->engine_lock);
+
+        ati_rage128_engine_depth = 1;
+        ati_rage128_engine_run_job(s, j.job, j.a, j.b);
+        ati_rage128_engine_depth = 0;
+        ati_rage128_2d_flush_dirty(s);
+
+        qemu_mutex_lock(&s->engine_lock);
+        qatomic_store_release(&s->engine_jobs_done, taken);
+        qemu_event_set(&s->engine_done);
+        qemu_bh_schedule(s->engine_bh);
+    }
+    qemu_mutex_unlock(&s->engine_lock);
+    return NULL;
+}
+
+static void ati_rage128_fifo_queue(ATIRage128State *s);
+
+static void ati_rage128_engine_bh(void *opaque)
+{
+    ATIRage128State *s = opaque;
+
+    ati_rage128_engine_complete(s);
+    /* never block the main loop: a full queue schedules this again */
+    if (s->fifo_stage_n && !s->engine_sync &&
+        s->engine_jobs_submitted - s->engine_jobs_retired <
+        ATI_RAGE128_JOB_QUEUE) {
+        ati_rage128_fifo_queue(s);
+    }
+}
+
+static bool ati_rage128_engine_async(ATIRage128State *s)
+{
+    return (s->engine_async == ON_OFF_AUTO_ON ||
+            (s->engine_async == ON_OFF_AUTO_AUTO && !qtest_enabled())) &&
+           bql_locked() && !ati_rage128_engine_depth;
+}
+
+/* Wait for a free queue slot and no synchronous section, the BQL released. */
+static void ati_rage128_engine_reserve(ATIRage128State *s)
+{
+    for (;;) {
+        if (s->engine_sync) {
+            bql_unlock();
+            qemu_event_wait(&s->engine_idle);
+            bql_lock();
+        } else if (s->engine_jobs_submitted - s->engine_jobs_retired >=
+                   ATI_RAGE128_JOB_QUEUE) {
+            ati_rage128_engine_wait_jobs(s, ATI_RAGE128_JOB_QUEUE - 1);
+        } else {
+            break;
+        }
+    }
+}
+
+/* Put a job in the reserved slot. */
+static void ati_rage128_engine_enqueue(ATIRage128State *s, int job,
+                                       uint32_t a, uint32_t b)
+{
+    s->engine_busy = true;
+    qemu_event_reset(&s->engine_idle);
+    trace_ati_rage128_engine_submit(job, a, b);
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_queue[s->engine_jobs_submitted % ATI_RAGE128_JOB_QUEUE] =
+        (ATIRage128Job) { job, a, b };
+    s->engine_jobs_submitted++;
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+}
+
+/* Hand the staged FIFO dwords to the reserved slot. */
+static void ati_rage128_fifo_queue(ATIRage128State *s)
+{
+    uint32_t slot = s->engine_jobs_submitted % ATI_RAGE128_JOB_QUEUE;
+    uint32_t n = s->fifo_stage_n;
+
+    memcpy(&s->fifo_batch[slot * ATI_RAGE128_FIFO_BATCH], s->fifo_stage,
+           n * sizeof(uint32_t));
+    s->fifo_stage_n = 0;
+    ati_rage128_engine_enqueue(s, ATI_RAGE128_JOB_FIFO, slot, n);
+}
+
+/* Queue the staged FIFO dwords as one job. Called with the BQL. */
+static void ati_rage128_fifo_flush(ATIRage128State *s)
+{
+    if (!s->fifo_stage_n) {
+        return;
+    }
+    ati_rage128_engine_reserve(s);
+    /* another vCPU may have queued them while the BQL was released */
+    if (s->fifo_stage_n) {
+        ati_rage128_fifo_queue(s);
+    }
+}
+
+/*
+ * A command FIFO dword written while jobs are outstanding goes behind
+ * them instead of waiting for them. Returns false when it is to be
+ * parsed at once.
+ */
+static bool ati_rage128_fifo_stage(ATIRage128State *s, uint32_t val)
+{
+    if (!ati_rage128_engine_async(s) ||
+        (!s->engine_busy && !s->fifo_stage_n)) {
+        return false;
+    }
+    if (s->fifo_stage_n == ATI_RAGE128_FIFO_BATCH) {
+        ati_rage128_fifo_flush(s);
+        if (!s->engine_busy && !s->fifo_stage_n) {
+            return false;
+        }
+    }
+    if (!s->fifo_stage_n) {
+        qemu_bh_schedule(s->engine_bh);
+    }
+    s->fifo_stage[s->fifo_stage_n++] = val;
+    return true;
+}
+
+/*
+ * Queue a job for the worker, behind any staged FIFO dwords, waiting
+ * only for a free slot. Returns false when the caller must run it itself:
+ * asynchronous mode off, qtest, or already inside a job.
+ */
+static bool ati_rage128_engine_submit(ATIRage128State *s, int job,
+                                      uint32_t a, uint32_t b)
+{
+    if (!ati_rage128_engine_async(s)) {
+        return false;
+    }
+    ati_rage128_fifo_flush(s);
+    ati_rage128_engine_reserve(s);
+    ati_rage128_engine_enqueue(s, job, a, b);
+    return true;
+}
+
+/*
  * Re-derive the effective 2D pitch/offset and scissors from the register
  * values, honouring DP_GUI_MASTER_CNTL's per-operation source selects.
  *
@@ -1494,10 +1873,50 @@ static void ati_rage128_resolve_gui_context(ATIRage128State *s)
     }
 }
 
+/*
+ * Registers a type-0/type-1 packet may not load. These configure the
+ * chip on the host bus side and the guest programs them through MMIO;
+ * a stream that writes them is a mis-framed stream.
+ *
+ * Without this such a packet is unrecoverable rather than merely
+ * wrong. Captured on Chessmaster 9000's 3D board under Mac OS X 10.4:
+ * 6 ms after the last triangle a type-0 packet marched the whole
+ * register file in address order, and the dword that landed on
+ * PCI_GART_PAGE moved the GART base from 0x06ea3000 to 0xa6427000 --
+ * outside the guest's RAM, so every later command fetch read zeros.
+ * All 517 remaining indirect buffers came back empty and the driver's
+ * own recovery, which runs through the stream, could not execute.
+ *
+ * The list is by register, not by range: the address map does not
+ * separate the two sides. PM4_IW_INDOFF/INDSIZE dispatch an indirect
+ * buffer and PC_NGUI_CTLSTAT flushes the cache, all three low-numbered
+ * and all three loaded by the stream in normal operation.
+ */
+static bool ati_rage128_stream_may_write(uint32_t base)
+{
+    switch (base) {
+    case R128_BUS_CNTL:
+    case R128_BUS_CNTL1:
+    case R128_CONFIG_CNTL:
+    case R128_CONFIG_APER_SIZE:
+    case R128_GEN_RESET_CNTL:
+    case R128_PCI_GART_PAGE:
+        return false;
+    default:
+        return true;
+    }
+}
+
 static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
                                     uint32_t val)
 {
     ati_rage128_audit_reg_write(s, base);
+
+    if (ati_rage128_engine_depth && !ati_rage128_stream_may_write(base)) {
+        trace_ati_rage128_pm4_reg_blocked(base, ati_rage128_reg_name(base),
+                                          val);
+        return;
+    }
 
     /*
      * Diagnostic: the 2D source/destination context. Mac OS X programs
@@ -1679,9 +2098,14 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
             s->pm4_wptr = 0;
         }
         break;
-    case R128_BM_GUI_TABLE:
+    case R128_BM_GUI:
         s->regs[base >> 2] = val;
-        ati_rage128_bm_gui_run(s, val);
+        if (!ati_rage128_engine_submit(s, ATI_RAGE128_JOB_BM,
+                                       val & R128_BM_TABLE_ADDR_MASK, 0)) {
+            ati_rage128_engine_enter(s);
+            ati_rage128_bm_gui_run(s, val & R128_BM_TABLE_ADDR_MASK);
+            ati_rage128_engine_exit(s);
+        }
         break;
     case R128_PM4_BUFFER_OFFSET:
         s->pm4_buffer_addr = val;
@@ -1715,14 +2139,25 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_PM4_BUFFER_DL_WPTR:
         s->pm4_wptr = val & ~R128_PM4_BUFFER_DL_DONE;
         /* bit31 (DL_DONE) is a flush marker -- either way, consume */
-        ati_rage128_pm4_run(s);
+        if (!ati_rage128_engine_submit(s, ATI_RAGE128_JOB_RING, 0, 0)) {
+            ati_rage128_engine_enter(s);
+            ati_rage128_pm4_run(s);
+            ati_rage128_engine_exit(s);
+        }
         break;
     case R128_PM4_IW_INDOFF:
         s->regs[base >> 2] = val;
         break;
     case R128_PM4_IW_INDSIZE:
         s->regs[base >> 2] = val;
-        ati_rage128_pm4_indirect(s, s->regs[R128_PM4_IW_INDOFF >> 2], val);
+        if (!ati_rage128_engine_submit(s, ATI_RAGE128_JOB_INDIRECT,
+                                       s->regs[R128_PM4_IW_INDOFF >> 2],
+                                       val)) {
+            ati_rage128_engine_enter(s);
+            ati_rage128_pm4_indirect(s, s->regs[R128_PM4_IW_INDOFF >> 2],
+                                     val);
+            ati_rage128_engine_exit(s);
+        }
         break;
     case R128_PM4_MICROCODE_ADDR:
         s->pm4_ucode_waddr = val & (R128_PM4_MICROCODE_WORDS - 1);
@@ -1752,7 +2187,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
          * the HOST_DATA stream that followed (menu bar restore, window
          * icons, drag save-behind) was thrown away.
          */
-        ati_rage128_pm4_fifo_push(s, val);
+        if (!ati_rage128_fifo_stage(s, val)) {
+            ati_rage128_pm4_fifo_push(s, val);
+        }
         break;
     case R128_DST_OFFSET:
         s->dst_offset_reg = val & 0xfffffff0;
@@ -1765,7 +2202,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_DST_WIDTH:
         s->dst_width = val & 0x3fff;
+        ati_rage128_engine_enter(s);
         ati_rage128_2d_blt(s);
+        ati_rage128_engine_exit(s);
         break;
     case R128_DST_HEIGHT:
         s->dst_height = val & 0x3fff;
@@ -1806,7 +2245,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_DST_HEIGHT_WIDTH:
         s->dst_width = val & 0x3fff;
         s->dst_height = (val >> 16) & 0x3fff;
+        ati_rage128_engine_enter(s);
         ati_rage128_2d_blt(s);
+        ati_rage128_engine_exit(s);
         break;
     case R128_SCALE_DST_HEIGHT_WIDTH:
         /* the register-programmed scaler's kick: parameters were stored
@@ -1854,7 +2295,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_DST_WIDTH_X:
         s->dst_x = val & 0x3fff;
         s->dst_width = (val >> 16) & 0x3fff;
+        ati_rage128_engine_enter(s);
         ati_rage128_2d_blt(s);
+        ati_rage128_engine_exit(s);
         break;
     case R128_SRC_X_Y:
         s->src_y = val & 0x3fff;
@@ -1867,7 +2310,9 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
     case R128_DST_WIDTH_HEIGHT:
         s->dst_height = val & 0x3fff;
         s->dst_width = (val >> 16) & 0x3fff;
+        ati_rage128_engine_enter(s);
         ati_rage128_2d_blt(s);
+        ati_rage128_engine_exit(s);
         break;
     case R128_DST_HEIGHT_Y:
         s->dst_y = val & 0x3fff;
@@ -2126,7 +2571,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
  * address. Each 12-byte, little-endian entry is {dest register offset,
  * source system-memory address, control}; control's low 16 bits are a
  * byte count and bit 31 is END_OF_LIST (both inferred from the smoke
- * test -- see the comment on R128_BM_GUI_TABLE in ati_rage128_regs.h).
+ * test -- see the comment on R128_BM_GUI in ati_rage128_regs.h).
  * The transfer completes synchronously, one dword at a time through the
  * normal register-write path so a descriptor can target any register
  * exactly as if the driver had written it directly via MM_INDEX/DATA.
@@ -2137,8 +2582,17 @@ static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
     dma_addr_t desc = table;
     int entry;
 
+    /*
+     * A descriptor whose register run reaches BM_GUI_TABLE would start
+     * the walk again from whatever it just wrote there.
+     */
+    if (s->bm_running) {
+        return;
+    }
+    s->bm_running = true;
+
     for (entry = 0; entry < 4096; entry++) {
-        uint32_t d[3];
+        uint32_t d[4];
         uint32_t reg_off, sysaddr, ctrl, count;
 
         if (pci_dma_read(pci, desc, d, sizeof(d)) != MEMTX_OK) {
@@ -2147,10 +2601,10 @@ static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
         reg_off = le32_to_cpu(d[0]);
         sysaddr = le32_to_cpu(d[1]);
         ctrl = le32_to_cpu(d[2]);
-        count = ctrl & 0xffff;
+        count = ctrl & R128_BM_BYTE_COUNT_MASK;
         trace_ati_rage128_bm_desc(reg_off, sysaddr, ctrl);
 
-        while (count >= 4) {
+        while ((ctrl & R128_BM_TRANSFER_DEST_REGS) && count >= 4) {
             uint32_t word;
 
             if (pci_dma_read(pci, sysaddr, &word, 4) != MEMTX_OK) {
@@ -2158,16 +2612,19 @@ static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
             }
             ati_rage128_reg_write32(s, reg_off & 0x3ffc, le32_to_cpu(word));
             sysaddr += 4;
-            reg_off += 4;
+            if (!(ctrl & R128_BM_FRAME_OFFSET_HOLD)) {
+                reg_off += 4;
+            }
             count -= 4;
         }
 
-        if (ctrl & (1u << 31)) {
+        if (ctrl & R128_BM_END_OF_LIST) {
             break;
         }
-        desc += 12;
+        desc += 16;
     }
 
+    s->bm_running = false;
     s->regs[R128_GEN_INT_STATUS >> 2] |= R128_BUSMASTER_EOL_INT;
     ati_rage128_update_irq(s);
 }
@@ -2218,6 +2675,50 @@ static uint32_t ati_rage128_card_read32(ATIRage128State *s, uint32_t addr,
         pci_dma_read(PCI_DEVICE(s), page | (addr & 0xfff), &val,
                      sizeof(val));
         return le32_to_cpu(val);
+    }
+}
+
+/*
+ * Read @dwords consecutive dwords starting at card address @addr with
+ * the same addressing as ati_rage128_card_read32(), one GART lookup and
+ * one DMA per page instead of two DMAs per dword.
+ */
+static void ati_rage128_card_read_block(ATIRage128State *s, uint32_t addr,
+                                        uint32_t *buf, uint32_t dwords,
+                                        bool gart)
+{
+    uint32_t gart_base = s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu;
+
+    while (dwords) {
+        uint32_t n = MIN(dwords, (0x1000 - (addr & 0xfff)) / 4);
+        uint32_t idx, entry, page, i;
+
+        if (!n || (!gart && addr + 4 <= ATI_RAGE128_VRAM_SIZE) ||
+            (addr & 3)) {
+            /* VRAM, or anything unusual: dword by dword */
+            *buf++ = ati_rage128_card_read32(s, addr, gart);
+            addr += 4;
+            dwords--;
+            continue;
+        }
+        idx = (addr >> 12) & (R128_PCIGART_TABLE_ENTRIES - 1);
+        page = 0;
+        if (gart_base) {
+            pci_dma_read(PCI_DEVICE(s), gart_base + idx * 4, &entry,
+                         sizeof(entry));
+            page = le32_to_cpu(entry) & ~0xfffu;
+        }
+        if (page) {
+            pci_dma_read(PCI_DEVICE(s), page | (addr & 0xfff), buf, n * 4);
+            for (i = 0; i < n; i++) {
+                buf[i] = le32_to_cpu(buf[i]);
+            }
+        } else {
+            memset(buf, 0, n * 4);
+        }
+        buf += n;
+        addr += n * 4;
+        dwords -= n;
     }
 }
 
@@ -2818,8 +3319,9 @@ static void ati_rage128_3d_trace_vert(const ATIRage128PM4Parser *p)
  * Decode the gathered vertex dwords into an ATIRage128Vertex. Same
  * VC_FORMAT offset walk as ati_rage128_3d_trace_vert above (one float
  * per component on the FPU path); rhw and the primary s/t are carried
- * for the texture unit, specular, fog and the second s/t pair are
- * stepped over -- fog and the secondary texture are later steps. A
+ * for the texture unit along with the fog float; specular and the
+ * second s/t pair are stepped over -- the secondary texture is a later
+ * step. A
  * vertex with no diffuse fields comes out solid white. Non-finite
  * floats are stored as-is; the rasterizer rejects the triangle
  * (per-triangle, so a poisoned vertex does not desync a strip's
@@ -2837,6 +3339,8 @@ static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
     v->rhw = 1.0f;
     v->b = v->g = v->r = v->a = 1.0f;
     v->s = v->t = 0.0f;
+    v->fog = 1.0f;
+    v->sb = v->sg = v->sr = 0.0f;
     if (fmt & R128_VC_FRMT_RHW) {
         v->rhw = ati_rage128_vc_f32(p->p3_vtx[o]);
         o++;
@@ -2866,8 +3370,20 @@ static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
             o++;
         }
     }
-    o += (fmt & R128_VC_FRMT_SPEC_BGR) ? 3 : 0;
-    o += !!(fmt & R128_VC_FRMT_SPEC_F);
+    if (fmt & R128_VC_FRMT_SPEC_BGR) {
+        if (o + 2 < ARRAY_SIZE(p->p3_vtx)) {
+            v->sb = ati_rage128_vc_f32(p->p3_vtx[o]);
+            v->sg = ati_rage128_vc_f32(p->p3_vtx[o + 1]);
+            v->sr = ati_rage128_vc_f32(p->p3_vtx[o + 2]);
+        }
+        o += 3;
+    }
+    if (fmt & R128_VC_FRMT_SPEC_F) {
+        if (o < ARRAY_SIZE(p->p3_vtx)) {
+            v->fog = ati_rage128_vc_f32(p->p3_vtx[o]);
+        }
+        o++;
+    }
     o += !!(fmt & R128_VC_FRMT_SPEC_FRGB);
     if ((fmt & R128_VC_FRMT_S_T) && o + 1 < ARRAY_SIZE(p->p3_vtx)) {
         v->s = ati_rage128_vc_f32(p->p3_vtx[o]);
@@ -2882,6 +3398,31 @@ static void ati_rage128_vc_decode(const ATIRage128PM4Parser *p,
  * the area sign -- so a strip keeps no parity and a fan just slides
  * its middle vertex.
  */
+/*
+ * One vertex of a GEN_INDX_PRIM draw, fetched from the vertex buffer the
+ * packet named: @idx * stride dwords past its address, through the same
+ * GART-or-VRAM addressing an indirect buffer uses. Fed to the triangle
+ * accumulator exactly as an inline GEN_PRIM vertex would be.
+ */
+static void ati_rage128_3d_prim_vertex(ATIRage128State *s,
+                                       ATIRage128PM4Parser *p);
+
+static void ati_rage128_3d_buffer_vertex(ATIRage128State *s,
+                                         ATIRage128PM4Parser *p,
+                                         unsigned idx)
+{
+    bool gart = (s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu) != 0;
+    unsigned stride = p->p3_vtx_stride;
+    uint32_t addr;
+
+    if (!stride || stride > ARRAY_SIZE(p->p3_vtx) || idx > 0xffff) {
+        return;
+    }
+    addr = p->p3_params[0] + idx * stride * 4;
+    ati_rage128_card_read_block(s, addr, p->p3_vtx, stride, gart);
+    ati_rage128_3d_prim_vertex(s, p);
+}
+
 static void ati_rage128_3d_prim_vertex(ATIRage128State *s,
                                        ATIRage128PM4Parser *p)
 {
@@ -2930,6 +3471,7 @@ static void ati_rage128_3d_prim_vertex(ATIRage128State *s,
  * being pulled from VRAM, so the state (in-flight packet type/count/
  * running register) has to live across calls instead of a loop index.
  */
+
 static void ati_rage128_pm4_parse(ATIRage128State *s,
                                   ATIRage128PM4Parser *p, uint32_t val)
 {
@@ -3278,16 +3820,58 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
             break;
         case R128_PM4_OPCODE_3D_RNDR_GEN_INDX_PRIM:
             /*
-             * Vertex-buffer form (Linux DRM layout): buffer offset and
-             * size, then the same VC_FORMAT/VC_CNTL pair, then indices
-             * when the walk mode says so. Trace-only, as above.
+             * Vertex-buffer form (Linux DRM layout): buffer address and
+             * size, then the same VC_FORMAT/VC_CNTL pair, then 16-bit
+             * indices two per dword (low half first) when the walk mode
+             * is IND, or nothing when it is LIST and the vertices are
+             * taken from the buffer in order. The address is what the
+             * bus master fetches from -- GART-translated system memory
+             * when a GART is configured, exactly like an indirect
+             * buffer. This is how Mac OS X's driver draws every vertex
+             * array (ATIRage128GLDriver FUN_0000e258 emits it for
+             * glDrawElements/glDrawArrays with a 0x16000-byte pageable
+             * vertex buffer the kernel maps into the GART); leaving it
+             * trace-only made all of those draws vanish, and Chessmaster
+             * 9000's pieces with them.
              */
             if (p->p3_param_idx < 4) {
                 p->p3_params[p->p3_param_idx] = val;
-                if (p->p3_param_idx == 3) {
+                if (p->p3_param_idx == 2) {
+                    p->p3_vc_format = val;
+                    p->p3_vtx_stride = ati_rage128_vc_stride(val);
+                } else if (p->p3_param_idx == 3) {
+                    unsigned walk = (val & R128_VC_CNTL_PRIM_WALK_MASK) >>
+                                    R128_VC_CNTL_PRIM_WALK_SHIFT;
+                    unsigned num = val >> R128_VC_CNTL_NUM_SHIFT;
+
+                    p->p3_vc_cntl = val;
+                    p->p3_vtx_count = 0;
                     trace_ati_rage128_3d_indx_prim(p->p3_params[0],
                                                    p->p3_params[1],
                                                    p->p3_params[2], val);
+                    trace_ati_rage128_3d_prim(p->p3_vc_format,
+                                              p->p3_vtx_stride,
+                                              val & R128_VC_CNTL_PRIM_TYPE_MASK,
+                                              walk, num);
+                    if (walk == R128_VC_CNTL_PRIM_WALK_LIST) {
+                        unsigned k;
+
+                        for (k = 0; k < num; k++) {
+                            ati_rage128_3d_buffer_vertex(s, p, k);
+                        }
+                    }
+                }
+            } else if (((p->p3_vc_cntl & R128_VC_CNTL_PRIM_WALK_MASK) >>
+                        R128_VC_CNTL_PRIM_WALK_SHIFT) ==
+                       R128_VC_CNTL_PRIM_WALK_IND) {
+                unsigned num = p->p3_vc_cntl >> R128_VC_CNTL_NUM_SHIFT;
+                unsigned done = (p->p3_param_idx - 4) * 2;
+
+                if (done < num) {
+                    ati_rage128_3d_buffer_vertex(s, p, val & 0xffff);
+                }
+                if (done + 1 < num) {
+                    ati_rage128_3d_buffer_vertex(s, p, val >> 16);
                 }
             }
             p->p3_param_idx++;
@@ -3353,15 +3937,27 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
 
     trace_ati_rage128_pm4_indirect(offset, dwords,
         dwords ? ati_rage128_card_read32(s, offset, gart) : 0);
-    if (dwords > 0x10000) {
-        /* bogus size -- a real IB is at most a few KB */
+    /*
+     * INDSIZE is a 23-bit dword count and Mac OS X's driver uses it:
+     * ATIRage128::submit_buffer hands the card one indirect buffer per
+     * texture mip level, unsplit, so level 0 of a 256x256 ARGB8888
+     * texture arrives as a single 0x10060-dword buffer. A 0x10000 cap
+     * here dropped exactly that buffer and nothing else, leaving the
+     * base level of every large texture unwritten while its smaller
+     * levels were perfect.
+     */
+    if (dwords > 0x7fffff) {
         return;
     }
-    for (i = 0; i < dwords; i++) {
-        uint32_t val = ati_rage128_card_read32(s, offset + i * 4, gart);
+    for (i = 0; i < dwords; ) {
+        uint32_t chunk[1024];
+        uint32_t n = MIN(dwords - i, ARRAY_SIZE(chunk)), j;
 
-        trace_ati_rage128_pm4_ib_dword(i, val);
-        ati_rage128_pm4_parse(s, &parser, val);
+        ati_rage128_card_read_block(s, offset + i * 4, chunk, n, gart);
+        for (j = 0; j < n; j++, i++) {
+            trace_ati_rage128_pm4_ib_dword(i, chunk[j]);
+            ati_rage128_pm4_parse(s, &parser, chunk[j]);
+        }
     }
 }
 
@@ -3376,7 +3972,15 @@ static uint64_t ati_rage128_mmio_read(void *opaque, hwaddr addr,
 {
     ATIRage128State *s = opaque;
     uint32_t base = addr & 0x3ffc;
-    uint32_t val = ati_rage128_reg_read32(s, base);
+    uint32_t val;
+
+    if (ati_rage128_engine_reg(base)) {
+        ati_rage128_engine_wait_reg(s, base, false);
+    } else {
+        ati_rage128_fifo_flush(s);
+        ati_rage128_engine_complete(s);
+    }
+    val = ati_rage128_reg_read32(s, base);
 
     val = extract32(val, (addr & 3) * 8, size * 8);
     if (ati_rage128_reg_name(base)[0] == '?') {
@@ -3388,8 +3992,8 @@ static uint64_t ati_rage128_mmio_read(void *opaque, hwaddr addr,
     return val;
 }
 
-static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
-                                   unsigned size)
+static void ati_rage128_mmio_write_one(void *opaque, hwaddr addr,
+                                       uint64_t data, unsigned size)
 {
     ATIRage128State *s = opaque;
     uint32_t base = addr & 0x3ffc;
@@ -3441,6 +4045,26 @@ static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     ati_rage128_reg_write32(s, base, val);
 }
 
+
+/* Engine work done by this write becomes visible to the display at once. */
+static void ati_rage128_mmio_write(void *opaque, hwaddr addr, uint64_t data,
+                                   unsigned size)
+{
+    ATIRage128State *s = opaque;
+    uint32_t base = addr & 0x3ffc;
+
+    /* kicks queue behind running jobs; everything else waits for them */
+    if (ati_rage128_engine_reg(base) &&
+        base != R128_PM4_IW_INDOFF && base != R128_PM4_IW_INDSIZE &&
+        base != R128_PM4_BUFFER_DL_WPTR &&
+        (base < R128_PM4_FIFO_DATA_EVEN || base > R128_PM4_FIFO_APER_END)) {
+        ati_rage128_engine_wait_reg(s, base, true);
+    }
+    ati_rage128_mmio_write_one(s, addr, data, size);
+    if (!s->engine_busy) {
+        ati_rage128_2d_flush_dirty(s);
+    }
+}
 static const MemoryRegionOps ati_rage128_mmio_ops = {
     .read = ati_rage128_mmio_read,
     .write = ati_rage128_mmio_write,
@@ -3631,6 +4255,19 @@ static const MemoryRegionOps ati_rage128_aper1_ops = {
 static void ati_rage128_reset_hold(Object *obj, ResetType type)
 {
     ATIRage128State *s = ATI_RAGE128(obj);
+
+    /* the worker never needs the BQL, so waiting here cannot deadlock */
+    s->fifo_stage_n = 0;
+    while (ati_rage128_engine_jobs_pending(s)) {
+        qemu_event_reset(&s->engine_done);
+        ati_rage128_engine_complete(s);
+        if (ati_rage128_engine_jobs_pending(s)) {
+            qemu_event_wait(&s->engine_done);
+        }
+    }
+    if (s->engine_busy && !s->engine_sync) {
+        ati_rage128_engine_settle(s);
+    }
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
@@ -3842,6 +4479,10 @@ static void ati_rage128_cursor_timer(void *opaque)
  */
 static void ati_rage128_cursor_update(ATIRage128State *s)
 {
+    if (!bql_locked()) {
+        qatomic_set(&s->cursor_deferred, true);
+        return;
+    }
     if (!s->cursor_timer) {
         ati_rage128_cursor_apply(s);
         return;
@@ -3930,6 +4571,19 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
                        ATI_RAGE128_APER_SIZE);
     memory_region_init_ram(&s->vram, obj, "ati-rage128-vram",
                            ATI_RAGE128_VRAM_SIZE, &error_fatal);
+    s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
+    qemu_event_init(&s->engine_idle, true);
+    qemu_event_init(&s->engine_done, false);
+    qemu_mutex_init(&s->engine_lock);
+    qemu_cond_init(&s->engine_cond);
+    s->engine_bh = qemu_bh_new(ati_rage128_engine_bh, s);
+    s->fifo_stage = g_new(uint32_t, ATI_RAGE128_FIFO_BATCH);
+    s->fifo_batch = g_new(uint32_t, ATI_RAGE128_JOB_QUEUE *
+                                    ATI_RAGE128_FIFO_BATCH);
+    qemu_thread_create(&s->engine_thread, "ati-rage128-engine",
+                       ati_rage128_engine_thread, s, QEMU_THREAD_JOINABLE);
+    s->dirty_lo = UINT32_MAX;
+    s->dirty_hi = 0;
     /*
      * Needed by ati_rage128_scan_vram_activity() to auto-detect the
      * real live framebuffer when CRTC1 never describes it (see that
@@ -3995,6 +4649,14 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
      */
     memory_region_init_io(&s->io, obj, &ati_rage128_mmio_ops, s,
                           "ati-rage128-io", ATI_RAGE128_IO_SIZE);
+    /*
+     * Engine waits release the BQL inside the handlers; accesses from
+     * other vCPUs then enter and wait their turn instead of failing.
+     */
+    s->mmio.disable_reentrancy_guard = true;
+    s->io.disable_reentrancy_guard = true;
+    s->vram_aper1.disable_reentrancy_guard = true;
+    s->vram_watch.disable_reentrancy_guard = true;
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_PREFETCH, &s->aper);
@@ -4070,6 +4732,15 @@ static void ati_rage128_exit(PCIDevice *dev)
 {
     ATIRage128State *s = ATI_RAGE128(dev);
 
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_quit = true;
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+    qemu_thread_join(&s->engine_thread);
+    qemu_bh_delete(s->engine_bh);
+    g_free(s->fifo_stage);
+    g_free(s->fifo_batch);
+
     timer_free(s->vblank_timer);
     timer_free(s->vblank_end_timer);
     timer_free(s->cursor_timer);
@@ -4104,6 +4775,9 @@ static const Property ati_rage128_properties[] = {
     DEFINE_PROP_UINT32("fillwatch-size", ATIRage128State, fillwatch_size, 0),
     DEFINE_PROP_BOOL("monitor-connected", ATIRage128State,
                      monitor_connected, true),
+    /* command-stream kicks on a worker thread; auto = on except qtest */
+    DEFINE_PROP_ON_OFF_AUTO("async-engine", ATIRage128State, engine_async,
+                            ON_OFF_AUTO_AUTO),
     DEFINE_EDID_PROPERTIES(ATIRage128State, edid_info),
 };
 

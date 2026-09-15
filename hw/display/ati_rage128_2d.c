@@ -55,7 +55,7 @@ static uint32_t ati_rage128_2d_read_pixel(ATIRage128State *s, uint32_t offset,
                                           uint32_t stride, int x, int y,
                                           int bpp)
 {
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint8_t *vram = s->vram_ptr;
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
 
     if (x < 0 || y < 0 || addr + bpp / 8 > ATI_RAGE128_VRAM_SIZE) {
@@ -80,7 +80,7 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
                                        uint32_t stride, int x, int y, int bpp,
                                        uint32_t color)
 {
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint8_t *vram = s->vram_ptr;
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
 
     if (x < 0 || y < 0 || addr + bpp / 8 > ATI_RAGE128_VRAM_SIZE) {
@@ -112,9 +112,23 @@ static void ati_rage128_2d_write_pixel(ATIRage128State *s, uint32_t offset,
      * refreshes it until an unrelated CPU store happens to dirty the
      * same scan block -- observed live as white Finder windows whose
      * icons only appear when clicked, and a Mac OS 9 menu bar that is
-     * never painted.
+     * never painted. The range is collected here and marked in one go
+     * by ati_rage128_2d_flush_dirty(): marking it per pixel dominated
+     * large blits.
      */
-    memory_region_set_dirty(&s->vram, addr & ~7ull, 8);
+    s->dirty_lo = MIN(s->dirty_lo, addr);
+    s->dirty_hi = MAX(s->dirty_hi, addr + bpp / 8);
+}
+
+void ati_rage128_2d_flush_dirty(ATIRage128State *s)
+{
+    if (s->dirty_hi > s->dirty_lo) {
+        uint64_t lo = s->dirty_lo & ~7ull;
+
+        memory_region_set_dirty(&s->vram, lo, s->dirty_hi - lo);
+    }
+    s->dirty_lo = UINT32_MAX;
+    s->dirty_hi = 0;
 }
 
 /*
@@ -618,6 +632,22 @@ static int ati_rage128_blend_factor(unsigned f, int sc, int sa, int dc,
     }
 }
 
+/*
+ * Combine the two weighted terms. @s and @d are the source and
+ * destination channels already multiplied by their factors, still on the
+ * 0..255*255 scale, so the two divide down together. The NCLAMP variants
+ * keep the low 8 bits of the true result rather than saturating.
+ */
+static unsigned ati_rage128_blend_comb(unsigned fcn, int s, int d)
+{
+    int v = ((fcn >= R128_ALPHA_COMB_SUB_CLAMP ? s - d : s + d) + 127) / 255;
+
+    if (fcn & 1) {                              /* the NCLAMP variants */
+        return v & 0xff;
+    }
+    return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
 /* Read a destination pixel as 8-bit ARGB regardless of surface depth. */
 static uint32_t ati_rage128_dst_to_argb(uint32_t px, int bpp)
 {
@@ -654,6 +684,7 @@ typedef struct ATIRage128ScaleOp {
     int bpp;
     int sc_left, sc_top, sc_right, sc_bottom;
     unsigned src_factor, dst_factor;  /* R128_ALPHA_BLEND_* */
+    unsigned comb_fcn;                /* R128_ALPHA_COMB_* */
 } ATIRage128ScaleOp;
 
 /*
@@ -740,13 +771,13 @@ static void ati_rage128_2d_scale_run(ATIRage128State *s,
                 out = 0;
                 for (c = 0, shift = 0; c < 4; c++, shift += 8) {
                     int sc = (src >> shift) & 0xff, dc = (dst >> shift) & 0xff;
-                    int v = (sc * ati_rage128_blend_factor(op->src_factor, sc,
-                                                           sa, dc, da) +
-                             dc * ati_rage128_blend_factor(op->dst_factor, sc,
-                                                           sa, dc, da) +
-                             127) / 255;
+                    int sv = sc * ati_rage128_blend_factor(op->src_factor, sc,
+                                                           sa, dc, da);
+                    int dv = dc * ati_rage128_blend_factor(op->dst_factor, sc,
+                                                           sa, dc, da);
 
-                    out |= (uint32_t)MIN(v, 255) << shift;
+                    out |= (uint32_t)ati_rage128_blend_comb(op->comb_fcn,
+                                                            sv, dv) << shift;
                 }
                 out = ati_rage128_argb_to_dst(out, op->bpp);
             }
@@ -844,8 +875,25 @@ void ati_rage128_2d_scale_regs(ATIRage128State *s)
     op.y_inc = s->regs[R128_SCALE_Y_INC >> 2] >> 4;
     op.dst_off = s->dst_offset;
     op.dst_stride = s->dst_pitch * op.bpp;
-    op.src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) & R128_ALPHA_BLEND_MASK;
-    op.dst_factor = (misc >> R128_ALPHA_BLEND_DST_SHIFT) & R128_ALPHA_BLEND_MASK;
+    /*
+     * TEX_CNTL's ALPHA_ENABLE gates the blender here, as TEX_CNTL_C's
+     * does for the 3D path; the factors are not the control. Mac OS X
+     * scales its alpha pointer with the bit set and SRCALPHA /
+     * INVSRCALPHA, and its 4:2:2 video frames with the bit clear and
+     * whatever the factor fields hold -- ZERO / ZERO, which blended
+     * every frame to black.
+     */
+    if (s->regs[R128_TEX_CNTL >> 2] & R128_ALPHA_ENABLE) {
+        op.src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) &
+                        R128_ALPHA_BLEND_MASK;
+        op.dst_factor = (misc >> R128_ALPHA_BLEND_DST_SHIFT) &
+                        R128_ALPHA_BLEND_MASK;
+        op.comb_fcn = (misc >> R128_ALPHA_COMB_FCN_SHIFT) &
+                      R128_ALPHA_COMB_FCN_MASK;
+    } else {
+        op.src_factor = R128_ALPHA_BLEND_ONE;
+        op.dst_factor = R128_ALPHA_BLEND_ZERO;
+    }
     ati_rage128_2d_scale_run(s, &op);
 }
 
@@ -1157,37 +1205,105 @@ typedef struct ATIRage128Tex {
     unsigned bypp;
     unsigned dt;
     unsigned clamp_s, clamp_t;    /* R128_TEX_CLAMP_* */
+    /*
+     * Chosen once per texture from dt and the clamp modes, so the texel
+     * loop carries no per-texel switch. That loop's speed turned out to
+     * depend on where the linker put it (a 2.35x swing in tex_fetch
+     * between two builds with a byte-identical 2d.o, traced to layout);
+     * straight-line code takes the branch predictor out of it.
+     */
+    uint32_t (*decode)(const uint8_t *px);       /* texel -> ARGB8888 */
+    int (*wrap_s)(int i, int n, bool *border);
+    int (*wrap_t)(int i, int n, bool *border);
     bool linear;                  /* bilinear (MAG_BLEND_LINEAR) */
+    unsigned min_blend;           /* R128_MIN_BLEND_*, the minify filter */
     uint32_t border;              /* PRIM_TEXTURE_BORDER_COLOR_C, ARGB */
+    unsigned l2w, l2h;            /* log2 of the base level's width/height */
+    unsigned slot;                /* PRIM_TEX_OFFSET_C slot of the base level */
+    unsigned levels;              /* mip levels the slots describe, >= 1 */
 } ATIRage128Tex;
+
+/* defined with the texel fetch below; chosen per texture in tex_setup */
+static uint32_t ati_rage128_decode_argb1555(const uint8_t *px);
+static uint32_t ati_rage128_decode_rgb565(const uint8_t *px);
+static uint32_t ati_rage128_decode_argb4444(const uint8_t *px);
+static uint32_t ati_rage128_decode_rgb888(const uint8_t *px);
+static uint32_t ati_rage128_decode_argb8888(const uint8_t *px);
+static int (*ati_rage128_wrap_select(unsigned mode))(int, int, bool *);
+
+/*
+ * Select mip level @lod of @base, in place. The slots run one per log2
+ * size, so the level whose width is 2^n lives in PRIM_TEX_n_OFFSET_C
+ * (measured live: a 256x256 chain filled slots 8 down to 0 with
+ * 0x579f00, 0x5b9f00, 0x5c9f00 ... 0x5cf460). Levels are packed tight,
+ * so each one's pitch is its own width.
+ */
+static void ati_rage128_tex_level(ATIRage128State *s, ATIRage128Tex *t,
+                                  const ATIRage128Tex *base, unsigned lod)
+{
+    unsigned l2w = base->l2w > lod ? base->l2w - lod : 0;
+    unsigned l2h = base->l2h > lod ? base->l2h - lod : 0;
+
+    *t = *base;
+    t->base = s->regs[R128_PRIM_TEX_OFFSET_C(base->slot - lod) >> 2] &
+              R128_TEX_OFFSET_MASK;
+    t->w = 1u << l2w;
+    t->h = 1u << l2h;
+    t->pitch = t->w * t->bypp;
+}
 
 static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
 {
     uint32_t cntl = s->regs[R128_PRIM_TEX_CNTL_C >> 2];
     uint32_t sp = s->regs[R128_TEX_SIZE_PITCH_C >> 2];
-    unsigned l2w = (sp >> R128_TEX_SIZE_SHIFT) & R128_TEX_LOG2_MASK;
-    unsigned l2h = (sp >> R128_TEX_HEIGHT_SHIFT) & R128_TEX_LOG2_MASK;
+    /*
+     * TEX_SIZE_PITCH_C, as Mesa's r128 driver packs it
+     * (r128_texstate.c): PITCH is log2 of the base level's WIDTH, SIZE
+     * is log2 of max(width, height), HEIGHT is log2 of the height, and
+     * MIN_SIZE is log2 of the smallest level present. The number of
+     * levels is SIZE - MIN_SIZE + 1, and r128_texmem.c files them
+     * backwards -- tex_offset[numLevels - 1 - level] -- so the base
+     * level lives in slot SIZE - MIN_SIZE, not in slot log2(width).
+     * They coincide only for a chain that runs down to 1x1, which is
+     * why reading the width out of SIZE and the slot out of it too went
+     * unnoticed: Mac OS 9's RAVE driver sets MIP_MAP_DISABLE, and that
+     * path writes every slot with the same address.
+     */
     unsigned l2p = (sp >> R128_TEX_PITCH_SHIFT) & R128_TEX_LOG2_MASK;
+    unsigned l2sz = (sp >> R128_TEX_SIZE_SHIFT) & R128_TEX_LOG2_MASK;
+    unsigned l2h = (sp >> R128_TEX_HEIGHT_SHIFT) & R128_TEX_LOG2_MASK;
+    unsigned l2min = (sp >> R128_TEX_MIN_SIZE_SHIFT) & R128_TEX_LOG2_MASK;
+    unsigned l2w = l2p;
+    unsigned slot = l2sz > l2min ? l2sz - l2min : 0;
 
     t->dt = (cntl & R128_TEX_DATATYPE_MASK) >> R128_TEX_DATATYPE_SHIFT;
     switch (t->dt) {
     case R128_TEX_DATATYPE_ARGB1555:
+        t->bypp = 2;
+        t->decode = ati_rage128_decode_argb1555;
+        break;
     case R128_TEX_DATATYPE_RGB565:
+        t->bypp = 2;
+        t->decode = ati_rage128_decode_rgb565;
+        break;
     case R128_TEX_DATATYPE_ARGB4444:
         t->bypp = 2;
+        t->decode = ati_rage128_decode_argb4444;
         break;
     case R128_TEX_DATATYPE_RGB888:
         t->bypp = 3;
+        t->decode = ati_rage128_decode_rgb888;
         break;
     case R128_TEX_DATATYPE_ARGB8888:
         t->bypp = 4;
+        t->decode = ati_rage128_decode_argb8888;
         break;
     default:
         /* palettised, VQ and YUV textures are not modeled */
         trace_ati_rage128_3d_unsupported("texture datatype", cntl);
         return false;
     }
-    if (l2w > 10) {
+    if (l2w > 10 || slot > 10) {
         /* no offset slot past PRIM_TEX_10_OFFSET_C */
         trace_ati_rage128_3d_unsupported("texture size", sp);
         return false;
@@ -1195,7 +1311,7 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     t->w = 1u << l2w;
     t->h = 1u << l2h;
     t->pitch = (1u << l2p) * t->bypp;
-    t->base = s->regs[R128_PRIM_TEX_OFFSET_C(l2w) >> 2] &
+    t->base = s->regs[R128_PRIM_TEX_OFFSET_C(slot) >> 2] &
               R128_TEX_OFFSET_MASK;
     if (t->base >= ATI_RAGE128_VRAM_SIZE) {
         trace_ati_rage128_3d_unsupported("texture offset", t->base);
@@ -1203,41 +1319,100 @@ static bool ati_rage128_tex_setup(ATIRage128State *s, ATIRage128Tex *t)
     }
     t->clamp_s = (cntl >> R128_TEX_CLAMP_S_SHIFT) & R128_TEX_CLAMP_MASK;
     t->clamp_t = (cntl >> R128_TEX_CLAMP_T_SHIFT) & R128_TEX_CLAMP_MASK;
+    t->wrap_s = ati_rage128_wrap_select(t->clamp_s);
+    t->wrap_t = ati_rage128_wrap_select(t->clamp_t);
     t->linear = cntl & R128_MAG_BLEND_LINEAR;
+    t->min_blend = (cntl >> R128_MIN_BLEND_SHIFT) & 7;
     t->border = s->regs[R128_PRIM_TEXTURE_BORDER_COLOR_C >> 2];
     t->vram = memory_region_get_ram_ptr(&s->vram);
+    t->l2w = l2w;
+    t->l2h = l2h;
+    t->slot = slot;
+    t->levels = 1;
     if (!(cntl & R128_MIP_MAP_DISABLE)) {
-        /* only the base level is sampled; the driver never enables this */
-        trace_ati_rage128_3d_unsupported("mip-mapping (base level used)",
-                                         cntl);
+        /*
+         * Mac OS X's OpenGL driver fills only the levels a minified draw
+         * can select and leaves the base level of a 256x256 texture
+         * unwritten, so sampling level 0 unconditionally paints black.
+         * Count the levels whose slot the guest actually programmed.
+         */
+        t->levels = slot + 1;
     }
-    trace_ati_rage128_3d_tex(s->regs[R128_PRIM_TEX_OFFSET_C(l2w) >> 2],
+    trace_ati_rage128_3d_tex(s->regs[R128_PRIM_TEX_OFFSET_C(slot) >> 2],
                              t->base, t->w, t->h, t->dt, cntl,
                              s->regs[R128_PRIM_TEXTURE_COMBINE_CNTL_C >> 2]);
     return true;
 }
 
-/* one texel index through the unit's addressing mode; n is a power of 2 */
-static inline int ati_rage128_tex_wrap(int i, int n, unsigned mode,
-                                       bool *border)
+/*
+ * The eight comparison codes, shared by Z_TEST and STENCIL_TEST: the
+ * incoming value @a against the value already in the buffer @b.
+ */
+static bool ati_rage128_3d_cmp(unsigned func, uint32_t a, uint32_t b)
 {
-    switch (mode) {
-    case R128_TEX_CLAMP_MIRROR:
-    {
-        int m = i & (2 * n - 1);
-
-        return m < n ? m : 2 * n - 1 - m;
+    switch (func) {
+    case 0:  return false;                      /* NEVER */
+    case 1:  return a < b;                      /* LESS */
+    case 2:  return a <= b;                     /* LESSEQUAL */
+    case 3:  return a == b;                     /* EQUAL */
+    case 4:  return a >= b;                     /* GREATEREQUAL */
+    case 5:  return a > b;                      /* GREATER */
+    case 6:  return a != b;                     /* NEQUAL */
+    default: return true;                       /* ALWAYS */
     }
-    case R128_TEX_CLAMP_CLAMP:
-        return i < 0 ? 0 : i >= n ? n - 1 : i;
-    case R128_TEX_CLAMP_BORDER_COLOR:
-        if (i < 0 || i >= n) {
-            *border = true;
-            return 0;
-        }
-        return i;
-    default:                                    /* R128_TEX_CLAMP_WRAP */
-        return i & (n - 1);
+}
+
+/* one stencil operation on the 8-bit stencil value; INC/DEC saturate */
+static unsigned ati_rage128_stencil_op(unsigned op, unsigned old, unsigned ref)
+{
+    switch (op) {
+    case R128_STENCIL_OP_ZERO:    return 0;
+    case R128_STENCIL_OP_REPLACE: return ref & 0xff;
+    case R128_STENCIL_OP_INC:     return old < 0xff ? old + 1 : 0xff;
+    case R128_STENCIL_OP_DEC:     return old > 0 ? old - 1 : 0;
+    case R128_STENCIL_OP_INV:     return ~old & 0xff;
+    default:                      return old;   /* KEEP */
+    }
+}
+
+/*
+ * The blender's source alpha. PRIM_TEXTURE_COMBINE_CNTL_C carries both
+ * the alpha function (COMB_ALPHA) and the factor it works on
+ * (ALPHA_FACTOR: 6 the texel's alpha, 7 its inverse). @ta is the texel
+ * alpha, @va the vertex alpha.
+ */
+static unsigned ati_rage128_3d_src_alpha(uint32_t comb, uint32_t tex_cntl,
+                                         bool textured, unsigned ta,
+                                         unsigned va)
+{
+    unsigned fn = (comb >> R128_COMB_ALPHA_SHIFT) & R128_COMB_ALPHA_MASK;
+    unsigned factor = (comb >> R128_ALPHA_FACTOR_SHIFT) &
+                      R128_ALPHA_FACTOR_MASK;
+    unsigned fa;
+
+    if (!textured) {
+        return va;
+    }
+    fa = factor == R128_ALPHA_FACTOR_NTEX_ALPHA ? 255 - ta : ta;
+
+    switch (fn) {
+    case R128_COMB_ALPHA_DIS:
+    case R128_COMB_ALPHA_COPY:
+        /* A = At: the factor alone (Mesa r128_texstate.c's comments) */
+        return fa;
+    case R128_COMB_ALPHA_COPY_INP:
+        return va;                              /* A = Af */
+    case R128_COMB_ALPHA_MODULATE:
+        /*
+         * A = AfAt. TEX_CNTL_C bit 13 selects COMPLETE_A (0) or LSB_A
+         * (1) for the texel alpha; it does not switch the texel alpha
+         * off. RAVE draws the ARGB8888 shadow blob with this function,
+         * SRCALPHA:INVSRCALPHA, bit 13 clear and vertex alpha 1.0, so
+         * reading the vertex alpha here painted the whole quad.
+         */
+        return fa * va / 255;
+    default:
+        return va;
     }
 }
 
@@ -1246,14 +1421,90 @@ static inline unsigned ati_rage128_tex_x5(unsigned v)
     return (v & 0x1f) << 3 | (v & 0x1f) >> 2;
 }
 
-/* fetch one texel as ARGB8888; out-of-VRAM reads as 0 (transparent black) */
+/*
+ * One texel index through each addressing mode; n is a power of 2.
+ * Selected per texture in ati_rage128_tex_setup.
+ */
+static int ati_rage128_wrap_repeat(int i, int n, bool *border)
+{
+    return i & (n - 1);
+}
+
+static int ati_rage128_wrap_mirror(int i, int n, bool *border)
+{
+    int m = i & (2 * n - 1);
+
+    return m < n ? m : 2 * n - 1 - m;
+}
+
+static int ati_rage128_wrap_clamp(int i, int n, bool *border)
+{
+    return i < 0 ? 0 : i >= n ? n - 1 : i;
+}
+
+static int ati_rage128_wrap_border(int i, int n, bool *border)
+{
+    if (i < 0 || i >= n) {
+        *border = true;
+        return 0;
+    }
+    return i;
+}
+
+static int (*ati_rage128_wrap_select(unsigned mode))(int, int, bool *)
+{
+    switch (mode) {
+    case R128_TEX_CLAMP_MIRROR:       return ati_rage128_wrap_mirror;
+    case R128_TEX_CLAMP_CLAMP:        return ati_rage128_wrap_clamp;
+    case R128_TEX_CLAMP_BORDER_COLOR: return ati_rage128_wrap_border;
+    default:                          return ati_rage128_wrap_repeat;
+    }
+}
+
+/* one texel of each datatype as ARGB8888; selected per texture */
+static uint32_t ati_rage128_decode_argb1555(const uint8_t *px)
+{
+    unsigned p = lduw_le_p(px);
+
+    return (p & 0x8000 ? 0xff000000 : 0) |
+           ati_rage128_tex_x5(p >> 10) << 16 |
+           ati_rage128_tex_x5(p >> 5) << 8 | ati_rage128_tex_x5(p);
+}
+
+static uint32_t ati_rage128_decode_rgb565(const uint8_t *px)
+{
+    unsigned p = lduw_le_p(px);
+
+    return 0xff000000 | ati_rage128_tex_x5(p >> 11) << 16 |
+           ((p >> 5 & 0x3f) << 2 | (p >> 9 & 3)) << 8 |
+           ati_rage128_tex_x5(p);
+}
+
+static uint32_t ati_rage128_decode_argb4444(const uint8_t *px)
+{
+    unsigned p = lduw_le_p(px);
+
+    return (p >> 12 & 0xf) * 0x11 << 24 | (p >> 8 & 0xf) * 0x11 << 16 |
+           (p >> 4 & 0xf) * 0x11 << 8 | (p & 0xf) * 0x11;
+}
+
+static uint32_t ati_rage128_decode_rgb888(const uint8_t *px)
+{
+    return 0xff000000 | (uint32_t)px[2] << 16 | (uint32_t)px[1] << 8 | px[0];
+}
+
+static uint32_t ati_rage128_decode_argb8888(const uint8_t *px)
+{
+    return ldl_le_p(px);
+}
+
 static uint32_t ati_rage128_tex_fetch(const ATIRage128Tex *t, int tx, int ty)
 {
     bool border = false;
     uint32_t addr;
 
-    tx = ati_rage128_tex_wrap(tx, t->w, t->clamp_s, &border);
-    ty = ati_rage128_tex_wrap(ty, t->h, t->clamp_t, &border);
+    tx = t->wrap_s(tx, t->w, &border);
+    ty = t->wrap_t(ty, t->h, &border);
     if (border) {
         return t->border;
     }
@@ -1261,36 +1512,7 @@ static uint32_t ati_rage128_tex_fetch(const ATIRage128Tex *t, int tx, int ty)
     if (addr + t->bypp > ATI_RAGE128_VRAM_SIZE) {
         return 0;
     }
-    switch (t->dt) {
-    case R128_TEX_DATATYPE_ARGB1555:
-    {
-        unsigned p = lduw_le_p(t->vram + addr);
-
-        return (p & 0x8000 ? 0xff000000 : 0) |
-               ati_rage128_tex_x5(p >> 10) << 16 |
-               ati_rage128_tex_x5(p >> 5) << 8 | ati_rage128_tex_x5(p);
-    }
-    case R128_TEX_DATATYPE_RGB565:
-    {
-        unsigned p = lduw_le_p(t->vram + addr);
-
-        return 0xff000000 | ati_rage128_tex_x5(p >> 11) << 16 |
-               ((p >> 5 & 0x3f) << 2 | (p >> 9 & 3)) << 8 |
-               ati_rage128_tex_x5(p);
-    }
-    case R128_TEX_DATATYPE_ARGB4444:
-    {
-        unsigned p = lduw_le_p(t->vram + addr);
-
-        return (p >> 12 & 0xf) * 0x11 << 24 | (p >> 8 & 0xf) * 0x11 << 16 |
-               (p >> 4 & 0xf) * 0x11 << 8 | (p & 0xf) * 0x11;
-    }
-    case R128_TEX_DATATYPE_RGB888:
-        return 0xff000000 | (uint32_t)t->vram[addr + 2] << 16 |
-               (uint32_t)t->vram[addr + 1] << 8 | t->vram[addr];
-    default:                                    /* ARGB8888 */
-        return ldl_le_p(t->vram + addr);
-    }
+    return t->decode(t->vram + addr);
 }
 
 /*
@@ -1407,11 +1629,12 @@ static void ati_rage128_tex_combine(uint32_t comb, uint32_t texel,
     for (i = 0; i < 3; i++) {
         switch (fcn) {
         case R128_COMB_DIS:
-        case R128_COMB_COPY_INP:
-            rgb[i] = in[i];
-            break;
         case R128_COMB_COPY:
+            /* C = Ct: the factor alone (Mesa r128_texstate.c's comments) */
             rgb[i] = fc[i];
+            break;
+        case R128_COMB_COPY_INP:
+            rgb[i] = in[i];                     /* C = Cf */
             break;
         case R128_COMB_MODULATE2X:
             rgb[i] = 2.0 * fc[i] * in[i];
@@ -1515,6 +1738,97 @@ static uint32_t ati_rage128_3d_dst_argb(unsigned dt, uint32_t px)
     }
 }
 
+/*
+ * Texture one fragment: sample (with the per-pixel mip choice), apply
+ * the LSB_A kill, and combine into @rgb / @alpha. Returns false when the
+ * fragment is killed. Pulled out of the pixel loop so it can run either
+ * before the depth test (LSB_A: the kill must precede Z) or after it
+ * (everything else: a depth-rejected fragment should not fetch texels).
+ */
+static inline bool ati_rage128_3d_texel(const ATIRage128Tex *texp,
+                                        const ATIRage128Tex *lvl, bool mip,
+                                        uint32_t comb, uint32_t const_color,
+                                        uint32_t tex_cntl,
+                                        double w0, double w1, double w2,
+                                        double dw0, double dw1, double dw2,
+                                        const double *q, const double *sq,
+                                        const double *tq,
+                                        double *rgb, double *alphap,
+                                        uint32_t *texelp)
+{
+    const ATIRage128Tex tex = *texp;
+    double alpha = *alphap;
+    uint32_t texel;
+
+    double qi = w0 * q[0] + w1 * q[1] + w2 * q[2];
+    double si = (w0 * sq[0] + w1 * sq[1] + w2 * sq[2]) / qi;
+    double ti = (w0 * tq[0] + w1 * tq[1] + w2 * tq[2]) / qi;
+    const ATIRage128Tex *tp = &tex;
+
+    if (mip) {
+        /* the same coordinates one pixel to the right */
+        double n0 = w0 + dw0, n1 = w1 + dw1, n2 = w2 + dw2;
+        double qn = n0 * q[0] + n1 * q[1] + n2 * q[2];
+        double ds, dt2, lodf = 0.0;
+        int lod;
+
+        ds = ((n0 * sq[0] + n1 * sq[1] + n2 * sq[2]) / qn - si)
+             * tex.w;
+        dt2 = ((n0 * tq[0] + n1 * tq[1] + n2 * tq[2]) / qn - ti)
+              * tex.h;
+        ds = ds * ds + dt2 * dt2;
+        if (ds > 1.0) {
+            lodf = 0.5 * log2(ds);
+        }
+        if (lodf > (double)tex.levels - 1) {
+            lodf = tex.levels - 1;
+        }
+        lod = (int)lodf;
+        /*
+         * MIPLINEAR and LINEARMIPLINEAR blend the two levels
+         * either side of the fractional level; the others
+         * take the nearer one.
+         */
+        if ((tex.min_blend == R128_MIN_BLEND_MIPLINEAR ||
+             tex.min_blend == R128_MIN_BLEND_LINMIPLINEAR) &&
+            lod + 1 < (int)tex.levels) {
+            unsigned f = (unsigned)((lodf - lod) * 256.0);
+            uint32_t a = ati_rage128_tex_sample(&lvl[lod], si, ti);
+            uint32_t b = ati_rage128_tex_sample(&lvl[lod + 1],
+                                                si, ti);
+            int k2;
+
+            texel = 0;
+            for (k2 = 0; k2 < 4; k2++) {
+                unsigned sh = k2 * 8;
+                unsigned ca = (a >> sh) & 0xff;
+                unsigned cb = (b >> sh) & 0xff;
+
+                texel |= (((ca * (256 - f) + cb * f) >> 8) & 0xff)
+                         << sh;
+            }
+            goto have_texel;
+        }
+        tp = &lvl[(int)(lodf + 0.5) < (int)tex.levels
+                  ? (int)(lodf + 0.5) : (int)tex.levels - 1];
+    }
+    texel = ati_rage128_tex_sample(tp, si, ti);
+have_texel:
+    /*
+     * ALPHA_IN_TEX_LSB_A: the decoded texel alpha's LSB is a
+     * 1-bit coverage flag; 0 kills the fragment before Z or
+     * colour, regardless of ALPHA_TEST_ENABLE/ALPHA_ENABLE.
+     */
+    if ((tex_cntl & R128_ALPHA_IN_TEX) && !(texel >> 24 & 1)) {
+        return false;
+    }
+    ati_rage128_tex_combine(comb, texel, const_color, rgb,
+                            &alpha);
+    *alphap = alpha;
+    *texelp = texel;
+    return true;
+}
+
 void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
 {
     unsigned dt = s->dp_datatype & R128_DP_DST_DATATYPE;
@@ -1527,17 +1841,60 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     uint32_t comb = s->regs[R128_PRIM_TEXTURE_COMBINE_CNTL_C >> 2];
     uint32_t const_color = s->regs[R128_CONSTANT_COLOR_C >> 2];
     uint32_t z_offset = s->regs[R128_Z_OFFSET_C >> 2] & 0xfffffff0;
-    uint32_t z_stride = (s->regs[R128_Z_PITCH_C >> 2] & R128_Z_PITCH_MASK)
-                        * 16;                   /* 8 px units, 16-bit Z */
+    uint32_t z_pitch = s->regs[R128_Z_PITCH_C >> 2] & R128_Z_PITCH_MASK;
+    unsigned z_bypp, z_bits;
+    uint32_t z_max, z_stride;
     bool z_test = tex_cntl & R128_Z_ENABLE;
+    /*
+     * Stencil lives in the top byte of the 32-bit Z word, so it exists
+     * only under Z_PIX_WIDTH_24; the enable bit is checked against that
+     * below, once the depth width is known.
+     */
+    bool stencil = tex_cntl & R128_STENCIL_ENABLE;
+    uint32_t sten_rm = s->regs[R128_STEN_REF_MASK_C >> 2];
+    unsigned sten_ref = (sten_rm >> R128_STEN_REFERENCE_SHIFT) & 0xff;
+    unsigned sten_mask = (sten_rm >> R128_STEN_MASK_SHIFT) & 0xff;
+    unsigned sten_wmask = (sten_rm >> R128_STEN_WRITE_MASK_SHIFT) & 0xff;
+    unsigned sten_func = (zsten & R128_STENCIL_TEST_MASK) >>
+                         R128_STENCIL_TEST_SHIFT;
+    unsigned sten_sfail = (zsten >> R128_STENCIL_SFAIL_SHIFT) &
+                          R128_STENCIL_OP_MASK;
+    unsigned sten_zpass = (zsten >> R128_STENCIL_ZPASS_SHIFT) &
+                          R128_STENCIL_OP_MASK;
+    unsigned sten_zfail = (zsten >> R128_STENCIL_ZFAIL_SHIFT) &
+                          R128_STENCIL_OP_MASK;
     bool z_write = tex_cntl & R128_Z_WRITE_ENABLE;
     bool textured = tex_cntl & R128_TEXMAP_ENABLE;
     bool alpha_test = tex_cntl & R128_ALPHA_TEST_ENABLE;
+    /*
+     * With ALPHA_IN_TEX_LSB_A the texel decides whether the fragment
+     * exists at all, so it must be sampled before the depth test; for
+     * every other draw the depth test goes first and a rejected fragment
+     * costs no texel fetch.
+     */
+    bool kill_first = tex_cntl & R128_ALPHA_IN_TEX;
+    /*
+     * TEX_CNTL_C's ALPHA_ENABLE gates the blender, and the factors are
+     * NOT the control. Both drivers we can read agree: Mesa's
+     * r128UpdateAlphaMode sets the factors only when GL blending is on
+     * and merely clears this bit to turn it off, and Mac OS X's driver
+     * does the same -- traced live through the OpenGL framework, a
+     * glDisable(GL_BLEND) clears the bit and leaves the previous
+     * factors sitting in MISC_3D_STATE_CNTL_REG.
+     *
+     * Treating the factors as the control instead blends draws that
+     * asked for none: an untextured overlap came out red+green where
+     * the reference renderer gives green, and Chessmaster 9000's
+     * dominant textured draw (ALPHA_ENABLE clear, stale
+     * SRCALPHA/INVSRCALPHA) blended itself into the cleared background.
+     */
     bool blend = tex_cntl & R128_ALPHA_ENABLE;
     unsigned src_factor = (misc >> R128_ALPHA_BLEND_SRC_SHIFT) &
                           R128_ALPHA_BLEND_MASK;
     unsigned dst_factor = (misc >> R128_ALPHA_BLEND_DST_SHIFT) &
                           R128_ALPHA_BLEND_MASK;
+    unsigned comb_fcn = (misc >> R128_ALPHA_COMB_FCN_SHIFT) &
+                        R128_ALPHA_COMB_FCN_MASK;
     ATIRage128Tex tex;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     unsigned bypp = bpp / 8;
@@ -1547,11 +1904,19 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     ATIRage128Vertex v[3];
     double x[3], y[3], z[3], r[3], g[3], b[3], a[3];
     double q[3], sq[3], tq[3];                  /* 1/w, s/w, t/w */
+    double fg[3], fog_r = 0, fog_g = 0, fog_b = 0;
+    double sr[3], sg[3], sb[3];
+    bool specular;
+    bool fogged;
     double area, bx0, bx1, by0, by1;
     /* edge i runs vertex (i+1)%3 -> (i+2)%3; w_i is vertex i's weight */
     double ea[3], eb[3];
+    double dw0 = 0, dw1 = 0, dw2 = 0;   /* barycentric step per pixel in x */
     bool tl[3];
     int sc_left, sc_top, sc_right, sc_bottom;
+    uint32_t texel;
+    ATIRage128Tex lvl[11];
+    bool mip = false;
     int minx, maxx, miny, maxy, px, py, i;
 
     if (dt != 3 && dt != 4 && dt != 6) {
@@ -1562,21 +1927,72 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     if (!dst_stride || dst_offset >= ATI_RAGE128_VRAM_SIZE) {
         return;
     }
-    if ((z_test || z_write) &&
-        (zsten & R128_Z_PIX_WIDTH_MASK) != R128_Z_PIX_WIDTH_16) {
-        /* only the 16-bit Z buffer the corpus uses is modeled */
+    /*
+     * Z pixel width: 16-bit in a halfword, 24- and 32-bit in a word (the
+     * 24-bit form leaves the top byte to the stencil, which is not
+     * modelled, so a write preserves it). Mac OS 9's RAVE driver picks
+     * 16-bit, Mac OS X's OpenGL driver 24-bit.
+     */
+    switch (zsten & R128_Z_PIX_WIDTH_MASK) {
+    case R128_Z_PIX_WIDTH_16:
+        z_bits = 16;
+        z_bypp = 2;
+        z_max = 0xffff;
+        break;
+    case R128_Z_PIX_WIDTH_24:
+        z_bits = 32;
+        z_bypp = 4;
+        z_max = 0xffffff;
+        break;
+    case R128_Z_PIX_WIDTH_32:
+        z_bits = 32;
+        z_bypp = 4;
+        z_max = 0xffffffff;
+        break;
+    default:
         trace_ati_rage128_3d_unsupported("z pix width", zsten);
+        z_bits = 16;
+        z_bypp = 2;
+        z_max = 0xffff;
         z_test = z_write = false;
+        break;
     }
-    if ((z_test || z_write) && !z_stride) {
-        z_test = z_write = false;
+    if (z_bits != 32 || z_max != 0x00ffffff) {
+        stencil = false;                        /* no stencil byte */
+    }
+    z_stride = z_pitch * 8 * z_bypp;            /* pitch is in 8-px units */
+    if ((z_test || z_write || stencil) && !z_stride) {
+        z_test = z_write = stencil = false;
     }
     if (textured && !ati_rage128_tex_setup(s, &tex)) {
         textured = false;                       /* traced; draw Gouraud */
     }
-    if (blend && src_factor == R128_ALPHA_BLEND_ONE &&
+    if (src_factor == R128_ALPHA_BLEND_ONE &&
         dst_factor == R128_ALPHA_BLEND_ZERO) {
-        blend = false;                          /* identity */
+        blend = false;                          /* pass-through */
+    }
+
+    /*
+     * SPEC_LIGHT_ENABLE: the secondary (specular) colour the vertex
+     * carries in SPEC_BGR is added to the fragment after texturing and
+     * before fog -- OpenGL's GL_SEPARATE_SPECULAR_COLOR. Neither the
+     * RRG nor the busmaster supplement describes the field beyond its
+     * name, and Mesa never sets it (r128_state.c falls back to software
+     * for separate specular), but Mac OS X's driver leans on it:
+     * decoding cm19.log's 54,062 state changes, Chessmaster 9000 sets
+     * bit 11 on 81.9% of its draws and 90% of its vertices arrive as
+     * vc_format 0x97, which carries SPEC_BGR. Dropping it renders every
+     * lit surface flat.
+     */
+    specular = tex_cntl & R128_SPEC_LIGHT_ENABLE;
+
+    fogged = tex_cntl & R128_FOG_ENABLE;
+    if (fogged) {
+        uint32_t fc = s->regs[R128_FOG_COLOR_C >> 2];
+
+        fog_r = ((fc >> 16) & 0xff) / 255.0;
+        fog_g = ((fc >> 8) & 0xff) / 255.0;
+        fog_b = (fc & 0xff) / 255.0;
     }
 
     v[0] = vin[0];
@@ -1600,6 +2016,25 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         v[2] = t;
         area = -area;
     }
+    if (textured && tex.levels > 1) {
+        /*
+         * Build the level table once; the level itself is chosen per
+         * pixel below, from how far the texture coordinates move
+         * between neighbouring pixels. Mac OS X's driver fills only the
+         * levels a minified draw can reach and leaves a big texture's
+         * base level unwritten, so picking one level for a whole
+         * triangle lands on the empty one wherever the triangle spans a
+         * range of depths -- which on a board seen in perspective is
+         * every triangle.
+         */
+        unsigned k;
+
+        for (k = 0; k < tex.levels; k++) {
+            ati_rage128_tex_level(s, &lvl[k], &tex, k);
+            lvl[k].linear = tex.min_blend >= R128_MIN_BLEND_LINMIPNEAREST;
+        }
+        mip = true;
+    }
     for (i = 0; i < 3; i++) {
         x[i] = v[i].x;
         y[i] = v[i].y;
@@ -1609,17 +2044,33 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         b[i] = ati_rage128_3d_csan(v[i].b);
         a[i] = ati_rage128_3d_csan(v[i].a);
         q[i] = v[i].rhw;
+        /*
+         * SPEC_F, the setup engine's fog factor: 1 leaves the pixel
+         * alone, 0 replaces it with FOG_COLOR_C. Nanosaur sends 1 near
+         * the camera and ~0.2 at the far plane, and clears the frame to
+         * the fog colour, so without this its distance haze is a hard
+         * edge between terrain and a flat block of colour.
+         */
+        fg[i] = ati_rage128_3d_csan(v[i].fog);
+        fg[i] = fg[i] < 0.0 ? 0.0 : fg[i] > 1.0 ? 1.0 : fg[i];
+        sr[i] = ati_rage128_3d_csan(v[i].sr);
+        sg[i] = ati_rage128_3d_csan(v[i].sg);
+        sb[i] = ati_rage128_3d_csan(v[i].sb);
     }
     /*
      * Perspective-correct s/t: interpolate s/w, t/w and 1/w linearly
-     * in screen space and divide per pixel. A vertex without a usable
-     * 1/w (absent from the format, non-positive, non-finite) or the
-     * unit's PERSPECTIVE_DISABLE drops the triangle to affine (all
+     * in screen space and divide per pixel. With SETUP_CNTL's
+     * TEXTURE_ST_DIRECT the vertex s,t already are s/w and t/w (Mac OS
+     * RAVE); otherwise they are multiplied by 1/w here. A vertex without
+     * a usable 1/w (absent from the format, non-positive, non-finite) or
+     * the unit's PERSPECTIVE_DISABLE drops the triangle to affine (all
      * weights 1).
      */
     if (textured) {
         bool affine = s->regs[R128_PRIM_TEX_CNTL_C >> 2] &
                       R128_TEX_PERSPECTIVE_DISABLE;
+        bool direct = s->regs[R128_SETUP_CNTL >> 2] &
+                      R128_TEXTURE_ST_DIRECT;
 
         for (i = 0; i < 3; i++) {
             if (!isfinite(q[i]) || q[i] <= 0.0) {
@@ -1627,11 +2078,14 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             }
         }
         for (i = 0; i < 3; i++) {
+            double k = direct ? 1.0 : q[i];
+
             if (affine) {
                 q[i] = 1.0;
+                k = 1.0;
             }
-            sq[i] = ati_rage128_3d_csan(v[i].s) * q[i];
-            tq[i] = ati_rage128_3d_csan(v[i].t) * q[i];
+            sq[i] = ati_rage128_3d_csan(v[i].s) * k;
+            tq[i] = ati_rage128_3d_csan(v[i].t) * k;
         }
     }
     for (i = 0; i < 3; i++) {
@@ -1640,6 +2094,13 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
 
         ea[i] = -(yb - ya);
         eb[i] = xb - xa;
+        if (i == 0) {
+            dw0 = ea[0] / area;
+        } else if (i == 1) {
+            dw1 = ea[1] / area;
+        } else {
+            dw2 = ea[2] / area;
+        }
         /*
          * Top-left fill rule so a shared edge paints exactly once. In
          * this y-down, positive-area winding a "top" edge is horizontal
@@ -1682,6 +2143,10 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
     pixmask = bpp >= 32 ? 0xffffffffu : (1u << bpp) - 1;
     wmask = s->dp_write_mask & pixmask;
 
+    trace_ati_rage128_3d_state(tex_cntl, misc,
+                               s->regs[R128_PRIM_TEXTURE_COMBINE_CNTL_C >> 2],
+                               s->regs[R128_PRIM_TEX_CNTL_C >> 2],
+                               blend, textured);
     trace_ati_rage128_3d_tri((int)x[0], (int)y[0], (int)x[1], (int)y[1],
                              (int)x[2], (int)y[2],
                              ati_rage128_3d_col8(a[0]) << 24 |
@@ -1693,12 +2158,42 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
         double sy = py + 0.5;
         uint32_t drow = dst_offset + (uint32_t)py * dst_stride;
         uint32_t zrow = z_offset + (uint32_t)py * z_stride;
+        int rowlo = minx, rowhi = maxx;
 
-        for (px = minx; px <= maxx; px++) {
+        /*
+         * The row's span, from each edge's zero crossing along it. Only
+         * pixels this excludes are skipped -- inside the span every pixel
+         * takes the same edge test as before, so what is painted does not
+         * change. Widened by one pixel each side to stay clear of the
+         * boundary case the solve itself could round the wrong way.
+         */
+        for (i = 0; i < 3; i++) {
+            double wx0 = ea[i] * (rowlo + 0.5 - x[(i + 1) % 3]) +
+                         eb[i] * (sy - y[(i + 1) % 3]);
+
+            if (ea[i] > 0.0) {
+                if (wx0 < 0.0) {
+                    rowlo += (int)(-wx0 / ea[i]);
+                }
+            } else if (ea[i] < 0.0) {
+                if (wx0 >= 0.0) {
+                    rowhi = MIN(rowhi, rowlo + (int)(wx0 / -ea[i]) + 1);
+                } else {
+                    rowhi = rowlo - 1;      /* outside at the row's start */
+                }
+            } else if (wx0 < 0.0) {
+                rowhi = rowlo - 1;          /* edge constant along the row */
+            }
+            rowlo = MAX(rowlo, minx);
+        }
+        rowlo = MAX(rowlo - 1, minx);
+        rowhi = MIN(rowhi + 1, maxx);
+
+        for (px = rowlo; px <= rowhi; px++) {
             double sx = px + 0.5;
             double w[3], w0, w1, w2, zd;
             double rgb[3], alpha;
-            unsigned r8, g8, b8, a8;
+            unsigned r8, g8, b8, a8, vtx_a8;
             uint32_t pix, daddr = drow + (uint32_t)px * bypp;
 
             for (i = 0; i < 3; i++) {
@@ -1714,72 +2209,89 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
             w1 = w[1] / area;
             w2 = w[2] / area;
 
-            if (z_test || z_write) {
-                unsigned z16;
-
-                zd = w0 * z[0] + w1 * z[1] + w2 * z[2];
-                z16 = zd <= 0.0 ? 0 : zd >= 1.0 ? 65535
-                      : (unsigned)(zd * 65535.0 + 0.5);
-                if (z_test) {
-                    /*
-                     * an out-of-VRAM Z address reads back 0 (and the
-                     * write below is dropped): safe, deterministic
-                     */
-                    uint32_t zold = ati_rage128_vram_ld(vram, zrow +
-                                                        (uint32_t)px * 2, 16);
-                    bool pass;
-
-                    switch (zsten & R128_Z_TEST_MASK) {
-                    case R128_Z_TEST_NEVER:
-                        pass = false;
-                        break;
-                    case R128_Z_TEST_LESS:
-                        pass = z16 < zold;
-                        break;
-                    case R128_Z_TEST_LESSEQUAL:
-                        pass = z16 <= zold;
-                        break;
-                    case R128_Z_TEST_EQUAL:
-                        pass = z16 == zold;
-                        break;
-                    case R128_Z_TEST_GREATEREQUAL:
-                        pass = z16 >= zold;
-                        break;
-                    case R128_Z_TEST_GREATER:
-                        pass = z16 > zold;
-                        break;
-                    case R128_Z_TEST_NEQUAL:
-                        pass = z16 != zold;
-                        break;
-                    default:                    /* R128_Z_TEST_ALWAYS */
-                        pass = true;
-                        break;
-                    }
-                    if (!pass) {
-                        continue;
-                    }
-                }
-                if (z_write) {
-                    uint32_t zaddr = zrow + (uint32_t)px * 2;
-
-                    if (ati_rage128_vram_st(vram, zaddr, 16, z16)) {
-                        ati_rage128_span_add(&zspan, zaddr, 2);
-                    }
-                }
-            }
-
             rgb[0] = w0 * r[0] + w1 * r[1] + w2 * r[2];
             rgb[1] = w0 * g[0] + w1 * g[1] + w2 * g[2];
             rgb[2] = w0 * b[0] + w1 * b[1] + w2 * b[2];
             alpha = w0 * a[0] + w1 * a[1] + w2 * a[2];
-            if (textured) {
-                double qi = w0 * q[0] + w1 * q[1] + w2 * q[2];
-                double si = (w0 * sq[0] + w1 * sq[1] + w2 * sq[2]) / qi;
-                double ti = (w0 * tq[0] + w1 * tq[1] + w2 * tq[2]) / qi;
+            vtx_a8 = ati_rage128_3d_col8(alpha);
+            texel = 0;
+            if (textured && kill_first &&
+                !ati_rage128_3d_texel(&tex, lvl, mip, comb, const_color,
+                                      tex_cntl, w0, w1, w2, dw0, dw1, dw2,
+                                      q, sq, tq, rgb, &alpha, &texel)) {
+                continue;
+            }
 
-                ati_rage128_tex_combine(comb,
-                                        ati_rage128_tex_sample(&tex, si, ti),
-                                        const_color, rgb, &alpha);
+            if (z_test || z_write || stencil) {
+                uint32_t zval, zaddr = zrow + (uint32_t)px * z_bypp;
+
+                zd = w0 * z[0] + w1 * z[1] + w2 * z[2];
+                zval = zd <= 0.0 ? 0 : zd >= 1.0 ? z_max
+                       : (uint32_t)(zd * (double)z_max + 0.5);
+                /*
+                 * an out-of-VRAM Z address reads back 0 (and the write
+                 * below is dropped): safe, deterministic
+                 */
+                uint32_t zraw = ati_rage128_vram_ld(vram, zaddr, z_bits);
+                uint32_t zout = zraw;
+                bool zpass = true, spass = true;
+                unsigned sold = (zraw >> 24) & 0xff;
+
+                /*
+                 * Stencil is tested BEFORE depth, and its operation is
+                 * applied whether or not the fragment survives -- a
+                 * mask-building pass draws nothing and exists only for
+                 * this side effect.
+                 */
+                if (stencil) {
+                    spass = ati_rage128_3d_cmp(sten_func,
+                                               sten_ref & sten_mask,
+                                               sold & sten_mask);
+                }
+                if (z_test) {
+                    zpass = ati_rage128_3d_cmp((zsten & R128_Z_TEST_MASK) >> 4,
+                                               zval, zraw & z_max);
+                }
+                if (stencil) {
+                    unsigned op = !spass ? sten_sfail
+                                  : zpass ? sten_zpass : sten_zfail;
+                    unsigned snew = ati_rage128_stencil_op(op, sold, sten_ref);
+
+                    snew = (sold & ~sten_wmask) | (snew & sten_wmask);
+                    zout = (zout & 0x00ffffff) | (snew & 0xff) << 24;
+                }
+                if (z_write && spass && zpass) {
+                    zout = (zout & ~z_max) | (zval & z_max);
+                }
+                if (zout != zraw &&
+                    ati_rage128_vram_st(vram, zaddr, z_bits, zout)) {
+                    ati_rage128_span_add(&zspan, zaddr, z_bypp);
+                }
+                if (!spass || !zpass) {
+                    continue;
+                }
+            }
+            if (textured && !kill_first &&
+                !ati_rage128_3d_texel(&tex, lvl, mip, comb, const_color,
+                                      tex_cntl, w0, w1, w2, dw0, dw1, dw2,
+                                      q, sq, tq, rgb, &alpha, &texel)) {
+                continue;
+            }
+            if (specular) {
+                /* the sum is clamped before fog, as GL specifies */
+                rgb[0] = MIN(rgb[0] + w0 * sr[0] + w1 * sr[1] + w2 * sr[2],
+                             1.0);
+                rgb[1] = MIN(rgb[1] + w0 * sg[0] + w1 * sg[1] + w2 * sg[2],
+                             1.0);
+                rgb[2] = MIN(rgb[2] + w0 * sb[0] + w1 * sb[1] + w2 * sb[2],
+                             1.0);
+            }
+            if (fogged) {
+                double fi = w0 * fg[0] + w1 * fg[1] + w2 * fg[2];
+
+                rgb[0] = fi * rgb[0] + (1.0 - fi) * fog_r;
+                rgb[1] = fi * rgb[1] + (1.0 - fi) * fog_g;
+                rgb[2] = fi * rgb[2] + (1.0 - fi) * fog_b;
             }
             r8 = ati_rage128_3d_col8(rgb[0]);
             g8 = ati_rage128_3d_col8(rgb[1]);
@@ -1797,20 +2309,33 @@ void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *vin)
                 uint32_t dst = ati_rage128_3d_dst_argb(dt,
                                    ati_rage128_vram_ld(vram, daddr, bpp));
                 unsigned sc[4] = { b8, g8, r8, a8 };
+                /*
+                 * The texture unit's alpha function decides what the
+                 * blender's source alpha is. Mac OS 9's RAVE driver
+                 * writes MODULATE and leaves ALPHA_IN_TEX clear for
+                 * opaque geometry, whose textures carry a zero alpha
+                 * channel; Mac OS X's OpenGL driver writes COPY, where
+                 * the texel's alpha stands on its own -- reading the
+                 * vertex alpha there painted Chessmaster 9000's 3D board
+                 * with a zero source alpha, so every triangle blended
+                 * away to the cleared background.
+                 */
+                unsigned sa = ati_rage128_3d_src_alpha(comb, tex_cntl,
+                                                       textured,
+                                                       texel >> 24, vtx_a8);
                 unsigned oc[4];
                 int k, shift;
 
                 for (k = 0, shift = 0; k < 4; k++, shift += 8) {
                     int dc = (dst >> shift) & 0xff;
-                    int val = ((int)sc[k] *
-                               ati_rage128_blend_factor(src_factor, sc[k],
-                                                        a8, dc, dst >> 24) +
-                               dc *
-                               ati_rage128_blend_factor(dst_factor, sc[k],
-                                                        a8, dc, dst >> 24) +
-                               127) / 255;
+                    int sv = (int)sc[k] *
+                             ati_rage128_blend_factor(src_factor, sc[k],
+                                                      sa, dc, dst >> 24);
+                    int dv = dc *
+                             ati_rage128_blend_factor(dst_factor, sc[k],
+                                                      sa, dc, dst >> 24);
 
-                    oc[k] = MIN(val, 255);
+                    oc[k] = ati_rage128_blend_comb(comb_fcn, sv, dv);
                 }
                 b8 = oc[0];
                 g8 = oc[1];

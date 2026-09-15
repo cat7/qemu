@@ -448,6 +448,34 @@
 #define R128_Z_TEST_NEQUAL           (6 << 4)
 #define R128_Z_TEST_ALWAYS           (7 << 4)
 #define R128_Z_TEST_MASK             (7 << 4)
+/*
+ * Stencil, all in Z_STEN_CNTL_C beside the depth fields (r128_reg.h
+ * 1204-1229). The comparison codes are the same eight as Z_TEST, so
+ * both tests share one comparator. The three operation fields pick what
+ * happens to the stencil value on stencil-fail, depth-pass and
+ * depth-fail. Mesa never programs any of this -- it has no stencil
+ * support for the r128 -- but Mac OS X's driver does: Chessmaster 9000
+ * runs an ALWAYS/DECR pass that writes no colour to build a mask and
+ * then an EQUAL pass that paints through it, together 35% of its draws.
+ * The buffer is the top byte of the 32-bit Z word, so stencil exists
+ * only under Z_PIX_WIDTH_24.
+ */
+#define R128_STENCIL_TEST_SHIFT      12
+#define R128_STENCIL_TEST_MASK       (7 << 12)
+#define R128_STENCIL_SFAIL_SHIFT     16
+#define R128_STENCIL_ZPASS_SHIFT     20
+#define R128_STENCIL_ZFAIL_SHIFT     24
+#define R128_STENCIL_OP_MASK         7
+#define R128_STENCIL_OP_KEEP         0
+#define R128_STENCIL_OP_ZERO         1
+#define R128_STENCIL_OP_REPLACE      2
+#define R128_STENCIL_OP_INC          3
+#define R128_STENCIL_OP_DEC          4
+#define R128_STENCIL_OP_INV          5
+/* STEN_REF_MASK_C: reference 7:0, compare mask 23:16, write mask 31:24 */
+#define R128_STEN_REFERENCE_SHIFT    0
+#define R128_STEN_MASK_SHIFT         16
+#define R128_STEN_WRITE_MASK_SHIFT   24
 /* Z_PITCH_C: pitch in units of 8 pixels, low 12 bits (bit 16 = tiling) */
 #define R128_Z_PITCH_MASK            0x00000fff
 /*
@@ -463,11 +491,14 @@
 #define R128_Z_ENABLE                (1 << 0)
 #define R128_Z_WRITE_ENABLE          (1 << 1)
 #define R128_TEXMAP_ENABLE           (1 << 4)
+#define R128_STENCIL_ENABLE          (1 << 3)
 #define R128_SEC_TEXMAP_ENABLE       (1 << 5)
 #define R128_FOG_ENABLE              (1 << 7)
 #define R128_DITHER_ENABLE           (1 << 8)
 #define R128_ALPHA_ENABLE            (1 << 9)
+#define R128_ALPHA_IN_TEX            (1 << 13)  /* LSB_A: 1-bit texel alpha, alpha-0 texels are killed */
 #define R128_ALPHA_TEST_ENABLE       (1 << 10)
+#define R128_SPEC_LIGHT_ENABLE       (1 << 11)  /* add the secondary colour */
 /*
  * Alpha test function (r128_reg.h 1139-1147, listed under SCALE_3D_CNTL
  * with the note that MISC_3D_STATE_CNTL_REG bits 26:16 carry the same
@@ -496,7 +527,21 @@
  * the Pro driver writes 3 there -- bit 4 is taken as "linear" and the
  * rest of the field ignored.
  */
+#define R128_MIN_BLEND_SHIFT         1
 #define R128_MIN_BLEND_MASK          (7 << 1)
+/*
+ * MIN_BLEND, the minification filter (r128_reg.h 1280-1286). The name's
+ * first half is the filter within a level, the second between levels:
+ * MIPNEAREST is nearest/nearest, MIPLINEAR nearest within and linear
+ * between, LINEARMIPNEAREST the reverse, LINEARMIPLINEAR both --
+ * trilinear, which is what Mac OS X's OpenGL driver asks for.
+ */
+#define R128_MIN_BLEND_NEAREST       0
+#define R128_MIN_BLEND_LINEAR_       1
+#define R128_MIN_BLEND_MIPNEAREST    2
+#define R128_MIN_BLEND_MIPLINEAR     3
+#define R128_MIN_BLEND_LINMIPNEAREST 4
+#define R128_MIN_BLEND_LINMIPLINEAR  5
 #define R128_MAG_BLEND_LINEAR        (1 << 4)
 #define R128_MAG_BLEND_MASK          (7 << 4)
 #define R128_MIP_MAP_DISABLE         (1 << 7)
@@ -549,8 +594,19 @@
 #define R128_INPUT_FACTOR_CONST_ALPHA 3
 #define R128_INPUT_FACTOR_INT_COLOR  4
 #define R128_INPUT_FACTOR_INT_ALPHA  5
+/*
+ * PRIM_TEXTURE_COMBINE_CNTL_C's alpha function (r128_reg.h 1338-1352)
+ * decides what the unit's alpha output is, and so what the blender takes
+ * as its source alpha. DIS leaves the vertex alpha alone, COPY takes the
+ * alpha factor (normally the texel's), MODULATE multiplies the two.
+ * Mac OS 9's RAVE driver writes MODULATE, Mac OS X's OpenGL driver COPY.
+ */
 #define R128_COMB_ALPHA_SHIFT        14
 #define R128_COMB_ALPHA_MASK         15
+#define R128_COMB_ALPHA_DIS          0
+#define R128_COMB_ALPHA_COPY         1
+#define R128_COMB_ALPHA_COPY_INP     2
+#define R128_COMB_ALPHA_MODULATE     3
 #define R128_ALPHA_FACTOR_SHIFT      18
 #define R128_ALPHA_FACTOR_MASK       15
 #define R128_ALPHA_FACTOR_TEX_ALPHA  6
@@ -670,20 +726,32 @@
 #define R128_ROP3_WHITENESS          0x00ff0000
 
 /*
- * GUI bus mastering (RRG-G04500-C 3.34 "GUI Bus Mastering Registers" is
- * a stub in the manual itself -- literally "<No description>" with no
- * register table, confirmed against the actual PDF page, not a text
- * extraction gap). Only BM_QUEUE_FREE_STATUS (0xA14), BM_ABORT (0xA88)
- * and the BM_CHUNK_0_VAL name (revision-history mention only) are
- * documented anywhere in it, and this smoke test doesn't touch any of
- * them. BM_GUI_TABLE's offset and the descriptor format are
- * reverse-engineered from a live capture of the real OEM Mac FCode's
- * post-CRTC-bringup bus-master smoke test (2026-08-02): it writes an 8
- * byte sentinel to system RAM, points a one-entry descriptor table at
- * it via this register, then reads back GUI_SCRATCH_REG0/1 expecting
- * the sentinel to have landed there -- see ati_rage128_bm_gui_run().
+ * GUI bus mastering. RRG-G04500-C 3.34 is a stub in the manual itself
+ * ("<No description>"); the block is specified in the "Rage 128 VR/GL
+ * Register Reference Supplement" (1999), "Rage 128 Bus Master
+ * Registers".
+ *
+ * Each channel -- GUI, the four VIP buffers, video capture -- is armed
+ * by one register holding {trigger 3:0, table address 31:4}. The table
+ * is a list of 16-byte descriptors: frame-buffer offset, system memory
+ * address, command, reserved. BM_GUI is 0x0a80; 0x0a50 is VIP buffer
+ * 3, and reading it as the GUI trigger made Mac OS X's writes walk a
+ * descriptor list that was never one.
  */
-#define R128_BM_GUI_TABLE            0x0a50
+#define R128_BM_FRAME_BUF_OFFSET     0x0a00
+#define R128_BM_SYSTEM_MEM_ADDR      0x0a04
+#define R128_BM_COMMAND              0x0a08
+#define R128_BM_QUEUE_STATUS         0x0a10
+#define R128_BM_VIP3_BUF             0x0a50
+#define R128_BM_GUI                  0x0a80
+#define R128_BM_ABORT                0x0a88
+/* BM_COMMAND fields */
+#define R128_BM_BYTE_COUNT_MASK      0x1fffff   /* [20:0] */
+#define R128_BM_TRANSFER_DEST_REGS   (1u << 28)
+#define R128_BM_FRAME_OFFSET_HOLD    (1u << 30)
+#define R128_BM_END_OF_LIST          (1u << 31)
+/* BM_GUI fields */
+#define R128_BM_TABLE_ADDR_MASK      0xfffffff0u
 #define R128_BM_CHUNK_0_VAL          0x0a18
 
 /* PCI config space read-only mirror */
@@ -810,6 +878,7 @@
 /* GUI_STAT */
 #define R128_GUI_FIFOCNT_MASK        0xfff      /* [11:0], default 0x40 free */
 #define R128_GUI_ACTIVE              (1u << 31)
+#define R128_PM4_BUSY                (1u << 16) /* PM4_STAT */
 
 /* I2C_CNTL_0 (undocumented; XFree86 r128_reg.h layout) */
 #define R128_I2C_DONE                (1 << 0)
@@ -905,6 +974,8 @@
  * register written, as for the mach64's scaler). Captured live from
  * OS X 10.3 on 2026-08-18. Bit layouts as in xf86-video-r128's
  * r128_reg.h; the RRG lists these registers but documents no fields.
+ * The same path carries OS X 10.4's QuickTime video: 4:2:2 frames from
+ * VRAM to the front buffer, with TEX_CNTL's ALPHA_ENABLE clear.
  */
 #define R128_SCALE_SRC_HEIGHT_WIDTH   0x1994
 #define R128_SCALE_OFFSET_0           0x1998
@@ -928,6 +999,20 @@
 #define R128_ALPHA_BLEND_SRC_SHIFT    16
 #define R128_ALPHA_BLEND_DST_SHIFT    20
 #define R128_ALPHA_BLEND_MASK         0xf
+/*
+ * How the two weighted terms are combined (r128_reg.h 1112-1116, same
+ * bits in SCALE_3D_CNTL and MISC_3D_STATE_CNTL_REG). Mesa's
+ * r128UpdateAlphaMode maps GL_FUNC_ADD to ADD_CLAMP and
+ * GL_FUNC_SUBTRACT to SUB_SRC_DST_CLAMP; NCLAMP keeps the low 8 bits
+ * instead of saturating. 0 is the reset value, so a guest that never
+ * writes the field gets the clamped add.
+ */
+#define R128_ALPHA_COMB_FCN_SHIFT     12
+#define R128_ALPHA_COMB_FCN_MASK      0x3
+#define R128_ALPHA_COMB_ADD_CLAMP     0
+#define R128_ALPHA_COMB_ADD_NCLAMP    1
+#define R128_ALPHA_COMB_SUB_CLAMP     2
+#define R128_ALPHA_COMB_SUB_NCLAMP    3
 #define R128_ALPHA_BLEND_ZERO         0
 #define R128_ALPHA_BLEND_ONE          1
 #define R128_ALPHA_BLEND_SRCCOLOR     2
@@ -963,6 +1048,7 @@
 #define R128_FLUSH_7                  0x171c
 #define R128_PC_GUI_CTLSTAT           0x1748
 #define R128_SETUP_CNTL               0x1bc4
+#define R128_TEXTURE_ST_DIRECT        (1u << 9)   /* s,t are s/w, t/w */
 #define R128_WINDOW_XY_OFFSET         0x1bcc
 #define R128_DRAW_LINE_POINT          0x1bd0
 #define R128_SETUP_CNTL_PM4           0x1bd4
@@ -1001,6 +1087,9 @@
 #define R128_VC_CNTL_PRIM_TYPE_TRI_STRIP 6
 #define R128_VC_CNTL_PRIM_WALK_MASK   0x00000030
 #define R128_VC_CNTL_PRIM_WALK_SHIFT  4
+#define R128_VC_CNTL_PRIM_WALK_IND    1   /* indices follow in the packet */
+#define R128_VC_CNTL_PRIM_WALK_LIST   2   /* vertices in order from the buffer */
+#define R128_VC_CNTL_PRIM_WALK_RING   3   /* vertices inline (GEN_PRIM) */
 #define R128_VC_CNTL_NUM_SHIFT        16
 
 #endif /* ATI_RAGE128_REGS_H */

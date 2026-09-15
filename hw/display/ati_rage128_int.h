@@ -97,6 +97,8 @@ typedef struct ATIRage128Vertex {
     float rhw;               /* 1/w, 1.0 when the format carries none */
     float b, g, r, a;
     float s, t;              /* primary texture coordinates, 0 if absent */
+    float fog;               /* SPEC_F: 1 = unfogged, 0 = the fog colour */
+    float sb, sg, sr;        /* SPEC_BGR: the secondary colour, 0 if absent */
 } ATIRage128Vertex;
 
 #define R128_HOSTDATA_HDR_MAX   (1 + 5 + 5)
@@ -135,11 +137,44 @@ typedef struct ATIRage128Mode {
     uint32_t pix_width;  /* raw CRTC_PIX_WIDTH field, for draw dispatch */
 } ATIRage128Mode;
 
+#define ATI_RAGE128_JOB_QUEUE 64
+#define ATI_RAGE128_FIFO_BATCH 4096   /* dwords */
+
+typedef struct ATIRage128Job {
+    int job;
+    uint32_t a, b;
+} ATIRage128Job;
+
 struct ATIRage128State {
     PCIDevice parent_obj;
 
     MemoryRegion aper;        /* BAR0: 64MB aperture container */
     MemoryRegion vram;        /* 16MB of real VRAM at aperture offset 0 */
+    uint8_t *vram_ptr;        /* host pointer to vram, fixed after realize */
+    uint32_t dirty_lo;        /* VRAM range drawn by the engine, not yet */
+    uint32_t dirty_hi;        /* marked dirty; see ati_rage128_2d_flush_dirty */
+    /* Engine work running without the BQL; see ati_rage128_engine_enter. */
+    QemuEvent engine_idle;
+    bool engine_busy;
+    bool engine_sync;
+    bool irq_deferred;
+    bool cursor_deferred;
+    /* Asynchronous jobs; see ati_rage128_engine_submit. */
+    QemuThread engine_thread;
+    QemuMutex engine_lock;
+    QemuCond engine_cond;
+    QemuEvent engine_done;
+    QEMUBH *engine_bh;
+    ATIRage128Job engine_queue[ATI_RAGE128_JOB_QUEUE];
+    uint64_t engine_jobs_submitted;   /* BQL + engine_lock */
+    uint64_t engine_jobs_done;        /* worker, atomic */
+    uint64_t engine_jobs_retired;     /* BQL */
+    bool engine_quit;
+    OnOffAuto engine_async;
+    /* FIFO dwords written behind queued jobs; see ati_rage128_fifo_stage. */
+    uint32_t *fifo_stage;             /* BQL */
+    uint32_t fifo_stage_n;            /* BQL */
+    uint32_t *fifo_batch;             /* one batch per queue slot */
     MemoryRegion vram_aper1;  /* alias of VRAM in the aperture's top half */
     MemoryRegion mmio;        /* BAR2: 16KB register file */
     MemoryRegion io;          /* BAR1: 256-byte I/O register window */
@@ -320,6 +355,8 @@ struct ATIRage128State {
      */
     ATIRage128PM4Parser pm4_fifo;
 
+    bool bm_running;      /* GUI bus master walking a table */
+
     /*
      * 2D GUI (destination datapath) engine state -- ported from the
      * real upstream `ati-vga` device (hw/display/ati.c/ati_2d.c), not
@@ -492,6 +529,7 @@ void ati_rage128_audit_reg_write(ATIRage128State *s, uint32_t base);
 
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
+void ati_rage128_2d_flush_dirty(ATIRage128State *s);
 void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *v);
 void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt);
 void ati_rage128_2d_scale_regs(ATIRage128State *s);

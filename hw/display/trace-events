@@ -200,6 +200,12 @@ ati_rage128_monid_wr(int64_t ns, uint32_t val, int scl, int sda_in, int sda_out)
 ati_rage128_amcgpio(int64_t ns, uint32_t tag, uint32_t a, uint32_t en, uint32_t val) "t=%"PRId64" AMCGPIO %c A=0x%08x EN=0x%08x val=0x%08x"
 ati_rage128_monidb(int64_t ns, uint32_t raw, uint32_t y) "t=%"PRId64" GPIO_MONIDB probe raw=0x%08x -> Y=0x%x"
 ati_rage128_monidb_wr(int64_t ns, uint32_t val) "t=%"PRId64" GPIO_MONIDB write val=0x%08x"
+ati_rage128_engine_submit(int job, uint32_t a, uint32_t b) "job %d 0x%x 0x%x"
+ati_rage128_engine_retire(void) ""
+ati_rage128_engine_drain(uint32_t reg, int write, int64_t us) "reg 0x%04x write %d waited %" PRId64 " us"
+ati_rage128_pm4_reg_blocked(uint32_t reg, const char *name, uint32_t val) "packet register write blocked: 0x%04x %s <- 0x%08x"
+ati_rage128_3d_state(uint32_t tex_cntl, uint32_t misc, uint32_t comb, uint32_t prim_tex, int blend, int textured) "tex_cntl=0x%08x misc=0x%08x comb=0x%08x prim_tex=0x%08x blend=%d textured=%d"
+ati_rage128_3d_lod(int lod, unsigned levels, unsigned w, unsigned h, uint32_t base) "mip level %d of %u -> %ux%u at 0x%x"
 
 # ati_mach64.c
 ati_mach64_host_cursor_evt(int64_t now_ns, int kind, int axis, int value, int x, int y) "now=%" PRId64 " kind=%d axis=%d value=%d -> (%d,%d)"

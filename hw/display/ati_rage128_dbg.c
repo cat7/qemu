@@ -158,7 +158,8 @@ const char *ati_rage128_reg_name(uint32_t base)
     case R128_GUI_STAT:              return "GUI_STAT";
     case R128_GUI_SCRATCH_REG0:      return "GUI_SCRATCH_REG0";
     case R128_GUI_SCRATCH_REG1:      return "GUI_SCRATCH_REG1";
-    case R128_BM_GUI_TABLE:          return "BM_GUI_TABLE";
+    case R128_BM_GUI:                return "BM_GUI";
+    case R128_BM_VIP3_BUF:           return "BM_VIP3_BUF";
     case R128_BM_CHUNK_0_VAL:        return "BM_CHUNK_0_VAL";
     case R128_PM4_BUFFER_OFFSET:     return "PM4_BUFFER_OFFSET";
     case R128_PM4_BUFFER_CNTL:       return "PM4_BUFFER_CNTL";
