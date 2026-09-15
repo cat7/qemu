@@ -36,30 +36,24 @@
 
 #define PCI_VENDOR_ID_ATI              0x1002
 /*
- * 0x5245 = Rage 128 Pro, PCI (non-AGP) variant -- matches a genuine
- * retail PCI-slot card ROM (ati_ret_nexus128_103_pci_full.rom,
- * PCIR-confirmed) rather than the AGP 4x TMDS variant (0x5046) this
- * device previously used. The Beige G3 (Desktop/Minitower/AIO) never
- * had an AGP slot at all -- AGP debuted with the later Blue & White
- * G3 -- so a card in one of its real PCI slots is always the PCI
- * variant; 0x5046 was only ever a stand-in used because it was the
- * only Rage 128 Pro ROM dump available at the time.
+ * 0x5245 ("RE") is ATI's ID for the original, non-Pro Rage 128
+ * (GL/SG family), not the Rage 128 Pro -- in ATI's own naming scheme
+ * the "P"-prefixed IDs (0x5041-0x5052, "PA".."PR") are Pro parts and
+ * the "R"-prefixed IDs (0x5245-0x524C, "RE".."RL") are the earlier
+ * non-Pro chip. This device models the Pro feature set but currently
+ * advertises the non-Pro ID because it matches a genuine retail
+ * PCI-slot card ROM dump (ati_ret_nexus128_103_pci_full.rom,
+ * PCIR-confirmed; note the filename itself lacks "pro") rather than
+ * the AGP 4x TMDS Pro variant (0x5046, "PF") this device previously
+ * used. The Beige G3 (Desktop/Minitower/AIO) never had an AGP slot at
+ * all -- AGP debuted with the later Blue & White G3 -- so a card in
+ * one of its real PCI slots is always the PCI variant; 0x5046 was
+ * only ever a stand-in used because it was the only Rage 128 Pro ROM
+ * dump available at the time. The ID/feature-set mismatch hasn't
+ * mattered functionally so far; a genuine Rage 128 Pro PCI ROM would
+ * resolve it if one turns up.
  */
 #define PCI_DEVICE_ID_ATI_RAGE128PRO   0x5245
-/*
- * 0x5046 "PF" = Rage 128 Pro, AGP 4x TMDS variant -- the real identity of
- * the OEM AGP ROMs (ati_oem_rage128pro_110/136_agp_full.rom, PCIR-confirmed:
- * both declare device 0x5046). Open Firmware's FCode-binding step requires
- * an exact vendor:device match against the ROM's own PCIR header, so an AGP
- * ROM paired with a card reporting 0x5245 (the PCI identity above) is
- * refused binding outright -- confirmed live on mac99/PM34: the generic PCI
- * bus-walk still sizes and reserves the card's BARs (identity-agnostic
- * housekeeping), but memory-space-enable is never set and the FCode never
- * runs. Selected via the "agp" property, not the default -- g3beige never
- * had an AGP slot (see PCI_DEVICE_ID_ATI_RAGE128PRO's own comment) so this
- * only matters for mac99 placements on the AGP bus.
- */
-#define PCI_DEVICE_ID_ATI_RAGE128PRO_AGP 0x5046
 
 #define TYPE_ATI_RAGE128 "ati-rage128-pro"
 OBJECT_DECLARE_SIMPLE_TYPE(ATIRage128State, ATI_RAGE128)
@@ -91,6 +85,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIRage128State, ATI_RAGE128)
 #define ATI_RAGE128_NUM_PLLS    64
 #define ATI_RAGE128_FB_SCAN_BLOCK (64 * 1024)
 
+/*
+ * One decoded GEN_PRIM vertex: pre-transformed screen-space position
+ * (x/y in pixels on the render target, z in 0..1) and the diffuse
+ * colour as 0..1 floats -- the CCE FPU path's native form. rhw, fog
+ * and s/t are parsed for stride but not carried: perspective, fog and
+ * texturing are later steps.
+ */
+typedef struct ATIRage128Vertex {
+    float x, y, z;
+    float rhw;               /* 1/w, 1.0 when the format carries none */
+    float b, g, r, a;
+    float s, t;              /* primary texture coordinates, 0 if absent */
+    float fog;               /* SPEC_F: 1 = unfogged, 0 = the fog colour */
+    float sb, sg, sr;        /* SPEC_BGR: the secondary colour, 0 if absent */
+} ATIRage128Vertex;
+
+#define R128_HOSTDATA_HDR_MAX   (1 + 5 + 5)
+
 typedef struct ATIRage128PM4Parser {
     uint32_t remaining;      /* data dwords still expected */
     uint32_t type;           /* packet type of the in-flight packet */
@@ -99,10 +111,21 @@ typedef struct ATIRage128PM4Parser {
     uint32_t p1_reg1;        /* packet1's two register offsets */
     uint32_t p1_reg2;
     uint32_t p3_opcode;      /* packet3 2D-draw sub-state */
-    uint32_t p3_params[8];
+    /*
+     * HOSTDATA_BLT's full header is the context dword, up to five
+     * GMC-announced prefix dwords, and five fixed ones (see the ring
+     * parser); PAINT's inline-brush form needs seven.
+     */
+    uint32_t p3_params[R128_HOSTDATA_HDR_MAX];
     uint32_t p3_scale[16];      /* R128_SCALE_PKT_DWORDS */
     uint32_t p3_param_idx;
     uint32_t p3_total;       /* payload dwords the packet3 declared */
+    uint32_t p3_vc_format;   /* GEN_PRIM: VC_FORMAT dword */
+    uint32_t p3_vc_cntl;     /* GEN_PRIM: VC_CNTL dword */
+    uint32_t p3_vtx_stride;  /* dwords per vertex, from VC_FORMAT */
+    uint32_t p3_vtx[16];     /* the vertex currently being gathered */
+    uint32_t p3_vtx_count;   /* completed vertices in this packet */
+    ATIRage128Vertex p3_tri[3]; /* triangle accumulator (list/fan/strip) */
 } ATIRage128PM4Parser;
 
 typedef struct ATIRage128Mode {
@@ -114,11 +137,44 @@ typedef struct ATIRage128Mode {
     uint32_t pix_width;  /* raw CRTC_PIX_WIDTH field, for draw dispatch */
 } ATIRage128Mode;
 
+#define ATI_RAGE128_JOB_QUEUE 64
+#define ATI_RAGE128_FIFO_BATCH 4096   /* dwords */
+
+typedef struct ATIRage128Job {
+    int job;
+    uint32_t a, b;
+} ATIRage128Job;
+
 struct ATIRage128State {
     PCIDevice parent_obj;
 
     MemoryRegion aper;        /* BAR0: 64MB aperture container */
     MemoryRegion vram;        /* 16MB of real VRAM at aperture offset 0 */
+    uint8_t *vram_ptr;        /* host pointer to vram, fixed after realize */
+    uint32_t dirty_lo;        /* VRAM range drawn by the engine, not yet */
+    uint32_t dirty_hi;        /* marked dirty; see ati_rage128_2d_flush_dirty */
+    /* Engine work running without the BQL; see ati_rage128_engine_enter. */
+    QemuEvent engine_idle;
+    bool engine_busy;
+    bool engine_sync;
+    bool irq_deferred;
+    bool cursor_deferred;
+    /* Asynchronous jobs; see ati_rage128_engine_submit. */
+    QemuThread engine_thread;
+    QemuMutex engine_lock;
+    QemuCond engine_cond;
+    QemuEvent engine_done;
+    QEMUBH *engine_bh;
+    ATIRage128Job engine_queue[ATI_RAGE128_JOB_QUEUE];
+    uint64_t engine_jobs_submitted;   /* BQL + engine_lock */
+    uint64_t engine_jobs_done;        /* worker, atomic */
+    uint64_t engine_jobs_retired;     /* BQL */
+    bool engine_quit;
+    OnOffAuto engine_async;
+    /* FIFO dwords written behind queued jobs; see ati_rage128_fifo_stage. */
+    uint32_t *fifo_stage;             /* BQL */
+    uint32_t fifo_stage_n;            /* BQL */
+    uint32_t *fifo_batch;             /* one batch per queue slot */
     MemoryRegion vram_aper1;  /* alias of VRAM in the aperture's top half */
     MemoryRegion mmio;        /* BAR2: 16KB register file */
     MemoryRegion io;          /* BAR1: 256-byte I/O register window */
@@ -192,11 +248,6 @@ struct ATIRage128State {
      * (all sense lines float high).
      */
     bool monitor_connected;
-    /*
-     * Report the AGP identity (0x5046) instead of the default PCI one
-     * (0x5245) -- see PCI_DEVICE_ID_ATI_RAGE128PRO_AGP's comment.
-     */
-    bool agp_ident;
     ATIRage128Mode auto_fb_pending;
 
     /*
@@ -236,6 +287,8 @@ struct ATIRage128State {
     bool host_cursor_published;   /* synthetic arrow handed to the UI */
     bitbang_i2c_interface monid_i2c;
     int monid_sda;           /* live SDA level fed back into MONID_Y */
+    bool monid_pads12;       /* DDC session uses SDA=pad1/SCL=pad2 (FCode) */
+    bool monid_ddc2;         /* host clocked SCL: DDC1 stream silenced */
     /*
      * A bit-banged I2C session on pads 1 (SDA) / 2 (SCL) under the
      * Apple-sense MASK nibble 0x7 -- what Mac OS 9's "ATI Resource
@@ -301,6 +354,8 @@ struct ATIRage128State {
      * stream after the first IB and wedged the guest driver).
      */
     ATIRage128PM4Parser pm4_fifo;
+
+    bool bm_running;      /* GUI bus master walking a table */
 
     /*
      * 2D GUI (destination datapath) engine state -- ported from the
@@ -411,14 +466,71 @@ struct ATIRage128State {
     bool host_data_active;
     uint32_t host_data_row, host_data_col, host_data_next;
     uint32_t host_data_acc[4];
+    /*
+     * The drawing context the transfer STARTED with. A host-data
+     * transfer spans many writes and its last partial accumulator is
+     * not flushed when the data stops arriving: it is flushed when the
+     * next blit turns up, from ati_rage128_2d_blt()'s implicit finish.
+     * By then that blit's caller has already installed its own
+     * destination rectangle -- every one of the packet handlers in
+     * ati_rage128.c assigns dst_x/dst_y/dst_width/dst_height and only
+     * then calls in -- so the tail would be written into the next
+     * operation's rectangle, and where the stale column index runs past
+     * the new width the unsigned `dst_width - col` underflows to a huge
+     * span and paints straight across its neighbours.
+     *
+     * The CCE packet handlers close their own transfer before returning,
+     * so they never reach that; the paths that can are the MMIO/type-0
+     * HOST_DATA0-7 register stream that ends without HOST_DATA_LAST, and
+     * a GEN_RESET_CNTL SOFT_RESET_GUI landing mid-packet (which drops
+     * the parser's packet state but not host_data_active). A transfer
+     * owns its context until it ends, which is what the FIFO semantics
+     * say, and it makes the ordering question disappear rather than
+     * adding a rule to each of the five callers.
+     */
+    struct {
+        uint32_t dst_x, dst_y, dst_width, dst_height;
+        uint32_t dst_offset, dst_pitch;
+        uint32_t datatype;
+        uint32_t src_frgd_clr, src_bkgd_clr;
+        int32_t sc_left, sc_top, sc_right, sc_bottom;
+    } hd;
+
+    /*
+     * Silent-register tally -- see ati_rage128_audit_reg_write(). One
+     * counter per register in the audited window, indexed by
+     * offset >> 2. A flat array rather than a first-seen slot list,
+     * following the R350's measurement: a 160-slot list saturated on a
+     * Mac OS X session and a truncated census reads as a complete one.
+     * The word count mirrors R128_REG_AUDIT_LIMIT in the generated
+     * ati_rage128_audit.h; ati_rage128_dbg.c build-checks the pairing.
+     * Deliberately not in vmstate: a diagnostic counter, not state a
+     * migrated guest can notice.
+     */
+#define R128_SILENT_REG_WORDS 4096
+    uint32_t silent_reg_count[R128_SILENT_REG_WORDS];
 };
 
 
 /* ati_rage128_dbg.c */
 const char *ati_rage128_reg_name(uint32_t base);
 
+/*
+ * Tally a write to a register no model code reads -- one stored into
+ * s->regs[] (or dropped) and consulted by no logic, so nothing else in
+ * the device can notice it. Called from the ati_rage128_reg_write32()
+ * funnel, which every register write passes through: the MMIO and I/O
+ * BAR ops, the MM_INDEX/MM_DATA indirection, PM4 type-0/1 packets from
+ * both the ring and the PIO FIFO/indirect buffers, the packet-3 blit
+ * decoders, and GUI bus-master descriptors. Read the tally with
+ * `qom-get <device> silent-regs`.
+ */
+void ati_rage128_audit_reg_write(ATIRage128State *s, uint32_t base);
+
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
+void ati_rage128_2d_flush_dirty(ATIRage128State *s);
+void ati_rage128_3d_triangle(ATIRage128State *s, const ATIRage128Vertex *v);
 void ati_rage128_2d_scale(ATIRage128State *s, const uint32_t *pkt);
 void ati_rage128_2d_scale_regs(ATIRage128State *s);
 bool ati_rage128_host_data_flush(ATIRage128State *s);

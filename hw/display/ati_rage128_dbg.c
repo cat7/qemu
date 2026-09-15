@@ -13,7 +13,56 @@
 
 const char *ati_rage128_reg_name(uint32_t base)
 {
+    /* runs of identically-named registers first */
+    if (base >= R128_BRUSH_DATA0 && base < R128_BRUSH_DATA0 + 32 * 4) {
+        return "BRUSH_DATAn";
+    }
+    if (base >= R128_PRIM_TEX_0_OFFSET_C &&
+        base <= R128_PRIM_TEX_10_OFFSET_C) {
+        return "PRIM_TEX_n_OFFSET_C";
+    }
+    if (base >= R128_SEC_TEX_0_OFFSET_C && base <= R128_SEC_TEX_10_OFFSET_C) {
+        return "SEC_TEX_n_OFFSET_C";
+    }
     switch (base) {
+    case R128_PM4_VC_FPU_SETUP:      return "PM4_VC_FPU_SETUP";
+    case R128_SURFACE3_LOWER_BOUND:  return "SURFACE3_LOWER_BOUND";
+    case R128_SURFACE3_UPPER_BOUND:  return "SURFACE3_UPPER_BOUND";
+    case R128_SURFACE3_INFO:         return "SURFACE3_INFO";
+    case R128_BRUSH_SCALE:           return "BRUSH_SCALE";
+    case R128_FLUSH_7:               return "FLUSH_7";
+    case R128_PC_GUI_CTLSTAT:        return "PC_GUI_CTLSTAT";
+    case R128_SETUP_CNTL:            return "SETUP_CNTL";
+    case R128_WINDOW_XY_OFFSET:      return "WINDOW_XY_OFFSET";
+    case R128_DRAW_LINE_POINT:       return "DRAW_LINE_POINT";
+    case R128_SETUP_CNTL_PM4:        return "SETUP_CNTL_PM4";
+    case R128_DST_PITCH_OFFSET_C:    return "DST_PITCH_OFFSET_C";
+    case R128_DP_GUI_MASTER_CNTL_C:  return "DP_GUI_MASTER_CNTL_C";
+    case R128_SC_TOP_LEFT_C:         return "SC_TOP_LEFT_C";
+    case R128_SC_BOTTOM_RIGHT_C:     return "SC_BOTTOM_RIGHT_C";
+    case R128_Z_OFFSET_C:            return "Z_OFFSET_C";
+    case R128_Z_PITCH_C:             return "Z_PITCH_C";
+    case R128_Z_STEN_CNTL_C:         return "Z_STEN_CNTL_C";
+    case R128_TEXTURE_CLR_CMP_CLR_C: return "TEXTURE_CLR_CMP_CLR_C";
+    case R128_TEXTURE_CLR_CMP_MSK_C: return "TEXTURE_CLR_CMP_MSK_C";
+    case R128_FOG_COLOR_C:           return "FOG_COLOR_C";
+    case R128_PRIM_TEXTURE_COMBINE_CNTL_C:
+        return "PRIM_TEXTURE_COMBINE_CNTL_C";
+    case R128_TEX_SIZE_PITCH_C:      return "TEX_SIZE_PITCH_C";
+    case R128_SEC_TEX_CNTL_C:        return "SEC_TEX_CNTL_C";
+    case R128_SEC_TEX_COMBINE_CNTL_C: return "SEC_TEX_COMBINE_CNTL_C";
+    case R128_CONSTANT_COLOR_C:      return "CONSTANT_COLOR_C";
+    case R128_PRIM_TEXTURE_BORDER_COLOR_C:
+        return "PRIM_TEXTURE_BORDER_COLOR_C";
+    case R128_SEC_TEXTURE_BORDER_COLOR_C:
+        return "SEC_TEXTURE_BORDER_COLOR_C";
+    case R128_STEN_REF_MASK_C:       return "STEN_REF_MASK_C";
+    case R128_PLANE_3D_MASK_C:       return "PLANE_3D_MASK_C";
+    case R128_DP_WRITE_MASK:         return "DP_WRITE_MASK";
+    case R128_DP_DATATYPE:           return "DP_DATATYPE";
+    case R128_BRUSH_Y_X:             return "BRUSH_Y_X";
+    case R128_DP_BRUSH_FRGD_CLR:     return "DP_BRUSH_FRGD_CLR";
+    case R128_DP_BRUSH_BKGD_CLR:     return "DP_BRUSH_BKGD_CLR";
     case R128_SCALE_SRC_HEIGHT_WIDTH: return "SCALE_SRC_HEIGHT_WIDTH";
     case R128_SCALE_OFFSET_0:        return "SCALE_OFFSET_0";
     case R128_SCALE_PITCH:           return "SCALE_PITCH";
@@ -109,7 +158,8 @@ const char *ati_rage128_reg_name(uint32_t base)
     case R128_GUI_STAT:              return "GUI_STAT";
     case R128_GUI_SCRATCH_REG0:      return "GUI_SCRATCH_REG0";
     case R128_GUI_SCRATCH_REG1:      return "GUI_SCRATCH_REG1";
-    case R128_BM_GUI_TABLE:          return "BM_GUI_TABLE";
+    case R128_BM_GUI:                return "BM_GUI";
+    case R128_BM_VIP3_BUF:           return "BM_VIP3_BUF";
     case R128_BM_CHUNK_0_VAL:        return "BM_CHUNK_0_VAL";
     case R128_PM4_BUFFER_OFFSET:     return "PM4_BUFFER_OFFSET";
     case R128_PM4_BUFFER_CNTL:       return "PM4_BUFFER_CNTL";
@@ -132,3 +182,41 @@ const char *ati_rage128_reg_name(uint32_t base)
     }
 }
 
+/*
+ * Silent-register audit: the register-level half of the coverage
+ * question this file's name table serves.
+ *
+ * A trace tells you a register was written; it does not tell you
+ * whether anything in the model then read it. A register this device
+ * stores and never consults is invisible from inside every implemented
+ * path -- no unimplemented-command warning fires, and the screen is
+ * simply wrong somewhere else. That silent class is where the R350's
+ * RBBM_GUICNTL/GUI_HOST_SWAP_CNTL root causes lived, and this device
+ * has the same shape of blind spot.
+ *
+ * The generated bitmap in ati_rage128_audit.h says which registers
+ * some model code consumes; every write to any other register is
+ * tallied here, one counter per register, and reported by the
+ * `silent-regs` property. Regenerate the bitmap (doc/radeon9800/
+ * regaudit2.py rage128-<tree> --emit-table) whenever the model learns
+ * to read a new register, or silent-regs will keep reporting it.
+ */
+#include "ati_rage128_audit.h"
+
+QEMU_BUILD_BUG_ON(R128_REG_AUDIT_LIMIT / 4 != R128_SILENT_REG_WORDS);
+
+void ati_rage128_audit_reg_write(ATIRage128State *s, uint32_t base)
+{
+    unsigned bit;
+
+    if (base >= R128_REG_AUDIT_LIMIT) {
+        return;
+    }
+    bit = base >> 2;
+    if (ati_rage128_reg_consumed[bit / 32] & (1u << (bit % 32))) {
+        return;
+    }
+    if (s->silent_reg_count[bit] != UINT32_MAX) {
+        s->silent_reg_count[bit]++;
+    }
+}
