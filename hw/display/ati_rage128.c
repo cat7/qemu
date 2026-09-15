@@ -2637,24 +2637,78 @@ static void ati_rage128_bm_gui_run(ATIRage128State *s, uint32_t table)
  * file.
  */
 /*
+ * Where the engine fetches a command stream from. The card reaches
+ * host memory two different ways and the same small offset means
+ * different things in each, so the caller has to say which is live
+ * rather than guessing from the address.
+ */
+typedef enum {
+    R128_ADDR_LOCAL,        /* frame buffer */
+    R128_ADDR_PCIGART,      /* the card's own PCI GART */
+    R128_ADDR_AGP,          /* AGP aperture, translated by the host bridge */
+} ATIRage128AddrSpace;
+
+static ATIRage128AddrSpace ati_rage128_cmd_space(ATIRage128State *s)
+{
+    PCIDevice *d = PCI_DEVICE(s);
+    uint8_t cap;
+
+    if (s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu) {
+        return R128_ADDR_PCIGART;
+    }
+    /*
+     * Once the driver completes the AGP handshake -- AGP_ENABLE in this
+     * card's own AGP capability command register, which it sets on both
+     * the card and the host bridge -- its command buffers live in AGP
+     * memory, and the addresses it hands the engine are offsets into
+     * the AGP aperture rather than frame-buffer offsets.
+     */
+    cap = pci_find_capability(d, PCI_CAP_ID_AGP);
+    if (cap && (pci_get_long(d->config + cap + PCI_AGP_COMMAND) &
+                PCI_AGP_COMMAND_AGP)) {
+        return R128_ADDR_AGP;
+    }
+    return R128_ADDR_LOCAL;
+}
+
+/*
  * Read one little-endian dword from card address space: local VRAM
- * below ATI_RAGE128_VRAM_SIZE, otherwise the 32MB GART-translated
+ * below ATI_RAGE128_VRAM_SIZE, otherwise either the 32MB GART-translated
  * "VM" window (see the R128_PCIGART_TABLE_ENTRIES comment in
- * ati_rage128_regs.h). Command streams are little-endian regardless
- * of guest CPU endianness -- big-endian Mac drivers byte-swap their
- * command buffers on the way out, exactly like the Linux driver's
- * cpu_to_le32() (verified live: PIO-FIFO dwords, which arrive
- * pre-swapped through the LE register aperture, decode with the
- * identical packet layout).
+ * ati_rage128_regs.h) or the AGP aperture the UniNorth host bridge
+ * translates. Command streams are little-endian regardless of guest CPU
+ * endianness -- big-endian Mac drivers byte-swap their command buffers
+ * on the way out, exactly like the Linux driver's cpu_to_le32() (verified
+ * live: PIO-FIFO dwords, which arrive pre-swapped through the LE register
+ * aperture, decode with the identical packet layout).
  *
- * The GART window's card-space base isn't modeled explicitly: the
+ * The PCI GART window's card-space base isn't modeled explicitly: the
  * window is exactly 32MB and its base is 32MB-aligned, so masking the
  * page index into the 8192-entry table is base-agnostic.
  */
 static uint32_t ati_rage128_card_read32(ATIRage128State *s, uint32_t addr,
-                                        bool gart)
+                                        ATIRage128AddrSpace space)
 {
-    if (!gart && addr + 4 <= ATI_RAGE128_VRAM_SIZE) {
+    if (space == R128_ADDR_AGP) {
+        /*
+         * An AGP offset. The card's addresses are virtual -- "The lower
+         * 32MB maps to frame buffer, the upper 32MB to AGP_BASE +
+         * DST_OFFSET(24:0)" (RRG, DST_OFFSET) -- so fold an upper-half
+         * address down and add AGP_BASE; the host bridge's GART turns
+         * the result into a system-memory page. Without this the
+         * driver's AGP-resident indirect buffers were read out of VRAM
+         * at the same numeric offset, so the engine executed whatever
+         * happened to be in the framebuffer, wedged, and stopped
+         * retiring the fences the driver was waiting on.
+         */
+        uint32_t off = addr >= ATI_RAGE128_VRAM_SIZE ?
+                       addr - ATI_RAGE128_VRAM_SIZE : addr;
+        dma_addr_t bus = (s->regs[R128_AGP_BASE >> 2] & ~0x3fffffu) + off;
+        uint32_t val = 0;
+
+        pci_dma_read(PCI_DEVICE(s), bus, &val, sizeof(val));
+        return le32_to_cpu(val);
+    } else if (space == R128_ADDR_LOCAL && addr + 4 <= ATI_RAGE128_VRAM_SIZE) {
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
         return ldl_le_p(vram + addr);
@@ -2680,23 +2734,40 @@ static uint32_t ati_rage128_card_read32(ATIRage128State *s, uint32_t addr,
 
 /*
  * Read @dwords consecutive dwords starting at card address @addr with
- * the same addressing as ati_rage128_card_read32(), one GART lookup and
- * one DMA per page instead of two DMAs per dword.
+ * the same addressing as ati_rage128_card_read32(). AGP goes through one
+ * linear DMA read per call -- the host bridge's IOMMU splits it across
+ * whatever GART pages back the range, the same core mechanism any other
+ * multi-page pci_dma_read() already relies on -- while PCI GART needs an
+ * explicit per-page table lookup here since consecutive card pages can
+ * land on unrelated physical pages.
  */
 static void ati_rage128_card_read_block(ATIRage128State *s, uint32_t addr,
                                         uint32_t *buf, uint32_t dwords,
-                                        bool gart)
+                                        ATIRage128AddrSpace space)
 {
     uint32_t gart_base = s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu;
+
+    if (space == R128_ADDR_AGP) {
+        uint32_t off = addr >= ATI_RAGE128_VRAM_SIZE ?
+                       addr - ATI_RAGE128_VRAM_SIZE : addr;
+        dma_addr_t bus = (s->regs[R128_AGP_BASE >> 2] & ~0x3fffffu) + off;
+        uint32_t i;
+
+        pci_dma_read(PCI_DEVICE(s), bus, buf, dwords * 4);
+        for (i = 0; i < dwords; i++) {
+            buf[i] = le32_to_cpu(buf[i]);
+        }
+        return;
+    }
 
     while (dwords) {
         uint32_t n = MIN(dwords, (0x1000 - (addr & 0xfff)) / 4);
         uint32_t idx, entry, page, i;
 
-        if (!n || (!gart && addr + 4 <= ATI_RAGE128_VRAM_SIZE) ||
-            (addr & 3)) {
+        if (!n || (space == R128_ADDR_LOCAL &&
+                   addr + 4 <= ATI_RAGE128_VRAM_SIZE) || (addr & 3)) {
             /* VRAM, or anything unusual: dword by dword */
-            *buf++ = ati_rage128_card_read32(s, addr, gart);
+            *buf++ = ati_rage128_card_read32(s, addr, space);
             addr += 4;
             dwords--;
             continue;
@@ -2724,11 +2795,12 @@ static void ati_rage128_card_read_block(ATIRage128State *s, uint32_t addr,
 
 static uint32_t ati_rage128_pm4_read_ring(ATIRage128State *s)
 {
-    bool gart = s->pm4_buffer_addr & R128_AGP_OFFSET_FLAG;
+    ATIRage128AddrSpace space = s->pm4_buffer_addr & R128_AGP_OFFSET_FLAG ?
+                                ati_rage128_cmd_space(s) : R128_ADDR_LOCAL;
     uint32_t base = s->pm4_buffer_addr & ~R128_AGP_OFFSET_FLAG;
     uint32_t val;
 
-    val = ati_rage128_card_read32(s, base + s->pm4_rptr * 4, gart);
+    val = ati_rage128_card_read32(s, base + s->pm4_rptr * 4, space);
     s->pm4_rptr = (s->pm4_rptr + 1) & (s->pm4_ring_dwords - 1);
     return val;
 }
@@ -3411,7 +3483,7 @@ static void ati_rage128_3d_buffer_vertex(ATIRage128State *s,
                                          ATIRage128PM4Parser *p,
                                          unsigned idx)
 {
-    bool gart = (s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu) != 0;
+    ATIRage128AddrSpace space = ati_rage128_cmd_space(s);
     unsigned stride = p->p3_vtx_stride;
     uint32_t addr;
 
@@ -3419,7 +3491,7 @@ static void ati_rage128_3d_buffer_vertex(ATIRage128State *s,
         return;
     }
     addr = p->p3_params[0] + idx * stride * 4;
-    ati_rage128_card_read_block(s, addr, p->p3_vtx, stride, gart);
+    ati_rage128_card_read_block(s, addr, p->p3_vtx, stride, space);
     ati_rage128_3d_prim_vertex(s, p);
 }
 
@@ -3931,12 +4003,12 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
      * treating small offsets as VRAM read all-zero/stale bytes, while
      * the guest's real command buffers sit in the GART pages.
      */
-    bool gart = (s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu) != 0;
+    ATIRage128AddrSpace space = ati_rage128_cmd_space(s);
     ATIRage128PM4Parser parser = { 0 };
     uint32_t i;
 
     trace_ati_rage128_pm4_indirect(offset, dwords,
-        dwords ? ati_rage128_card_read32(s, offset, gart) : 0);
+        dwords ? ati_rage128_card_read32(s, offset, space) : 0);
     /*
      * INDSIZE is a 23-bit dword count and Mac OS X's driver uses it:
      * ATIRage128::submit_buffer hands the card one indirect buffer per
@@ -3953,7 +4025,7 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
         uint32_t chunk[1024];
         uint32_t n = MIN(dwords - i, ARRAY_SIZE(chunk)), j;
 
-        ati_rage128_card_read_block(s, offset + i * 4, chunk, n, gart);
+        ati_rage128_card_read_block(s, offset + i * 4, chunk, n, space);
         for (j = 0; j < n; j++, i++) {
             trace_ati_rage128_pm4_ib_dword(i, chunk[j]);
             ati_rage128_pm4_parse(s, &parser, chunk[j]);
@@ -4594,6 +4666,16 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
      */
 
     /*
+     * Report the AGP identity when asked (see the "agp" property /
+     * PCI_DEVICE_ID_ATI_RAGE128PRO_AGP's comment) -- an AGP ROM's FCode
+     * will not bind to a device whose PCIR-visible device ID doesn't
+     * match its own header exactly.
+     */
+    if (s->agp_ident) {
+        pci_config_set_device_id(dev->config, PCI_DEVICE_ID_ATI_RAGE128PRO_AGP);
+    }
+
+    /*
      * AGP capability block. The Rage 128 Pro OEM AGP ROMs (FCode part
      * numbers 113-630xx / 113-720xx) walk the PCI capability chain for a
      * PCI_CAP_ID_AGP block during their init probe; when it is absent they
@@ -4602,11 +4684,16 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
      * Model a minimal AGP 2.0 capability -- advertise 1x/2x rates,
      * sideband addressing and a full request queue in the read-only
      * status word, and leave the command register guest-writable so the
-     * driver's AGP-enable handshake completes harmlessly. (The PCI-side
-     * Rage 128 retail ROM ignores this block, so it is safe on either
-     * bus.)
+     * driver's AGP-enable handshake completes harmlessly.
+     *
+     * Only the AGP card advertises one. This device now picks its
+     * command-fetch address space by checking AGP_ENABLE in this block
+     * (see ati_rage128_cmd_space()), and a PCI-slot card has no AGP host
+     * bridge behind it to translate that space -- advertising the
+     * capability there would let a guest set AGP_ENABLE on a card whose
+     * fetches then go nowhere real.
      */
-    {
+    if (s->agp_ident) {
         int cap = pci_add_capability(dev, PCI_CAP_ID_AGP, 0, 0x0c, errp);
         if (cap < 0) {
             return;
@@ -4775,6 +4862,7 @@ static const Property ati_rage128_properties[] = {
     DEFINE_PROP_UINT32("fillwatch-size", ATIRage128State, fillwatch_size, 0),
     DEFINE_PROP_BOOL("monitor-connected", ATIRage128State,
                      monitor_connected, true),
+    DEFINE_PROP_BOOL("agp", ATIRage128State, agp_ident, false),
     /* command-stream kicks on a worker thread; auto = on except qtest */
     DEFINE_PROP_ON_OFF_AUTO("async-engine", ATIRage128State, engine_async,
                             ON_OFF_AUTO_AUTO),
@@ -4826,9 +4914,9 @@ static void ati_rage128_class_init(ObjectClass *klass, const void *data)
     /*
      * Must match the PCIR vendor/device of the OEM Mac ROM image
      * exactly, or Open Firmware refuses to bind the FCode to the
-     * card. 0x5046 "PF" is an AGP-only part on real silicon; QEMU has
-     * no AGP bus and the electrical difference is invisible to
-     * software beyond the (absent) AGP capability block.
+     * card. Default is the PCI identity; realize() overrides it to
+     * PCI_DEVICE_ID_ATI_RAGE128PRO_AGP when the "agp" property is set,
+     * for placement on a real AGP bus (see that define's comment).
      */
     k->device_id = PCI_DEVICE_ID_ATI_RAGE128PRO;
     k->revision  = 0x00;

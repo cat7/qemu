@@ -197,6 +197,21 @@ ati_rage128_monid_wr(int64_t ns, uint32_t val, int scl, int sda_in, int sda_out)
 ati_rage128_amcgpio(int64_t ns, uint32_t tag, uint32_t a, uint32_t en, uint32_t val) "t=%"PRId64" AMCGPIO %c A=0x%08x EN=0x%08x val=0x%08x"
 ati_rage128_monidb(int64_t ns, uint32_t raw, uint32_t y) "t=%"PRId64" GPIO_MONIDB probe raw=0x%08x -> Y=0x%x"
 ati_rage128_monidb_wr(int64_t ns, uint32_t val) "t=%"PRId64" GPIO_MONIDB write val=0x%08x"
+ati_rage128_engine_submit(int job, uint32_t a, uint32_t b) "job %d 0x%x 0x%x"
+ati_rage128_engine_retire(void) ""
+ati_rage128_engine_drain(uint32_t reg, int write, int64_t us) "reg 0x%04x write %d waited %" PRId64 " us"
+ati_rage128_host_data_reg(uint32_t reg, uint64_t val, int active, uint32_t next) "HOST_DATA reg 0x%03x <- 0x%08" PRIx64 " active=%d next=%u"
+ati_rage128_hostdata_hdr(uint32_t gmc, unsigned nhdr, uint32_t last, uint32_t count) "HOSTDATA_BLT gmc=0x%08x header %u dwords: count dword %u vs %u payload"
+ati_rage128_2d_cmp(uint32_t cntl, uint32_t mask, uint32_t src, uint32_t dst, uint32_t wmask, uint32_t brush) "blt clr_cmp cntl=0x%08x mask=0x%08x src=0x%08x dst=0x%08x wmask=0x%08x brush=0x%08x"
+ati_rage128_pm4_reg_blocked(uint32_t reg, const char *name, uint32_t val) "packet register write blocked: 0x%04x %s <- 0x%08x"
+ati_rage128_3d_prim(uint32_t format, unsigned stride, unsigned prim, unsigned walk, unsigned num) "GEN_PRIM vc_format=0x%x stride=%u prim=%u walk=%u num=%u"
+ati_rage128_3d_vert(unsigned n, int x, int y, int z, uint32_t argb, uint32_t s, uint32_t t) "vtx[%u] x=%d y=%d z=%d argb=0x%08x s=0x%08x t=0x%08x"
+ati_rage128_3d_indx_prim(uint32_t offset, uint32_t size, uint32_t format, uint32_t cntl) "GEN_INDX_PRIM buf=0x%x size=%u vc_format=0x%x vc_cntl=0x%08x"
+ati_rage128_3d_state(uint32_t tex_cntl, uint32_t misc, uint32_t comb, uint32_t prim_tex, int blend, int textured) "tex_cntl=0x%08x misc=0x%08x comb=0x%08x prim_tex=0x%08x blend=%d textured=%d"
+ati_rage128_3d_tri(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t argb) "tri (%d,%d)-(%d,%d)-(%d,%d) argb[0]=0x%08x"
+ati_rage128_3d_unsupported(const char *what, uint32_t val) "3d draw skipped: %s 0x%x"
+ati_rage128_3d_lod(int lod, unsigned levels, unsigned w, unsigned h, uint32_t base) "mip level %d of %u -> %ux%u at 0x%x"
+ati_rage128_3d_tex(uint32_t raw, uint32_t base, unsigned w, unsigned h, unsigned dt, uint32_t cntl, uint32_t comb) "tex raw=0x%08x base=0x%x %ux%u dt=%u cntl=0x%08x comb=0x%08x"
 
 # ati_mach64.c
 ati_mach64_mmio_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s -> 0x%"PRIx64
