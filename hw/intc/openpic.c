@@ -1350,6 +1350,29 @@ typedef struct MemReg {
     ram_addr_t              size;
 } MemReg;
 
+/*
+ * Global timers are part of the base OpenPIC architecture, not an FSL
+ * extension: every model maps the TMR register block (see list_be/
+ * list_le in openpic_realize()) and openpic_tmr_write() unconditionally
+ * calls timer_mod() on it. KEYLARGO sets its own opp->irq_tim0 and maps
+ * that same block, so it needs this too -- it was only ever called from
+ * fsl_common_init(), leaving KEYLARGO's opp->timers[].qemu_timer NULL
+ * forever and crashing the first time a guest enables a timer.
+ */
+static void openpic_timer_init(OpenPICState *opp)
+{
+    int i;
+
+    for (i = 0; i < OPENPIC_MAX_TMR; i++) {
+        opp->timers[i].n_IRQ = opp->irq_tim0 + i;
+        opp->timers[i].qemu_timer_active = false;
+        opp->timers[i].qemu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                                 &qemu_timer_cb,
+                                                 &opp->timers[i]);
+        opp->timers[i].opp = opp;
+    }
+}
+
 static void fsl_common_init(OpenPICState *opp)
 {
     int i;
@@ -1389,14 +1412,7 @@ static void fsl_common_init(OpenPICState *opp)
         opp->src[i].level = false;
     }
 
-    for (i = 0; i < OPENPIC_MAX_TMR; i++) {
-        opp->timers[i].n_IRQ = opp->irq_tim0 + i;
-        opp->timers[i].qemu_timer_active = false;
-        opp->timers[i].qemu_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                                 &qemu_timer_cb,
-                                                 &opp->timers[i]);
-        opp->timers[i].opp = opp;
-    }
+    openpic_timer_init(opp);
 }
 
 static void map_list(OpenPICState *opp, const MemReg *list, int *count)
@@ -1615,6 +1631,7 @@ static void openpic_realize(DeviceState *dev, Error **errp)
             return;
         }
 
+        openpic_timer_init(opp);
         map_list(opp, list_le, &list_count);
         break;
     }
