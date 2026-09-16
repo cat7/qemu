@@ -2726,6 +2726,68 @@ static void ati_rage128_card_read_block(ATIRage128State *s, uint32_t addr,
     }
 }
 
+/*
+ * The 2D engine's own source/destination registers (DST/SRC_PITCH_OFFSET
+ * and the scaler's SCALE_OFFSET_0) were never given the CCE ring's
+ * off-VRAM addressing: a 2D blit whose driver placed its data in the
+ * PCI GART's mapped window read straight past local VRAM's bound and
+ * got back zero for every pixel. ati_rage128_card_read_block() already
+ * falls through to the GART lookup for any out-of-range address
+ * regardless of its own @gart argument (see its "VRAM, or anything
+ * unusual" branch), so resolving via it here needs no address-space
+ * decision of its own -- only local-VRAM-or-not.
+ */
+uint8_t *ati_rage128_2d_span(ATIRage128State *s, uint32_t offset,
+                             uint32_t bytes, uint8_t **bounce)
+{
+    uint32_t dwords;
+    uint32_t *buf;
+
+    *bounce = NULL;
+    if (bytes == 0) {
+        return NULL;
+    }
+    if (offset < ATI_RAGE128_VRAM_SIZE &&
+        offset + bytes <= ATI_RAGE128_VRAM_SIZE) {
+        return memory_region_get_ram_ptr(&s->vram) + offset;
+    }
+    if (!(s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu)) {
+        return NULL;
+    }
+    dwords = (bytes + 3) / 4;
+    buf = g_malloc0((size_t)dwords * 4);
+    ati_rage128_card_read_block(s, offset, buf, dwords, true);
+    *bounce = (uint8_t *)buf;
+    return *bounce;
+}
+
+void ati_rage128_2d_span_flush(ATIRage128State *s, uint32_t offset,
+                               uint8_t *bounce, uint32_t bytes)
+{
+    uint32_t gart_base = s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu;
+    uint32_t done = 0;
+
+    if (!bounce) {
+        return;
+    }
+    while (gart_base && done < bytes) {
+        uint32_t addr = offset + done;
+        uint32_t idx = (addr >> 12) & (R128_PCIGART_TABLE_ENTRIES - 1);
+        uint32_t n = MIN(bytes - done, 0x1000 - (addr & 0xfff));
+        uint32_t entry, page;
+
+        pci_dma_read(PCI_DEVICE(s), gart_base + idx * 4, &entry,
+                    sizeof(entry));
+        page = le32_to_cpu(entry) & ~0xfffu;
+        if (page) {
+            pci_dma_write(PCI_DEVICE(s), page | (addr & 0xfff),
+                          bounce + done, n);
+        }
+        done += n;
+    }
+    g_free(bounce);
+}
+
 static uint32_t ati_rage128_pm4_read_ring(ATIRage128State *s)
 {
     bool gart = s->pm4_buffer_addr & R128_AGP_OFFSET_FLAG;

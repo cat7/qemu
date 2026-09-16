@@ -527,6 +527,30 @@ const char *ati_rage128_reg_name(uint32_t base);
  */
 void ati_rage128_audit_reg_write(ATIRage128State *s, uint32_t base);
 
+/*
+ * Resolve @bytes at card address @offset for the 2D engine's own
+ * source/destination registers, which -- unlike the CCE ring and
+ * indirect buffers -- were never routed through this card's off-VRAM
+ * addressing. An offset entirely inside local VRAM returns a direct
+ * pointer (*bounce left NULL, nothing to free or flush). One that
+ * isn't is bounced through a malloc'd buffer, read in via whatever
+ * off-card path this tree's card model has; the caller frees it with
+ * ati_rage128_2d_span_flush() (a plain read span: pass bytes=0 there,
+ * or just free it directly -- flush is only needed to write it back).
+ * Implemented once per tree in ati_rage128.c, against that tree's own
+ * addressing model; ati_rage128_2d.c calls only this name.
+ */
+uint8_t *ati_rage128_2d_span(ATIRage128State *s, uint32_t offset,
+                             uint32_t bytes, uint8_t **bounce);
+/*
+ * Write a span back to its card address if it was bounced (a no-op,
+ * bounce freed either way, when *bounce came back NULL from
+ * ati_rage128_2d_span() -- that was a direct VRAM pointer already
+ * written in place).
+ */
+void ati_rage128_2d_span_flush(ATIRage128State *s, uint32_t offset,
+                               uint8_t *bounce, uint32_t bytes);
+
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
 void ati_rage128_2d_flush_dirty(ATIRage128State *s);
