@@ -179,12 +179,13 @@ static const USBDescIface desc_iface[] = {
                 }
             },{
                 /* Headphone Output Terminal ID3 Descriptor */
+                /* A 0x03xx speaker terminal makes Mac OS 9 replace its built-in output with the device. */
                 .data = (uint8_t[]) {
                     0x09,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AC_OUTPUT_TERMINAL,     /*  u8  bDescriptorSubtype */
                     0x03,                       /*  u8  bUnitID */
-                    U16(0x0301),                /* u16  wTerminalType (SPK) */
+                    U16(0x0603),                /* u16  wTerminalType (Line connector) */
                     0x00,                       /*  u8  bAssocTerminal */
                     0x02,                       /*  u8  bSourceID */
                     STRING_OUTPUT_TERMINAL,     /*  u8  iTerminal */
@@ -448,7 +449,7 @@ static const USBDescIface desc_iface_multi[] = {
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AC_OUTPUT_TERMINAL,     /*  u8  bDescriptorSubtype */
                     0x03,                       /*  u8  bUnitID */
-                    U16(0x0301),                /* u16  wTerminalType (SPK) */
+                    U16(0x0603),                /* u16  wTerminalType (Line connector) */
                     0x00,                       /*  u8  bAssocTerminal */
                     0x02,                       /*  u8  bSourceID */
                     STRING_OUTPUT_TERMINAL,     /*  u8  iTerminal */
