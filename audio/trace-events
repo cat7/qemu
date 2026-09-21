@@ -76,3 +76,9 @@ audio_rate_reset(int64_t frames) "Resetting rate control (%" PRId64 " frames)"
 audio_open_out(const char *name, int freq, int nchannels, int fmt) "open %s, freq %d, nchannels %d, fmt %d"
 audio_open_in(const char *name, int freq, int nchannels, int fmt) "open %s, freq %d, nchannels %d, fmt %d"
 audio_voice_pair(const char *type, const char *name, const char *hw_fmt, int hw_freq, int hw_nchannels, const char *sw_fmt, int sw_freq, int sw_nchannels) "%s: name=%s hw=%s/%d/%d sw=%s/%d/%d"
+
+# coreaudio.m
+coreaudio_out_ioproc(void *core, uint32_t dev, uint32_t bytes, uint32_t frames, uint32_t pending) "core=%p dev=%u bytes=%u frames=%u pending_frames=%u"
+coreaudio_in_ioproc(void *core, uint32_t dev, uint32_t bytes, uint32_t frames) "core=%p dev=%u bytes=%u frames=%u"
+coreaudio_init_out(void *core, uint32_t dev, uint32_t req_frames, uint32_t got_frames, uint32_t rate, uint32_t chans, uint32_t flags, uint32_t bits, uint32_t bpf) "core=%p dev=%u frames req=%u got=%u fmt rate=%u ch=%u flags=0x%x bits=%u bpf=%u"
+coreaudio_init_in(void *core, uint32_t dev, uint32_t req_frames, uint32_t got_frames, uint32_t rate, uint32_t chans, uint32_t flags, uint32_t bits, uint32_t bpf) "core=%p dev=%u frames req=%u got=%u fmt rate=%u ch=%u flags=0x%x bits=%u bpf=%u"
