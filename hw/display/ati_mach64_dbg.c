@@ -16,11 +16,9 @@ const char *ati_mach64_reg_name(uint32_t base)
 {
     switch (base) {
     case ATI_CRTC_H_TOTAL_DISP:       return "CRTC_H_TOTAL_DISP";
-    case ATI_BKGD_SRC_PATTERN:        return "BKGD_SRC_PATTERN";
     case ATI_CRTC_V_TOTAL_DISP:       return "CRTC_V_TOTAL_DISP";
-    case ATI_MIX_AND:                 return "MIX_AND";
-    case ATI_SRC_LINE_X_L2R:          return "SRC_LINE_X_L2R";
     case ATI_CRTC_OFF_PITCH:          return "CRTC_OFF_PITCH";
+    case ATI_CRTC_VLINE_CRNT_VLINE:   return "CRTC_VLINE_CRNT_VLINE";
     case ATI_CRTC_INT_CNTL:           return "CRTC_INT_CNTL";
     case ATI_CRTC_GEN_CNTL:           return "CRTC_GEN_CNTL";
     case ATI_CUR_CLR0:                return "CUR_CLR0";

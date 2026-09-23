@@ -1522,6 +1522,37 @@ static uint64_t ati_mach64_mmio_read(void *opaque, hwaddr addr, unsigned size)
         result = (ATI_RAGE_PRO_ASIC_ID << ATI_CFG_CHIP_MAJOR_SHIFT) |
                  (PCI_DEVICE_ID_ATI_RAGE_PRO << ATI_CFG_CHIP_TYPE_SHIFT);
         break;
+    case ATI_CRTC_VLINE_CRNT_VLINE:
+    {
+        /*
+         * CRNT_VLINE (bits 26:16) is the live scanline counter, free-
+         * running over CRTC_V_TOTAL lines per frame period; bits 10:0
+         * hold the guest-written VLINE interrupt trigger and read back
+         * unchanged. Firmware and drivers poll this to wait for the
+         * beam to reach a given line, so a fixed value wedges them:
+         * a constant 0 spins any "wait while line < N" loop forever,
+         * and a constant N any "wait until line >= N" loop.
+         */
+        uint32_t v_total = ((s->regs[ATI_CRTC_V_TOTAL_DISP >> 2] >>
+                             ATI_CRTC_V_TOTAL_SHIFT) &
+                            ATI_CRTC_V_TOTAL_MASK) + 1;
+
+        if (v_total <= 1) {
+            /* CRTC timing not programmed yet: free-run over the full
+             * field width rather than pinning the counter at 0, which
+             * is itself a value guests wait to leave. */
+            v_total = ATI_CRTC_V_TOTAL_MASK + 1;
+        }
+
+        int64_t phase = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) %
+                        ATI_MACH64_VBLANK_PERIOD_NS;
+        uint32_t line = phase * v_total / ATI_MACH64_VBLANK_PERIOD_NS;
+
+        result = (result & ATI_CRTC_VLINE_MASK) |
+                 ((line & ATI_CRTC_CRNT_VLINE_MASK) <<
+                  ATI_CRTC_CRNT_VLINE_SHIFT);
+        break;
+    }
     case ATI_CRTC_INT_CNTL:
     {
         /*

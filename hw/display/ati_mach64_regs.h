@@ -14,6 +14,7 @@
 /* CRTC block */
 #define ATI_CRTC_H_TOTAL_DISP     0x000
 #define ATI_CRTC_V_TOTAL_DISP     0x008
+#define ATI_CRTC_VLINE_CRNT_VLINE 0x010
 #define ATI_CRTC_INT_CNTL         0x018
 #define ATI_CRTC_OFF_PITCH        0x014
 #define ATI_CRTC_GEN_CNTL         0x01C
@@ -47,6 +48,14 @@
 #define ATI_CRTC_H_DISP_MASK      0xff
 #define ATI_CRTC_V_DISP_SHIFT     16
 #define ATI_CRTC_V_DISP_MASK      0x7ff
+#define ATI_CRTC_V_TOTAL_SHIFT    0
+#define ATI_CRTC_V_TOTAL_MASK     0x7ff
+
+/* CRTC_VLINE_CRNT_VLINE fields: written trigger line in [10:0],
+ * read-only current scanline in [26:16] */
+#define ATI_CRTC_VLINE_MASK       0x7ff
+#define ATI_CRTC_CRNT_VLINE_SHIFT 16
+#define ATI_CRTC_CRNT_VLINE_MASK  0x7ff
 
 /* Pixel-width encodings for CRTC_GEN_CNTL's PIX_WIDTH field */
 #define ATI_PIX_FMT_4BPP          1
