@@ -203,11 +203,45 @@ static void ati_rage128_draw_8bpp(ATIRage128State *s, DisplaySurface *ds,
     }
 }
 
+/*
+ * The DAC runs every pixel component through the 256-entry palette in
+ * the direct-colour depths too: an 8-bit component selects its own
+ * entry, a 5-bit one entry c << 3 and a 6-bit one entry c << 2 (the
+ * entries the r128 drivers load for 15/16bpp). That palette is the
+ * guest's gamma ramp; Mac OS X keeps its display profile's curve there
+ * and Quake III draws at half intensity and doubles it through the
+ * ramp. With the identity ramp the plain expansion below is kept.
+ */
+static void ati_rage128_palette_reset(ATIRage128State *s)
+{
+    int i;
+
+    for (i = 0; i < 256; i++) {
+        s->palette[i][0] = i;
+        s->palette[i][1] = i;
+        s->palette[i][2] = i;
+    }
+}
+
+static const uint8_t (*ati_rage128_palette_lut(ATIRage128State *s))[3]
+{
+    int i;
+
+    for (i = 0; i < 256; i++) {
+        if (s->palette[i][0] != i || s->palette[i][1] != i ||
+            s->palette[i][2] != i) {
+            return (const uint8_t (*)[3])s->palette;
+        }
+    }
+    return NULL;
+}
+
 static void ati_rage128_draw_16bpp(ATIRage128State *s, DisplaySurface *ds,
                                    const ATIRage128Mode *mode, bool rgb565)
 {
     uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                    mode->fb_offset;
+    const uint8_t (*lut)[3] = ati_rage128_palette_lut(s);
     uint32_t *dst;
     int x, y;
 
@@ -222,15 +256,20 @@ static void ati_rage128_draw_16bpp(ATIRage128State *s, DisplaySurface *ds,
                 r = ((pixel >> 11) & 0x1f) << 3;
                 g = ((pixel >> 5) & 0x3f) << 2;
                 b = (pixel & 0x1f) << 3;
-                g |= g >> 6;
             } else {                        /* RGB555 */
                 r = ((pixel >> 10) & 0x1f) << 3;
                 g = ((pixel >> 5) & 0x1f) << 3;
                 b = (pixel & 0x1f) << 3;
-                g |= g >> 5;
             }
-            r |= r >> 5;
-            b |= b >> 5;
+            if (lut) {
+                r = lut[r][0];
+                g = lut[g][1];
+                b = lut[b][2];
+            } else {
+                g |= rgb565 ? g >> 6 : g >> 5;
+                r |= r >> 5;
+                b |= b >> 5;
+            }
             dst[x] = 0xff000000u | ((uint32_t)r << 16) |
                      ((uint32_t)g << 8) | b;
         }
@@ -243,16 +282,26 @@ static void ati_rage128_draw_32bpp(ATIRage128State *s, DisplaySurface *ds,
 {
     uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                    mode->fb_offset;
+    const uint8_t (*lut)[3] = ati_rage128_palette_lut(s);
     uint32_t *dst;
     int x, y;
 
     for (y = 0; y < mode->height; y++) {
         dst = (uint32_t *)((uint8_t *)surface_data(ds) +
                            y * surface_stride(ds));
-        for (x = 0; x < mode->width; x++) {
-            /* chip-native little-endian: B,G,R,X in VRAM */
-            dst[x] = 0xff000000u | ((uint32_t)src[4 * x + 2] << 16) |
-                     ((uint32_t)src[4 * x + 1] << 8) | src[4 * x];
+        /* chip-native little-endian: B,G,R,X in VRAM */
+        if (lut) {
+            for (x = 0; x < mode->width; x++) {
+                dst[x] = 0xff000000u |
+                         ((uint32_t)lut[src[4 * x + 2]][0] << 16) |
+                         ((uint32_t)lut[src[4 * x + 1]][1] << 8) |
+                         lut[src[4 * x]][2];
+            }
+        } else {
+            for (x = 0; x < mode->width; x++) {
+                dst[x] = 0xff000000u | ((uint32_t)src[4 * x + 2] << 16) |
+                         ((uint32_t)src[4 * x + 1] << 8) | src[4 * x];
+            }
         }
         src += mode->pitch;
     }
@@ -263,16 +312,26 @@ static void ati_rage128_draw_24bpp(ATIRage128State *s, DisplaySurface *ds,
 {
     uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                    mode->fb_offset;
+    const uint8_t (*lut)[3] = ati_rage128_palette_lut(s);
     uint32_t *dst;
     int x, y;
 
     for (y = 0; y < mode->height; y++) {
         dst = (uint32_t *)((uint8_t *)surface_data(ds) +
                            y * surface_stride(ds));
-        for (x = 0; x < mode->width; x++) {
-            /* chip-native little-endian: B,G,R in VRAM */
-            dst[x] = 0xff000000u | ((uint32_t)src[3 * x + 2] << 16) |
-                     ((uint32_t)src[3 * x + 1] << 8) | src[3 * x];
+        /* chip-native little-endian: B,G,R in VRAM */
+        if (lut) {
+            for (x = 0; x < mode->width; x++) {
+                dst[x] = 0xff000000u |
+                         ((uint32_t)lut[src[3 * x + 2]][0] << 16) |
+                         ((uint32_t)lut[src[3 * x + 1]][1] << 8) |
+                         lut[src[3 * x]][2];
+            }
+        } else {
+            for (x = 0; x < mode->width; x++) {
+                dst[x] = 0xff000000u | ((uint32_t)src[3 * x + 2] << 16) |
+                         ((uint32_t)src[3 * x + 1] << 8) | src[3 * x];
+            }
         }
         src += mode->pitch;
     }
@@ -4292,7 +4351,7 @@ static void ati_rage128_reset_hold(Object *obj, ResetType type)
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
-    memset(s->palette, 0, sizeof(s->palette));
+    ati_rage128_palette_reset(s);
     /* every driver's engine init writes all-ones here; a zero mask
      * would silently draw nothing until it does */
     s->dp_write_mask = 0xffffffff;
