@@ -42,6 +42,8 @@ static int ati_rage128_bpp_from_datatype(uint32_t datatype)
         return 24;
     case 6:
         return 32;
+    case 15:
+        return 16;                              /* ARGB4444 */
     default:
         return 0;
     }
