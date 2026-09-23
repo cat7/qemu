@@ -4582,6 +4582,7 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
                                     ATI_RAGE128_FIFO_BATCH);
     qemu_thread_create(&s->engine_thread, "ati-rage128-engine",
                        ati_rage128_engine_thread, s, QEMU_THREAD_JOINABLE);
+    ati_rage128_raster_init(s);
     s->dirty_lo = UINT32_MAX;
     s->dirty_hi = 0;
     /*
@@ -4737,6 +4738,7 @@ static void ati_rage128_exit(PCIDevice *dev)
     qemu_cond_signal(&s->engine_cond);
     qemu_mutex_unlock(&s->engine_lock);
     qemu_thread_join(&s->engine_thread);
+    ati_rage128_raster_fini(s);
     qemu_bh_delete(s->engine_bh);
     g_free(s->fifo_stage);
     g_free(s->fifo_batch);
@@ -4778,6 +4780,11 @@ static const Property ati_rage128_properties[] = {
     /* command-stream kicks on a worker thread; auto = on except qtest */
     DEFINE_PROP_ON_OFF_AUTO("async-engine", ATIRage128State, engine_async,
                             ON_OFF_AUTO_AUTO),
+    /*
+     * Threads a triangle's rows are split across, counting the one that
+     * submitted it: 0 = half the host's cores, 1 = draw serially.
+     */
+    DEFINE_PROP_UINT32("raster-threads", ATIRage128State, raster.threads, 0),
     DEFINE_EDID_PROPERTIES(ATIRage128State, edid_info),
 };
 
@@ -4794,6 +4801,31 @@ static const Property ati_rage128_properties[] = {
  * generated (ati_rage128_audit.h); regenerate it when the model learns
  * a register, or that register keeps being reported.
  */
+/*
+ * `raster-stats`: whether triangles are actually reaching the parallel
+ * path. A guest whose triangles all fall under ATI_RAGE128_RASTER_MIN_PX
+ * shows split 0, and then an unchanged frame rate says nothing about
+ * the bands -- it says the threshold never let them run.
+ */
+static char *ati_rage128_get_raster_stats(Object *obj, Error **errp)
+{
+    ATIRage128State *s = ATI_RAGE128(obj);
+    uint64_t tri = s->raster.tri_serial + s->raster.tri_split;
+    uint64_t px = s->raster.px_serial + s->raster.px_split;
+
+    return g_strdup_printf(
+        "workers %u (+submitter), threshold %d px\n"
+        "triangles %" PRIu64 ": %" PRIu64 " split (%.1f%%), "
+        "%" PRIu64 " serial\n"
+        "bbox pixels %" PRIu64 ": %" PRIu64 " split (%.1f%%), "
+        "%" PRIu64 " serial",
+        s->raster.nworkers, ATI_RAGE128_RASTER_MIN_PX,
+        tri, s->raster.tri_split, tri ? 100.0 * s->raster.tri_split / tri : 0.0,
+        s->raster.tri_serial,
+        px, s->raster.px_split, px ? 100.0 * s->raster.px_split / px : 0.0,
+        s->raster.px_serial);
+}
+
 static char *ati_rage128_get_silent_regs(Object *obj, Error **errp)
 {
     ATIRage128State *s = ATI_RAGE128(obj);
@@ -4848,6 +4880,8 @@ static void ati_rage128_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     object_class_property_add_str(klass, "silent-regs",
                                   ati_rage128_get_silent_regs, NULL);
+    object_class_property_add_str(klass, "raster-stats",
+                                  ati_rage128_get_raster_stats, NULL);
 }
 
 static const TypeInfo ati_rage128_type_info = {
