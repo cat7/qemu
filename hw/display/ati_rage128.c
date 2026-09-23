@@ -1662,6 +1662,8 @@ static void ati_rage128_engine_run_job(ATIRage128State *s, int job,
         break;
     }
     }
+    /* a job ends where the guest can look again: leave nothing queued */
+    ati_rage128_raster_flush(s);
 }
 
 static void *ati_rage128_engine_thread(void *opaque)
@@ -3228,6 +3230,8 @@ static void ati_rage128_pm4_run(ATIRage128State *s)
         }
         }
     }
+    /* the buffer is parsed: nothing may stay queued past its end */
+    ati_rage128_raster_flush(s);
 }
 
 /*
@@ -3895,12 +3899,23 @@ static void ati_rage128_pm4_parse(ATIRage128State *s,
         break;
     }
     p->remaining--;
-    if (p->remaining == 0 && p->type == 3 &&
-        p->p3_opcode == R128_PM4_OPCODE_HOSTDATA_BLT &&
-        s->host_data_active) {
-        ati_rage128_host_data_flush(s);
-        s->host_data_active = false;
-        s->host_data_next = 0;
+    if (p->remaining == 0) {
+        if (p->type == 3 &&
+            p->p3_opcode == R128_PM4_OPCODE_HOSTDATA_BLT &&
+            s->host_data_active) {
+            ati_rage128_host_data_flush(s);
+            s->host_data_active = false;
+            s->host_data_next = 0;
+        }
+        /*
+         * Draw whatever this packet queued, so a packet still leaves
+         * the card drawn when it ends -- everything that looks at the
+         * result, from the next packet to a guest read of the frame
+         * buffer, keeps seeing it finished. A batch therefore never
+         * outlives one primitive packet, which is also what makes the
+         * draw state it was queued under still the current one.
+         */
+        ati_rage128_raster_flush(s);
     }
 }
 
@@ -3959,6 +3974,8 @@ static void ati_rage128_pm4_indirect(ATIRage128State *s, uint32_t offset,
             ati_rage128_pm4_parse(s, &parser, chunk[j]);
         }
     }
+    /* the buffer is parsed: nothing may stay queued past its end */
+    ati_rage128_raster_flush(s);
 }
 
 /*
