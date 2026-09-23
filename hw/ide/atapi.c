@@ -701,6 +701,7 @@ static void cmd_inquiry(IDEState *s, uint8_t *buf)
     unsigned idx = 0;
     unsigned size_idx;
     unsigned preamble_len;
+    unsigned pad_to = 0;
 
     /* If the EVPD (Enable Vital Product Data) bit is set in byte 1,
      * we are being asked for a specific page of info indicated by byte 2. */
@@ -801,10 +802,26 @@ static void cmd_inquiry(IDEState *s, uint8_t *buf)
         padstr8(buf + 16, 16, "CD-ROM CDU-8003A");
         padstr8(buf + 32, 4, "1.9a");
         idx = 36;
+        /*
+         * Return the full allocation length, zero-padded past the
+         * 36-byte standard page, as real drives do. Transferring only
+         * the bytes we populate is spec-legal, but a driver that sized
+         * its buffer from the allocation length can treat the short
+         * data phase as an error after the fact: the command completes
+         * normally, then the transferred count is compared against the
+         * requested one and rewritten to an underrun status, so the
+         * device is dropped with nothing logged. buf[size_idx] still
+         * reports the true additional length.
+         */
+        pad_to = max_len;
     }
 
  out:
     buf[size_idx] = idx - preamble_len;
+    if (pad_to > idx) {
+        memset(buf + idx, 0, pad_to - idx);
+        idx = pad_to;
+    }
     ide_atapi_cmd_reply(s, idx, max_len);
 }
 
