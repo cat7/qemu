@@ -45,6 +45,7 @@
 #include "ui/console.h"
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
+#include "qemu/rcu.h"
 #include "system/qtest.h"
 #include "qom/object.h"
 #include "hw/i2c/i2c.h"
@@ -1671,6 +1672,8 @@ static void *ati_rage128_engine_thread(void *opaque)
     ATIRage128State *s = opaque;
     uint64_t taken = 0;
 
+    /* the jobs resolve VRAM through memory_region_get_ram_ptr() */
+    rcu_register_thread();
     qemu_mutex_lock(&s->engine_lock);
     for (;;) {
         ATIRage128Job j;
@@ -1696,6 +1699,7 @@ static void *ati_rage128_engine_thread(void *opaque)
         qemu_bh_schedule(s->engine_bh);
     }
     qemu_mutex_unlock(&s->engine_lock);
+    rcu_unregister_thread();
     return NULL;
 }
 
