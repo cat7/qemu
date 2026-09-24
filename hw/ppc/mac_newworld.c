@@ -192,7 +192,9 @@ static void ppc_core99_init(MachineState *machine)
     SysBusDevice *s;
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
-    DeviceState *ht_dev;
+    DeviceState *ht_dev = NULL;
+    PCIBus *macio_bus;
+    int macio_devfn;
     hwaddr nvram_addr = 0xFFF04000;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
 
@@ -410,7 +412,15 @@ static void ppc_core99_init(MachineState *machine)
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
 
     /* MacIO */
-    macio = OBJECT(pci_new(-1, TYPE_NEWWORLD_MACIO));
+    /* The K2 is behind the first HT-PCI bridge, the KeyLargo on the PCI bus */
+    if (machine_arch == ARCH_MAC99_U3) {
+        macio_bus = pci_bridge_get_sec_bus(U3_HT_HOST_BRIDGE(ht_dev)->k2[0]);
+        macio_devfn = PCI_DEVFN(7, 0);
+    } else {
+        macio_bus = pci_bus;
+        macio_devfn = -1;
+    }
+    macio = OBJECT(pci_new(macio_devfn, TYPE_NEWWORLD_MACIO));
     dev = DEVICE(macio);
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
@@ -426,7 +436,7 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_uint32(DEVICE(object_resolve_path_component(macio, "gpio")),
                          "nb-cpus", machine->smp.cpus);
 
-    pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
+    pci_realize_and_unref(PCI_DEVICE(macio), macio_bus, &error_fatal);
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     for (i = 0; i < 4; i++) {
@@ -505,7 +515,11 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     if (machine->usb) {
-        pci_create_simple(pci_bus, -1, "pci-ohci");
+        if (machine_arch == ARCH_MAC99_U3) {
+            pci_create_simple(macio_bus, PCI_DEVFN(8, 0), "pci-ohci");
+        } else {
+            pci_create_simple(pci_bus, -1, "pci-ohci");
+        }
 
         /* U3 needs to use USB for input because Linux doesn't support via-cuda
         on PPC64 */
@@ -534,6 +548,18 @@ static void ppc_core99_init(MachineState *machine)
         graphic_depth = 15;
     }
 
+    if (machine_arch == ARCH_MAC99_U3) {
+        /* The K2 GMAC is behind the fourth HT-PCI bridge */
+        PCIDevice *gmac = pci_new(PCI_DEVFN(15, 0), mc->default_nic);
+
+        if (qemu_configure_nic_device(DEVICE(gmac), true, NULL)) {
+            pci_realize_and_unref(gmac, pci_bridge_get_sec_bus(
+                                  U3_HT_HOST_BRIDGE(ht_dev)->k2[3]),
+                                  &error_fatal);
+        } else {
+            object_unref(OBJECT(gmac));
+        }
+    }
     pci_init_nic_devices(pci_bus, mc->default_nic);
 
     /* The NewWorld NVRAM is not located in the MacIO device */
