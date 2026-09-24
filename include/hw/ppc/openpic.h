@@ -74,6 +74,7 @@ typedef struct IRQSource {
     IRQType type;
     bool level:1;   /* level-triggered */
     bool nomask:1;  /* critical interrupts ignore mask on some FSL MPICs */
+    bool line:1;    /* current state of the input line, as last driven */
 } IRQSource;
 
 #define IVPR_MASK_SHIFT       31
