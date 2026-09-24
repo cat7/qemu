@@ -155,6 +155,7 @@ typedef struct DBDMA_channel {
     DBDMA_rw rw;
     DBDMA_flush flush;
     dbdma_cmd current;
+    bool devstat_driven;        /* device publishes s7-s4 */
 } DBDMA_channel;
 
 struct DBDMAState {
@@ -174,5 +175,6 @@ void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
                             DBDMA_rw rw, DBDMA_flush flush,
                             void *opaque);
 void DBDMA_kick(DBDMAState *dbdma);
+void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat);
 
 #endif

@@ -117,6 +117,17 @@ static void kill_channel(DBDMA_channel *ch)
     qemu_irq_raise(ch->irq);
 }
 
+/*
+ * ChannelStatus bits 7:4 (s7-s4) are the attached device's status lines.
+ * Wait/Branch/Int conditions compare them only on channels whose device
+ * publishes them through DBDMA_set_devstat(); elsewhere they read as zero,
+ * which the hardware would not show, so keep the low-nibble compare.
+ */
+static uint16_t devstat_sel_mask(DBDMA_channel *ch)
+{
+    return ch->devstat_driven ? DEVSTAT : 0x0f;
+}
+
 static void conditional_interrupt(DBDMA_channel *ch)
 {
     dbdma_cmd *current = &ch->current;
@@ -140,8 +151,8 @@ static void conditional_interrupt(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_INTR_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_INTR_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -181,8 +192,8 @@ static int conditional_wait(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_WAIT_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_WAIT_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -247,8 +258,8 @@ static void conditional_branch(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_BRANCH_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_BRANCH_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -555,6 +566,23 @@ static void DBDMA_run_bh(void *opaque)
     DBDMA_DPRINTF("-> DBDMA_run_bh\n");
     DBDMA_run(s);
     DBDMA_DPRINTF("<- DBDMA_run_bh\n");
+}
+
+/* Publish a device's status lines s7-s0 for the channel it owns */
+void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat)
+{
+    DBDMAState *s = dbdma;
+    DBDMA_channel *ch = &s->channels[nchan];
+    uint32_t old = ch->regs[DBDMA_STATUS];
+
+    ch->devstat_driven = true;
+    ch->regs[DBDMA_STATUS] = (old & ~(uint32_t)DEVSTAT) | devstat;
+
+    /* let a channel parked on a wait continue now */
+    if (ch->regs[DBDMA_STATUS] != old &&
+        (ch->regs[DBDMA_STATUS] & RUN) && (ch->regs[DBDMA_STATUS] & ACTIVE)) {
+        DBDMA_kick(s);
+    }
 }
 
 void DBDMA_kick(DBDMAState *dbdma)
