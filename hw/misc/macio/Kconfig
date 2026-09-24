@@ -9,3 +9,7 @@ config MAC_DBDMA
 
 config MACIO_GPIO
     bool
+
+config KEYWEST_I2C
+    bool
+    select I2C

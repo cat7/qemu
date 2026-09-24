@@ -27,6 +27,7 @@
 
 #include "hw/pci/pci_host.h"
 #include "hw/pci/pci_bridge.h"
+#include "hw/misc/macio/keywest_i2c.h"
 #include "qom/object.h"
 
 /* UniNorth version */
@@ -64,6 +65,7 @@ struct UNINState {
 
     MemoryRegion mem;
     uint32_t version;
+    KeyWestI2CState i2c;        /* at +0x1000 on the U3 */
 };
 
 #define TYPE_UNI_NORTH "uni-north"

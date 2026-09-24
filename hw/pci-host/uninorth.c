@@ -859,18 +859,26 @@ static void unin_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memory_region_init_io(&s->mem, obj, &unin_ops, s, "unin", 0x1000);
+    keywest_i2c_init(&s->i2c, DEVICE(obj), "unin-i2c", 0x1000);
 
     sysbus_init_mmio(sbd, &s->mem);
+    sysbus_init_mmio(sbd, &s->i2c.mem);
 }
 
 static const Property unin_properties[] = {
     DEFINE_PROP_UINT32("version", UNINState, version, UNINORTH_VERSION_10A),
 };
 
+static void unin_reset(DeviceState *dev)
+{
+    keywest_i2c_reset(&UNI_NORTH(dev)->i2c);
+}
+
 static void unin_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_legacy_reset(dc, unin_reset);
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
     device_class_set_props(dc, unin_properties);
 }

@@ -56,6 +56,7 @@
 #include "hw/nvram/mac_nvram.h"
 #include "hw/core/boards.h"
 #include "hw/pci-host/uninorth.h"
+#include "hw/i2c/i2c.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/pci/pci.h"
@@ -193,6 +194,7 @@ static void ppc_core99_init(MachineState *machine)
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
     DeviceState *ht_dev = NULL;
+    SysBusDevice *unin_dev;
     PCIBus *macio_bus;
     PCIDevice *usb0, *usb1;
     int macio_devfn;
@@ -343,6 +345,7 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_realize_and_unref(s, &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0xf8000000,
                                 sysbus_mmio_get_region(s, 0));
+    unin_dev = s;
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;
@@ -359,6 +362,11 @@ static void ppc_core99_init(MachineState *machine)
         /* Register 8 MB of ISA IO space */
         memory_region_add_subregion(get_system_memory(), 0xf0000000,
                                     sysbus_mmio_get_region(s, 3));
+
+        /* U3 I2C, with the Pulsar clock chip at 0xd2 */
+        sysbus_mmio_map(SYS_BUS_DEVICE(unin_dev), 1, 0xf8001000);
+        i2c_slave_create_simple(UNI_NORTH(unin_dev)->i2c.bus,
+                                TYPE_PULSAR_CLOCK, 0xd2 >> 1);
 
         /* HyperTransport */
         ht_dev = qdev_new(TYPE_U3_HT_HOST_BRIDGE);

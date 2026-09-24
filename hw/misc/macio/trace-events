@@ -41,3 +41,7 @@ pmu_debug_protocol_cmd_toobig(int len) "command too big (%d bytes)"
 pmu_debug_protocol_cmd_send_resp_size(int len) "sending length byte: %d"
 pmu_debug_protocol_cmd_send_resp(int pos, int len) "sending byte: %d/%d"
 pmu_debug_protocol_cmd_resp_complete(int ier) "Response send complete. IER=0x%02x"
+
+# keywest_i2c.c
+keywest_i2c_read(const char *n, uint64_t addr, uint32_t val) "%s R reg=0x%02"PRIx64" val=0x%02x"
+keywest_i2c_write(const char *n, uint64_t addr, uint32_t val) "%s W reg=0x%02"PRIx64" val=0x%02x"
