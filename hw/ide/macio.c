@@ -338,6 +338,7 @@ static void pmac_ide_write(void *opaque, hwaddr addr, uint64_t val,
         if (size == 4) {
             if (val & 0x80000000u) {
                 d->irq_reg &= 0x7fffffff;
+                qemu_set_irq(d->real_dma_irq, 0);
             }
         }
         break;
@@ -428,17 +429,21 @@ static void pmac_ide_irq(void *opaque, int n, int level)
     MACIOIDEState *s = opaque;
     uint32_t mask = 0x80000000u >> n;
 
-    /* We need to reflect the IRQ state in the irq register */
-    if (level) {
-        s->irq_reg |= mask;
-    } else {
-        s->irq_reg &= ~mask;
-    }
-
+    /*
+     * The disk interrupt is an image of the drive's line. The DMA
+     * interrupt latches, and its line stays up until the driver clears
+     * the latch through the interrupt state register.
+     */
     if (n) {
+        if (level) {
+            s->irq_reg |= mask;
+        } else {
+            s->irq_reg &= ~mask;
+        }
         qemu_set_irq(s->real_ide_irq, level);
-    } else {
-        qemu_set_irq(s->real_dma_irq, level);
+    } else if (level) {
+        s->irq_reg |= mask;
+        qemu_set_irq(s->real_dma_irq, 1);
     }
 }
 
