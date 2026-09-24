@@ -35,6 +35,8 @@ void keywest_i2c_reset(KeyWestI2CState *c)
     c->manual_addr_pending = false;
     c->manual_byte_delivered = false;
     c->read_pending = false;
+    c->last_nak = false;
+    timer_del(c->byte_timer);
     c->mode = 0;
     c->control = 0;
     c->status = 0;
@@ -110,6 +112,24 @@ static bool keywest_i2c_start(KeyWestI2CState *c)
     }
 
     return true;
+}
+
+/* Clock in a read byte, remembering whether the driver ACKs it */
+static void keywest_i2c_read_byte(KeyWestI2CState *c)
+{
+    c->data = i2c_recv(c->bus);
+    c->status |= KW_I2C_STAT_LAST_AAK;
+    c->last_nak = !(c->control & KW_I2C_CTL_AAK);
+    keywest_i2c_set_irq(c, KW_I2C_IRQ_DATA);
+}
+
+static void keywest_i2c_byte_timer(void *opaque)
+{
+    KeyWestI2CState *c = opaque;
+
+    if (c->xfer_active && (c->addr & 1)) {
+        keywest_i2c_read_byte(c);
+    }
 }
 
 static uint64_t keywest_i2c_read(void *opaque, hwaddr addr, unsigned size)
@@ -241,7 +261,9 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         c->status = val;
         break;
 
-    case KW_I2C_REG_ISR:
+    case KW_I2C_REG_ISR: {
+        uint8_t old_isr = c->isr;
+
         /* Write-1-to-clear. */
         c->isr &= ~(val & KW_I2C_IRQ_MASK);
         keywest_i2c_update_irq(c);
@@ -255,9 +277,7 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
          */
         if ((val & KW_I2C_IRQ_ADDR) && c->xfer_active && c->read_pending) {
             c->read_pending = false;
-            c->data = i2c_recv(c->bus);
-            c->status |= KW_I2C_STAT_LAST_AAK;
-            keywest_i2c_set_irq(c, KW_I2C_IRQ_DATA);
+            keywest_i2c_read_byte(c);
         }
 
         /*
@@ -272,30 +292,34 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
             int mode = c->mode & KW_I2C_MODE_MODE_MASK;
             bool manual_read = mode == KW_I2C_MODE_DUMB && (c->addr & 1);
 
-            if ((mode == KW_I2C_MODE_COMBINED && (c->addr & 1)) ||
-                (mode == KW_I2C_MODE_STANDARD && (c->addr & 1)) ||
-                (manual_read && c->manual_byte_delivered)) {
+            bool xaddr_read = (mode == KW_I2C_MODE_COMBINED ||
+                               mode == KW_I2C_MODE_STANDARD) && (c->addr & 1);
+
+            if (xaddr_read) {
                 /*
-                 * Combined mode is the register-read form: sub-address write,
-                 * repeated start, one data byte, stop. The controller closes
-                 * the transfer out by itself once the driver has taken that
-                 * byte -- the Apple ROM reads it and then waits for the stop
-                 * interrupt without ever writing a STOP of its own.
-                 *
-                 * Plain STANDARD mode never sends a sub-address at all (see
-                 * keywest_i2c_start()) -- it's a bare "current address read"
-                 * of whatever byte the target device's own internal pointer
-                 * is sitting on. The PowerMac3,6 ROM's ADM1030 probe
-                 * addresses for read with mode=STANDARD and never writes a
-                 * STOP itself either, so without this the
-                 * transfer free-runs forever, reading device memory
-                 * sequentially -- same one-byte-then-stop contract as
-                 * COMBINED's read leg, just without the write leg first.
-                 *
-                 * DUMB (manual) mode reads do the same, just one ack later: the address-ack's IRQ_DATA is "empty" (see
-                 * the DATA-register case), so it's the driver's *second* ack
-                 * -- after actually consuming the byte this first ack
-                 * delivers below -- that should auto-stop.
+                 * Only an ack of a pending DATA interrupt moves the read on:
+                 * Linux acks twice per byte. After a byte sent with AAK the
+                 * next one clocks in a byte time later; after a NAK'd one
+                 * the controller stops the bus itself, which the Apple ROM
+                 * and Mac OS X, reading single bytes without AAK, wait for.
+                 */
+                if (!(old_isr & KW_I2C_IRQ_DATA)) {
+                    break;
+                }
+                if (c->last_nak) {
+                    keywest_i2c_stop(c);
+                    keywest_i2c_set_irq(c, KW_I2C_IRQ_STOP);
+                } else {
+                    timer_mod(c->byte_timer,
+                              qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) +
+                              KW_I2C_BYTE_US);
+                }
+            } else if (manual_read && c->manual_byte_delivered) {
+                /*
+                 * DUMB (manual) mode reads stop one ack later: the
+                 * address-ack's IRQ_DATA is "empty" (see the DATA-register
+                 * case), so it's the driver's second ack, after consuming
+                 * the byte the first one delivers, that auto-stops.
                  */
                 keywest_i2c_stop(c);
                 keywest_i2c_set_irq(c, KW_I2C_IRQ_STOP);
@@ -311,6 +335,8 @@ static void keywest_i2c_write(void *opaque, hwaddr addr, uint64_t value,
             }
         }
         break;
+
+    }
 
     case KW_I2C_REG_IER:
         c->ier = val;
@@ -384,6 +410,7 @@ void keywest_i2c_init(KeyWestI2CState *c, DeviceState *owner,
 
     c->name = name;
     c->bus = i2c_init_bus(owner, busname);
+    c->byte_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, keywest_i2c_byte_timer, c);
     memory_region_init_io(&c->mem, OBJECT(owner), &keywest_i2c_ops, c,
                           name, size);
 }

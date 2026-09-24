@@ -9,6 +9,7 @@
 
 #include "hw/i2c/i2c.h"
 #include "system/memory.h"
+#include "qemu/timer.h"
 
 #define KW_I2C_REG_MODE             0x00
 #define KW_I2C_REG_CONTROL          0x10
@@ -42,6 +43,9 @@
 #define KW_I2C_IRQ_START            0x08
 #define KW_I2C_IRQ_MASK             0x0f
 
+/* One byte at 100 kHz */
+#define KW_I2C_BYTE_US              90
+
 typedef struct KeyWestI2CState {
     MemoryRegion mem;
     const char *name;
@@ -54,6 +58,10 @@ typedef struct KeyWestI2CState {
     bool manual_byte_delivered;
     /* XADDR reads: the data byte is fetched when IRQ_ADDR is acked */
     bool read_pending;
+    /* XADDR reads: the byte just delivered was NAK'd (AAK clear) */
+    bool last_nak;
+    /* XADDR reads: the next byte clocks in one byte time after an ack */
+    QEMUTimer *byte_timer;
     uint8_t mode;
     uint8_t control;
     uint8_t status;
