@@ -110,6 +110,7 @@ struct K2UATAState {
     MemoryRegion bar;
     MemoryRegion fcr_mem;
     uint32_t fcr;
+    bool irq_level[2];          /* DMA, IDE */
     DBDMAState dbdma;
     MACIOIDEState ide;
 };

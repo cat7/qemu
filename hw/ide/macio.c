@@ -517,9 +517,19 @@ static const MemoryRegionOps k2_uata_fcr_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/*
+ * The drive and DMA interrupts share INTA. The drive's line is also the
+ * channel's s7, which Apple's driver waits on before a transfer ends.
+ */
 static void k2_uata_set_irq(void *opaque, int n, int level)
 {
-    pci_set_irq(PCI_DEVICE(opaque), level);
+    K2UATAState *s = opaque;
+
+    s->irq_level[n] = level;
+    if (n == MACIO_IDE_PMAC_IDE_IRQ) {
+        DBDMA_set_devstat(&s->dbdma, 0, level ? 0x80 : 0);
+    }
+    pci_set_irq(PCI_DEVICE(s), s->irq_level[0] || s->irq_level[1]);
 }
 
 static void k2_uata_realize(PCIDevice *d, Error **errp)
@@ -541,7 +551,11 @@ static void k2_uata_realize(PCIDevice *d, Error **errp)
         return;
     }
     sbd = SYS_BUS_DEVICE(&s->ide);
-    sysbus_connect_irq(sbd, 0, qemu_allocate_irq(k2_uata_set_irq, s, 0));
+    sysbus_connect_irq(sbd, 0, qemu_allocate_irq(k2_uata_set_irq, s,
+                                                 MACIO_IDE_PMAC_IDE_IRQ));
+    sysbus_connect_irq(sbd, 1, qemu_allocate_irq(k2_uata_set_irq, s,
+                                                 MACIO_IDE_PMAC_DMA_IRQ));
+    DBDMA_set_devstat(&s->dbdma, 0, 0);
 
     memory_region_init(&s->bar, OBJECT(s), "k2-uata", 0x4000);
     memory_region_init_io(&s->fcr_mem, OBJECT(s), &k2_uata_fcr_ops, s,
