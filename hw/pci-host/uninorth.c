@@ -508,8 +508,25 @@ static void unin_agp_pci_host_realize(PCIDevice *d, Error **errp)
 
 static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
 {
+    int cap;
+
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
     d->config[PCI_LATENCY_TIMER] = 0x10;
+
+    /* AGP 3.0 at 0x80, as the U3 reports; Mac OS X's AGP driver needs it */
+    cap = pci_add_capability(d, PCI_CAP_ID_AGP, 0x80, PCI_AGP_SIZEOF, errp);
+    if (cap < 0) {
+        return;
+    }
+    d->config[cap + PCI_AGP_VERSION] = 0x30;
+    /* 32 requests, sideband, AGP 3.0 mode (bit 3) where RATE1/2 are 4x/8x */
+    pci_set_long(d->config + cap + PCI_AGP_STATUS,
+                 0x1f000000 | PCI_AGP_STATUS_SBA | (1 << 3) |
+                 PCI_AGP_STATUS_RATE2 | PCI_AGP_STATUS_RATE1);
+
+    /* address select: one bit per 256 MB region decoded to AGP */
+    pci_set_long(d->config + 0x48, 1u << (16 + 9));
+    pci_set_long(d->wmask + 0x48, 0);
 }
 
 /* Decode register: 16M at 0xfa000000-0xfeffffff, 256M at 0x8 and 0xa-0xe */
