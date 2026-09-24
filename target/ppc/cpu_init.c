@@ -5408,6 +5408,22 @@ static void register_power5p_tb_sprs(CPUPPCState *env)
                     0x00000000);
 }
 
+/*
+ * In Apple mode the 970's hypervisor SPRGs are still reachable from
+ * supervisor state; Mac OS X keeps a register there across rfid.
+ */
+static void register_970_hsprg_sprs(CPUPPCState *env)
+{
+    spr_register(env, SPR_HSPRG0, "HSPRG0",
+                 SPR_NOACCESS, SPR_NOACCESS,
+                 &spr_read_generic, &spr_write_generic,
+                 0x00000000);
+    spr_register(env, SPR_HSPRG1, "HSPRG1",
+                 SPR_NOACCESS, SPR_NOACCESS,
+                 &spr_read_generic, &spr_write_generic,
+                 0x00000000);
+}
+
 static void register_970_lpar_sprs(CPUPPCState *env)
 {
 #if !defined(CONFIG_USER_ONLY)
