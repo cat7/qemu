@@ -13,3 +13,7 @@ config MACIO_GPIO
 config KEYWEST_I2C
     bool
     select I2C
+
+config TAS3004
+    bool
+    select I2C

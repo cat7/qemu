@@ -32,6 +32,7 @@
 #include "hw/intc/heathrow_pic.h"
 #include "hw/misc/macio/cuda.h"
 #include "hw/misc/macio/gpio.h"
+#include "hw/misc/macio/keywest_i2c.h"
 #include "hw/misc/macio/pmu.h"
 #include "hw/nvram/mac_nvram.h"
 #include "hw/ppc/mac_dbdma.h"
@@ -54,6 +55,7 @@
 #define NEWWORLD_ESCCA_IRQ     0x25
 #define K2_ESCCB_IRQ           0x17
 #define K2_ESCCA_IRQ           0x16
+#define K2_I2C_IRQ             0x1a
 #define NEWWORLD_IDE0_IRQ      0xd
 #define NEWWORLD_IDE0_DMA_IRQ  0x2
 #define NEWWORLD_IDE1_IRQ      0xe
@@ -165,6 +167,7 @@ struct NewWorldMacIOState {
     OpenPICState pic;
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
+    KeyWestI2CState i2c;
 };
 
 #endif /* MACIO_H */

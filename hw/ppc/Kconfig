@@ -146,6 +146,7 @@ config MAC_NEWWORLD
     select MACIO_GPIO
     select MAC_PMU
     select KEYWEST_I2C
+    select TAS3004
     select UNIN_PCI
     select FW_CFG_PPC
 

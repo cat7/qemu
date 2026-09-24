@@ -33,6 +33,8 @@
 #include "migration/vmstate.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/misc/macio/tas3004.h"
+#include "hw/i2c/i2c.h"
 #include "hw/intc/heathrow_pic.h"
 #include "trace.h"
 
@@ -289,6 +291,14 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev,
                        ns->k2 ? K2_ESCCA_IRQ : NEWWORLD_ESCCA_IRQ));
 
+    /* K2 I2C, with the TAS3004 sound equalizer */
+    if (ns->k2) {
+        keywest_i2c_init(&ns->i2c, DEVICE(d), "k2-i2c", 0x1000);
+        ns->i2c.irq = qdev_get_gpio_in(pic_dev, K2_I2C_IRQ);
+        memory_region_add_subregion(&s->bar, 0x18000, &ns->i2c.mem);
+        i2c_slave_create_simple(ns->i2c.bus, TYPE_TAS3004, TAS3004_I2C_ADDR);
+    }
+
     /* IDE buses; the K2's ATA is a separate PCI function */
     if (ns->k2) {
         memory_region_del_subregion(&s->bar, &ns->ide[0].mem);
@@ -421,6 +431,15 @@ static const VMStateDescription vmstate_macio_newworld = {
     }
 };
 
+static void macio_newworld_reset(DeviceState *dev)
+{
+    NewWorldMacIOState *ns = NEWWORLD_MACIO(dev);
+
+    if (ns->k2) {
+        keywest_i2c_reset(&ns->i2c);
+    }
+}
+
 static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
@@ -434,6 +453,7 @@ static void macio_newworld_class_init(ObjectClass *oc, const void *data)
 
     pdc->realize = macio_newworld_realize;
     pdc->device_id = PCI_DEVICE_ID_APPLE_UNI_N_KEYL;
+    device_class_set_legacy_reset(dc, macio_newworld_reset);
     dc->vmsd = &vmstate_macio_newworld;
     device_class_set_props(dc, macio_newworld_properties);
 }
