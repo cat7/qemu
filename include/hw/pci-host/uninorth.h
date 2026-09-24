@@ -36,6 +36,7 @@
 #define TYPE_UNI_NORTH_AGP_HOST_BRIDGE "uni-north-agp-pcihost"
 #define TYPE_UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE "uni-north-internal-pci-pcihost"
 #define TYPE_U3_AGP_HOST_BRIDGE "u3-agp-pcihost"
+#define TYPE_U3_HT_HOST_BRIDGE "u3-ht-pcihost"
 
 typedef struct UNINHostState UNINHostState;
 DECLARE_INSTANCE_CHECKER(UNINHostState, UNI_NORTH_PCI_HOST_BRIDGE,
@@ -66,5 +67,29 @@ struct UNINState {
 
 #define TYPE_UNI_NORTH "uni-north"
 OBJECT_DECLARE_SIMPLE_TYPE(UNINState, UNI_NORTH)
+
+/* U3 HyperTransport host */
+#define U3_HT_CFG_BASE      0xf2000000
+#define U3_HT_CFG_SIZE      0x02000000
+#define U3_HT_IO_BASE       0xf4000000
+#define U3_HT_IO_SIZE       0x00400000
+#define U3_HT_SELF_BASE     0xf8070000
+#define U3_HT_SELF_SIZE     0x1000
+#define U3_HT_NUM_IRQS      64
+
+OBJECT_DECLARE_SIMPLE_TYPE(U3HTHostState, U3_HT_HOST_BRIDGE)
+
+struct U3HTHostState {
+    PCIHostState parent_obj;
+
+    qemu_irq irqs[U3_HT_NUM_IRQS];
+    MemoryRegion cfg;
+    MemoryRegion self;
+    MemoryRegion pci_mmio;
+    MemoryRegion pci_io;
+    MemoryRegion mem_win[3];
+};
+
+void u3_ht_map(SysBusDevice *sbd);
 
 #endif /* UNINORTH_H */

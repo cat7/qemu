@@ -192,6 +192,7 @@ static void ppc_core99_init(MachineState *machine)
     SysBusDevice *s;
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
+    DeviceState *ht_dev;
     hwaddr nvram_addr = 0xFFF04000;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
 
@@ -350,11 +351,16 @@ static void ppc_core99_init(MachineState *machine)
         sysbus_mmio_map(s, 0, 0xf0800000);
         sysbus_mmio_map(s, 1, 0xf0c00000);
         /* PCI hole */
-        memory_region_add_subregion(get_system_memory(), 0x80000000,
+        memory_region_add_subregion(get_system_memory(), 0x90000000,
                                     sysbus_mmio_get_region(s, 2));
         /* Register 8 MB of ISA IO space */
-        memory_region_add_subregion(get_system_memory(), 0xf2000000,
+        memory_region_add_subregion(get_system_memory(), 0xf0000000,
                                     sysbus_mmio_get_region(s, 3));
+
+        /* HyperTransport */
+        ht_dev = qdev_new(TYPE_U3_HT_HOST_BRIDGE);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ht_dev), &error_fatal);
+        u3_ht_map(SYS_BUS_DEVICE(ht_dev));
     } else {
         machine_arch = ARCH_MAC99;
         /* Use values found on a real PowerMac */
@@ -426,6 +432,11 @@ static void ppc_core99_init(MachineState *machine)
     for (i = 0; i < 4; i++) {
         qdev_connect_gpio_out(uninorth_pci_dev, i,
                               qdev_get_gpio_in(pic_dev, 0x1b + i));
+    }
+    if (machine_arch == ARCH_MAC99_U3) {
+        for (i = 0; i < U3_HT_NUM_IRQS; i++) {
+            qdev_connect_gpio_out(ht_dev, i, qdev_get_gpio_in(pic_dev, i));
+        }
     }
 
     /* TODO: additional PCI buses only wired up for 32-bit machines */

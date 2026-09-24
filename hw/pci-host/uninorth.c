@@ -29,6 +29,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_host.h"
 #include "hw/pci-host/uninorth.h"
+#include "system/address-spaces.h"
 #include "trace.h"
 
 static int pci_unin_map_irq(PCIDevice *pci_dev, int irq_num)
@@ -198,7 +199,7 @@ static void pci_u3_agp_init(Object *obj)
 
     memory_region_init_alias(&s->pci_hole, OBJECT(s),
                              "unin-pci-hole", &s->pci_mmio,
-                             0x80000000ULL, 0x70000000ULL);
+                             0x90000000ULL, 0x10000000ULL);
 
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
@@ -206,6 +207,144 @@ static void pci_u3_agp_init(Object *obj)
     sysbus_init_mmio(sbd, &s->pci_io);
 
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
+}
+
+/*
+ * HyperTransport configuration window: type 0 cycles at devfn << 8 | reg,
+ * type 1 cycles at 0x01000000 + (bus << 16 | devfn << 8 | reg).
+ */
+static uint32_t u3_ht_cfg_addr(hwaddr addr)
+{
+    if (addr & 0x01000000) {
+        return addr & 0x00ffffff;
+    }
+    return addr & 0xffff;
+}
+
+static uint64_t u3_ht_cfg_read(void *opaque, hwaddr addr, unsigned len)
+{
+    PCIHostState *h = opaque;
+
+    return pci_data_read(h->bus, u3_ht_cfg_addr(addr), len);
+}
+
+static void u3_ht_cfg_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned len)
+{
+    PCIHostState *h = opaque;
+
+    pci_data_write(h->bus, u3_ht_cfg_addr(addr), val, len);
+}
+
+static const MemoryRegionOps u3_ht_cfg_ops = {
+    .read = u3_ht_cfg_read,
+    .write = u3_ht_cfg_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* The host's own configuration space, one register every four bytes */
+static uint64_t u3_ht_self_read(void *opaque, hwaddr addr, unsigned len)
+{
+    PCIDevice *d = opaque;
+
+    return pci_host_config_read_common(d, addr >> 2, PCI_CONFIG_SPACE_SIZE,
+                                       len);
+}
+
+static void u3_ht_self_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned len)
+{
+    PCIDevice *d = opaque;
+
+    pci_host_config_write_common(d, addr >> 2, PCI_CONFIG_SPACE_SIZE,
+                                 val, len);
+}
+
+static const MemoryRegionOps u3_ht_self_ops = {
+    .read = u3_ht_self_read,
+    .write = u3_ht_self_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/*
+ * HyperTransport interrupts reach the MPIC input named by the device's
+ * bridge; a root bus interrupt number is an MPIC input.
+ */
+static int u3_ht_map_irq(PCIDevice *pci_dev, int irq_num)
+{
+    return irq_num;
+}
+
+static void u3_ht_set_irq(void *opaque, int irq_num, int level)
+{
+    U3HTHostState *s = opaque;
+
+    qemu_set_irq(s->irqs[irq_num], level);
+}
+
+/* Memory decoded to HyperTransport, as in the host's decode register */
+static const struct {
+    hwaddr base;
+    hwaddr size;
+} u3_ht_mem_windows[3] = {
+    { 0x80000000, 0x10000000 },
+    { 0xa0000000, 0x50000000 },
+    { 0xfa000000, 0x05000000 },
+};
+
+static void pci_u3_ht_realize(DeviceState *dev, Error **errp)
+{
+    U3HTHostState *s = U3_HT_HOST_BRIDGE(dev);
+    PCIHostState *h = PCI_HOST_BRIDGE(dev);
+    PCIDevice *d;
+
+    h->bus = pci_register_root_bus(dev, NULL,
+                                   u3_ht_set_irq, u3_ht_map_irq,
+                                   s,
+                                   &s->pci_mmio,
+                                   &s->pci_io,
+                                   PCI_DEVFN(0, 0), U3_HT_NUM_IRQS,
+                                   TYPE_PCI_BUS);
+
+    d = pci_create_simple(h->bus, PCI_DEVFN(0, 0), "u3-ht");
+    memory_region_init_io(&s->self, OBJECT(s), &u3_ht_self_ops, d,
+                          "u3-ht-self", U3_HT_SELF_SIZE);
+}
+
+static void pci_u3_ht_init(Object *obj)
+{
+    U3HTHostState *s = U3_HT_HOST_BRIDGE(obj);
+    int i;
+
+    memory_region_init_io(&s->cfg, obj, &u3_ht_cfg_ops, obj,
+                          "u3-ht-cfg", U3_HT_CFG_SIZE);
+    memory_region_init(&s->pci_mmio, obj, "u3-ht-mmio", 0x100000000ULL);
+    memory_region_init_io(&s->pci_io, obj, &unassigned_io_ops, obj,
+                          "u3-ht-io", U3_HT_IO_SIZE);
+    for (i = 0; i < ARRAY_SIZE(u3_ht_mem_windows); i++) {
+        memory_region_init_alias(&s->mem_win[i], obj, "u3-ht-mem",
+                                 &s->pci_mmio, u3_ht_mem_windows[i].base,
+                                 u3_ht_mem_windows[i].size);
+    }
+
+    qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
+}
+
+void u3_ht_map(SysBusDevice *sbd)
+{
+    U3HTHostState *s = U3_HT_HOST_BRIDGE(sbd);
+    MemoryRegion *sysmem = get_system_memory();
+    int i;
+
+    memory_region_add_subregion(sysmem, U3_HT_CFG_BASE, &s->cfg);
+    memory_region_add_subregion(sysmem, U3_HT_SELF_BASE, &s->self);
+    memory_region_add_subregion(sysmem, U3_HT_IO_BASE, &s->pci_io);
+    for (i = 0; i < ARRAY_SIZE(u3_ht_mem_windows); i++) {
+        memory_region_add_subregion(sysmem, u3_ht_mem_windows[i].base,
+                                    &s->mem_win[i]);
+    }
 }
 
 static void pci_unin_agp_realize(DeviceState *dev, Error **errp)
@@ -304,6 +443,15 @@ static void u3_agp_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[PCI_LATENCY_TIMER] = 0x10;
 }
 
+/* Decode register: 16M at 0xfa000000-0xfeffffff, 256M at 0x8 and 0xa-0xe */
+#define U3_HT_DECODE    0x003f00be
+
+static void u3_ht_pci_host_realize(PCIDevice *d, Error **errp)
+{
+    pci_set_long(d->config + 0x80, U3_HT_DECODE);
+    pci_set_long(d->wmask + 0x80, 0);
+}
+
 static void unin_internal_pci_host_realize(PCIDevice *d, Error **errp)
 {
     d->config[PCI_CACHE_LINE_SIZE] = 0x08;
@@ -361,6 +509,30 @@ static const TypeInfo u3_agp_pci_host_info = {
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCIDevice),
     .class_init = u3_agp_pci_host_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
+static void u3_ht_pci_host_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    k->realize   = u3_ht_pci_host_realize;
+    k->vendor_id = PCI_VENDOR_ID_APPLE;
+    k->device_id = PCI_DEVICE_ID_APPLE_U3_HT;
+    k->revision  = 0x00;
+    k->class_id  = PCI_CLASS_BRIDGE_HOST;
+    dc->user_creatable = false;
+}
+
+static const TypeInfo u3_ht_pci_host_info = {
+    .name = "u3-ht",
+    .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(PCIDevice),
+    .class_init = u3_ht_pci_host_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
@@ -453,6 +625,21 @@ static void pci_u3_agp_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = pci_u3_agp_realize;
 }
+
+static void pci_u3_ht_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = pci_u3_ht_realize;
+}
+
+static const TypeInfo pci_u3_ht_info = {
+    .name          = TYPE_U3_HT_HOST_BRIDGE,
+    .parent        = TYPE_PCI_HOST_BRIDGE,
+    .instance_size = sizeof(U3HTHostState),
+    .instance_init = pci_u3_ht_init,
+    .class_init    = pci_u3_ht_class_init,
+};
 
 static const TypeInfo pci_u3_agp_info = {
     .name          = TYPE_U3_AGP_HOST_BRIDGE,
@@ -557,11 +744,13 @@ static void unin_register_types(void)
 {
     type_register_static(&unin_main_pci_host_info);
     type_register_static(&u3_agp_pci_host_info);
+    type_register_static(&u3_ht_pci_host_info);
     type_register_static(&unin_agp_pci_host_info);
     type_register_static(&unin_internal_pci_host_info);
 
     type_register_static(&pci_unin_main_info);
     type_register_static(&pci_u3_agp_info);
+    type_register_static(&pci_u3_ht_info);
     type_register_static(&pci_unin_agp_info);
     type_register_static(&pci_unin_internal_info);
 
