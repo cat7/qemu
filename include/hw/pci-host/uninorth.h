@@ -26,6 +26,7 @@
 #define UNINORTH_H
 
 #include "hw/pci/pci_host.h"
+#include "hw/pci/pci_bridge.h"
 #include "qom/object.h"
 
 /* UniNorth version */
@@ -77,6 +78,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(UNINState, UNI_NORTH)
 #define U3_HT_SELF_SIZE     0x1000
 #define U3_HT_NUM_IRQS      64
 
+/* K2 HyperTransport-PCI bridges, at HT devices 3-7 */
+#define K2_HT_PCI_FIRST_SLOT 3
+#define K2_HT_PCI_NUM       5
+#define TYPE_K2_HT_PCI_BRIDGE "k2-ht-pci-bridge"
+
 OBJECT_DECLARE_SIMPLE_TYPE(U3HTHostState, U3_HT_HOST_BRIDGE)
 
 struct U3HTHostState {
@@ -88,6 +94,7 @@ struct U3HTHostState {
     MemoryRegion pci_mmio;
     MemoryRegion pci_io;
     MemoryRegion mem_win[3];
+    PCIBridge *k2[K2_HT_PCI_NUM];
 };
 
 void u3_ht_map(SysBusDevice *sbd);

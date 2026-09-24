@@ -30,6 +30,9 @@
 #include "hw/pci/pci_host.h"
 #include "hw/pci-host/uninorth.h"
 #include "system/address-spaces.h"
+#include "qapi/error.h"
+#include "qemu/log.h"
+#include "migration/vmstate.h"
 #include "trace.h"
 
 static int pci_unin_map_irq(PCIDevice *pci_dev, int irq_num)
@@ -284,6 +287,35 @@ static void u3_ht_set_irq(void *opaque, int irq_num, int level)
     qemu_set_irq(s->irqs[irq_num], level);
 }
 
+/* MPIC inputs of the devices behind each K2 bridge, by slot */
+static const struct {
+    int slot;
+    int irq;
+} k2_ht_pci_irqs[K2_HT_PCI_NUM][2] = {
+    { { 8, 0x1b }, { 9, 0x1c } },           /* USB0, USB1 */
+    { { 11, 0x3f } },                       /* USB2 */
+    { { 13, 0x27 }, { 14, 0x28 } },         /* ATA-100, FireWire */
+    { { 15, 0x29 } },                       /* GMAC */
+    { { 12, 0x11 } },                       /* SATA */
+};
+
+static int k2_ht_pci_map_irq(PCIDevice *pci_dev, int irq_num)
+{
+    PCIDevice *br = pci_bridge_get_device(pci_get_bus(pci_dev));
+    int n = PCI_SLOT(br->devfn) - K2_HT_PCI_FIRST_SLOT;
+    int slot = PCI_SLOT(pci_dev->devfn);
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(k2_ht_pci_irqs[n]); i++) {
+        if (k2_ht_pci_irqs[n][i].irq && k2_ht_pci_irqs[n][i].slot == slot) {
+            return k2_ht_pci_irqs[n][i].irq;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "K2 HT-PCI: no interrupt for slot %d\n",
+                  slot);
+    return 0;
+}
+
 /* Memory decoded to HyperTransport, as in the host's decode register */
 static const struct {
     hwaddr base;
@@ -299,6 +331,7 @@ static void pci_u3_ht_realize(DeviceState *dev, Error **errp)
     U3HTHostState *s = U3_HT_HOST_BRIDGE(dev);
     PCIHostState *h = PCI_HOST_BRIDGE(dev);
     PCIDevice *d;
+    int i;
 
     h->bus = pci_register_root_bus(dev, NULL,
                                    u3_ht_set_irq, u3_ht_map_irq,
@@ -311,6 +344,18 @@ static void pci_u3_ht_realize(DeviceState *dev, Error **errp)
     d = pci_create_simple(h->bus, PCI_DEVFN(0, 0), "u3-ht");
     memory_region_init_io(&s->self, OBJECT(s), &u3_ht_self_ops, d,
                           "u3-ht-self", U3_HT_SELF_SIZE);
+
+    for (i = 0; i < K2_HT_PCI_NUM; i++) {
+        g_autofree char *name = g_strdup_printf("k2-pci%d", i + 1);
+
+        d = pci_new(PCI_DEVFN(K2_HT_PCI_FIRST_SLOT + i, 0),
+                    TYPE_K2_HT_PCI_BRIDGE);
+        qdev_prop_set_uint16(DEVICE(d), "device-id",
+                             PCI_DEVICE_ID_APPLE_K2_HT_PCI_1 + i);
+        s->k2[i] = PCI_BRIDGE(d);
+        pci_bridge_map_irq(s->k2[i], name, k2_ht_pci_map_irq);
+        pci_realize_and_unref(d, h->bus, &error_fatal);
+    }
 }
 
 static void pci_u3_ht_init(Object *obj)
@@ -539,6 +584,55 @@ static const TypeInfo u3_ht_pci_host_info = {
     },
 };
 
+typedef struct K2HTPCIBridge {
+    PCIBridge parent_obj;
+
+    uint16_t device_id;
+} K2HTPCIBridge;
+
+OBJECT_DECLARE_SIMPLE_TYPE(K2HTPCIBridge, K2_HT_PCI_BRIDGE)
+
+static void k2_ht_pci_bridge_realize(PCIDevice *d, Error **errp)
+{
+    K2HTPCIBridge *br = K2_HT_PCI_BRIDGE(d);
+
+    pci_bridge_initfn(d, TYPE_PCI_BUS);
+    pci_config_set_device_id(d->config, br->device_id);
+}
+
+static const Property k2_ht_pci_bridge_properties[] = {
+    DEFINE_PROP_UINT16("device-id", K2HTPCIBridge, device_id,
+                       PCI_DEVICE_ID_APPLE_K2_HT_PCI_1),
+};
+
+static void k2_ht_pci_bridge_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    k->realize = k2_ht_pci_bridge_realize;
+    k->exit = pci_bridge_exitfn;
+    k->vendor_id = PCI_VENDOR_ID_APPLE;
+    k->device_id = PCI_DEVICE_ID_APPLE_K2_HT_PCI_1;
+    k->config_write = pci_bridge_write_config;
+    device_class_set_legacy_reset(dc, pci_bridge_reset);
+    device_class_set_props(dc, k2_ht_pci_bridge_properties);
+    dc->vmsd = &vmstate_pci_device;
+    dc->user_creatable = false;
+    set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
+}
+
+static const TypeInfo k2_ht_pci_bridge_info = {
+    .name          = TYPE_K2_HT_PCI_BRIDGE,
+    .parent        = TYPE_PCI_BRIDGE,
+    .instance_size = sizeof(K2HTPCIBridge),
+    .class_init    = k2_ht_pci_bridge_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
 static void unin_agp_pci_host_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -745,6 +839,7 @@ static void unin_register_types(void)
     type_register_static(&unin_main_pci_host_info);
     type_register_static(&u3_agp_pci_host_info);
     type_register_static(&u3_ht_pci_host_info);
+    type_register_static(&k2_ht_pci_bridge_info);
     type_register_static(&unin_agp_pci_host_info);
     type_register_static(&unin_internal_pci_host_info);
 
