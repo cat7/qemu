@@ -1103,7 +1103,8 @@ static void ati_surface_update(ATIVGAState *s)
     memory_region_set_enabled(&s->surface_aper, enabled);
 }
 
-static bool ati_surface_offset(ATIVGAState *s, hwaddr addr, uint64_t *offset)
+static bool ati_surface_offset(ATIVGAState *s, hwaddr addr, uint64_t *offset,
+                               bool ap1)
 {
     uint32_t swap = s->regs.surface_cntl;
 
@@ -1139,25 +1140,25 @@ static bool ati_surface_offset(ATIVGAState *s, hwaddr addr, uint64_t *offset)
         swap = info;
         break;
     }
-    switch (swap & R100_SURF_AP0_SWP_MASK) {
-    case R100_SURF_AP0_SWP_16BPP:
+    switch ((swap >> (ap1 ? 22 : 20)) & 3) {
+    case 1:
         *offset ^= 1;
         break;
-    case R100_SURF_AP0_SWP_32BPP:
+    case 2:
         *offset ^= 3;
         break;
     }
     return *offset < s->vga.vram_size;
 }
 
-static uint64_t ati_surface_read(void *opaque, hwaddr addr, unsigned int size)
+static uint64_t ati_aper_read(ATIVGAState *s, hwaddr addr, unsigned int size,
+                              bool ap1)
 {
-    ATIVGAState *s = opaque;
     uint64_t value = 0;
 
     for (unsigned i = 0; i < size; i++) {
         uint64_t offset;
-        uint8_t byte = ati_surface_offset(s, addr + i, &offset) ?
+        uint8_t byte = ati_surface_offset(s, addr + i, &offset, ap1) ?
                        s->vga.vram_ptr[offset] : 0xff;
 
         value |= (uint64_t)byte << (i * 8);
@@ -1165,20 +1166,48 @@ static uint64_t ati_surface_read(void *opaque, hwaddr addr, unsigned int size)
     return value;
 }
 
-static void ati_surface_write(void *opaque, hwaddr addr, uint64_t value,
-                              unsigned int size)
+static void ati_aper_write(ATIVGAState *s, hwaddr addr, uint64_t value,
+                           unsigned int size, bool ap1)
 {
-    ATIVGAState *s = opaque;
-
     for (unsigned i = 0; i < size; i++) {
         uint64_t offset;
 
-        if (ati_surface_offset(s, addr + i, &offset)) {
+        if (ati_surface_offset(s, addr + i, &offset, ap1)) {
             s->vga.vram_ptr[offset] = value >> (i * 8);
             memory_region_set_dirty(&s->vga.vram, offset, 1);
         }
     }
 }
+
+static uint64_t ati_surface_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    return ati_aper_read(opaque, addr, size, false);
+}
+
+static void ati_surface_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned int size)
+{
+    ati_aper_write(opaque, addr, value, size, false);
+}
+
+static uint64_t ati_aper1_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    return ati_aper_read(opaque, addr, size, true);
+}
+
+static void ati_aper1_write(void *opaque, hwaddr addr, uint64_t value,
+                            unsigned int size)
+{
+    ati_aper_write(opaque, addr, value, size, true);
+}
+
+static const MemoryRegionOps ati_aper1_ops = {
+    .read = ati_aper1_read,
+    .write = ati_aper1_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
+    .impl = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
+};
 
 static const MemoryRegionOps ati_surface_ops = {
     .read = ati_surface_read,
@@ -1317,6 +1346,9 @@ static uint64_t ati_reg_read(void *opaque, hwaddr addr, unsigned int size)
     case CONFIG_APER_1_BASE:
         val = pci_default_read_config(&s->dev,
                                       PCI_BASE_ADDRESS_0, size) & 0xfffffff0;
+        if (addr == CONFIG_APER_1_BASE && ati_is_rv100_family(s)) {
+            val += memory_region_size(&s->linear_aper) / 2;
+        }
         break;
     case CONFIG_APER_SIZE:
         val = memory_region_size(&s->linear_aper) / 2;
@@ -2832,6 +2864,11 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
         memory_region_set_enabled(&s->surface_aper, false);
         memory_region_add_subregion_overlap(&s->linear_aper, 0,
                                             &s->surface_aper, 1);
+        /* Aperture 1: upper half, AP1 byte swapping */
+        memory_region_init_io(&s->aper1, OBJECT(s), &ati_aper1_ops,
+                              s, "ati-linear-aperture1", vga->vram_size);
+        memory_region_add_subregion(&s->linear_aper, s->linear_aper_sz / 2,
+                                    &s->aper1);
     }
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->linear_aper);

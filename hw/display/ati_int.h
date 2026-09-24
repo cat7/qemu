@@ -214,6 +214,10 @@ typedef struct ATI3DState {
     uint64_t blit_work_remaining;
     uint8_t processing_depth;
     bool command_budget_exhausted;
+
+    /* Primary queue fed through PM4_FIFO_DATA in CSQ PIO modes */
+    uint32_t pio_buf[0x4001];
+    uint32_t pio_count;
 } ATI3DState;
 
 struct ATIVGAState {
@@ -266,6 +270,7 @@ struct ATIVGAState {
     uint64_t linear_aper_sz;
     MemoryRegion linear_aper;
     MemoryRegion surface_aper;
+    MemoryRegion aper1;
     MemoryRegion io;
     MemoryRegion mm;
     ATIVGARegs regs;

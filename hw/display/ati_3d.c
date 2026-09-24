@@ -108,6 +108,7 @@ typedef struct R100Stream {
     uint32_t remaining;
     uint32_t mask;
     bool ring;
+    const uint32_t *host;
 } R100Stream;
 
 typedef struct R100TextureAxis {
@@ -3630,10 +3631,13 @@ static bool r100_stream_read(ATIVGAState *s, R100Stream *stream,
         return false;
     }
     index = stream->ring ? stream->pos & stream->mask : stream->pos;
-    if (!r100_gpu_read_u32(s, stream->base + (uint64_t)index * 4, value)) {
+    if (stream->host) {
+        *value = stream->host[index];
+    } else if (!r100_gpu_read_u32(s, stream->base + (uint64_t)index * 4,
+                                  value)) {
         return false;
     }
-    if (stream->ring) {
+    if (!stream->host) {
         *value = r100_swap_word(*value, extract32(
             r->cp_rb_cntl, R100_RB_BUF_SWAP_SHIFT, 2));
     }
@@ -3659,12 +3663,18 @@ static bool r100_stream_read_payload(ATIVGAState *s, R100Stream *stream,
 
         words = MIN(words, until_wrap);
         words = MIN(words, r->command_work_remaining);
-        if (words &&
+        if (words && stream->host) {
+            r100_consume_command_work(r, words);
+            memcpy(payload + done, stream->host + index, words * 4);
+            stream->pos += words;
+            stream->remaining -= words;
+            done += words;
+        } else if (words &&
             !uadd64_overflow(stream->base, (uint64_t)index * 4, &address) &&
             r100_programmed_vram_span(s, address, (uint64_t)words * 4,
                                       &offset, &span) && span >= 4) {
-            unsigned int swap = stream->ring ? extract32(
-                r->cp_rb_cntl, R100_RB_BUF_SWAP_SHIFT, 2) : 0;
+            unsigned int swap = extract32(r->cp_rb_cntl,
+                                          R100_RB_BUF_SWAP_SHIFT, 2);
 
             words = span / 4;
             r100_consume_command_work(r, words);
@@ -4608,6 +4618,44 @@ static bool r100_process_ib(ATIVGAState *s)
     return r100_process_stream(s, &stream);
 }
 
+static bool r100_csq_primary_pio(const ATI3DState *r)
+{
+    return extract32(r->cp_csq_cntl, 28, 4) & 1;
+}
+
+static void r100_pio_write(ATIVGAState *s, uint32_t value)
+{
+    ATI3DState *r = &s->r100_3d;
+    uint32_t header, need;
+    R100Stream stream;
+
+    if (r->pio_count >= ARRAY_SIZE(r->pio_buf)) {
+        r->pio_count = 0;
+    }
+    r->pio_buf[r->pio_count++] = value;
+    header = r->pio_buf[0];
+    switch (header & R100_CP_PACKET_TYPE_MASK) {
+    case R100_CP_PACKET2:
+        need = 1;
+        break;
+    case R100_CP_PACKET1:
+        need = 3;
+        break;
+    default:
+        need = extract32(header, R100_CP_PACKET_COUNT_SHIFT, 14) + 2;
+        break;
+    }
+    if (r->pio_count < need || r->processing_depth) {
+        return;
+    }
+    stream = (R100Stream) {
+        .remaining = need,
+        .host = r->pio_buf,
+    };
+    r100_process_stream(s, &stream);
+    r->pio_count = 0;
+}
+
 static void r100_port_submit(ATIVGAState *s)
 {
     ATI3DState *r = &s->r100_3d;
@@ -4642,6 +4690,8 @@ bool ati_3d_read(ATIVGAState *s, hwaddr addr, uint64_t *data,
     }
     if (base == R100_CP_STAT) {
         value = 0;
+    } else if (base == R100_CP_CSQ_CNTL && r100_csq_primary_pio(r)) {
+        value = (r->cp_csq_cntl & ~0xffffU) | 0x80;
     } else if (base == R100_SE_CNTL_STATUS) {
         value = r->se_cntl_status;
     } else {
@@ -4687,6 +4737,13 @@ bool ati_3d_write(ATIVGAState *s, hwaddr addr, uint64_t data,
         return true;
     }
     if (base == R100_CP_STAT) {
+        return true;
+    }
+    if (base >= PM4_FIFO_DATA_EVEN && base < PM4_FIFO_DATA_EVEN + 0x400 &&
+        r100_csq_primary_pio(r)) {
+        if (size == 4 && !(addr & 3)) {
+            r100_pio_write(s, data);
+        }
         return true;
     }
     if (base == R100_SE_CNTL_STATUS) {
