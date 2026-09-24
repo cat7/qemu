@@ -31,6 +31,8 @@
 #define PCI_DEVICE_ID_ATI_RAGE128_PF 0x5046
 /* Radeon RV100 (VE) */
 #define PCI_DEVICE_ID_ATI_RADEON_QY 0x5159
+/* R100 Radeon QD; hardware TCL not modelled */
+#define PCI_DEVICE_ID_ATI_RADEON_QD 0x5144
 /* Radeon RN50 / ES1000 */
 #define PCI_DEVICE_ID_ATI_ES1000 0x515e
 
@@ -280,12 +282,14 @@ struct ATIVGAState {
 static inline bool ati_is_rv100_family(const ATIVGAState *s)
 {
     return s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QY ||
+           s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QD ||
            s->dev_id == PCI_DEVICE_ID_ATI_ES1000;
 }
 
 static inline bool ati_has_rv100_3d(const ATIVGAState *s)
 {
-    return s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QY;
+    return s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QY ||
+           s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QD;
 }
 
 const char *ati_reg_name(int num);

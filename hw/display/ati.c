@@ -83,6 +83,7 @@ static const struct {
 } ati_model_aliases[] = {
     { "rage128p", PCI_DEVICE_ID_ATI_RAGE128_PF },
     { "rv100", PCI_DEVICE_ID_ATI_RADEON_QY },
+    { "r100", PCI_DEVICE_ID_ATI_RADEON_QD },
     { "es1000", PCI_DEVICE_ID_ATI_ES1000 },
 };
 
@@ -2733,7 +2734,7 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF &&
         !ati_is_rv100_family(s)) {
         error_setg(errp, "Unknown ATI VGA device id, "
-                   "only 0x5046, 0x5159 and 0x515e are supported");
+                   "only 0x5046, 0x5144, 0x5159 and 0x515e are supported");
         return;
     }
     pci_set_word(dev->config + PCI_DEVICE_ID, s->dev_id);
