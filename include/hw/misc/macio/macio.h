@@ -32,6 +32,7 @@
 #include "hw/intc/heathrow_pic.h"
 #include "hw/misc/macio/cuda.h"
 #include "hw/misc/macio/gpio.h"
+#include "hw/misc/macio/k2_sound.h"
 #include "hw/misc/macio/keywest_i2c.h"
 #include "hw/misc/macio/pmu.h"
 #include "hw/nvram/mac_nvram.h"
@@ -168,6 +169,8 @@ struct NewWorldMacIOState {
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
     KeyWestI2CState i2c;
+    K2SoundState sound;
+    AudioBackend *audio_be;
 };
 
 #endif /* MACIO_H */

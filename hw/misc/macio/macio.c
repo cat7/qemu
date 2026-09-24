@@ -291,12 +291,22 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev,
                        ns->k2 ? K2_ESCCA_IRQ : NEWWORLD_ESCCA_IRQ));
 
-    /* K2 I2C, with the TAS3004 sound equalizer */
+    /* K2 I2C with the TAS3004 equalizer, FCRs and the I2S-a cell */
     if (ns->k2) {
+        if (!audio_be_check(&ns->audio_be, errp)) {
+            return;
+        }
         keywest_i2c_init(&ns->i2c, DEVICE(d), "k2-i2c", 0x1000);
         ns->i2c.irq = qdev_get_gpio_in(pic_dev, K2_I2C_IRQ);
         memory_region_add_subregion(&s->bar, 0x18000, &ns->i2c.mem);
-        i2c_slave_create_simple(ns->i2c.bus, TYPE_TAS3004, TAS3004_I2C_ADDR);
+
+        k2_sound_init(&ns->sound, DEVICE(d), &s->bar);
+        ns->sound.audio_be = ns->audio_be;
+        ns->sound.codec = i2c_slave_create_simple(ns->i2c.bus, TYPE_TAS3004,
+                                                  TAS3004_I2C_ADDR);
+        k2_sound_register_dma(&ns->sound, &s->dbdma,
+                              qdev_get_gpio_in(pic_dev, K2_I2S_TX_DMA_IRQ),
+                              qdev_get_gpio_in(pic_dev, K2_I2S_RX_DMA_IRQ));
     }
 
     /* IDE buses; the K2's ATA is a separate PCI function */
@@ -437,6 +447,7 @@ static void macio_newworld_reset(DeviceState *dev)
 
     if (ns->k2) {
         keywest_i2c_reset(&ns->i2c);
+        k2_sound_reset(&ns->sound);
     }
 }
 
@@ -444,6 +455,7 @@ static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
     DEFINE_PROP_BOOL("k2", NewWorldMacIOState, k2, false),
+    DEFINE_AUDIO_PROPERTIES(NewWorldMacIOState, audio_be),
 };
 
 static void macio_newworld_class_init(ObjectClass *oc, const void *data)
