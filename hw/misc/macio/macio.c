@@ -271,6 +271,11 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         return;
     }
 
+    if (ns->k2) {
+        pci_config_set_device_id(d->config, PCI_DEVICE_ID_APPLE_K2_MACIO);
+        pci_config_set_revision(d->config, 0x60);
+    }
+
     /* OpenPIC */
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
     sbd = SYS_BUS_DEVICE(&ns->pic);
@@ -408,6 +413,7 @@ static const VMStateDescription vmstate_macio_newworld = {
 static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
+    DEFINE_PROP_BOOL("k2", NewWorldMacIOState, k2, false),
 };
 
 static void macio_newworld_class_init(ObjectClass *oc, const void *data)

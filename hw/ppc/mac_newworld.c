@@ -409,6 +409,7 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
     qdev_prop_set_bit(dev, "has-adb", has_adb);
+    qdev_prop_set_bit(dev, "k2", machine_arch == ARCH_MAC99_U3);
 
     dev = DEVICE(object_resolve_path_component(macio, "escc"));
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));

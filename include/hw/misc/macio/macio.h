@@ -139,6 +139,7 @@ struct NewWorldMacIOState {
 
     bool has_pmu;
     bool has_adb;
+    bool k2;
     OpenPICState pic;
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
