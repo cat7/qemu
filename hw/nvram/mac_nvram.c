@@ -287,6 +287,40 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
     stl_be_p(&data[16], adler32(0, &data[20], len - 20));
 }
 
+/*
+ * A G5's flash NVRAM, as its firmware, Mac OS X and Linux keep it: two
+ * 8 KB banks, the live one being the valid bank with the higher
+ * generation. Each starts with a header partition (0x5a "nvram": Adler-32
+ * of the bank from byte 20, then the generation), followed by the Open
+ * Firmware variables in "common" and free space. Bank A is written,
+ * bank B left erased.
+ */
+void pmac_format_nvram_core99(MacIONVRAMState *nvr)
+{
+    uint8_t *bank = nvr->data;
+    ChrpNvramPartHdr *hdr = (ChrpNvramPartHdr *)bank;
+    ChrpNvramPartHdr *common;
+    int end;
+
+    memset(nvr->data, 0xff, nvr->size);
+
+    memset(bank, 0, 32);
+    hdr->signature = OSX_NVRAM_SIGNATURE;
+    pstrcpy(hdr->name, sizeof(hdr->name), "nvram");
+    chrp_nvram_finish_partition(hdr, 32);
+
+    common = (ChrpNvramPartHdr *)&bank[32];
+    end = chrp_nvram_create_system_partition(&bank[32], DEF_SYSTEM_SIZE,
+                                             MACIO_NVRAM_SIZE - 32);
+    pstrcpy(common->name, sizeof(common->name), "common");
+    chrp_nvram_finish_partition(common, end);
+    chrp_nvram_create_free_partition(&bank[32 + end],
+                                     MACIO_NVRAM_SIZE - 32 - end);
+
+    stl_be_p(&bank[20], 1);
+    stl_be_p(&bank[16], adler32(1, &bank[20], MACIO_NVRAM_SIZE - 20));
+}
+
 /* Set up NVRAM with OF and OSX partitions */
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
 {

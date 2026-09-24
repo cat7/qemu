@@ -631,9 +631,7 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
     if (machine_arch == ARCH_MAC99_U3) {
-        /* erased flash reads all ones */
-        memset(nvr->data, 0xff, MACIO_NVRAM_FLASH_SIZE);
-        pmac_format_nvram_partition(nvr, MACIO_NVRAM_FLASH_SIZE);
+        pmac_format_nvram_core99(nvr);
     } else {
         pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
     }

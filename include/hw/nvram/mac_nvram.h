@@ -53,5 +53,6 @@ struct MacIONVRAMState {
 };
 
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);
+void pmac_format_nvram_core99(MacIONVRAMState *nvr);
 
 #endif /* MAC_NVRAM_H */
