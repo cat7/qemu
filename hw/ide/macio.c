@@ -518,8 +518,10 @@ static const MemoryRegionOps k2_uata_fcr_ops = {
 };
 
 /*
- * The drive and DMA interrupts share INTA. The drive's line is also the
- * channel's s7, which Apple's driver waits on before a transfer ends.
+ * The drive interrupts on INTA, and its line is also the channel's s7,
+ * which Apple's driver waits on before a transfer ends. The DMA interrupt
+ * has an MPIC input of its own: Apple's driver runs its DMA-completion
+ * check whenever that source fires.
  */
 static void k2_uata_set_irq(void *opaque, int n, int level)
 {
@@ -528,8 +530,10 @@ static void k2_uata_set_irq(void *opaque, int n, int level)
     s->irq_level[n] = level;
     if (n == MACIO_IDE_PMAC_IDE_IRQ) {
         DBDMA_set_devstat(&s->dbdma, 0, level ? 0x80 : 0);
+        pci_set_irq(PCI_DEVICE(s), level);
+    } else {
+        qemu_set_irq(s->dma_irq, level);
     }
-    pci_set_irq(PCI_DEVICE(s), s->irq_level[0] || s->irq_level[1]);
 }
 
 static void k2_uata_realize(PCIDevice *d, Error **errp)
@@ -574,6 +578,7 @@ static void k2_uata_init(Object *obj)
 
     object_initialize_child(obj, "dbdma", &s->dbdma, TYPE_MAC_DBDMA);
     object_initialize_child(obj, "ide", &s->ide, TYPE_MACIO_IDE);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->dma_irq, "dma", 1);
 }
 
 void k2_uata_init_drives(K2UATAState *s, DriveInfo **hd_table)

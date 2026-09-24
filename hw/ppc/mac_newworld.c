@@ -524,6 +524,9 @@ static void ppc_core99_init(MachineState *machine)
         pci_realize_and_unref(uata, pci_bridge_get_sec_bus(
                               U3_HT_HOST_BRIDGE(ht_dev)->k2[2]),
                               &error_fatal);
+        qdev_connect_gpio_out_named(DEVICE(uata), "dma", 0,
+                                    qdev_get_gpio_in(pic_dev,
+                                                     K2_UATA_DMA_IRQ));
         k2_uata_init_drives(K2_UATA(uata), uata_hd);
     } else {
         /* We only emulate 2 out of 3 IDE controllers for now */

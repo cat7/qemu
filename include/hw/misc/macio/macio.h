@@ -102,6 +102,8 @@ void macio_ide_register_dma(MACIOIDEState *ide);
 
 /* K2 ATA-100: a PCI function with its own DBDMA channel */
 #define TYPE_K2_UATA "k2-uata"
+/* The K2 ATA-100's DMA interrupt, on an MPIC input of its own */
+#define K2_UATA_DMA_IRQ 0x0d
 OBJECT_DECLARE_SIMPLE_TYPE(K2UATAState, K2_UATA)
 
 struct K2UATAState {
@@ -111,6 +113,7 @@ struct K2UATAState {
     MemoryRegion fcr_mem;
     uint32_t fcr;
     bool irq_level[2];          /* DMA, IDE */
+    qemu_irq dma_irq;           /* separate MPIC source for the DMA interrupt */
     DBDMAState dbdma;
     MACIOIDEState ide;
 };
