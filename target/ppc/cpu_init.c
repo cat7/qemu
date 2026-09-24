@@ -7249,11 +7249,14 @@ static int ppc_cpu_mmu_index(CPUState *cs, bool ifetch)
 /*
  * A 970 in doze or nap resumes on a decrementer or external event even
  * with MSR[EE] clear, without taking the interrupt: Mac OS X naps that
- * way for a few decrementer ticks and carries on after the mtmsr.
+ * way for a few decrementer ticks and carries on after the mtmsr. Only a
+ * CPU that napped itself (MSR[POW]) does; one the board holds in reset
+ * does not.
  */
 bool ppc_970_nap_wakeup(CPUPPCState *env)
 {
     return env->excp_model == POWERPC_EXCP_970 && env_cpu(env)->halted &&
+           FIELD_EX64(env->msr, MSR, POW) &&
            (env->pending_interrupts & (PPC_INTERRUPT_DECR | PPC_INTERRUPT_EXT));
 }
 
