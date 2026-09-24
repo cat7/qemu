@@ -40,6 +40,12 @@ enum MacioGPIORegisterBits {
     OUT_ENABLE = 4,
 };
 
+/* Soft-reset registers of CPU0-3; the K2 has two CPUs */
+static const uint8_t keylargo_cpu_reset[MACIO_GPIO_MAX_CPUS] = {
+    0x5b, 0x5c, 0x67, 0x68
+};
+static const uint8_t k2_cpu_reset[MACIO_GPIO_MAX_CPUS] = { 0x71, 0x72 };
+
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 {
     uint8_t new_reg;
@@ -56,9 +62,7 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
         new_reg |= IN_DATA;
     }
 
-    /* CPU soft-reset lines propagate every write, changed or not */
-    if (gpio != 3 && gpio != 4 && gpio != 15 && gpio != 16 &&
-        new_reg == s->gpio_regs[gpio]) {
+    if (new_reg == s->gpio_regs[gpio]) {
         return;
     }
 
@@ -73,11 +77,7 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 
     switch (gpio) {
     case 1:
-    case 3:
-    case 4:
-    case 15:
-    case 16:
-        /* Level low; 3/4/15/16 are the CPU0-3 soft-reset lines */
+        /* Level low */
         if (!state) {
             trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
@@ -108,6 +108,7 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
 {
     MacIOGPIOState *s = opaque;
     uint8_t ibit;
+    int n;
 
     trace_macio_gpio_write(addr, value);
 
@@ -126,18 +127,19 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
             ibit = s->gpio_regs[addr] & IN_DATA;
         }
 
-        /* Pins of absent CPUs carry other functions (e.g. speaker id) */
-        if (s->nb_cpus > 1 &&
-            addr == (KL_GPIO_RESET_CPU1 - KEYLARGO_GPIO_EXTINT_0)) {
-            macio_set_gpio(s, 4, !(value & OUT_ENABLE) || (ibit != 0));
-        } else if (s->nb_cpus > 2 &&
-                   addr == (KL_GPIO_RESET_CPU2 - KEYLARGO_GPIO_EXTINT_0)) {
-            macio_set_gpio(s, 15, !(value & OUT_ENABLE) || (ibit != 0));
-        } else if (s->nb_cpus > 3 &&
-                   addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
-            macio_set_gpio(s, 16, !(value & OUT_ENABLE) || (ibit != 0));
-        } else {
-            s->gpio_regs[addr] = value | ibit;
+        s->gpio_regs[addr] = value | ibit;
+
+        /*
+         * A secondary CPU's soft-reset line, driven low to hold it in
+         * reset. Pins of absent CPUs carry other functions.
+         */
+        for (n = 1; n < MIN(s->nb_cpus, MACIO_GPIO_MAX_CPUS); n++) {
+            const uint8_t *reset = s->k2 ? k2_cpu_reset : keylargo_cpu_reset;
+
+            if (reset[n] && addr == reset[n] - MACIO_GPIO_EXTINT_0) {
+                qemu_set_irq(s->cpu_reset[n], (value & OUT_ENABLE) &&
+                                              !(value & OUT_DATA));
+            }
         }
     }
 }
@@ -178,9 +180,11 @@ static void macio_gpio_init(Object *obj)
     MacIOGPIOState *s = MACIO_GPIO(obj);
     int i;
 
-    for (i = 0; i < KEYLARGO_GPIO_EXTINT_CNT; i++) {
+    for (i = 0; i < ARRAY_SIZE(s->gpio_extirqs); i++) {
         sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
     }
+    qdev_init_gpio_out_named(DEVICE(obj), s->cpu_reset, "cpu-reset",
+                             MACIO_GPIO_MAX_CPUS);
 
     memory_region_init_io(&s->gpiomem, OBJECT(s), &macio_gpio_ops, obj,
                           "gpio", 0x30);
@@ -189,6 +193,7 @@ static void macio_gpio_init(Object *obj)
 
 static const Property macio_gpio_properties[] = {
     DEFINE_PROP_UINT32("nb-cpus", MacIOGPIOState, nb_cpus, 1),
+    DEFINE_PROP_BOOL("k2", MacIOGPIOState, k2, false),
 };
 
 static const VMStateDescription vmstate_macio_gpio = {
@@ -209,8 +214,6 @@ static void macio_gpio_reset(DeviceState *dev)
     /* GPIO 1 is up by default */
     macio_set_gpio(s, 1, true);
 
-    /* CPU0 runs; CPU1-3 stay in reset until the guest releases them */
-    macio_set_gpio(s, 3, true);
 }
 
 static void macio_gpio_nmi(NMIState *n)

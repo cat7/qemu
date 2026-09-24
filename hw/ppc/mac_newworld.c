@@ -416,6 +416,11 @@ static void ppc_core99_init(MachineState *machine)
                      machine->smp.cpus);
         exit(1);
     }
+    /* The K2 has soft-reset lines for two CPUs */
+    if (machine_arch == ARCH_MAC99_U3 && machine->smp.cpus > 2) {
+        error_report("mac99: a 970 machine takes at most 2 CPUs");
+        exit(1);
+    }
 
     /* init basic PC hardware */
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
@@ -442,8 +447,9 @@ static void ppc_core99_init(MachineState *machine)
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
-    qdev_prop_set_uint32(DEVICE(object_resolve_path_component(macio, "gpio")),
-                         "nb-cpus", machine->smp.cpus);
+    dev = DEVICE(object_resolve_path_component(macio, "gpio"));
+    qdev_prop_set_uint32(dev, "nb-cpus", machine->smp.cpus);
+    qdev_prop_set_bit(dev, "k2", machine_arch == ARCH_MAC99_U3);
 
     pci_realize_and_unref(PCI_DEVICE(macio), macio_bus, &error_fatal);
 
@@ -484,18 +490,10 @@ static void ppc_core99_init(MachineState *machine)
     g_free(openpic_irqs);
 
     /* CPU1-3 soft-reset lines */
-    s = SYS_BUS_DEVICE(object_resolve_path_component(macio, "gpio"));
-    if (machine->smp.cpus > 1) {
-        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[1], 0);
-        sysbus_connect_irq(s, 4, cpu_kick_irq);
-    }
-    if (machine->smp.cpus > 2) {
-        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[2], 0);
-        sysbus_connect_irq(s, 15, cpu_kick_irq);
-    }
-    if (machine->smp.cpus > 3) {
-        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[3], 0);
-        sysbus_connect_irq(s, 16, cpu_kick_irq);
+    dev = DEVICE(object_resolve_path_component(macio, "gpio"));
+    for (i = 1; i < machine->smp.cpus; i++) {
+        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[i], 0);
+        qdev_connect_gpio_out_named(dev, "cpu-reset", i, cpu_kick_irq);
     }
     g_free(cpus);
 

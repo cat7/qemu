@@ -30,15 +30,9 @@
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 
-#define KEYLARGO_GPIO_EXTINT_CNT 18
-
-/* KeyLargo GPIO register offsets used for SMP CPU reset control */
-#define KEYLARGO_GPIO_EXTINT_0        0x58
-
-#define KL_GPIO_RESET_CPU0             (KEYLARGO_GPIO_EXTINT_0 + 0x03)
-#define KL_GPIO_RESET_CPU1             (KEYLARGO_GPIO_EXTINT_0 + 0x04)
-#define KL_GPIO_RESET_CPU2             (KEYLARGO_GPIO_EXTINT_0 + 0x0f)
-#define KL_GPIO_RESET_CPU3             (KEYLARGO_GPIO_EXTINT_0 + 0x10)
+/* Offset of the first pin register in the mac-io */
+#define MACIO_GPIO_EXTINT_0     0x58
+#define MACIO_GPIO_MAX_CPUS     4
 
 #define TYPE_MACIO_GPIO "macio-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOGPIOState, MACIO_GPIO)
@@ -49,10 +43,12 @@ struct MacIOGPIOState {
     /*< public >*/
 
     MemoryRegion gpiomem;
-    qemu_irq gpio_extirqs[KEYLARGO_GPIO_EXTINT_CNT];
+    qemu_irq gpio_extirqs[10];
+    qemu_irq cpu_reset[MACIO_GPIO_MAX_CPUS];  /* asserted = held in reset */
     uint8_t gpio_levels[8];
     uint8_t gpio_regs[36]; /* XXX Check count */
     uint32_t nb_cpus;
+    bool k2;
 };
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state);
