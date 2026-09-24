@@ -1647,6 +1647,7 @@ int ppc32_cpu_write_elf32_note(WriteCoreDumpFunction f, CPUState *cs,
                                int cpuid, DumpState *s);
 #ifndef CONFIG_USER_ONLY
 void ppc_maybe_interrupt(CPUPPCState *env);
+bool ppc_970_nap_wakeup(CPUPPCState *env);
 void ppc_cpu_do_interrupt(CPUState *cpu);
 bool ppc_cpu_exec_interrupt(CPUState *cpu, int int_req);
 void ppc_cpu_do_system_reset(CPUState *cs);

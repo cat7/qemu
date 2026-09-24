@@ -2304,6 +2304,10 @@ void ppc_maybe_interrupt(CPUPPCState *env)
         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
     } else {
         cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+        /* a napping 970 wakes on a masked event too, see ppc_cpu_has_work */
+        if (ppc_970_nap_wakeup(env)) {
+            qemu_cpu_kick(cs);
+        }
     }
 }
 

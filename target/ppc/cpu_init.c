@@ -5069,9 +5069,15 @@ POWERPC_FAMILY(e600)(ObjectClass *oc, const void *data)
 #define POWERPC970_HID5_INIT 0x00000000
 #endif
 
+/* The 970's power-saving modes are HID0 bits 8-10 of 64 */
+#define HID0_970_DOZE       (1ULL << 55)
+#define HID0_970_NAP        (1ULL << 54)
+#define HID0_970_DEEPNAP    (1ULL << 53)
+
 static int check_pow_970(CPUPPCState *env)
 {
-    if (env->spr[SPR_HID0] & (HID0_DEEPNAP | HID0_DOZE | HID0_NAP)) {
+    if (env->spr[SPR_HID0] &
+        (HID0_970_DEEPNAP | HID0_970_DOZE | HID0_970_NAP)) {
         return 1;
     }
 
@@ -5081,9 +5087,10 @@ static int check_pow_970(CPUPPCState *env)
 static void register_970_hid_sprs(CPUPPCState *env)
 {
     /* Hardware implementation registers */
+    /* Mac OS X reads back the nap bit to leave its idle loop */
     spr_register(env, SPR_HID0, "HID0",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, &spr_write_clear,
+                 &spr_read_generic, &spr_write_generic,
                  0x60000000);
     spr_register(env, SPR_HID1, "HID1",
                  SPR_NOACCESS, SPR_NOACCESS,
@@ -5985,6 +5992,7 @@ static void init_proc_970(CPUPPCState *env)
     register_970_pmu_sup_sprs(env);
     register_970_pmu_user_sprs(env);
     register_970_lpar_sprs(env);
+    register_970_hsprg_sprs(env);
     register_970_dbg_sprs(env);
 
     /* env variables */
@@ -7238,9 +7246,21 @@ static int ppc_cpu_mmu_index(CPUState *cs, bool ifetch)
 #endif /* CONFIG_TCG */
 
 #ifndef CONFIG_USER_ONLY
+/*
+ * A 970 in doze or nap resumes on a decrementer or external event even
+ * with MSR[EE] clear, without taking the interrupt: Mac OS X naps that
+ * way for a few decrementer ticks and carries on after the mtmsr.
+ */
+bool ppc_970_nap_wakeup(CPUPPCState *env)
+{
+    return env->excp_model == POWERPC_EXCP_970 && env_cpu(env)->halted &&
+           (env->pending_interrupts & (PPC_INTERRUPT_DECR | PPC_INTERRUPT_EXT));
+}
+
 static bool ppc_cpu_has_work(CPUState *cs)
 {
-    return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD);
+    return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD) ||
+           ppc_970_nap_wakeup(cpu_env(cs));
 }
 #endif /* !CONFIG_USER_ONLY */
 
