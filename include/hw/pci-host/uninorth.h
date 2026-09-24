@@ -78,10 +78,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(UNINState, UNI_NORTH)
 #define U3_HT_SELF_SIZE     0x1000
 #define U3_HT_NUM_IRQS      64
 
-/* K2 HyperTransport-PCI bridges, at HT devices 3-7 */
+/* AMD-8131 PCI-X bridges at HT devices 1-2, K2 HT-PCI bridges at 3-7 */
+#define AMD8131_FIRST_SLOT  1
+#define AMD8131_NUM         2
 #define K2_HT_PCI_FIRST_SLOT 3
 #define K2_HT_PCI_NUM       5
-#define TYPE_K2_HT_PCI_BRIDGE "k2-ht-pci-bridge"
+#define TYPE_U3_HT_PCI_BRIDGE "u3-ht-pci-bridge"
 
 OBJECT_DECLARE_SIMPLE_TYPE(U3HTHostState, U3_HT_HOST_BRIDGE)
 
@@ -94,6 +96,7 @@ struct U3HTHostState {
     MemoryRegion pci_mmio;
     MemoryRegion pci_io;
     MemoryRegion mem_win[3];
+    PCIBridge *pcix[AMD8131_NUM];
     PCIBridge *k2[K2_HT_PCI_NUM];
 };
 

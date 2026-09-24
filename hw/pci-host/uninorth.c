@@ -287,33 +287,52 @@ static void u3_ht_set_irq(void *opaque, int irq_num, int level)
     qemu_set_irq(s->irqs[irq_num], level);
 }
 
-/* MPIC inputs of the devices behind each K2 bridge, by slot */
+/* MPIC inputs of the slots behind each HT bridge */
 static const struct {
+    int ht_slot;
     int slot;
     int irq;
-} k2_ht_pci_irqs[K2_HT_PCI_NUM][2] = {
-    { { 8, 0x1b }, { 9, 0x1c } },           /* USB0, USB1 */
-    { { 11, 0x3f } },                       /* USB2 */
-    { { 13, 0x27 }, { 14, 0x28 } },         /* ATA-100, FireWire */
-    { { 15, 0x29 } },                       /* GMAC */
-    { { 12, 0x11 } },                       /* SATA */
+} u3_ht_pci_irqs[] = {
+    { 1, 2, 0x34 }, { 1, 3, 0x35 },         /* PCI-X SLOT-2, SLOT-3 */
+    { 2, 4, 0x36 },                         /* PCI-X SLOT-4 */
+    { 3, 8, 0x1b }, { 3, 9, 0x1c },         /* USB0, USB1 */
+    { 4, 11, 0x3f },                        /* USB2 */
+    { 5, 13, 0x27 }, { 5, 14, 0x28 },       /* ATA-100, FireWire */
+    { 6, 15, 0x29 },                        /* GMAC */
+    { 7, 12, 0x11 },                        /* SATA */
 };
 
-static int k2_ht_pci_map_irq(PCIDevice *pci_dev, int irq_num)
+static int u3_ht_pci_map_irq(PCIDevice *pci_dev, int irq_num)
 {
     PCIDevice *br = pci_bridge_get_device(pci_get_bus(pci_dev));
-    int n = PCI_SLOT(br->devfn) - K2_HT_PCI_FIRST_SLOT;
+    int ht_slot = PCI_SLOT(br->devfn);
     int slot = PCI_SLOT(pci_dev->devfn);
     int i;
 
-    for (i = 0; i < ARRAY_SIZE(k2_ht_pci_irqs[n]); i++) {
-        if (k2_ht_pci_irqs[n][i].irq && k2_ht_pci_irqs[n][i].slot == slot) {
-            return k2_ht_pci_irqs[n][i].irq;
+    for (i = 0; i < ARRAY_SIZE(u3_ht_pci_irqs); i++) {
+        if (u3_ht_pci_irqs[i].ht_slot == ht_slot &&
+            u3_ht_pci_irqs[i].slot == slot) {
+            return u3_ht_pci_irqs[i].irq;
         }
     }
-    qemu_log_mask(LOG_GUEST_ERROR, "K2 HT-PCI: no interrupt for slot %d\n",
-                  slot);
+    qemu_log_mask(LOG_GUEST_ERROR, "U3 HT: no interrupt for %d:%d\n",
+                  ht_slot, slot);
     return 0;
+}
+
+static PCIBridge *u3_ht_add_bridge(PCIBus *bus, int ht_slot, uint16_t vendor,
+                                   uint16_t device, uint8_t revision,
+                                   const char *name)
+{
+    PCIDevice *d = pci_new(PCI_DEVFN(ht_slot, 0), TYPE_U3_HT_PCI_BRIDGE);
+    PCIBridge *br = PCI_BRIDGE(d);
+
+    qdev_prop_set_uint16(DEVICE(d), "vendor-id", vendor);
+    qdev_prop_set_uint16(DEVICE(d), "device-id", device);
+    qdev_prop_set_uint8(DEVICE(d), "revision", revision);
+    pci_bridge_map_irq(br, name, u3_ht_pci_map_irq);
+    pci_realize_and_unref(d, bus, &error_fatal);
+    return br;
 }
 
 /* Memory decoded to HyperTransport, as in the host's decode register */
@@ -345,16 +364,21 @@ static void pci_u3_ht_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->self, OBJECT(s), &u3_ht_self_ops, d,
                           "u3-ht-self", U3_HT_SELF_SIZE);
 
+    for (i = 0; i < AMD8131_NUM; i++) {
+        g_autofree char *name = g_strdup_printf("pcix%d", i + 1);
+
+        s->pcix[i] = u3_ht_add_bridge(h->bus, AMD8131_FIRST_SLOT + i,
+                                      PCI_VENDOR_ID_AMD,
+                                      PCI_DEVICE_ID_AMD_8131_BRIDGE, 0x12,
+                                      name);
+    }
     for (i = 0; i < K2_HT_PCI_NUM; i++) {
         g_autofree char *name = g_strdup_printf("k2-pci%d", i + 1);
 
-        d = pci_new(PCI_DEVFN(K2_HT_PCI_FIRST_SLOT + i, 0),
-                    TYPE_K2_HT_PCI_BRIDGE);
-        qdev_prop_set_uint16(DEVICE(d), "device-id",
-                             PCI_DEVICE_ID_APPLE_K2_HT_PCI_1 + i);
-        s->k2[i] = PCI_BRIDGE(d);
-        pci_bridge_map_irq(s->k2[i], name, k2_ht_pci_map_irq);
-        pci_realize_and_unref(d, h->bus, &error_fatal);
+        s->k2[i] = u3_ht_add_bridge(h->bus, K2_HT_PCI_FIRST_SLOT + i,
+                                    PCI_VENDOR_ID_APPLE,
+                                    PCI_DEVICE_ID_APPLE_K2_HT_PCI_1 + i, 0,
+                                    name);
     }
 }
 
@@ -584,49 +608,57 @@ static const TypeInfo u3_ht_pci_host_info = {
     },
 };
 
-typedef struct K2HTPCIBridge {
+/* A PCI-PCI bridge on the U3's HyperTransport: K2 HT-PCI or AMD-8131 */
+typedef struct U3HTPCIBridge {
     PCIBridge parent_obj;
 
+    uint16_t vendor_id;
     uint16_t device_id;
-} K2HTPCIBridge;
+    uint8_t revision;
+} U3HTPCIBridge;
 
-OBJECT_DECLARE_SIMPLE_TYPE(K2HTPCIBridge, K2_HT_PCI_BRIDGE)
+OBJECT_DECLARE_SIMPLE_TYPE(U3HTPCIBridge, U3_HT_PCI_BRIDGE)
 
-static void k2_ht_pci_bridge_realize(PCIDevice *d, Error **errp)
+static void u3_ht_pci_bridge_realize(PCIDevice *d, Error **errp)
 {
-    K2HTPCIBridge *br = K2_HT_PCI_BRIDGE(d);
+    U3HTPCIBridge *br = U3_HT_PCI_BRIDGE(d);
 
     pci_bridge_initfn(d, TYPE_PCI_BUS);
+    pci_config_set_vendor_id(d->config, br->vendor_id);
     pci_config_set_device_id(d->config, br->device_id);
+    pci_config_set_revision(d->config, br->revision);
 }
 
-static const Property k2_ht_pci_bridge_properties[] = {
-    DEFINE_PROP_UINT16("device-id", K2HTPCIBridge, device_id,
+static const Property u3_ht_pci_bridge_properties[] = {
+    DEFINE_PROP_UINT16("vendor-id", U3HTPCIBridge, vendor_id,
+                       PCI_VENDOR_ID_APPLE),
+    DEFINE_PROP_UINT16("device-id", U3HTPCIBridge, device_id,
                        PCI_DEVICE_ID_APPLE_K2_HT_PCI_1),
+    DEFINE_PROP_UINT8("revision", U3HTPCIBridge, revision, 0),
 };
 
-static void k2_ht_pci_bridge_class_init(ObjectClass *klass, const void *data)
+static void u3_ht_pci_bridge_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    k->realize = k2_ht_pci_bridge_realize;
+    k->realize = u3_ht_pci_bridge_realize;
     k->exit = pci_bridge_exitfn;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_K2_HT_PCI_1;
     k->config_write = pci_bridge_write_config;
     device_class_set_legacy_reset(dc, pci_bridge_reset);
-    device_class_set_props(dc, k2_ht_pci_bridge_properties);
+    device_class_set_props(dc, u3_ht_pci_bridge_properties);
     dc->vmsd = &vmstate_pci_device;
     dc->user_creatable = false;
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
 }
 
-static const TypeInfo k2_ht_pci_bridge_info = {
-    .name          = TYPE_K2_HT_PCI_BRIDGE,
+static const TypeInfo u3_ht_pci_bridge_info = {
+    .name          = TYPE_U3_HT_PCI_BRIDGE,
     .parent        = TYPE_PCI_BRIDGE,
-    .instance_size = sizeof(K2HTPCIBridge),
-    .class_init    = k2_ht_pci_bridge_class_init,
+    .instance_size = sizeof(U3HTPCIBridge),
+    .class_init    = u3_ht_pci_bridge_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
@@ -839,7 +871,7 @@ static void unin_register_types(void)
     type_register_static(&unin_main_pci_host_info);
     type_register_static(&u3_agp_pci_host_info);
     type_register_static(&u3_ht_pci_host_info);
-    type_register_static(&k2_ht_pci_bridge_info);
+    type_register_static(&u3_ht_pci_bridge_info);
     type_register_static(&unin_agp_pci_host_info);
     type_register_static(&unin_internal_pci_host_info);
 
