@@ -1093,6 +1093,14 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
             cs->exception_index = POWERPC_EXCP_DSEG;
             env->error_code = 0;
             env->spr[SPR_DAR] = eaddr;
+            /*
+             * Mac OS X reads DSISR on a 970 data segment interrupt and
+             * takes a stale "no PTE" bit to mean the segment is already
+             * mapped, so do not leave the previous fault's value there.
+             */
+            if (env->excp_model == POWERPC_EXCP_970) {
+                env->spr[SPR_DSISR] = 0;
+            }
             break;
         default:
             g_assert_not_reached();
