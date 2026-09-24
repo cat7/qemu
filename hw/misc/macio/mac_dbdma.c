@@ -669,6 +669,16 @@ static void dbdma_control_write(DBDMA_channel *ch)
                         (value & PAUSE) ? "sett" : "clear");
     }
 
+    /*
+     * The device status bits s0-s7 are software writable through the same
+     * mask/value protocol. Mac OS X stops its I2S output ring by setting
+     * s0, which the ring's branch-if-s0-set hook turns into a stop.
+     */
+    if (mask & DEVSTAT) {
+        status = (status & ~(uint32_t)(mask & DEVSTAT)) |
+                 (value & mask & DEVSTAT);
+    }
+
     /* FLUSH is its own thing */
     if ((mask & FLUSH) && (value & FLUSH))  {
         DBDMA_DPRINTFCH(ch, " Setting FLUSH !\n");
@@ -890,7 +900,20 @@ static void mac_dbdma_reset(DeviceState *d)
     int i;
 
     for (i = 0; i < DBDMA_CHANNELS; i++) {
-        memset(s->channels[i].regs, 0, DBDMA_SIZE);
+        DBDMA_channel *ch = &s->channels[i];
+
+        memset(ch->regs, 0, DBDMA_SIZE);
+        /*
+         * A channel reset mid-transfer (an armed, unfed ring) must not keep
+         * io.processing, which only dma_end() clears and which blocks the
+         * channel from ever running again.
+         */
+        ch->io.processing = false;
+        ch->io.addr = 0;
+        ch->io.len = 0;
+        ch->io.is_last = 0;
+        ch->io.is_dma_out = 0;
+        ch->io.dma_end = NULL;
     }
 }
 
