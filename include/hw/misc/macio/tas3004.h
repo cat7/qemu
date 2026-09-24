@@ -14,7 +14,7 @@
 
 #include "hw/i2c/i2c.h"
 
-/* Output silenced: volume programmed to zero, or analog power-down */
-bool tas3004_muted(I2CSlave *i2c);
+/* Output gain per channel, 8.16 fixed point */
+void tas3004_gain(I2CSlave *i2c, uint32_t *left, uint32_t *right);
 
 #endif

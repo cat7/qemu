@@ -14,6 +14,7 @@
 #include "hw/misc/macio/tas3004.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "system/dma.h"
+#include "qemu/bswap.h"
 #include "trace.h"
 
 #define I2S_REG_INT_CTL             0x00
@@ -191,6 +192,34 @@ static const MemoryRegionOps k2_i2s_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/* Scale big-endian stereo frames by the codec gain, saturating */
+static void k2_i2s_apply_gain(K2SoundState *s, uint8_t *buf, int len)
+{
+    uint32_t gain[2] = { 0x10000, 0x10000 };
+    int fb = s->voice_frame_bytes;
+    int ss = fb / 2;
+    int i;
+
+    if (s->codec) {
+        tas3004_gain(s->codec, &gain[0], &gain[1]);
+    }
+    if (gain[0] == 0x10000 && gain[1] == 0x10000) {
+        return;
+    }
+    for (i = 0; i + ss <= len; i += ss) {
+        uint32_t g = gain[(i / ss) & 1];
+        int64_t v;
+
+        if (ss == 2) {
+            v = ((int64_t)(int16_t)lduw_be_p(buf + i) * g) >> 16;
+            stw_be_p(buf + i, MIN(MAX(v, INT16_MIN), INT16_MAX));
+        } else {
+            v = ((int64_t)(int32_t)ldl_be_p(buf + i) * g) >> 16;
+            stl_be_p(buf + i, MIN(MAX(v, INT32_MIN), INT32_MAX));
+        }
+    }
+}
+
 /* An active voice that writes nothing stalls the shared mixer */
 static void k2_i2s_write_silence(K2SoundState *s, int avail)
 {
@@ -215,7 +244,6 @@ static void k2_i2s_audio_cb(void *opaque, int avail)
 {
     K2SoundState *s = opaque;
     int fb = s->voice_frame_bytes;
-    bool muted = s->codec && tas3004_muted(s->codec);
 
     if (s->fifo_count == 0) {
         s->prebuffering = true;
@@ -248,9 +276,7 @@ static void k2_i2s_audio_cb(void *opaque, int avail)
             s->fifo_rptr = (s->fifo_rptr + 1) % sizeof(s->out_fifo);
         }
         s->fifo_count -= chunk;
-        if (muted) {
-            memset(staging, 0, chunk);
-        }
+        k2_i2s_apply_gain(s, staging, chunk);
         written = audio_be_write(s->audio_be, s->voice, staging, chunk);
         written -= written % fb;
         avail -= written;

@@ -76,25 +76,24 @@ static uint8_t tas3004_recv(I2CSlave *i2c)
     return val;
 }
 
-/* Before a driver sets the volume, the reset value must not mute. */
-bool tas3004_muted(I2CSlave *i2c)
+/*
+ * Per-channel output gain, 8.16 fixed point (unity 0x10000). Until a
+ * driver sets the volume the codec passes audio at unity; analog
+ * power-down silences it.
+ */
+void tas3004_gain(I2CSlave *i2c, uint32_t *left, uint32_t *right)
 {
     TAS3004State *s = TAS3004(i2c);
     const uint8_t *vol = &s->regs[TAS3004_VOL * TAS3004_MAX_REG_LEN];
-    int i;
 
     if (s->regs[TAS3004_ACR * TAS3004_MAX_REG_LEN] & TAS3004_ACR_APD) {
-        return true;
+        *left = *right = 0;
+    } else if (!s->vol_written) {
+        *left = *right = 0x10000;
+    } else {
+        *left = vol[0] << 16 | vol[1] << 8 | vol[2];
+        *right = vol[3] << 16 | vol[4] << 8 | vol[5];
     }
-    if (!s->vol_written) {
-        return false;
-    }
-    for (i = 0; i < 6; i++) {
-        if (vol[i]) {
-            return false;
-        }
-    }
-    return true;
 }
 
 static void tas3004_reset(DeviceState *dev)
