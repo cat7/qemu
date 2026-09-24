@@ -194,6 +194,7 @@ static void ppc_core99_init(MachineState *machine)
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
     DeviceState *ht_dev = NULL;
     PCIBus *macio_bus;
+    PCIDevice *usb0, *usb1;
     int macio_devfn;
     hwaddr nvram_addr = 0xFFF04000;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
@@ -516,7 +517,8 @@ static void ppc_core99_init(MachineState *machine)
 
     if (machine->usb) {
         if (machine_arch == ARCH_MAC99_U3) {
-            pci_create_simple(macio_bus, PCI_DEVFN(8, 0), "pci-ohci");
+            usb0 = pci_create_simple(macio_bus, PCI_DEVFN(8, 0), "pci-ohci");
+            pci_config_set_device_id(usb0->config, PCI_DEVICE_ID_APPLE_K2_USB);
         } else {
             pci_create_simple(pci_bus, -1, "pci-ohci");
         }
@@ -530,6 +532,12 @@ static void ppc_core99_init(MachineState *machine)
                                                               &error_abort));
             usb_create_simple(usb_bus, "usb-kbd");
             usb_create_simple(usb_bus, "usb-mouse");
+        }
+
+        /* The K2 has a second USB controller */
+        if (machine_arch == ARCH_MAC99_U3) {
+            usb1 = pci_create_simple(macio_bus, PCI_DEVFN(9, 0), "pci-ohci");
+            pci_config_set_device_id(usb1->config, PCI_DEVICE_ID_APPLE_K2_USB);
         }
     }
 
@@ -552,10 +560,14 @@ static void ppc_core99_init(MachineState *machine)
         /* The K2 GMAC is behind the fourth HT-PCI bridge */
         PCIDevice *gmac = pci_new(PCI_DEVFN(15, 0), mc->default_nic);
 
+        /* The K2 GMAC's PHY is at MII address 1 */
+        qdev_prop_set_uint32(DEVICE(gmac), "phy_addr", 1);
         if (qemu_configure_nic_device(DEVICE(gmac), true, NULL)) {
             pci_realize_and_unref(gmac, pci_bridge_get_sec_bus(
                                   U3_HT_HOST_BRIDGE(ht_dev)->k2[3]),
                                   &error_fatal);
+            pci_config_set_device_id(gmac->config,
+                                     PCI_DEVICE_ID_APPLE_K2_GMAC);
         } else {
             object_unref(OBJECT(gmac));
         }

@@ -52,6 +52,8 @@
 #define NEWWORLD_PMU_IRQ       0x19
 #define NEWWORLD_ESCCB_IRQ     0x24
 #define NEWWORLD_ESCCA_IRQ     0x25
+#define K2_ESCCB_IRQ           0x17
+#define K2_ESCCA_IRQ           0x16
 #define NEWWORLD_IDE0_IRQ      0xd
 #define NEWWORLD_IDE0_DMA_IRQ  0x2
 #define NEWWORLD_IDE1_IRQ      0xe

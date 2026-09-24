@@ -284,8 +284,10 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
                                 sysbus_mmio_get_region(sbd, 0));
 
     sbd = SYS_BUS_DEVICE(&s->escc);
-    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCB_IRQ));
-    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCA_IRQ));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev,
+                       ns->k2 ? K2_ESCCB_IRQ : NEWWORLD_ESCCB_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev,
+                       ns->k2 ? K2_ESCCA_IRQ : NEWWORLD_ESCCA_IRQ));
 
     /* IDE buses */
     if (!macio_realize_ide(s, &ns->ide[0],
