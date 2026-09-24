@@ -1562,7 +1562,8 @@ static void powerpc_excp_books(PowerPCCPU *cpu, int excp)
             /* ISAv3.1 puts LEV into SRR1 */
             msr |= lev << 20;
         }
-        if (lev == 1) {
+        /* sc 1 enters the hypervisor only where there is one (not a 970) */
+        if (lev == 1 && (env->msr_mask & MSR_HVB)) {
             new_msr |= (target_ulong)MSR_HVB;
         }
         break;
