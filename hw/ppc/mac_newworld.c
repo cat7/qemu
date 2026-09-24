@@ -333,6 +333,9 @@ static void ppc_core99_init(MachineState *machine)
 
     /* UniN init */
     s = SYS_BUS_DEVICE(qdev_new(TYPE_UNI_NORTH));
+    if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
+        qdev_prop_set_uint32(DEVICE(s), "version", U3_VERSION_23);
+    }
     sysbus_realize_and_unref(s, &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0xf8000000,
                                 sysbus_mmio_get_region(s, 0));

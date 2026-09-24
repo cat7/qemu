@@ -30,6 +30,7 @@
 
 /* UniNorth version */
 #define UNINORTH_VERSION_10A    0x7
+#define U3_VERSION_23           0x33
 
 #define TYPE_UNI_NORTH_PCI_HOST_BRIDGE "uni-north-pci-pcihost"
 #define TYPE_UNI_NORTH_AGP_HOST_BRIDGE "uni-north-agp-pcihost"
@@ -60,6 +61,7 @@ struct UNINState {
     SysBusDevice parent_obj;
 
     MemoryRegion mem;
+    uint32_t version;
 };
 
 #define TYPE_UNI_NORTH "uni-north"
