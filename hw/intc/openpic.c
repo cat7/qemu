@@ -1581,8 +1581,9 @@ static void openpic_realize(DeviceState *dev, Error **errp)
         opp->brr1 = -1;
         opp->mpic_mode_mask = GCR_MODE_MIXED;
 
-        if (opp->nb_cpus != 1) {
-            error_setg(errp, "Only UP supported today");
+        if (opp->nb_cpus > KEYLARGO_MAX_CPU) {
+            error_setg(errp, "KeyLargo OpenPIC supports at most %d CPUs",
+                       KEYLARGO_MAX_CPU);
             return;
         }
 
