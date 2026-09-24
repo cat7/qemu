@@ -100,6 +100,22 @@ struct MACIOIDEState {
 void macio_ide_init_drives(MACIOIDEState *ide, DriveInfo **hd_table);
 void macio_ide_register_dma(MACIOIDEState *ide);
 
+/* K2 ATA-100: a PCI function with its own DBDMA channel */
+#define TYPE_K2_UATA "k2-uata"
+OBJECT_DECLARE_SIMPLE_TYPE(K2UATAState, K2_UATA)
+
+struct K2UATAState {
+    PCIDevice parent_obj;
+
+    MemoryRegion bar;
+    MemoryRegion fcr_mem;
+    uint32_t fcr;
+    DBDMAState dbdma;
+    MACIOIDEState ide;
+};
+
+void k2_uata_init_drives(K2UATAState *s, DriveInfo **hd_table);
+
 #define TYPE_MACIO "macio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOState, MACIO)
 

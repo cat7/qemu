@@ -289,19 +289,28 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev,
                        ns->k2 ? K2_ESCCA_IRQ : NEWWORLD_ESCCA_IRQ));
 
-    /* IDE buses */
-    if (!macio_realize_ide(s, &ns->ide[0],
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_IRQ),
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_DMA_IRQ),
-                           0x16, errp)) {
-        return;
-    }
+    /* IDE buses; the K2's ATA is a separate PCI function */
+    if (ns->k2) {
+        memory_region_del_subregion(&s->bar, &ns->ide[0].mem);
+        memory_region_del_subregion(&s->bar, &ns->ide[1].mem);
+        object_unparent(OBJECT(&ns->ide[0]));
+        object_unparent(OBJECT(&ns->ide[1]));
+    } else {
+        if (!macio_realize_ide(s, &ns->ide[0],
+                               qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_IRQ),
+                               qdev_get_gpio_in(pic_dev,
+                                                NEWWORLD_IDE0_DMA_IRQ),
+                               0x16, errp)) {
+            return;
+        }
 
-    if (!macio_realize_ide(s, &ns->ide[1],
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_IRQ),
-                           qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_DMA_IRQ),
-                           0x1a, errp)) {
-        return;
+        if (!macio_realize_ide(s, &ns->ide[1],
+                               qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_IRQ),
+                               qdev_get_gpio_in(pic_dev,
+                                                NEWWORLD_IDE1_DMA_IRQ),
+                               0x1a, errp)) {
+            return;
+        }
     }
 
     /* Timer */

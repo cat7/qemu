@@ -491,14 +491,40 @@ static void ppc_core99_init(MachineState *machine)
     }
     g_free(cpus);
 
-    /* We only emulate 2 out of 3 IDE controllers for now */
     ide_drive_get(hd, ARRAY_SIZE(hd));
 
-    macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[0]"));
-    macio_ide_init_drives(macio_ide, hd);
+    if (machine_arch == ARCH_MAC99_U3) {
+        /*
+         * The K2 ATA-100, behind the third HT-PCI bridge, takes the first
+         * two IDE drives as master and slave, as a G5's optical drive
+         * shares it with a disk.
+         */
+        DriveInfo *uata_hd[MAX_IDE_DEVS] = {};
+        PCIDevice *uata;
 
-    macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
-    macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
+        for (i = 0, j = 0; i < ARRAY_SIZE(hd); i++) {
+            if (!hd[i]) {
+                continue;
+            }
+            if (j == MAX_IDE_DEVS) {
+                error_report("mac99: the K2 ATA-100 takes two IDE drives");
+                exit(1);
+            }
+            uata_hd[j++] = hd[i];
+        }
+        uata = pci_new(PCI_DEVFN(13, 0), TYPE_K2_UATA);
+        pci_realize_and_unref(uata, pci_bridge_get_sec_bus(
+                              U3_HT_HOST_BRIDGE(ht_dev)->k2[2]),
+                              &error_fatal);
+        k2_uata_init_drives(K2_UATA(uata), uata_hd);
+    } else {
+        /* We only emulate 2 out of 3 IDE controllers for now */
+        macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[0]"));
+        macio_ide_init_drives(macio_ide, hd);
+
+        macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
+        macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
+    }
 
     if (has_adb) {
         if (has_pmu) {
