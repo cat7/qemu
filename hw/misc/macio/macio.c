@@ -34,6 +34,7 @@
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
 #include "hw/misc/macio/tas3004.h"
+#include "hw/misc/macio/cs8420.h"
 #include "hw/i2c/i2c.h"
 #include "hw/intc/heathrow_pic.h"
 #include "trace.h"
@@ -291,7 +292,7 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev,
                        ns->k2 ? K2_ESCCA_IRQ : NEWWORLD_ESCCA_IRQ));
 
-    /* K2 I2C with the TAS3004 equalizer, FCRs and the I2S-a cell */
+    /* K2 I2C with the TAS3004 and CS8420, FCRs and the I2S-a cell */
     if (ns->k2) {
         if (!audio_be_check(&ns->audio_be, errp)) {
             return;
@@ -304,6 +305,7 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         ns->sound.audio_be = ns->audio_be;
         ns->sound.codec = i2c_slave_create_simple(ns->i2c.bus, TYPE_TAS3004,
                                                   TAS3004_I2C_ADDR);
+        i2c_slave_create_simple(ns->i2c.bus, TYPE_CS8420, CS8420_I2C_ADDR);
         k2_sound_register_dma(&ns->sound, &s->dbdma,
                               qdev_get_gpio_in(pic_dev, K2_I2S_TX_DMA_IRQ),
                               qdev_get_gpio_in(pic_dev, K2_I2S_RX_DMA_IRQ));
