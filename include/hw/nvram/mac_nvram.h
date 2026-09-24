@@ -30,6 +30,8 @@
 #include "hw/core/sysbus.h"
 
 #define MACIO_NVRAM_SIZE 0x2000
+/* Two 8 KB flash banks, byte-addressed, as on a G5 */
+#define MACIO_NVRAM_FLASH_SIZE 0x4000
 
 #define TYPE_MACIO_NVRAM "macio-nvram"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIONVRAMState, MACIO_NVRAM)
@@ -41,6 +43,9 @@ struct MacIONVRAMState {
 
     uint32_t size;
     uint32_t it_shift;
+    bool flash;                 /* Intel-style flash command interface */
+    uint8_t flash_cmd;
+    uint8_t flash_status;
 
     MemoryRegion mem;
     uint8_t *data;

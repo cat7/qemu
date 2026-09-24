@@ -607,12 +607,25 @@ static void ppc_core99_init(MachineState *machine)
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
-    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
-    qdev_prop_set_uint32(dev, "it_shift", 1);
+    if (machine_arch == ARCH_MAC99_U3) {
+        /* The G5's NVRAM is flat, two 8 KB flash banks */
+        qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_FLASH_SIZE);
+        qdev_prop_set_uint32(dev, "it_shift", 0);
+        qdev_prop_set_bit(dev, "flash", true);
+    } else {
+        qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
+        qdev_prop_set_uint32(dev, "it_shift", 1);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
-    pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    if (machine_arch == ARCH_MAC99_U3) {
+        /* erased flash reads all ones */
+        memset(nvr->data, 0xff, MACIO_NVRAM_FLASH_SIZE);
+        pmac_format_nvram_partition(nvr, MACIO_NVRAM_FLASH_SIZE);
+    } else {
+        pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    }
     /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
@@ -647,6 +660,8 @@ static void ppc_core99_init(MachineState *machine)
     fw_cfg_add_i16(fw_cfg, FW_CFG_PPC_DEPTH, graphic_depth);
 
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_VIACONFIG, core99_machine->via_config);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_FLAT,
+                   machine_arch == ARCH_MAC99_U3);
 
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_IS_KVM, kvm_enabled());
     if (kvm_enabled()) {

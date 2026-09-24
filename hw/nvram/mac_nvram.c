@@ -39,6 +39,83 @@
 
 #define DEF_SYSTEM_SIZE 0xc10
 
+/*
+ * Flash NVRAM, Intel command set as used by Apple firmware and by the
+ * Sharp/Micron parts Linux drives:
+ *   erase: 20, d0 to the block, poll status bit 0x80, ff
+ *   write: 40, data to the byte, poll status, ff
+ * Erase granularity is 8 KB.
+ */
+#define NVRAM_FLASH_SECTOR   0x2000
+#define NVRAM_FLASH_READY    0x80
+
+enum {
+    NVRAM_FLASH_CMD_NONE        = 0x00,
+    NVRAM_FLASH_CMD_ERASE_SETUP = 0x20,
+    NVRAM_FLASH_CMD_PROGRAM     = 0x40,
+    NVRAM_FLASH_CMD_ERASE_CONF  = 0xd0,
+    NVRAM_FLASH_CMD_READ_ARRAY  = 0xff,
+};
+
+static void macio_nvram_flush(MacIONVRAMState *s, hwaddr addr, int len)
+{
+    if (s->blk) {
+        if (blk_pwrite(s->blk, addr, len, &s->data[addr], 0) < 0) {
+            error_report("%s: write of NVRAM data to backing store failed",
+                         blk_name(s->blk));
+        }
+    }
+}
+
+/* Returns true if the write was a command rather than plain data */
+static bool macio_nvram_flash_write(MacIONVRAMState *s, hwaddr addr,
+                                    uint8_t value)
+{
+    if (!s->flash) {
+        return false;
+    }
+
+    switch (s->flash_cmd) {
+    case NVRAM_FLASH_CMD_ERASE_SETUP:
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        if (value == NVRAM_FLASH_CMD_ERASE_CONF) {
+            hwaddr base = addr & ~(hwaddr)(NVRAM_FLASH_SECTOR - 1);
+
+            memset(&s->data[base], 0xff, NVRAM_FLASH_SECTOR);
+            macio_nvram_flush(s, base, NVRAM_FLASH_SECTOR);
+            s->flash_status = NVRAM_FLASH_READY;
+        }
+        return true;
+
+    case NVRAM_FLASH_CMD_PROGRAM:
+        /* programming can only clear bits */
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        s->data[addr] &= value;
+        macio_nvram_flush(s, addr, 1);
+        s->flash_status = NVRAM_FLASH_READY;
+        return true;
+
+    default:
+        break;
+    }
+
+    switch (value) {
+    case NVRAM_FLASH_CMD_ERASE_SETUP:
+    case NVRAM_FLASH_CMD_PROGRAM:
+        s->flash_cmd = value;
+        s->flash_status = 0;
+        break;
+    case NVRAM_FLASH_CMD_READ_ARRAY:
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        s->flash_status = 0;
+        break;
+    default:
+        /* status and other commands leave the array untouched */
+        break;
+    }
+    return true;
+}
+
 /* macio style NVRAM device */
 static void macio_nvram_writeb(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
@@ -47,6 +124,9 @@ static void macio_nvram_writeb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     trace_macio_nvram_write(addr, value);
+    if (macio_nvram_flash_write(s, addr, value)) {
+        return;
+    }
     s->data[addr] = value;
     if (s->blk) {
         if (blk_pwrite(s->blk, addr, 1, &s->data[addr], 0) < 0) {
@@ -64,6 +144,10 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     value = s->data[addr];
+    /* while a command is in flight the part answers with its status */
+    if (s->flash && s->flash_status) {
+        value = s->flash_status;
+    }
     trace_macio_nvram_read(addr, value);
 
     return value;
@@ -73,7 +157,7 @@ static const MemoryRegionOps macio_nvram_ops = {
     .read = macio_nvram_readb,
     .write = macio_nvram_writeb,
     .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
+    .valid.max_access_size = 8,
     .impl.min_access_size = 1,
     .impl.max_access_size = 1,
     .endianness = DEVICE_BIG_ENDIAN,
@@ -137,6 +221,7 @@ static void macio_nvram_unrealizefn(DeviceState *dev)
 static const Property macio_nvram_properties[] = {
     DEFINE_PROP_UINT32("size", MacIONVRAMState, size, 0),
     DEFINE_PROP_UINT32("it_shift", MacIONVRAMState, it_shift, 0),
+    DEFINE_PROP_BOOL("flash", MacIONVRAMState, flash, false),
     DEFINE_PROP_DRIVE("drive", MacIONVRAMState, blk),
 };
 
