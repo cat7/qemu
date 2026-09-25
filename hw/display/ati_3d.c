@@ -2997,15 +2997,12 @@ static bool r100_triangle_setup(ATIVGAState *s, const R100Vertex *v0,
 }
 
 /*
- * Rows are dealt out to bands in stripes of 1 << R100_RASTER_STRIPE_SHIFT
- * absolute screen rows. A band still steps the edge sums through every
- * row, so each pixel it draws sees exactly the values the serial loop
- * computed.
+ * Draw the triangle's rows in [row_first, row_last]. The edge sums are
+ * still stepped through every row from the top, so each pixel sees exactly
+ * the values the whole-triangle loop computes.
  */
-#define R100_RASTER_STRIPE_SHIFT 3
-
 static void r100_triangle_rows(ATIVGAState *s, const R100Tri *tri,
-                               unsigned int band, unsigned int nbands,
+                               int row_first, int row_last,
                                R100DirtyBatch *batch, R100DrawState *draw)
 {
     const R100Vertex *v0 = &tri->v[0];
@@ -3030,16 +3027,17 @@ static void r100_triangle_rows(ATIVGAState *s, const R100Tri *tri,
     row_value0 = r100_edge_value(&edge0, min_x + 0.5, min_y + 0.5);
     row_value1 = r100_edge_value(&edge1, min_x + 0.5, min_y + 0.5);
     row_value2 = r100_edge_value(&edge2, min_x + 0.5, min_y + 0.5);
-    for (y = min_y; y <= max_y; y++) {
+    for (y = min_y; y < row_first && y <= max_y; y++) {
+        row_value0 += edge0.y;
+        row_value1 += edge1.y;
+        row_value2 += edge2.y;
+    }
+    for (; y <= max_y && y <= row_last; y++) {
         double value0 = row_value0;
         double value1 = row_value1;
         double value2 = row_value2;
         bool block_inside = false;
 
-        if (nbands > 1 &&
-            ((unsigned int)y >> R100_RASTER_STRIPE_SHIFT) % nbands != band) {
-            goto next_row;
-        }
         for (x = min_x; x <= max_x; x++) {
             double pixel_value0 = value0;
             double pixel_value1 = value1;
@@ -3126,7 +3124,6 @@ static void r100_triangle_rows(ATIVGAState *s, const R100Tri *tri,
                           specular, tex_s, tex_t, tex_q, &gradients, batch,
                           draw);
         }
-next_row:
         row_value0 += edge0.y;
         row_value1 += edge1.y;
         row_value2 += edge2.y;
@@ -3135,14 +3132,16 @@ next_row:
 
 /*
  * Parallel rasterisation. While a draw packet is being walked its
- * triangles are queued; at its end their rows are dealt out to bands of
- * absolute screen rows and the bands are drawn concurrently, the
- * submitting thread drawing band 0 and waiting for the rest. A pixel
- * belongs to one band whichever triangle covers it, and a band draws its
- * triangles in submission order, so every pixel sees the writes it saw
- * serially. Only batches whose colour, depth and textures all lie in
- * local VRAM are split; everything else is drawn where it stands.
+ * triangles are queued; at its end the screen rows they cover are cut
+ * into stripes of 1 << R100_RASTER_STRIPE_SHIFT absolute rows, and the
+ * submitting thread and the workers take stripes in turn until none is
+ * left. A pixel belongs to one stripe whichever triangle covers it, and a
+ * stripe is drawn by one thread, its triangles in submission order, so
+ * every pixel sees the writes it saw serially. Only batches whose colour,
+ * depth and textures all lie in local VRAM are split; everything else is
+ * drawn where it stands.
  */
+#define R100_RASTER_STRIPE_SHIFT 3
 #define R100_RASTER_MAX_THREADS 8
 #define R100_RASTER_MIN_PX 4096
 
@@ -3150,7 +3149,8 @@ typedef struct R100RasterWorker {
     ATIVGAState *s;
     QemuThread thread;
     QemuSemaphore start;
-    unsigned int band;
+    /* the job its draw state was set up for */
+    uint32_t job;
     R100DrawState draw;
 } R100RasterWorker;
 
@@ -3158,32 +3158,61 @@ typedef struct R100Raster {
     R100RasterWorker worker[R100_RASTER_MAX_THREADS - 1];
     unsigned int nworkers;
     bool quit;
-    QemuSemaphore done;
     bool queueing;
     R100Tri *tri;
     unsigned int ntri;
     unsigned int capacity;
-    unsigned int nbands;
     uint64_t pixels;
     int min_y, max_y;
+    uint32_t job;
+    /* job << 32 | last stripe << 16 | next stripe to take */
+    uint64_t next;
+    unsigned int stripes_done;
 } R100Raster;
 
-static void r100_raster_band(ATIVGAState *s, R100Raster *q,
-                             unsigned int band, R100DirtyBatch *batch,
-                             R100DrawState *draw)
+/*
+ * Take a stripe of the given job, or -1 once they are all taken. The job
+ * and its stripes share one word, so a thread that wakes late finds its
+ * job over and takes nothing: the submitting thread waits only for the
+ * stripes being drawn.
+ */
+static int r100_raster_take(R100Raster *q, uint32_t job)
 {
-    for (unsigned int i = 0; i < q->ntri; i++) {
-        const R100Tri *tri = &q->tri[i];
-        int first = tri->min_y >> R100_RASTER_STRIPE_SHIFT;
-        int last = tri->max_y >> R100_RASTER_STRIPE_SHIFT;
+    uint64_t next = qatomic_load_acquire(&q->next);
 
-        /* skip triangles that have no stripe in this band */
-        if (last - first + 1 < (int)q->nbands &&
-            (unsigned int)(band - first % q->nbands + q->nbands) % q->nbands >
-            (unsigned int)(last - first)) {
-            continue;
+    for (;;) {
+        uint64_t seen;
+
+        if (next >> 32 != job ||
+            extract64(next, 0, 16) > extract64(next, 16, 16)) {
+            return -1;
         }
-        r100_triangle_rows(s, tri, band, q->nbands, batch, draw);
+        seen = qatomic_cmpxchg(&q->next, next, next + 1);
+        if (seen == next) {
+            return extract64(next, 0, 16);
+        }
+        next = seen;
+    }
+}
+
+static void r100_raster_stripes(ATIVGAState *s, R100Raster *q, uint32_t job,
+                                R100DirtyBatch *batch, R100DrawState *draw)
+{
+    int stripe;
+
+    while ((stripe = r100_raster_take(q, job)) >= 0) {
+        int first = stripe << R100_RASTER_STRIPE_SHIFT;
+        int last = first + (1 << R100_RASTER_STRIPE_SHIFT) - 1;
+
+        for (unsigned int i = 0; i < q->ntri; i++) {
+            const R100Tri *tri = &q->tri[i];
+
+            if (tri->max_y >= first && tri->min_y <= last) {
+                r100_triangle_rows(s, tri, first, last, batch, draw);
+            }
+        }
+        r100_dirty_batch_flush(s, batch);
+        qatomic_inc(&q->stripes_done);
     }
 }
 
@@ -3193,7 +3222,7 @@ static void *r100_raster_thread(void *opaque)
     ATIVGAState *s = w->s;
     R100Raster *q = s->raster;
 
-    /* bands resolve VRAM and mark it dirty inside RCU read sections */
+    /* stripes resolve VRAM and mark it dirty inside RCU read sections */
     rcu_register_thread();
     for (;;) {
         R100DirtyBatch batch = { 0 };
@@ -3202,12 +3231,39 @@ static void *r100_raster_thread(void *opaque)
         if (qatomic_read(&q->quit)) {
             break;
         }
-        r100_raster_band(s, q, w->band, &batch, &w->draw);
-        r100_dirty_batch_flush(s, &batch);
-        qemu_sem_post(&q->done);
+        r100_raster_stripes(s, q, qatomic_load_acquire(&w->job), &batch,
+                            &w->draw);
     }
     rcu_unregister_thread();
     return NULL;
+}
+
+/* Draw the queued triangles' stripes with the submitting thread and helpers. */
+static void r100_raster_run(ATIVGAState *s, R100Raster *q,
+                            unsigned int helpers, R100DirtyBatch *batch,
+                            R100DrawState *draw)
+{
+    int first = q->min_y >> R100_RASTER_STRIPE_SHIFT;
+    int last = q->max_y >> R100_RASTER_STRIPE_SHIFT;
+    unsigned int stripes = last - first + 1;
+    unsigned int i;
+
+    q->job++;
+    qatomic_set(&q->stripes_done, 0);
+    for (i = 0; i < helpers; i++) {
+        /* the stripes draw under this state, bus textures copied */
+        q->worker[i].draw = *draw;
+        qatomic_store_release(&q->worker[i].job, q->job);
+    }
+    qatomic_store_release(&q->next, (uint64_t)q->job << 32 |
+                                    (uint64_t)last << 16 | first);
+    for (i = 0; i < helpers; i++) {
+        qemu_sem_post(&q->worker[i].start);
+    }
+    r100_raster_stripes(s, q, q->job, batch, draw);
+    while (qatomic_load_acquire(&q->stripes_done) < stripes) {
+        cpu_relax();
+    }
 }
 
 /*
@@ -3278,38 +3334,34 @@ static void r100_raster_flush(ATIVGAState *s, R100DirtyBatch *batch,
 {
     R100Raster *q = s->raster;
     unsigned int i, n = q->ntri;
-    unsigned int stripes;
+    unsigned int helpers;
+    int stripes;
 
     if (!n) {
         return;
     }
     stripes = (q->max_y >> R100_RASTER_STRIPE_SHIFT) -
               (q->min_y >> R100_RASTER_STRIPE_SHIFT) + 1;
-    q->nbands = MIN(q->nworkers + 1, stripes);
-    if (q->nbands > 1 &&
+    helpers = MIN(q->nworkers, stripes - 1);
+    if ((q->max_y >> R100_RASTER_STRIPE_SHIFT) >= UINT16_MAX) {
+        helpers = 0;
+    }
+    if (helpers &&
         (q->pixels < R100_RASTER_MIN_PX ||
          !r100_raster_local(s, r100_draw_state(s, draw), q->max_y) ||
          !r100_raster_textures(s, draw, q->pixels) ||
          /* the copies went over the bus: nothing may have moved */
          draw->generation != s->r100_state_generation)) {
-        q->nbands = 1;
+        helpers = 0;
     }
-    if (q->nbands <= 1) {
+    if (!helpers) {
         s->raster_tri_serial += n;
         for (i = 0; i < n; i++) {
-            r100_triangle_rows(s, &q->tri[i], 0, 1, batch, draw);
+            r100_triangle_rows(s, &q->tri[i], INT_MIN, INT_MAX, batch, draw);
         }
     } else {
         s->raster_tri_split += n;
-        for (i = 1; i < q->nbands; i++) {
-            /* the bands draw under this state, bus textures copied */
-            q->worker[i - 1].draw = *draw;
-            qemu_sem_post(&q->worker[i - 1].start);
-        }
-        r100_raster_band(s, q, 0, batch, draw);
-        for (i = 1; i < q->nbands; i++) {
-            qemu_sem_wait(&q->done);
-        }
+        r100_raster_run(s, q, helpers, batch, draw);
     }
     s->r100_3d.submitted_primitives += n;
     q->ntri = 0;
@@ -3349,13 +3401,11 @@ void ati_3d_raster_init(ATIVGAState *s)
     }
     q = g_new0(R100Raster, 1);
     s->raster = q;
-    qemu_sem_init(&q->done, 0);
     for (unsigned int i = 0; i < want - 1; i++) {
         R100RasterWorker *w = &q->worker[i];
         char name[24];
 
         w->s = s;
-        w->band = i + 1;
         qemu_sem_init(&w->start, 0);
         snprintf(name, sizeof(name), "ati-r100-raster%u", i);
         qemu_thread_create(&w->thread, name, r100_raster_thread, w,
@@ -3379,7 +3429,6 @@ void ati_3d_raster_fini(ATIVGAState *s)
         qemu_thread_join(&q->worker[i].thread);
         qemu_sem_destroy(&q->worker[i].start);
     }
-    qemu_sem_destroy(&q->done);
     g_free(q->tri);
     g_free(q);
     s->raster = NULL;
@@ -3410,7 +3459,7 @@ static void r100_draw_triangle(ATIVGAState *s, const R100Vertex *v0,
     if (!r100_triangle_setup(s, v0, v1, v2, &tri)) {
         return;
     }
-    r100_triangle_rows(s, &tri, 0, 1, batch, draw);
+    r100_triangle_rows(s, &tri, INT_MIN, INT_MAX, batch, draw);
     s->r100_3d.submitted_primitives++;
 }
 
@@ -5210,7 +5259,7 @@ static void *ati_engine_thread(void *opaque)
 {
     ATIVGAState *s = opaque;
 
-    /* rasteriser bands and DMA resolve memory inside RCU read sections */
+    /* rasteriser stripes and DMA resolve memory inside RCU read sections */
     rcu_register_thread();
     ati_engine_ctx = true;
     qemu_mutex_lock(&s->engine_lock);
