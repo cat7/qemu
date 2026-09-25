@@ -215,6 +215,7 @@ static struct ati_regdesc ati_reg_names[] = {
     {"SC_BOTTOM_RIGHT", 0x16f0},
     {"SRC_SC_BOTTOM_RIGHT", 0x16f4},
     {"DST_TILE", 0x1700},
+    {"SRC_TILE", 0x1704},
     {"WAIT_UNTIL", 0x1720},
     {"CACHE_CNTL", 0x1724},
     {"RBBM_GUICNTL", 0x172c},

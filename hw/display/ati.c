@@ -2077,6 +2077,11 @@ void ati_mmio_write(ATIVGAState *s, hwaddr addr, uint64_t data,
             s->regs.dst_tile = data & 3;
         }
         break;
+    case R100_SRC_TILE:
+        if (ati_is_rv100_family(s)) {
+            s->regs.src_tile = data & 3;
+        }
+        break;
     case DST_WIDTH:
         s->regs.dst_width = data & 0x3fff;
         ati_2d_blt(s);

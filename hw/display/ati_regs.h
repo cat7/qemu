@@ -326,6 +326,7 @@
 #define SC_BOTTOM_RIGHT                         0x16f0
 #define SRC_SC_BOTTOM_RIGHT                     0x16f4
 #define DST_TILE                                0x1700
+#define R100_SRC_TILE                           0x1704
 #define WAIT_UNTIL                              0x1720
 #define CACHE_CNTL                              0x1724
 #define RBBM_GUICNTL                           0x172c
