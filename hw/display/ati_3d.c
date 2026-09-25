@@ -3221,7 +3221,8 @@ static void r100_triangle_rows(ATIVGAState *s, const R100Tri *tri,
  * depth and textures all lie in local VRAM are split; everything else is
  * drawn where it stands.
  */
-#define R100_RASTER_STRIPE_SHIFT 3
+/* small stripes keep the last one short: its drawer is waited for */
+#define R100_RASTER_STRIPE_SHIFT 1
 #define R100_RASTER_MAX_THREADS 8
 #define R100_RASTER_MIN_PX 4096
 
