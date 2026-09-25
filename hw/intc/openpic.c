@@ -1614,7 +1614,7 @@ static void openpic_realize(DeviceState *dev, Error **errp)
             return;
         }
 
-        map_list(opp, list_le, &list_count);
+        map_list(opp, opp->big_endian ? list_be : list_le, &list_count);
         break;
     }
 
@@ -1637,6 +1637,7 @@ static void openpic_realize(DeviceState *dev, Error **errp)
 static const Property openpic_properties[] = {
     DEFINE_PROP_UINT32("model", OpenPICState, model, OPENPIC_MODEL_FSL_MPIC_20),
     DEFINE_PROP_UINT32("nb_cpus", OpenPICState, nb_cpus, 1),
+    DEFINE_PROP_BOOL("big-endian", OpenPICState, big_endian, false),
 };
 
 static void openpic_class_init(ObjectClass *oc, const void *data)

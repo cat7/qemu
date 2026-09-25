@@ -162,6 +162,7 @@ struct OpenPICState {
     /* Local registers per output pin */
     IRQDest dst[MAX_CPU];
     uint32_t nb_cpus;
+    bool big_endian;            /* KeyLargo model: registers big-endian */
     /* Timer registers */
     OpenPICTimer timers[OPENPIC_MAX_TMR];
     uint32_t max_tmr;
