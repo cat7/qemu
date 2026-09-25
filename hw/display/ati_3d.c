@@ -411,6 +411,30 @@ static bool r100_translate_gart(ATIVGAState *s, uint64_t address,
     return true;
 }
 
+/*
+ * The AGP window: MC_AGP_LOCATION gives its start and top in the card's
+ * address space (64 KB units, top in the high half), and AGP_BASE the
+ * bus address its start maps to. It decodes once the AGP handshake has
+ * set AGP_ENABLE in the card's AGP command register.
+ */
+static bool r100_agp_span(ATIVGAState *s, uint64_t address, uint64_t length,
+                          uint64_t *translated, uint64_t *span)
+{
+    ATI3DState *r = &s->r100_3d;
+    uint64_t start = (uint64_t)(r->mc_agp_location & 0xffffU) << 16;
+    uint64_t top = (uint64_t)(r->mc_agp_location >> 16) << 16 | 0xffffU;
+    uint8_t cap = pci_find_capability(&s->dev, PCI_CAP_ID_AGP);
+
+    if (!cap || !(pci_get_long(s->dev.config + cap + PCI_AGP_COMMAND) &
+                  PCI_AGP_COMMAND_AGP) ||
+        !length || top < start || address < start || address > top) {
+        return false;
+    }
+    *translated = (uint64_t)r->agp_base + (address - start);
+    *span = MIN(length, top - address + 1);
+    return true;
+}
+
 static void r100_cap_span_at(uint64_t address, uint64_t boundary,
                              uint64_t *span)
 {
@@ -420,19 +444,21 @@ static void r100_cap_span_at(uint64_t address, uint64_t boundary,
 }
 
 static bool r100_gpu_decode(ATIVGAState *s, uint64_t address,
-                            uint64_t length, bool *vram,
+                            uint64_t length, AddressSpace **as,
                             uint64_t *translated, uint64_t *span)
 {
+    AddressSpace *bus_as = pci_get_address_space(&s->dev);
+
     ATI3DState *r = &s->r100_3d;
     uint64_t fb_start = (uint64_t)(r->mc_fb_location & 0xffffU) << 16;
     uint64_t fb_top = (uint64_t)(r->mc_fb_location >> 16) << 16 | 0xffffU;
 
     if (r100_programmed_vram_span(s, address, length, translated, span)) {
-        *vram = true;
+        *as = NULL;
         return true;
     }
     if (r100_in_gart(r, address)) {
-        *vram = false;
+        *as = bus_as;
         if (!r100_translate_gart(s, address, length, translated, span)) {
             return false;
         }
@@ -441,8 +467,13 @@ static bool r100_gpu_decode(ATIVGAState *s, uint64_t address,
         }
         return true;
     }
+    if (r100_agp_span(s, address, length, translated, span)) {
+        *as = s->agp_as_valid ? &s->agp_as : bus_as;
+        trace_ati_r100_agp_access(address, *translated, *span);
+        return true;
+    }
     if (r100_zero_vram_span(s, address, length, translated, span)) {
-        *vram = true;
+        *as = NULL;
         if (r->aic_cntl & R100_PCIGART_TRANSLATE_EN) {
             r100_cap_span_at(address, r->aic_lo_addr, span);
         }
@@ -451,7 +482,7 @@ static bool r100_gpu_decode(ATIVGAState *s, uint64_t address,
     if (r->aic_cntl & R100_DIS_OUT_OF_PCI_GART_ACCESS) {
         return false;
     }
-    *vram = false;
+    *as = bus_as;
     *translated = address;
     *span = length;
     if (fb_top >= fb_start && s->vga.vram_size) {
@@ -469,18 +500,18 @@ bool ati_r100_gpu_access_valid(ATIVGAState *s, uint64_t address,
     uint64_t done = 0;
     uint64_t translated;
     uint64_t span;
-    bool vram;
+    AddressSpace *as;
 
     if (length > UINT64_MAX - address) {
         return false;
     }
     while (done < length) {
-        if (!r100_gpu_decode(s, address + done, length - done, &vram,
+        if (!r100_gpu_decode(s, address + done, length - done, &as,
                              &translated, &span)) {
             return false;
         }
-        if (!vram &&
-            !dma_memory_valid(pci_get_address_space(&s->dev), translated,
+        if (as &&
+            !dma_memory_valid(as, translated,
                               span, is_write ? DMA_DIRECTION_FROM_DEVICE :
                                                DMA_DIRECTION_TO_DEVICE,
                               MEMTXATTRS_UNSPECIFIED)) {
@@ -506,24 +537,24 @@ bool ati_r100_gpu_ranges_overlap(ATIVGAState *s, uint64_t first,
         uint64_t first_translated;
         uint64_t first_span;
         uint64_t second_done = 0;
-        bool first_vram;
+        AddressSpace *first_as;
 
         if (!r100_gpu_decode(s, first + first_done,
-                             first_length - first_done, &first_vram,
+                             first_length - first_done, &first_as,
                              &first_translated, &first_span)) {
             return false;
         }
         while (second_done < second_length) {
             uint64_t second_translated;
             uint64_t second_span;
-            bool second_vram;
+            AddressSpace *second_as;
 
             if (!r100_gpu_decode(s, second + second_done,
-                                 second_length - second_done, &second_vram,
+                                 second_length - second_done, &second_as,
                                  &second_translated, &second_span)) {
                 return false;
             }
-            if (first_vram == second_vram &&
+            if (first_as == second_as &&
                 first_translated < second_translated + second_span &&
                 second_translated < first_translated + first_span) {
                 *overlap = true;
@@ -543,20 +574,20 @@ bool ati_r100_gpu_read(ATIVGAState *s, uint64_t address, void *buf,
     uint64_t done = 0;
     uint64_t translated;
     uint64_t span;
-    bool vram;
+    AddressSpace *as;
 
     if (length > UINT64_MAX - address) {
         return false;
     }
     while (done < length) {
-        if (!r100_gpu_decode(s, address + done, length - done, &vram,
+        if (!r100_gpu_decode(s, address + done, length - done, &as,
                              &translated, &span)) {
             return false;
         }
-        if (vram) {
+        if (!as) {
             memcpy(out + done, s->vga.vram_ptr + translated, span);
-        } else if (pci_dma_read(&s->dev, translated, out + done,
-                                span) != MEMTX_OK) {
+        } else if (dma_memory_read(as, translated, out + done, span,
+                                   MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             return false;
         }
         done += span;
@@ -619,17 +650,17 @@ static bool r100_gpu_write(ATIVGAState *s, uint64_t address, const void *buf,
     uint64_t done = 0;
     uint64_t translated;
     uint64_t span;
-    bool vram;
+    AddressSpace *as;
 
     if (length > UINT64_MAX - address) {
         return false;
     }
     while (done < length) {
-        if (!r100_gpu_decode(s, address + done, length - done, &vram,
+        if (!r100_gpu_decode(s, address + done, length - done, &as,
                              &translated, &span)) {
             return false;
         }
-        if (vram) {
+        if (!as) {
             memcpy(s->vga.vram_ptr + translated, in + done, span);
             if (dirty) {
                 if (batch) {
@@ -638,8 +669,8 @@ static bool r100_gpu_write(ATIVGAState *s, uint64_t address, const void *buf,
                     memory_region_set_dirty(&s->vga.vram, translated, span);
                 }
             }
-        } else if (pci_dma_write(&s->dev, translated, in + done,
-                                 span) != MEMTX_OK) {
+        } else if (dma_memory_write(as, translated, in + done, span,
+                                    MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             return false;
         }
         done += span;

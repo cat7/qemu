@@ -148,6 +148,7 @@ ati_mm_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%
 ati_mm_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s <- 0x%"PRIx64
 
 # ati_3d.c
+ati_r100_agp_access(uint64_t addr, uint64_t bus, uint64_t len) "card 0x%"PRIx64" bus 0x%"PRIx64" len 0x%"PRIx64
 ati_cp_packet3_unknown(unsigned int opcode, unsigned int count, uint32_t word0, uint32_t word1, uint32_t word2, uint32_t word3) "opcode=0x%x count=%u first=0x%08"PRIx32",0x%08"PRIx32",0x%08"PRIx32",0x%08"PRIx32
 
 # artist.c

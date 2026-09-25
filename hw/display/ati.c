@@ -47,6 +47,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_regs.h"
+#include "hw/pci/pci_bus.h"
 #include "vga_regs.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
@@ -2735,6 +2736,60 @@ static const VMStateDescription vmstate_ati_vga = {
     },
 };
 
+/* Host bridges whose root bus is an AGP port */
+static bool ati_on_agp_bus(PCIDevice *dev)
+{
+    PCIBus *bus = pci_get_bus(dev);
+    Object *host;
+
+    if (!pci_bus_is_root(bus) || !bus->qbus.parent) {
+        return false;
+    }
+    host = OBJECT(bus->qbus.parent);
+    return object_dynamic_cast(host, "u3-agp-pcihost") ||
+           object_dynamic_cast(host, "uni-north-agp-pcihost");
+}
+
+/* Radeon 7000: AGP 2.0 at 0x58, RQ 48, SBA, fast writes, 1x/2x/4x */
+#define ATI_R100_AGP_CAP    0x58
+
+static bool ati_r100_agp_init(PCIDevice *dev, Error **errp)
+{
+    int cap = pci_add_capability(dev, PCI_CAP_ID_AGP, ATI_R100_AGP_CAP,
+                                 PCI_AGP_SIZEOF, errp);
+
+    if (cap < 0) {
+        return false;
+    }
+    pci_set_byte(dev->config + cap + PCI_AGP_VERSION, 0x20);
+    pci_set_long(dev->config + cap + PCI_AGP_STATUS,
+                 0x2f000000 | PCI_AGP_STATUS_SBA | PCI_AGP_STATUS_FW |
+                 PCI_AGP_STATUS_RATE4 | PCI_AGP_STATUS_RATE2 |
+                 PCI_AGP_STATUS_RATE1);
+    pci_set_long(dev->wmask + cap + PCI_AGP_COMMAND,
+                 0xff000000 | PCI_AGP_COMMAND_SBA | PCI_AGP_COMMAND_AGP |
+                 PCI_AGP_COMMAND_FW | PCI_AGP_COMMAND_RATE4 |
+                 PCI_AGP_COMMAND_RATE2 | PCI_AGP_COMMAND_RATE1);
+    return true;
+}
+
+/* AGP transactions go through the host bridge's "agp-gart" if it has one */
+static void ati_agp_attach(ATIVGAState *s)
+{
+    PCIBus *bus = pci_get_bus(&s->dev);
+    Object *mr;
+
+    if (!bus->qbus.parent) {
+        return;
+    }
+    mr = object_resolve_path_component(OBJECT(bus->qbus.parent),
+                                       "agp-gart[0]");
+    if (mr && object_dynamic_cast(mr, TYPE_MEMORY_REGION)) {
+        address_space_init(&s->agp_as, MEMORY_REGION(mr), "ati-agp");
+        s->agp_as_valid = true;
+    }
+}
+
 static void ati_vga_realize(PCIDevice *dev, Error **errp)
 {
     ATIVGAState *s = ATI_VGA(dev);
@@ -2796,6 +2851,15 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
         pci_set_byte(dev->config + PCI_CACHE_LINE_SIZE, 0x10);
         pci_set_byte(dev->config + PCI_LATENCY_TIMER, 0x40);
         pci_set_byte(dev->config + PCI_MIN_GNT, 0x08);
+    }
+
+    if (s->agp == ON_OFF_AUTO_ON ||
+        (s->agp == ON_OFF_AUTO_AUTO && ati_is_rv100_family(s) &&
+         ati_on_agp_bus(dev))) {
+        if (!ati_r100_agp_init(dev, errp)) {
+            return;
+        }
+        ati_agp_attach(s);
     }
 
     if (ati_is_rv100_family(s) && s->vga.vram_size_mb < 16) {
@@ -2955,6 +3019,10 @@ static void ati_vga_exit(PCIDevice *dev)
     ATIVGAState *s = ATI_VGA(dev);
 
     timer_del(&s->vblank_timer);
+    if (s->agp_as_valid) {
+        address_space_destroy(&s->agp_as);
+        s->agp_as_valid = false;
+    }
     qemu_graphic_console_close(s->vga.con);
     cursor_unref(s->cursor);
     s->cursor = NULL;
@@ -2965,6 +3033,8 @@ static void ati_vga_exit(PCIDevice *dev)
 static const Property ati_vga_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", ATIVGAState, vga.vram_size_mb, 16),
     DEFINE_PROP_STRING("model", ATIVGAState, model),
+    /* AGP capability: on, or auto for a Radeon on an AGP bus */
+    DEFINE_PROP_ON_OFF_AUTO("agp", ATIVGAState, agp, ON_OFF_AUTO_OFF),
     DEFINE_PROP_UINT16("x-device-id", ATIVGAState, dev_id,
                        PCI_DEVICE_ID_ATI_RAGE128_PF),
     /* Position registers specify the cursor image origin. */

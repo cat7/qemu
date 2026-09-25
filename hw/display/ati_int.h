@@ -17,6 +17,7 @@
 #include "migration/vmstate.h"
 #include "vga_int.h"
 #include "qom/object.h"
+#include "qapi/qapi-types-common.h"
 
 /*#define DEBUG_ATI*/
 
@@ -224,6 +225,9 @@ struct ATIVGAState {
     PCIDevice dev;
     VGACommonState vga;
     char *model;
+    OnOffAuto agp;
+    AddressSpace agp_as;        /* AGP transactions, via the host's GART */
+    bool agp_as_valid;
     uint16_t dev_id;
     uint8_t mode;
     uint8_t use_pixman;
