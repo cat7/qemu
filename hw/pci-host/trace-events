@@ -40,6 +40,11 @@ sabre_pci_config_read(uint64_t addr, uint64_t val) "addr 0x%"PRIx64" val 0x%"PRI
 sabre_pci_set_irq(int irq_num, int level) "set irq_in %d level %d"
 sabre_pci_set_obio_irq(int irq_num, int level) "set irq %d level %d"
 
+# u3_dart.c
+u3_dart_read(uint64_t addr, uint32_t val) "0x%02"PRIx64" -> 0x%08x"
+u3_dart_write(uint64_t addr, uint64_t val) "0x%02"PRIx64" <- 0x%08"PRIx64
+u3_dart_fault(uint64_t addr, uint32_t entry) "bus address 0x%"PRIx64" entry 0x%08x"
+
 # uninorth.c
 unin_set_irq(int irq_num, int level) "setting INT %d = %d"
 unin_get_config_reg(uint32_t reg, uint32_t addr, uint32_t retval) "converted config space accessor 0x%"PRIx32 "/0x%"PRIx32 " -> 0x%"PRIx32

@@ -56,6 +56,7 @@
 #include "hw/nvram/mac_nvram.h"
 #include "hw/core/boards.h"
 #include "hw/pci-host/uninorth.h"
+#include "hw/pci-host/u3_dart.h"
 #include "hw/i2c/i2c.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
@@ -194,6 +195,7 @@ static void ppc_core99_init(MachineState *machine)
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
     DeviceState *ht_dev = NULL;
+    DeviceState *dart;
     SysBusDevice *unin_dev;
     PCIBus *macio_bus;
     PCIDevice *usb0, *usb1;
@@ -372,6 +374,14 @@ static void ppc_core99_init(MachineState *machine)
         ht_dev = qdev_new(TYPE_U3_HT_HOST_BRIDGE);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(ht_dev), &error_fatal);
         u3_ht_map(SYS_BUS_DEVICE(ht_dev));
+
+        /* DMA from both host buses goes through the DART */
+        dart = qdev_new(TYPE_U3_DART);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dart), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dart), 0, U3_DART_BASE);
+        u3_dart_attach(U3_DART(dart),
+                       PCI_HOST_BRIDGE(uninorth_pci_dev)->bus);
+        u3_dart_attach(U3_DART(dart), PCI_HOST_BRIDGE(ht_dev)->bus);
     } else {
         machine_arch = ARCH_MAC99;
         /* Use values found on a real PowerMac */
