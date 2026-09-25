@@ -34,6 +34,7 @@ const char *fw_cfg_arch_key_name(uint16_t key)
         {FW_CFG_PPC_BUSFREQ, "busfreq"},
         {FW_CFG_PPC_NVRAM_FLAT, "nvram_flat"},
         {FW_CFG_PPC_VIACONFIG, "viaconfig"},
+        {FW_CFG_PPC_HIGH_RAM_SIZE, "high_ram_size"},
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(fw_cfg_arch_wellknown_keys); i++) {

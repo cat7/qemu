@@ -195,6 +195,7 @@ static void ppc_core99_init(MachineState *machine)
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
     DeviceState *ht_dev = NULL;
+    uint64_t low_ram_size;
     DeviceState *dart;
     SysBusDevice *unin_dev;
     PCIBus *macio_bus;
@@ -221,12 +222,28 @@ static void ppc_core99_init(MachineState *machine)
     }
     env = &cpus[0]->env;
 
-    /* allocate RAM */
+    /* allocate RAM; on U3, RAM beyond 2 GiB continues at 4 GiB */
+    low_ram_size = machine->ram_size;
     if (machine->ram_size > 2 * GiB) {
-        error_report("RAM size more than 2 GiB is not supported");
-        exit(1);
+        MemoryRegion *low, *high;
+
+        if (PPC_INPUT(env) != PPC_FLAGS_INPUT_970) {
+            error_report("RAM size more than 2 GiB is not supported");
+            exit(1);
+        }
+        low_ram_size = 2 * GiB;
+        low = g_new(MemoryRegion, 1);
+        high = g_new(MemoryRegion, 1);
+        memory_region_init_alias(low, NULL, "ram-low", machine->ram, 0,
+                                 low_ram_size);
+        memory_region_init_alias(high, NULL, "ram-high", machine->ram,
+                                 low_ram_size,
+                                 machine->ram_size - low_ram_size);
+        memory_region_add_subregion(get_system_memory(), 0, low);
+        memory_region_add_subregion(get_system_memory(), 4 * GiB, high);
+    } else {
+        memory_region_add_subregion(get_system_memory(), 0, machine->ram);
     }
-    memory_region_add_subregion(get_system_memory(), 0, machine->ram);
 
     /* allocate and load firmware ROM */
     memory_region_init_rom(bios, NULL, "ppc_core99.bios", PROM_SIZE,
@@ -259,13 +276,13 @@ static void ppc_core99_init(MachineState *machine)
                                NULL, NULL, ELFDATA2MSB, PPC_ELF_MACHINE, 0, 0);
         if (kernel_size < 0) {
             kernel_size = load_aout(machine->kernel_filename, kernel_base,
-                                    machine->ram_size - kernel_base,
+                                    low_ram_size - kernel_base,
                                     true, TARGET_PAGE_SIZE);
         }
         if (kernel_size < 0) {
             kernel_size = load_image_targphys(machine->kernel_filename,
                                               kernel_base,
-                                              machine->ram_size - kernel_base,
+                                              low_ram_size - kernel_base,
                                               &error_fatal);
         }
         /* load initrd */
@@ -273,7 +290,7 @@ static void ppc_core99_init(MachineState *machine)
             initrd_base = TARGET_PAGE_ALIGN(kernel_base + kernel_size + KERNEL_GAP);
             initrd_size = load_image_targphys(machine->initrd_filename,
                                               initrd_base,
-                                              machine->ram_size - initrd_base,
+                                              low_ram_size - initrd_base,
                                               &error_fatal);
             cmdline_base = TARGET_PAGE_ALIGN(initrd_base + initrd_size);
         } else {
@@ -657,7 +674,9 @@ static void ppc_core99_init(MachineState *machine)
 
     fw_cfg_add_i16(fw_cfg, FW_CFG_NB_CPUS, (uint16_t)machine->smp.cpus);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, (uint16_t)machine->smp.max_cpus);
-    fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, (uint64_t)machine->ram_size);
+    fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, low_ram_size);
+    fw_cfg_add_i64(fw_cfg, FW_CFG_PPC_HIGH_RAM_SIZE,
+                   machine->ram_size - low_ram_size);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MACHINE_ID, machine_arch);
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ADDR, kernel_base);
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_SIZE, kernel_size);
