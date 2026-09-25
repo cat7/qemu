@@ -1476,6 +1476,12 @@ static R100Color r100_decode_yuv422(const uint8_t pair[4],
     };
 }
 
+/* Bytes of a tiled row that stay contiguous in memory */
+unsigned int ati_2d_tile_run(unsigned int cpp, unsigned int tile)
+{
+    return tile == 2 && cpp == 1 ? 8 : 16;
+}
+
 /*
  * Byte coordinates keep the macro layout independent of pixel depth.  The
  * returned offset is relative to base, which also selects the Radeon macro
@@ -1496,6 +1502,17 @@ bool ati_2d_tile_offset(const ATIVGAState *s, uint32_t base, uint32_t pitch,
     }
     if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
         return false;
+    } else if (tile == 2 && cpp < 4) {
+        /* 32-byte microtiles: 8bpp 8x4, 16bpp 8x2 */
+        unsigned int row_bytes = cpp == 1 ? 8 : 16;
+        unsigned int rows = 32 / row_bytes;
+
+        if (pitch % row_bytes) {
+            return false;
+        }
+        address = (uint64_t)(y / rows) * pitch * rows +
+                  (uint64_t)(xbyte / row_bytes) * 32 +
+                  (y % rows) * row_bytes + xbyte % row_bytes;
     } else if (tile & 2) {
         /* R100 destination microtiles use two rows of sixteen bytes. */
         if (cpp != 4 || (pitch & 127)) {

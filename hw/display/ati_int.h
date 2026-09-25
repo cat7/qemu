@@ -305,6 +305,7 @@ static inline bool ati_has_rv100_3d(const ATIVGAState *s)
 
 const char *ati_reg_name(int num);
 
+unsigned int ati_2d_tile_run(unsigned int cpp, unsigned int tile);
 bool ati_2d_tile_offset(const ATIVGAState *s, uint32_t base, uint32_t pitch,
                          unsigned int cpp, unsigned int tile,
                          uint32_t xbyte, uint32_t y, uint64_t *offset);

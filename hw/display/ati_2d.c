@@ -422,8 +422,9 @@ static bool ati_2d_prepare_surface(ATIVGAState *s, const ATI2DCtx *ctx,
             for (unsigned int col = 0; col < rect->width * bypp; ) {
                 uint64_t offset, physical;
                 uint32_t xbyte = rect->x * bypp + col;
+                unsigned int run = ati_2d_tile_run(bypp, tile);
                 unsigned int count = MIN(rect->width * bypp - col,
-                                         16 - (xbyte & 15));
+                                         run - (xbyte & (run - 1)));
 
                 if (!ati_2d_tile_offset(s, address, stride, bypp, tile, xbyte,
                                         rect->y + row, &offset) ||
@@ -1205,7 +1206,9 @@ static bool ati_2d_tiled_access(ATIVGAState *s, const ATI2DCtx *ctx,
 
     for (uint64_t done = 0; done < length; ) {
         uint64_t offset, physical;
-        unsigned int count = MIN(length - done, 16 - ((xbyte + done) & 15));
+        unsigned int run = ati_2d_tile_run(ctx->bpp / 8, tile);
+        unsigned int count = MIN(length - done,
+                                 run - ((xbyte + done) & (run - 1)));
 
         if (!ati_2d_tile_offset(s, address, stride, ctx->bpp / 8, tile,
                                 xbyte + done, y, &offset)) {
@@ -1407,7 +1410,8 @@ static bool ati_2d_surface_vram_bounds(const ATI2DCtx *ctx, bool source,
     for (unsigned int y = 0; y < rect->height; y++) {
         for (unsigned int done = 0; done < bytes; ) {
             unsigned int x = rect->x * cpp + done;
-            unsigned int length = MIN(bytes - done, 16 - (x & 15));
+            unsigned int run = ati_2d_tile_run(cpp, tile);
+            unsigned int length = MIN(bytes - done, run - (x & (run - 1)));
             uint64_t offset, physical;
 
             if (!ati_2d_tile_offset(ctx->s, address, stride, cpp, tile,
