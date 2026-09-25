@@ -86,6 +86,8 @@ typedef struct R100DirtyRange {
 typedef struct R100DirtyBatch {
     R100DirtyRange ranges[R100_DIRTY_BATCH_RANGES];
     unsigned int count;
+    /* the range the last add fell in */
+    unsigned int last;
 } R100DirtyBatch;
 
 typedef struct R100Color {
@@ -222,6 +224,10 @@ typedef struct R100DrawState {
     R100DepthState depth;
     R100TextureState texture[3];
     R100TextureBlockCache texture_cache[3];
+    /* PP_TXCBLEND, PP_TXABLEND and the decoded PP_TFACTOR of each unit */
+    uint32_t txcblend[3];
+    uint32_t txablend[3];
+    R100Color tfactor[3];
     uint8_t coordinate_mask;
     bool specular_rgb;
     bool specular_alpha;
@@ -643,17 +649,28 @@ static void r100_dirty_batch_flush(ATIVGAState *s, R100DirtyBatch *batch)
 static void r100_dirty_batch_add(ATIVGAState *s, R100DirtyBatch *batch,
                                  uint64_t offset, uint64_t length)
 {
-    uint64_t page_size = qemu_target_page_size();
-    uint64_t page_mask = page_size - 1;
-    uint64_t start = offset & ~page_mask;
-    uint64_t end = MIN((offset + length + page_mask) & ~page_mask,
-                       s->vga.vram_size);
+    const R100DirtyRange *last = &batch->ranges[batch->last];
+    uint64_t page_size;
+    uint64_t page_mask;
+    uint64_t start;
+    uint64_t end;
     unsigned int i = 0;
+
+    /* consecutive pixels mostly land in the range the last one did */
+    if (batch->last < batch->count && offset >= last->start &&
+        offset + length <= last->end) {
+        return;
+    }
+    page_size = qemu_target_page_size();
+    page_mask = page_size - 1;
+    start = offset & ~page_mask;
+    end = MIN((offset + length + page_mask) & ~page_mask, s->vga.vram_size);
 
     while (i < batch->count) {
         R100DirtyRange *range = &batch->ranges[i];
 
         if (start >= range->start && end <= range->end) {
+            batch->last = i;
             return;
         }
         if (start <= range->end && range->start <= end) {
@@ -668,6 +685,7 @@ static void r100_dirty_batch_add(ATIVGAState *s, R100DirtyBatch *batch,
     if (batch->count == R100_DIRTY_BATCH_RANGES) {
         r100_dirty_batch_flush(s, batch);
     }
+    batch->last = batch->count;
     batch->ranges[batch->count++] = (R100DirtyRange) {
         .start = start,
         .end = end,
@@ -757,6 +775,16 @@ static float r100_float(uint32_t value)
 
     memcpy(&result, &value, sizeof(result));
     return result;
+}
+
+/* i / 255.0f, the 8-bit channel values */
+static float r100_unorm8[256];
+
+static void __attribute__((constructor)) r100_unorm8_init(void)
+{
+    for (unsigned int i = 0; i < 256; i++) {
+        r100_unorm8[i] = i / 255.0f;
+    }
 }
 
 static float r100_clamp_float(float value, float low, float high)
@@ -963,10 +991,10 @@ static R100Color r100_decode_color(uint32_t raw, unsigned int format)
         c.b = (raw & 0x1f) / 31.0f;
         break;
     case 6: /* ARGB8888 */
-        c.a = ((raw >> 24) & 0xff) / 255.0f;
-        c.r = ((raw >> 16) & 0xff) / 255.0f;
-        c.g = ((raw >> 8) & 0xff) / 255.0f;
-        c.b = (raw & 0xff) / 255.0f;
+        c.a = r100_unorm8[(raw >> 24) & 0xff];
+        c.r = r100_unorm8[(raw >> 16) & 0xff];
+        c.g = r100_unorm8[(raw >> 8) & 0xff];
+        c.b = r100_unorm8[raw & 0xff];
         break;
     case 7: /* RGB332 */
         c.r = ((raw >> 5) & 7) / 7.0f;
@@ -974,7 +1002,7 @@ static R100Color r100_decode_color(uint32_t raw, unsigned int format)
         c.b = (raw & 3) / 3.0f;
         break;
     case 8: /* Y8 */
-        c.r = c.g = c.b = (raw & 0xff) / 255.0f;
+        c.r = c.g = c.b = r100_unorm8[raw & 0xff];
         break;
     case 15: /* ARGB4444 */
         c.a = ((raw >> 12) & 0xf) / 15.0f;
@@ -1373,6 +1401,14 @@ static R100DrawState *r100_draw_state_update(ATIVGAState *s,
     draw->specular_alpha = false;
     draw->texture_memory_local = true;
     for (unsigned int unit = 0; unit < 3; unit++) {
+        draw->txcblend[unit] = r100_context_read(
+            r, R100_PP_TXCBLEND_0 + unit * 0x18);
+        draw->txablend[unit] = r100_context_read(
+            r, R100_PP_TXABLEND_0 + unit * 0x18);
+        draw->tfactor[unit] = r100_decode_color(
+            r100_context_read(r, R100_PP_TFACTOR_0 + unit * 0x18), 6);
+    }
+    for (unsigned int unit = 0; unit < 3; unit++) {
         R100TextureState *texture = &draw->texture[unit];
         bool prepared = r100_prepare_texture(s, unit, texture);
 
@@ -1487,12 +1523,12 @@ static R100Color r100_decode_texture_color(uint32_t raw,
 
     switch (format) {
     case 0: /* I8 */
-        c.r = c.g = c.b = (raw & 0xff) / 255.0f;
+        c.r = c.g = c.b = r100_unorm8[raw & 0xff];
         c.a = alpha_in_map ? c.r : 1.0f;
         return c;
     case 1: /* AI88 */
-        c.r = c.g = c.b = (raw & 0xff) / 255.0f;
-        c.a = ((raw >> 8) & 0xff) / 255.0f;
+        c.r = c.g = c.b = r100_unorm8[raw & 0xff];
+        c.a = r100_unorm8[(raw >> 8) & 0xff];
         break;
     case 2: /* RGB332 */
         return r100_decode_color(raw, 7);
@@ -1508,10 +1544,10 @@ static R100Color r100_decode_texture_color(uint32_t raw,
         c = r100_decode_color(raw, 6);
         break;
     case 7: /* RGBA8888 */
-        c.r = ((raw >> 24) & 0xff) / 255.0f;
-        c.g = ((raw >> 16) & 0xff) / 255.0f;
-        c.b = ((raw >> 8) & 0xff) / 255.0f;
-        c.a = (raw & 0xff) / 255.0f;
+        c.r = r100_unorm8[(raw >> 24) & 0xff];
+        c.g = r100_unorm8[(raw >> 16) & 0xff];
+        c.b = r100_unorm8[(raw >> 8) & 0xff];
+        c.a = r100_unorm8[raw & 0xff];
         break;
     case 8: /* Y8 */
         return r100_decode_color(raw, 8);
@@ -1639,12 +1675,13 @@ bool ati_2d_tile_offset(const ATIVGAState *s, uint32_t base, uint32_t pitch,
     return true;
 }
 
-static bool r100_texture_pixel_offset(uint32_t txoffset, unsigned int pitch,
-                                      unsigned int cpp, int x, int y,
-                                      uint64_t *pixel_offset)
+static inline QEMU_ALWAYS_INLINE bool
+r100_texture_pixel_offset(uint32_t txoffset, unsigned int pitch,
+                          unsigned int cpp, int x, int y,
+                          uint64_t *pixel_offset)
 {
-    unsigned int tile_width;
-    unsigned int tile_height;
+    unsigned int tile_width_log2;
+    unsigned int tile_height_log2;
     unsigned int micro = extract32(txoffset, 3, 2);
     bool macro = txoffset & R100_TXO_MACRO_TILE;
     uint64_t offset;
@@ -1680,26 +1717,31 @@ static bool r100_texture_pixel_offset(uint32_t txoffset, unsigned int pitch,
         *pixel_offset = (uint64_t)y * pitch + (uint64_t)x * cpp;
         return true;
     }
+    /* 32-byte tiles, sizes in log2 texels */
     switch (cpp) {
     case 1:
-        tile_width = 8;
-        tile_height = 4;
+        tile_width_log2 = 3;
+        tile_height_log2 = 2;
         break;
     case 2:
-        tile_width = micro == 1 ? 8 : 4;
-        tile_height = micro == 1 ? 2 : 4;
+        tile_width_log2 = micro == 1 ? 3 : 2;
+        tile_height_log2 = micro == 1 ? 1 : 2;
         break;
     case 4:
-        tile_width = 4;
-        tile_height = 2;
+        tile_width_log2 = 2;
+        tile_height_log2 = 1;
         break;
     default:
         return false;
     }
-    *pixel_offset = (uint64_t)(y / tile_height) * pitch * tile_height +
-                    (uint64_t)(x / tile_width) * 32 +
-                    (uint64_t)(y % tile_height) * tile_width * cpp +
-                    (uint64_t)(x % tile_width) * cpp;
+    /* x and y wrap as unsigned */
+    *pixel_offset = (uint64_t)((unsigned int)y >> tile_height_log2) * pitch *
+                        (1U << tile_height_log2) +
+                    (uint64_t)((unsigned int)x >> tile_width_log2) * 32 +
+                    (uint64_t)((unsigned int)y & ((1U << tile_height_log2) - 1)) *
+                        (1U << tile_width_log2) * cpp +
+                    (uint64_t)((unsigned int)x & ((1U << tile_width_log2) - 1)) *
+                        cpp;
     return true;
 }
 
@@ -1843,18 +1885,18 @@ static R100Color r100_decode_dxt_texel(R100TextureBlock *entry,
     return color;
 }
 
-static R100Color r100_texture_texel(ATIVGAState *s,
-                                    const R100TextureState *texture,
-                                    uint32_t txformat,
-                                    uint32_t txoffset, unsigned int format,
-                                    unsigned int width, unsigned int height,
-                                    unsigned int pitch, unsigned int cpp,
-                                    uint64_t offset, R100Color border_color,
-                                    bool yuv_to_rgb, bool border, int x, int y,
-                                    R100TextureBlockCache *cache)
+/* inlined: the sampler calls it with most arguments constant */
+static inline QEMU_ALWAYS_INLINE R100Color
+r100_texture_texel(ATIVGAState *s, const R100TextureState *texture,
+                   uint32_t txformat, uint32_t txoffset, unsigned int format,
+                   unsigned int width, unsigned int height,
+                   unsigned int pitch, unsigned int cpp, uint64_t offset,
+                   R100Color border_color, bool yuv_to_rgb, bool border,
+                   int x, int y, R100TextureBlockCache *cache)
 {
     unsigned int block_bytes = r100_texture_block_bytes(format);
     uint64_t pixel_offset;
+    uint64_t address;
     uint8_t texel[4] = { 0 };
     uint32_t raw;
 
@@ -1886,11 +1928,19 @@ static R100Color r100_texture_texel(ATIVGAState *s,
         return r100_decode_yuv422(pair->data, format, x & 1, yuv_to_rgb);
     }
     if (!r100_texture_pixel_offset(txoffset, pitch, cpp, x, y,
-                                   &pixel_offset) || !cpp || cpp > 4 ||
-        !r100_texture_read(s, texture, offset + pixel_offset, texel, cpp)) {
+                                   &pixel_offset) || !cpp || cpp > 4) {
         return (R100Color) { 1.0f, 1.0f, 1.0f, 1.0f };
     }
-    raw = ldn_le_p(texel, cpp);
+    address = offset + pixel_offset;
+    if (texture->host && address >= texture->offset &&
+        address - texture->offset <= texture->host_length &&
+        cpp <= texture->host_length - (address - texture->offset)) {
+        raw = ldn_le_p(texture->host + (address - texture->offset), cpp);
+    } else if (r100_texture_read(s, texture, address, texel, cpp)) {
+        raw = ldn_le_p(texel, cpp);
+    } else {
+        return (R100Color) { 1.0f, 1.0f, 1.0f, 1.0f };
+    }
     return r100_decode_texture_color(raw, format,
                                      txformat & R100_TXFORMAT_ALPHA_IN_MAP);
 }
@@ -1964,28 +2014,23 @@ static void r100_texture_level_info(const R100TextureState *texture,
     *offset = layout->offset;
 }
 
-static R100Color r100_sample_texture_level(ATIVGAState *s,
-                                           const R100TextureState *texture,
-                                           float s_coord, float t_coord,
-                                           bool nonparametric,
-                                           unsigned int level, bool linear,
-                                           R100TextureBlockCache *shared_cache)
+/* Sample one level; cache is NULL only for formats that never use it. */
+static R100Color r100_sample_texture_cached(ATIVGAState *s,
+                                            const R100TextureState *texture,
+                                            float s_coord, float t_coord,
+                                            bool nonparametric,
+                                            unsigned int level, bool linear,
+                                            R100TextureBlockCache *cache)
 {
     unsigned int width, height, pitch;
     uint64_t offset;
     R100TextureAxis xaxis;
     R100TextureAxis yaxis;
-    R100TextureBlockCache local_cache;
-    R100TextureBlockCache *cache = shared_cache ? shared_cache : &local_cache;
     float u, v;
 
-    if (!shared_cache) {
-        /* entries past count are never read */
-        local_cache.count = 0;
-        local_cache.next = 0;
-        local_cache.sample = 0;
+    if (cache) {
+        cache->sample++;
     }
-    cache->sample++;
     r100_texture_level_info(texture, level, &width, &height, &pitch, &offset);
     if (nonparametric) {
         u = s_coord * width / texture->width;
@@ -2042,6 +2087,40 @@ static R100Color r100_sample_texture_level(ATIVGAState *s,
             r100_color_lerp(c00, c10, xaxis.fraction),
             r100_color_lerp(c01, c11, xaxis.fraction), yaxis.fraction);
     }
+}
+
+static R100Color __attribute__((noinline))
+r100_sample_texture_local(ATIVGAState *s, const R100TextureState *texture,
+                          float s_coord, float t_coord, bool nonparametric,
+                          unsigned int level, bool linear)
+{
+    R100TextureBlockCache cache;
+
+    /* entries past count are never read */
+    cache.count = 0;
+    cache.next = 0;
+    cache.sample = 0;
+    return r100_sample_texture_cached(s, texture, s_coord, t_coord,
+                                      nonparametric, level, linear, &cache);
+}
+
+static R100Color r100_sample_texture_level(ATIVGAState *s,
+                                           const R100TextureState *texture,
+                                           float s_coord, float t_coord,
+                                           bool nonparametric,
+                                           unsigned int level, bool linear,
+                                           R100TextureBlockCache *shared_cache)
+{
+    /* only block and YUV texels go through a cache */
+    if (!shared_cache && (texture->block_bytes ||
+                          texture->format == R100_TXFORMAT_VYUY422 ||
+                          texture->format == R100_TXFORMAT_YVYU422)) {
+        return r100_sample_texture_local(s, texture, s_coord, t_coord,
+                                         nonparametric, level, linear);
+    }
+    return r100_sample_texture_cached(s, texture, s_coord, t_coord,
+                                      nonparametric, level, linear,
+                                      shared_cache);
 }
 
 static R100Color r100_sample_texture(ATIVGAState *s, R100DrawState *draw,
@@ -2368,15 +2447,15 @@ static float r100_combiner_component(unsigned int operation, float a,
     }
 }
 
-static R100Color r100_run_combiner(ATI3DState *r, unsigned int unit,
+static R100Color r100_run_combiner(const R100DrawState *state,
+                                   unsigned int unit,
                                    R100Color current, R100Color diffuse,
                                    R100Color specular,
                                    const R100Color texture[3])
 {
-    uint32_t cblend = r100_context_read(r, R100_PP_TXCBLEND_0 + unit * 0x18);
-    uint32_t ablend = r100_context_read(r, R100_PP_TXABLEND_0 + unit * 0x18);
-    R100Color tfactor = r100_decode_color(
-        r100_context_read(r, R100_PP_TFACTOR_0 + unit * 0x18), 6);
+    uint32_t cblend = state->txcblend[unit];
+    uint32_t ablend = state->txablend[unit];
+    R100Color tfactor = state->tfactor[unit];
     R100Color args[3];
     R100Color result;
     float alpha[3];
@@ -2478,7 +2557,8 @@ static R100Color r100_texture_pipeline(ATIVGAState *s, R100DrawState *draw,
     }
     for (i = 0; i < 3; i++) {
         if (pp_cntl & BIT(12 + i)) {
-            current = r100_run_combiner(r, i, current, diffuse, specular,
+            current = r100_run_combiner(r100_draw_state(s, draw), i,
+                                        current, diffuse, specular,
                                         texture);
         }
     }
