@@ -40,6 +40,15 @@ static int pci_unin_map_irq(PCIDevice *pci_dev, int irq_num)
     return (irq_num + (pci_dev->devfn >> 3)) & 3;
 }
 
+/* The U3 AGP slot, device 0x10, has an interrupt line of its own */
+static int pci_u3_agp_map_irq(PCIDevice *pci_dev, int irq_num)
+{
+    if (PCI_SLOT(pci_dev->devfn) == U3_AGP_SLOT) {
+        return U3_AGP_SLOT_IRQ_LINE;
+    }
+    return pci_unin_map_irq(pci_dev, irq_num);
+}
+
 static void pci_unin_set_irq(void *opaque, int irq_num, int level)
 {
     UNINHostState *s = opaque;
@@ -174,11 +183,12 @@ static void pci_u3_agp_realize(DeviceState *dev, Error **errp)
     PCIHostState *h = PCI_HOST_BRIDGE(dev);
 
     h->bus = pci_register_root_bus(dev, NULL,
-                                   pci_unin_set_irq, pci_unin_map_irq,
+                                   pci_unin_set_irq, pci_u3_agp_map_irq,
                                    s,
                                    &s->pci_mmio,
                                    &s->pci_io,
-                                   PCI_DEVFN(11, 0), 4, TYPE_PCI_BUS);
+                                   PCI_DEVFN(11, 0), U3_AGP_NUM_IRQS,
+                                   TYPE_PCI_BUS);
 
     pci_create_simple(h->bus, PCI_DEVFN(11, 0), "u3-agp");
 }

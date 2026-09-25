@@ -54,7 +54,7 @@ struct UNINHostState {
     PCIHostState parent_obj;
 
     uint32_t ofw_addr;
-    qemu_irq irqs[4];
+    qemu_irq irqs[5];
     MemoryRegion pci_mmio;
     MemoryRegion pci_hole;
     MemoryRegion pci_io;
@@ -70,6 +70,12 @@ struct UNINState {
 
 #define TYPE_UNI_NORTH "uni-north"
 OBJECT_DECLARE_SIMPLE_TYPE(UNINState, UNI_NORTH)
+
+/* U3 AGP: lines 0-3 swizzle, line 4 is the AGP slot's own on MPIC 0x30 */
+#define U3_AGP_SLOT             0x10
+#define U3_AGP_SLOT_IRQ_LINE    4
+#define U3_AGP_SLOT_IRQ         0x30
+#define U3_AGP_NUM_IRQS         5
 
 /* U3 HyperTransport host */
 #define U3_HT_CFG_BASE      0xf2000000

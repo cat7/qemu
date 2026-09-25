@@ -486,6 +486,8 @@ static void ppc_core99_init(MachineState *machine)
                               qdev_get_gpio_in(pic_dev, 0x1b + i));
     }
     if (machine_arch == ARCH_MAC99_U3) {
+        qdev_connect_gpio_out(uninorth_pci_dev, U3_AGP_SLOT_IRQ_LINE,
+                              qdev_get_gpio_in(pic_dev, U3_AGP_SLOT_IRQ));
         for (i = 0; i < U3_HT_NUM_IRQS; i++) {
             qdev_connect_gpio_out(ht_dev, i, qdev_get_gpio_in(pic_dev, i));
         }
