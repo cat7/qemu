@@ -52,6 +52,8 @@ unin_data_write(uint64_t addr, unsigned len, uint64_t val) "write addr 0x%"PRIx6
 unin_data_read(uint64_t addr, unsigned len, uint64_t val) "read addr 0x%"PRIx64 " len %d val 0x%"PRIx64
 unin_write(uint64_t addr, uint64_t value) "addr=0x%" PRIx64 " val=0x%"PRIx64
 unin_read(uint64_t addr, uint64_t value) "addr=0x%" PRIx64 " val=0x%"PRIx64
+u3_agp_gart_cfg(uint32_t gart_base, uint32_t agp_base, uint32_t ctrl, uint32_t dummy) "GART_BASE 0x%08x AGP_BASE 0x%08x GART_CTRL 0x%08x DUMMY 0x%08x"
+u3_agp_gart_translate(uint64_t addr, uint32_t entry) "bus 0x%"PRIx64" entry 0x%08x"
 
 # ppc4xx_pci.c
 ppc4xx_pci_map_irq(int32_t devfn, int irq_num, int slot) "devfn 0x%x irq %d -> %d"

@@ -58,7 +58,18 @@ struct UNINHostState {
     MemoryRegion pci_mmio;
     MemoryRegion pci_hole;
     MemoryRegion pci_io;
+
+    /* U3 AGP GART */
+    uint32_t gart_base;
+    uint32_t agp_base;
+    uint32_t gart_ctrl;
+    uint32_t gart_dummy;
+    IOMMUMemoryRegion agp_iommu;
+    AddressSpace *agp_dma_down;
 };
+
+/* U3 AGP transactions outside the GART aperture go to @as */
+void u3_agp_set_dma_as(UNINHostState *s, AddressSpace *as);
 
 struct UNINState {
     SysBusDevice parent_obj;

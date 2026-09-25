@@ -398,6 +398,8 @@ static void ppc_core99_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(dart), 0, U3_DART_BASE);
         u3_dart_attach(U3_DART(dart),
                        PCI_HOST_BRIDGE(uninorth_pci_dev)->bus);
+        u3_agp_set_dma_as(U3_AGP_HOST_BRIDGE(uninorth_pci_dev),
+                          &U3_DART(dart)->as);
         u3_dart_attach(U3_DART(dart), PCI_HOST_BRIDGE(ht_dev)->bus);
     } else {
         machine_arch = ARCH_MAC99;
