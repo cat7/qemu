@@ -77,6 +77,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(UNINState, UNI_NORTH)
 #define U3_HT_IO_BASE       0xf4000000
 #define U3_HT_IO_SIZE       0x00400000
 #define U3_HT_SELF_BASE     0xf8070000
+
+/* U3 MPIC and its input on the K2 MPIC */
+#define U3_MPIC_BASE        0xf8040000
+#define U3_MPIC_CASCADE_IRQ 0x38
 #define U3_HT_SELF_SIZE     0x1000
 #define U3_HT_NUM_IRQS      64
 

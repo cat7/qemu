@@ -489,6 +489,18 @@ static void ppc_core99_init(MachineState *machine)
         for (i = 0; i < U3_HT_NUM_IRQS; i++) {
             qdev_connect_gpio_out(ht_dev, i, qdev_get_gpio_in(pic_dev, i));
         }
+
+        /*
+         * U3 MPIC, cascaded into the K2 MPIC. Its window also spans the
+         * HT self registers, which take precedence.
+         */
+        dev = qdev_new(TYPE_OPENPIC);
+        qdev_prop_set_uint32(dev, "model", OPENPIC_MODEL_KEYLARGO);
+        qdev_prop_set_bit(dev, "big-endian", true);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, U3_MPIC_BASE, -1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), OPENPIC_OUTPUT_INT,
+                           qdev_get_gpio_in(pic_dev, U3_MPIC_CASCADE_IRQ));
     }
 
     /* TODO: additional PCI buses only wired up for 32-bit machines */
