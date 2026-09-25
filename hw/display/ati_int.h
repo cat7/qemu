@@ -11,6 +11,7 @@
 
 #include "qemu/timer.h"
 #include "qemu/units.h"
+#include "qemu/thread.h"
 #include "hw/pci/pci_device.h"
 #include "hw/i2c/bitbang_i2c.h"
 #include "hw/display/i2c-ddc.h"
@@ -293,6 +294,31 @@ struct ATIVGAState {
     struct R100Raster *raster;
     uint64_t raster_tri_split;
     uint64_t raster_tri_serial;
+
+    /* command processor thread; see ati_engine_wait() */
+    OnOffAuto engine_async;
+    bool engine_thread_on;
+    QemuThread engine_thread;
+    QemuMutex engine_lock;
+    QemuCond engine_cond;
+    QemuEvent engine_idle;
+    QEMUBH *engine_bh;
+    VMChangeStateEntry *engine_vmse;
+    bool engine_kick;           /* engine_lock */
+    bool engine_quit;           /* engine_lock */
+    bool engine_busy;           /* set under engine_lock, read atomically */
+    bool engine_gui_idle;       /* GUI_IDLE_INT raised by the engine */
+    uint32_t engine_rptr_wb;    /* ring dwords since the last writeback */
+    /* CSQ PIO dwords queued for the engine, whole packets published */
+    uint32_t *engine_q;
+    uint32_t engine_q_head;     /* published by the CPU */
+    uint32_t engine_q_tail;     /* consumed by the engine */
+    uint32_t engine_q_fill;     /* next CPU dword */
+    uint32_t engine_q_pkt;      /* start of the packet being filled */
+    uint32_t engine_q_need;     /* its length, 0 until the header */
+    uint64_t engine_waits;
+    uint64_t engine_wait_us;
+    uint64_t engine_bql_writes;
 };
 
 static inline bool ati_is_rv100_family(const ATIVGAState *s)
@@ -329,6 +355,13 @@ bool ati_3d_read(ATIVGAState *s, hwaddr addr, uint64_t *data,
 bool ati_3d_write(ATIVGAState *s, hwaddr addr, uint64_t data,
                   unsigned int size);
 void ati_3d_reset(ATIVGAState *s);
+void ati_engine_init(ATIVGAState *s);
+void ati_engine_fini(ATIVGAState *s);
+bool ati_engine_on_thread(void);
+bool ati_engine_reg(hwaddr addr);
+bool ati_engine_status_reg(hwaddr addr);
+void ati_engine_wait(ATIVGAState *s);
+void ati_engine_settle(ATIVGAState *s);
 void ati_3d_raster_init(ATIVGAState *s);
 void ati_3d_raster_fini(ATIVGAState *s);
 int ati_3d_post_load(ATIVGAState *s);

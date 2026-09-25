@@ -51,6 +51,7 @@
 #include "vga_regs.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
@@ -742,6 +743,11 @@ static void ati_vga_update_irq(ATIVGAState *s)
 
 void ati_2d_complete(ATIVGAState *s)
 {
+    if (ati_engine_on_thread()) {
+        /* raised under the BQL once the engine is idle */
+        qatomic_set(&s->engine_gui_idle, true);
+        return;
+    }
     s->regs.gen_int_status |= BIT(19); /* GUI_IDLE_INT */
     ati_vga_update_irq(s);
 }
@@ -1221,12 +1227,27 @@ static const MemoryRegionOps ati_surface_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
 };
 
+/* A CPU access to a register the engine owns waits for it to finish. */
+static void ati_engine_wait_reg(ATIVGAState *s, hwaddr addr, bool write)
+{
+    int64_t t0 = get_clock();
+
+    ati_engine_wait(s);
+    trace_ati_engine_wait(addr, write, (get_clock() - t0) / 1000);
+}
+
 static uint64_t ati_reg_read(void *opaque, hwaddr addr, unsigned int size)
 {
     ATIVGAState *s = opaque;
     uint32_t val = 0;
     uint64_t engine_val;
-    uint32_t *surface = ati_surface_register(s, addr & ~3ULL);
+    uint32_t *surface;
+
+    if (s->engine_thread_on && qatomic_read(&s->engine_busy) &&
+        ati_engine_reg(addr) && !ati_engine_status_reg(addr)) {
+        ati_engine_wait_reg(s, addr, false);
+    }
+    surface = ati_surface_register(s, addr & ~3ULL);
 
     if (surface && (addr & 3) + size <= 4) {
         return ati_reg_read_offs(*surface, addr & 3, size);
@@ -1378,6 +1399,9 @@ static uint64_t ati_reg_read(void *opaque, hwaddr addr, unsigned int size)
     case RBBM_STATUS:
     case GUI_STAT:
         val = 64; /* free CMDFIFO entries */
+        if (qatomic_read(&s->engine_busy)) {
+            val |= BIT(31) | BIT(16); /* GUI_ACTIVE, CP_CMDSTRM_BUSY */
+        }
         break;
     case CRTC_H_TOTAL_DISP ... CRTC_H_TOTAL_DISP + 3:
         val = ati_reg_read_offs(s->regs.crtc_h_total_disp,
@@ -1622,7 +1646,27 @@ static uint32_t ati_brush_y_x_mask(const ATIVGAState *s)
 void ati_mmio_write(ATIVGAState *s, hwaddr addr, uint64_t data,
                     unsigned int size)
 {
-    uint32_t *surface = ati_surface_register(s, addr & ~3ULL);
+    uint32_t *surface;
+
+    if (s->engine_thread_on) {
+        if (ati_engine_on_thread()) {
+            if (!ati_engine_reg(addr) && !bql_locked()) {
+                /* display, interrupt and cursor state belong to the BQL */
+                bql_lock();
+                s->engine_bql_writes++;
+                trace_ati_engine_bql_write(addr, data);
+                ati_mmio_write(s, addr, data, size);
+                bql_unlock();
+                return;
+            }
+        } else if ((addr & ~3ULL) != R100_CP_RB_WPTR &&
+                   (addr < PM4_FIFO_DATA_EVEN ||
+                    addr >= PM4_FIFO_DATA_EVEN + 0x400) &&
+                   qatomic_read(&s->engine_busy) && ati_engine_reg(addr)) {
+            ati_engine_wait_reg(s, addr, true);
+        }
+    }
+    surface = ati_surface_register(s, addr & ~3ULL);
 
     if (addr < CUR_OFFSET || addr > CUR_CLR1 || ATI_DEBUG_HW_CURSOR) {
         trace_ati_mm_write(size, addr, ati_reg_name(addr & ~3ULL), data);
@@ -2538,6 +2582,8 @@ static int ati_vga_pre_save(void *opaque)
     ATIVGAState *s = opaque;
     int64_t elapsed;
 
+    ati_engine_wait(s);
+
     if (!ati_crtc_enabled(s)) {
         s->crtc_frame_elapsed_ns = 0;
         return 0;
@@ -2970,12 +3016,14 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     dev->config[PCI_INTERRUPT_PIN] = 1;
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL, ati_crtc_event, s);
     ati_3d_raster_init(s);
+    ati_engine_init(s);
 }
 
 static void ati_vga_reset(DeviceState *dev)
 {
     ATIVGAState *s = ATI_VGA(dev);
 
+    ati_engine_wait(s);
     timer_del(&s->vblank_timer);
     i2c_end_transfer(s->bbi2c.bus);
     bitbang_i2c_init(&s->bbi2c, s->bbi2c.bus);
@@ -3046,6 +3094,7 @@ static void ati_vga_exit(PCIDevice *dev)
 {
     ATIVGAState *s = ATI_VGA(dev);
 
+    ati_engine_fini(s);
     timer_del(&s->vblank_timer);
     ati_3d_raster_fini(s);
     if (s->agp_as_valid) {
@@ -3067,6 +3116,13 @@ static const Property ati_vga_properties[] = {
     DEFINE_PROP_UINT32("raster-threads", ATIVGAState, raster_threads, 0),
     DEFINE_PROP_UINT64("x-raster-split", ATIVGAState, raster_tri_split, 0),
     DEFINE_PROP_UINT64("x-raster-serial", ATIVGAState, raster_tri_serial, 0),
+    /* command processor on its own thread; auto is on except under qtest */
+    DEFINE_PROP_ON_OFF_AUTO("async-engine", ATIVGAState, engine_async,
+                            ON_OFF_AUTO_AUTO),
+    DEFINE_PROP_UINT64("x-engine-waits", ATIVGAState, engine_waits, 0),
+    DEFINE_PROP_UINT64("x-engine-wait-us", ATIVGAState, engine_wait_us, 0),
+    DEFINE_PROP_UINT64("x-engine-bql-writes", ATIVGAState,
+                       engine_bql_writes, 0),
     DEFINE_PROP_UINT16("x-device-id", ATIVGAState, dev_id,
                        PCI_DEVICE_ID_ATI_RAGE128_PF),
     /* Position registers specify the cursor image origin. */

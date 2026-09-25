@@ -58,6 +58,9 @@
 #include "qemu/log.h"
 #include "qemu/rcu.h"
 #include "qemu/thread.h"
+#include "qemu/main-loop.h"
+#include "system/qtest.h"
+#include "system/runstate.h"
 #include "migration/vmstate.h"
 #include "trace.h"
 
@@ -112,6 +115,14 @@ typedef struct R100Stream {
     bool ring;
     const uint32_t *host;
 } R100Stream;
+
+/* set on the command processor thread */
+static __thread bool ati_engine_ctx;
+
+/* ring dwords consumed between read pointer writebacks */
+#define R100_RPTR_WB_DWORDS 256
+/* CSQ PIO dwords the engine can have queued */
+#define R100_PIO_QUEUE_DWORDS (1U << 20)
 
 typedef struct R100TextureAxis {
     int texel[2];
@@ -4183,6 +4194,8 @@ static void r100_write_scratchback(ATIVGAState *s, unsigned int index)
                                               R100_SCRATCH_SWAP_SHIFT, 2));
 
     if (r->scratch_umsk & BIT(index)) {
+        /* a fence: what the engine drew before it is visible first */
+        smp_wmb();
         r100_gpu_write_u32(s, address + index * 4,
                            value, true);
     }
@@ -4901,6 +4914,25 @@ static bool r100_process_packet3(ATIVGAState *s, unsigned int opcode,
     }
 }
 
+static void r100_rptr_writeback(ATIVGAState *s);
+
+/*
+ * The asynchronous engine publishes its read pointer as it goes, so the
+ * guest can refill the ring while it runs; packets before it are done.
+ */
+static void r100_ring_progress(ATIVGAState *s, const R100Stream *stream)
+{
+    ATI3DState *r = &s->r100_3d;
+    uint32_t pos = stream->pos & stream->mask;
+
+    s->engine_rptr_wb += (pos - r->cp_rb_rptr) & stream->mask;
+    qatomic_store_release(&r->cp_rb_rptr, pos);
+    if (s->engine_rptr_wb >= R100_RPTR_WB_DWORDS) {
+        s->engine_rptr_wb = 0;
+        r100_rptr_writeback(s);
+    }
+}
+
 static bool r100_process_stream(ATIVGAState *s, R100Stream *stream)
 {
     ATI3DState *r = &s->r100_3d;
@@ -4928,6 +4960,10 @@ static bool r100_process_stream(ATIVGAState *s, R100Stream *stream)
         unsigned int count;
         unsigned int max_count = ATI_3D_MAX_VERTEX_DWORDS;
         unsigned int i;
+
+        if (stream->ring && !stream->host && ati_engine_ctx) {
+            r100_ring_progress(s, stream);
+        }
 
         if (!r100_stream_read(s, stream, &header)) {
             ok = false;
@@ -5041,6 +5077,8 @@ static void r100_rptr_writeback(ATIVGAState *s)
                                     R100_RB_RPTR_SWAP_MASK);
 
     if (!(r->cp_rb_cntl & R100_RB_NO_UPDATE)) {
+        /* the packets before it are drawn and visible first */
+        smp_wmb();
         r100_gpu_write_u32(s, address, value, true);
     }
 }
@@ -5050,7 +5088,7 @@ static void r100_process_ring(ATIVGAState *s)
     ATI3DState *r = &s->r100_3d;
     unsigned int mode = extract32(r->cp_csq_cntl, 28, 4);
     uint32_t dwords = r100_ring_dwords(r);
-    uint32_t mask;
+    uint32_t mask, wptr;
     R100Stream stream;
 
     if (r->processing_depth || mode < 2 || mode > 8 || (mode & 1) || !dwords ||
@@ -5058,24 +5096,209 @@ static void r100_process_ring(ATIVGAState *s)
         return;
     }
     mask = dwords - 1;
-    r->cp_rb_rptr &= mask;
-    r->cp_rb_wptr &= mask;
+    /* the CPU moves the write pointer while the engine thread runs */
+    wptr = qatomic_load_acquire(&r->cp_rb_wptr) & mask;
+    qatomic_set(&r->cp_rb_rptr, r->cp_rb_rptr & mask);
+    if (!ati_engine_ctx) {
+        r->cp_rb_wptr = wptr;
+    }
     stream = (R100Stream) {
         .base = r->cp_rb_base,
         .pos = r->cp_rb_rptr,
-        .remaining = (r->cp_rb_wptr - r->cp_rb_rptr) & mask,
+        .remaining = (wptr - r->cp_rb_rptr) & mask,
         .mask = mask,
         .ring = true,
     };
     if (!stream.remaining) {
         return;
     }
+    s->engine_rptr_wb = 0;
     if (!r100_process_stream(s, &stream)) {
-        r->cp_rb_rptr = r->cp_rb_wptr;
+        qatomic_store_release(&r->cp_rb_rptr, wptr);
     } else {
-        r->cp_rb_rptr = stream.pos & mask;
+        qatomic_store_release(&r->cp_rb_rptr, stream.pos & mask);
     }
     r100_rptr_writeback(s);
+}
+
+/*
+ * Command processor thread. A CPU write of CP_RB_WPTR records the pointer
+ * and kicks the thread, which runs the ring without the BQL, as the chip's
+ * CP runs alongside the CPU; CSQ PIO packets are queued to it as each one
+ * completes (r100_pio_queue).
+ *
+ * While it runs, CPU accesses to the registers it owns (ati_engine_reg)
+ * first wait for it to go idle, the BQL released; so the guest sees its
+ * commands complete in order, CPU register blits, indirect buffers and
+ * immediate-mode vertices run after the queued work, and no register the
+ * engine uses is changed under it. The status registers, the ring
+ * pointers, the CSQ FIFO count and the scratch registers report its
+ * progress without waiting, as the chip does. A command stream write to
+ * any other register (display, surface, interrupt, cursor) is made under
+ * the BQL; GUI_IDLE_INT is raised once the engine is idle.
+ */
+bool ati_engine_on_thread(void)
+{
+    return ati_engine_ctx;
+}
+
+bool ati_engine_reg(hwaddr addr)
+{
+    addr &= ~3ULL;
+    return (addr >= R100_CP_RB_BASE && addr < 0x0800) ||
+           addr >= PM4_FIFO_DATA_EVEN ||
+           addr == MC_FB_LOCATION || addr == MC_AGP_LOCATION ||
+           addr == AGP_BASE || addr == PC_NGUI_MODE ||
+           addr == PC_NGUI_CTLSTAT ||
+           (addr >= R100_AIC_CNTL && addr <= R100_AIC_HI_ADDR);
+}
+
+bool ati_engine_status_reg(hwaddr addr)
+{
+    addr &= ~3ULL;
+    return addr == R100_CP_RB_RPTR || addr == R100_CP_RB_WPTR ||
+           addr == R100_CP_CSQ_CNTL || addr == R100_CP_STAT ||
+           addr == GUI_STAT ||
+           (addr >= R100_SCRATCH_REG0 && addr <= R100_SCRATCH_REG7);
+}
+
+/* Apply what the engine deferred to the BQL. */
+void ati_engine_settle(ATIVGAState *s)
+{
+    if (qatomic_read(&s->engine_gui_idle) &&
+        qatomic_xchg(&s->engine_gui_idle, false)) {
+        ati_2d_complete(s);
+    }
+}
+
+/* Wait for the engine to go idle. Called with the BQL, which is released. */
+void ati_engine_wait(ATIVGAState *s)
+{
+    int64_t t0;
+
+    if (!s->engine_thread_on || ati_engine_ctx) {
+        return;
+    }
+    if (qatomic_load_acquire(&s->engine_busy)) {
+        t0 = get_clock();
+        do {
+            bql_unlock();
+            qemu_event_wait(&s->engine_idle);
+            bql_lock();
+        } while (qatomic_load_acquire(&s->engine_busy));
+        s->engine_waits++;
+        s->engine_wait_us += (get_clock() - t0) / 1000;
+    }
+    ati_engine_settle(s);
+}
+
+static void ati_engine_kick(ATIVGAState *s)
+{
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_kick = true;
+    if (!s->engine_busy) {
+        qemu_event_reset(&s->engine_idle);
+        qatomic_store_release(&s->engine_busy, true);
+    }
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+}
+
+static void r100_pio_run(ATIVGAState *s);
+
+static void *ati_engine_thread(void *opaque)
+{
+    ATIVGAState *s = opaque;
+
+    /* rasteriser bands and DMA resolve memory inside RCU read sections */
+    rcu_register_thread();
+    ati_engine_ctx = true;
+    qemu_mutex_lock(&s->engine_lock);
+    for (;;) {
+        while (!s->engine_kick && !s->engine_quit) {
+            qemu_cond_wait(&s->engine_cond, &s->engine_lock);
+        }
+        if (s->engine_quit) {
+            break;
+        }
+        s->engine_kick = false;
+        qemu_mutex_unlock(&s->engine_lock);
+
+        r100_pio_run(s);
+        r100_process_ring(s);
+
+        qemu_mutex_lock(&s->engine_lock);
+        if (!s->engine_kick) {
+            qatomic_store_release(&s->engine_busy, false);
+            qemu_event_set(&s->engine_idle);
+            if (qatomic_read(&s->engine_gui_idle)) {
+                qemu_bh_schedule(s->engine_bh);
+            }
+        }
+    }
+    qatomic_store_release(&s->engine_busy, false);
+    qemu_event_set(&s->engine_idle);
+    qemu_mutex_unlock(&s->engine_lock);
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void ati_engine_bh(void *opaque)
+{
+    ATIVGAState *s = opaque;
+
+    if (!qatomic_load_acquire(&s->engine_busy)) {
+        ati_engine_settle(s);
+    }
+}
+
+/* Stopping the VM (savevm, migration) leaves the engine idle. */
+static void ati_engine_vm_state(void *opaque, bool running, RunState state)
+{
+    if (!running) {
+        ati_engine_wait(opaque);
+    }
+}
+
+void ati_engine_init(ATIVGAState *s)
+{
+    if (!ati_has_rv100_3d(s) || s->engine_async == ON_OFF_AUTO_OFF ||
+        (s->engine_async == ON_OFF_AUTO_AUTO && qtest_enabled())) {
+        return;
+    }
+    qemu_mutex_init(&s->engine_lock);
+    qemu_cond_init(&s->engine_cond);
+    qemu_event_init(&s->engine_idle, true);
+    s->engine_q = g_new(uint32_t, R100_PIO_QUEUE_DWORDS);
+    s->engine_bh = qemu_bh_new(ati_engine_bh, s);
+    s->engine_vmse = qemu_add_vm_change_state_handler(ati_engine_vm_state, s);
+    /* a vCPU waiting for the engine lets the other vCPUs in */
+    s->mm.disable_reentrancy_guard = true;
+    s->surface_aper.disable_reentrancy_guard = true;
+    s->aper1.disable_reentrancy_guard = true;
+    s->engine_thread_on = true;
+    qemu_thread_create(&s->engine_thread, "ati-r100-cp", ati_engine_thread,
+                       s, QEMU_THREAD_JOINABLE);
+}
+
+void ati_engine_fini(ATIVGAState *s)
+{
+    if (!s->engine_thread_on) {
+        return;
+    }
+    ati_engine_wait(s);
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_quit = true;
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+    qemu_thread_join(&s->engine_thread);
+    s->engine_thread_on = false;
+    qemu_del_vm_change_state_handler(s->engine_vmse);
+    qemu_bh_delete(s->engine_bh);
+    qemu_event_destroy(&s->engine_idle);
+    qemu_cond_destroy(&s->engine_cond);
+    qemu_mutex_destroy(&s->engine_lock);
+    g_clear_pointer(&s->engine_q, g_free);
 }
 
 static bool r100_process_ib(ATIVGAState *s)
@@ -5102,11 +5325,78 @@ static bool r100_csq_primary_pio(const ATI3DState *r)
     return extract32(r->cp_csq_cntl, 28, 4) & 1;
 }
 
+static uint32_t r100_packet_dwords(uint32_t header)
+{
+    switch (header & R100_CP_PACKET_TYPE_MASK) {
+    case R100_CP_PACKET2:
+        return 1;
+    case R100_CP_PACKET1:
+        return 3;
+    default:
+        return extract32(header, R100_CP_PACKET_COUNT_SHIFT, 14) + 2;
+    }
+}
+
+static void ati_engine_kick(ATIVGAState *s);
+
+/*
+ * With the engine thread, a PIO dword goes into the engine's queue and
+ * each whole packet is handed over as it completes, in order; a full
+ * queue waits for the engine.
+ */
+static void r100_pio_queue(ATIVGAState *s, uint32_t value)
+{
+    uint32_t mask = R100_PIO_QUEUE_DWORDS - 1;
+
+    if (s->engine_q_fill - qatomic_load_acquire(&s->engine_q_tail) >= mask) {
+        ati_engine_wait(s);
+    }
+    s->engine_q[s->engine_q_fill & mask] = value;
+    s->engine_q_fill++;
+    if (!s->engine_q_need) {
+        s->engine_q_need = r100_packet_dwords(value);
+    }
+    if (s->engine_q_fill - s->engine_q_pkt == s->engine_q_need) {
+        s->engine_q_pkt = s->engine_q_fill;
+        s->engine_q_need = 0;
+        qatomic_store_release(&s->engine_q_head, s->engine_q_fill);
+        ati_engine_kick(s);
+    }
+}
+
+/* Engine thread: run the queued PIO packets one at a time. */
+static void r100_pio_run(ATIVGAState *s)
+{
+    uint32_t head = qatomic_load_acquire(&s->engine_q_head);
+    uint32_t tail = s->engine_q_tail;
+
+    while (tail != head) {
+        uint32_t need = r100_packet_dwords(
+            s->engine_q[tail & (R100_PIO_QUEUE_DWORDS - 1)]);
+        R100Stream stream = {
+            .pos = tail,
+            .remaining = need,
+            .mask = R100_PIO_QUEUE_DWORDS - 1,
+            .ring = true,
+            .host = s->engine_q,
+        };
+
+        r100_process_stream(s, &stream);
+        tail += need;
+        qatomic_store_release(&s->engine_q_tail, tail);
+    }
+}
+
 static void r100_pio_write(ATIVGAState *s, uint32_t value)
 {
     ATI3DState *r = &s->r100_3d;
     uint32_t header, need;
     R100Stream stream;
+
+    if (s->engine_thread_on && !ati_engine_ctx) {
+        r100_pio_queue(s, value);
+        return;
+    }
 
     if (r->pio_count >= ARRAY_SIZE(r->pio_buf)) {
         r->pio_count = 0;
@@ -5168,7 +5458,7 @@ bool ati_3d_read(ATIVGAState *s, hwaddr addr, uint64_t *data,
         return false;
     }
     if (base == R100_CP_STAT) {
-        value = 0;
+        value = qatomic_read(&s->engine_busy) ? BIT(31) : 0;
     } else if (base == R100_CP_CSQ_CNTL && r100_csq_primary_pio(r)) {
         value = (r->cp_csq_cntl & ~0xffffU) | 0x80;
     } else if (base == R100_SE_CNTL_STATUS) {
@@ -5178,7 +5468,8 @@ bool ati_3d_read(ATIVGAState *s, hwaddr addr, uint64_t *data,
         if (reg == NULL) {
             return false;
         }
-        value = *reg;
+        /* the ring pointers and scratch registers move under the engine */
+        value = qatomic_read(reg);
     }
     *data = r100_extract_read(value, addr, size);
     return true;
@@ -5240,6 +5531,11 @@ bool ati_3d_write(ATIVGAState *s, hwaddr addr, uint64_t data,
     if (base == R100_CP_RB_RPTR) {
         return true;
     }
+    if (base == R100_CP_RB_WPTR && s->engine_thread_on && !ati_engine_ctx) {
+        qatomic_store_release(reg, value);
+        ati_engine_kick(s);
+        return true;
+    }
     *reg = value;
     s->r100_state_generation++;
     if (base >= R100_SCRATCH_REG0 && base <= R100_SCRATCH_REG7) {
@@ -5253,7 +5549,11 @@ bool ati_3d_write(ATIVGAState *s, hwaddr addr, uint64_t data,
         break;
     case R100_CP_RB_WPTR:
     case R100_CP_CSQ_CNTL:
-        r100_process_ring(s);
+        if (s->engine_thread_on && !ati_engine_ctx) {
+            ati_engine_kick(s);
+        } else {
+            r100_process_ring(s);
+        }
         break;
     case R100_CP_IB_BUFSZ:
         (void)r100_process_ib(s);
@@ -5284,6 +5584,9 @@ void ati_3d_reset(ATIVGAState *s)
 
     s->r100_state_generation++;
     memset(r, 0, sizeof(*r));
+    /* the engine is idle: its queue is empty, a partial packet dropped */
+    s->engine_q_fill = s->engine_q_pkt = s->engine_q_head;
+    s->engine_q_need = 0;
     r->mc_fb_location = ((top >> 16) & 0xffffU) << 16;
     r->se_cntl_status = R100_TCL_BYPASS;
     r->context[(R100_RB3D_PLANEMASK - R100_CONTEXT_BASE) / 4] = UINT32_MAX;
