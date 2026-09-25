@@ -104,6 +104,7 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
     sbd = SYS_BUS_DEVICE(&s->dbdma);
     memory_region_add_subregion(&s->bar, 0x08000,
                                 sysbus_mmio_get_region(sbd, 0));
+    DBDMA_set_address_space(&s->dbdma, pci_device_iommu_address_space(d));
 
     qdev_prop_set_uint32(DEVICE(&s->escc), "disabled", 0);
     qdev_prop_set_uint32(DEVICE(&s->escc), "frequency", ESCC_CLOCK);

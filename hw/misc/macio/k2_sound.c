@@ -321,7 +321,7 @@ static void k2_i2s_tap_out(K2SoundState *s, DBDMA_io *io, int rate)
         int len = MIN(remaining, (int)sizeof(buf));
         int i;
 
-        dma_memory_read(&address_space_memory, addr, buf, len,
+        dma_memory_read(io->as, addr, buf, len,
                         MEMTXATTRS_UNSPECIFIED);
         for (i = 0; i < len && s->fifo_count < sizeof(s->out_fifo); i++) {
             s->out_fifo[s->fifo_wptr] = buf[i];
@@ -359,7 +359,7 @@ static void k2_i2s_dma_rw(DBDMA_io *io)
         s->walk_frames += frames;
         k2_i2s_tap_out(s, io, rate);
     } else {
-        dma_memory_set(&address_space_memory, io->addr, 0, io->len,
+        dma_memory_set(io->as, io->addr, 0, io->len,
                        MEMTXATTRS_UNSPECIFIED);
     }
 

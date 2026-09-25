@@ -93,7 +93,7 @@ static void dbdma_cmdptr_load(DBDMA_channel *ch)
 {
     DBDMA_DPRINTFCH(ch, "dbdma_cmdptr_load 0x%08x\n",
                     ch->regs[DBDMA_CMDPTR_LO]);
-    dma_memory_read(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
+    dma_memory_read(ch->io.as, ch->regs[DBDMA_CMDPTR_LO],
                     &ch->current, sizeof(dbdma_cmd), MEMTXATTRS_UNSPECIFIED);
 }
 
@@ -103,7 +103,7 @@ static void dbdma_cmdptr_save(DBDMA_channel *ch)
                     ch->regs[DBDMA_CMDPTR_LO],
                     le16_to_cpu(ch->current.xfer_status),
                     le16_to_cpu(ch->current.res_count));
-    dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
+    dma_memory_write(ch->io.as, ch->regs[DBDMA_CMDPTR_LO],
                      &ch->current, sizeof(dbdma_cmd), MEMTXATTRS_UNSPECIFIED);
 }
 
@@ -382,7 +382,7 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
         return;
     }
 
-    dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len,
+    dma_memory_read(ch->io.as, addr, &current->cmd_dep, len,
                     MEMTXATTRS_UNSPECIFIED);
 
     if (conditional_wait(ch))
@@ -415,7 +415,7 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
         return;
     }
 
-    dma_memory_write(&address_space_memory, addr, &current->cmd_dep, len,
+    dma_memory_write(ch->io.as, addr, &current->cmd_dep, len,
                      MEMTXATTRS_UNSPECIFIED);
 
     if (conditional_wait(ch))
@@ -606,6 +606,16 @@ void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
     ch->rw = rw;
     ch->flush = flush;
     ch->io.opaque = opaque;
+}
+
+/* Bus addresses of every channel resolve in @as */
+void DBDMA_set_address_space(DBDMAState *dbdma, AddressSpace *as)
+{
+    int i;
+
+    for (i = 0; i < DBDMA_CHANNELS; i++) {
+        dbdma->channels[i].io.as = as;
+    }
 }
 
 static void dbdma_control_write(DBDMA_channel *ch)
@@ -955,6 +965,7 @@ static void mac_dbdma_init(Object *obj)
         ch->flush = dbdma_unassigned_flush;
         ch->channel = i;
         ch->io.channel = ch;
+        ch->io.as = &address_space_memory;
     }
 
     memory_region_init_io(&s->mem, obj, &dbdma_ops, s, "dbdma", 0x1000);

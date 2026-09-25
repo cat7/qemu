@@ -37,6 +37,7 @@ typedef void (*DBDMA_end)(DBDMA_io *io);
 struct DBDMA_io {
     void *opaque;
     void *channel;
+    AddressSpace *as;           /* where the channel's bus addresses go */
     hwaddr addr;
     int len;
     int is_last;
@@ -176,5 +177,6 @@ void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
                             void *opaque);
 void DBDMA_kick(DBDMAState *dbdma);
 void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat);
+void DBDMA_set_address_space(DBDMAState *dbdma, AddressSpace *as);
 
 #endif
