@@ -2969,6 +2969,7 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     /* Primary CRTC, software and GUI-idle interrupt sources are modeled. */
     dev->config[PCI_INTERRUPT_PIN] = 1;
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL, ati_crtc_event, s);
+    ati_3d_raster_init(s);
 }
 
 static void ati_vga_reset(DeviceState *dev)
@@ -3046,6 +3047,7 @@ static void ati_vga_exit(PCIDevice *dev)
     ATIVGAState *s = ATI_VGA(dev);
 
     timer_del(&s->vblank_timer);
+    ati_3d_raster_fini(s);
     if (s->agp_as_valid) {
         address_space_destroy(&s->agp_as);
         s->agp_as_valid = false;
@@ -3062,6 +3064,9 @@ static const Property ati_vga_properties[] = {
     DEFINE_PROP_STRING("model", ATIVGAState, model),
     /* AGP capability: on, or auto for a Radeon on an AGP bus */
     DEFINE_PROP_ON_OFF_AUTO("agp", ATIVGAState, agp, ON_OFF_AUTO_OFF),
+    DEFINE_PROP_UINT32("raster-threads", ATIVGAState, raster_threads, 0),
+    DEFINE_PROP_UINT64("x-raster-split", ATIVGAState, raster_tri_split, 0),
+    DEFINE_PROP_UINT64("x-raster-serial", ATIVGAState, raster_tri_serial, 0),
     DEFINE_PROP_UINT16("x-device-id", ATIVGAState, dev_id,
                        PCI_DEVICE_ID_ATI_RAGE128_PF),
     /* Position registers specify the cursor image origin. */

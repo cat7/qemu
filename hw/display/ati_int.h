@@ -288,6 +288,11 @@ struct ATIVGAState {
     ATI3DState r100_3d;
     uint64_t r100_state_generation;
     bool default_rom;
+    /* triangle rows drawn on several threads; 0 = half the host's cores */
+    uint32_t raster_threads;
+    struct R100Raster *raster;
+    uint64_t raster_tri_split;
+    uint64_t raster_tri_serial;
 };
 
 static inline bool ati_is_rv100_family(const ATIVGAState *s)
@@ -324,6 +329,8 @@ bool ati_3d_read(ATIVGAState *s, hwaddr addr, uint64_t *data,
 bool ati_3d_write(ATIVGAState *s, hwaddr addr, uint64_t data,
                   unsigned int size);
 void ati_3d_reset(ATIVGAState *s);
+void ati_3d_raster_init(ATIVGAState *s);
+void ati_3d_raster_fini(ATIVGAState *s);
 int ati_3d_post_load(ATIVGAState *s);
 bool ati_3d_consume_command_work(ATIVGAState *s, uint64_t work);
 bool ati_3d_consume_2d_work(ATIVGAState *s, uint64_t work);
