@@ -244,6 +244,9 @@ static bool ati_cursor_get_params(ATIVGAState *s, ATICursorParams *params)
     params->mode = ati_is_rv100_family(s) ?
         extract32(s->regs.crtc_gen_cntl, R100_CRTC_CUR_MODE_SHIFT, 3) :
         R100_CRTC_CUR_MODE_MONO;
+    if (params->mode == R100_CRTC_CUR_MODE_ARGB) {
+        params->mode = R100_CRTC_CUR_MODE_24BPP;
+    }
     if (params->mode == R100_CRTC_CUR_MODE_MONO) {
         params->stride = ATI_MONO_CURSOR_STRIDE;
     } else if (ati_is_rv100_family(s) &&

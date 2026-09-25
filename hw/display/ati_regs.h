@@ -724,6 +724,7 @@
 #define R100_CRTC_CUR_MODE_MASK                 (7U << R100_CRTC_CUR_MODE_SHIFT)
 #define R100_CRTC_CUR_MODE_MONO                 0
 #define R100_CRTC_CUR_MODE_24BPP                2
+#define R100_CRTC_CUR_MODE_ARGB                 3
 #define CRTC2_EXT_DISP_EN                       0x01000000
 #define CRTC2_EN                                0x02000000
 #define CRTC2_DISP_REQ_EN_B                     0x04000000
