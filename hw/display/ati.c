@@ -2135,10 +2135,7 @@ void ati_mmio_write(ATIVGAState *s, hwaddr addr, uint64_t data,
             s->regs.dp_datatype |= (data & R100_GMC_SRC_DATATYPE2) >> 9;
         }
         s->regs.dp_mix = (data & GMC_ROP3_MASK) | (data & 0x7000000) >> 16;
-        s->regs.dp_cntl |= DST_Y_TOP_TO_BOTTOM;
-        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
-            s->regs.dp_cntl |= DST_X_LEFT_TO_RIGHT;
-        }
+        s->regs.dp_cntl |= DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM;
         if (data & GMC_WRITE_MASK_SET) {
             s->regs.dp_write_mask = UINT32_MAX;
             s->regs.clr_cmp_mask = UINT32_MAX;
