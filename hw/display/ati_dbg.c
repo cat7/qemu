@@ -184,6 +184,8 @@ static struct ati_regdesc ati_reg_names[] = {
     {"CLR_CMP_CLR_SRC", 0x15c4},
     {"CLR_CMP_CLR_DST", 0x15c8},
     {"CLR_CMP_MASK", 0x15cc},
+    {"DP_DST_ENDIAN", 0x15d0},
+    {"DP_SRC_ENDIAN", 0x15d4},
     {"DP_SRC_FRGD_CLR", 0x15d8},
     {"DP_SRC_BKGD_CLR", 0x15dc},
     {"DST_BRES_ERR", 0x1628},

@@ -1514,6 +1514,12 @@ static uint64_t ati_reg_read(void *opaque, hwaddr addr, unsigned int size)
     case DP_SRC_BKGD_CLR:
         val = s->regs.dp_src_bkgd_clr;
         break;
+    case R100_DP_DST_ENDIAN:
+        val = ati_is_rv100_family(s) ? s->regs.dp_dst_endian : 0;
+        break;
+    case R100_DP_SRC_ENDIAN:
+        val = ati_is_rv100_family(s) ? s->regs.dp_src_endian : 0;
+        break;
     case DP_CNTL:
         val = s->regs.dp_cntl;
         break;
@@ -2246,6 +2252,16 @@ void ati_mmio_write(ATIVGAState *s, hwaddr addr, uint64_t data,
     case DP_SRC_BKGD_CLR:
         s->regs.dp_src_bkgd_clr = data;
         break;
+    case R100_DP_DST_ENDIAN:
+        if (ati_is_rv100_family(s)) {
+            s->regs.dp_dst_endian = data & 3;
+        }
+        break;
+    case R100_DP_SRC_ENDIAN:
+        if (ati_is_rv100_family(s)) {
+            s->regs.dp_src_endian = data & 3;
+        }
+        break;
     case DP_DATATYPE:
         s->regs.dp_datatype = data &
             (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ?
@@ -2537,6 +2553,10 @@ static int ati_vga_post_load(void *opaque, int version_id)
 {
     ATIVGAState *s = opaque;
 
+    if (version_id < 10) {
+        s->regs.dp_dst_endian = 0;
+        s->regs.dp_src_endian = 0;
+    }
     if (version_id < 9) {
         s->regs.surface_cntl = 0;
         memset(s->regs.surface_lower, 0, sizeof(s->regs.surface_lower));
@@ -2676,7 +2696,7 @@ static int ati_vga_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ati_vga = {
     .name = "ati-vga",
-    .version_id = 9,
+    .version_id = 10,
     .minimum_version_id = 1,
     .pre_save = ati_vga_pre_save,
     .post_load = ati_vga_post_load,
@@ -2734,6 +2754,8 @@ static const VMStateDescription vmstate_ati_vga = {
                                ATI_SURFACE_COUNT, 9),
         VMSTATE_UINT32_ARRAY_V(regs.surface_info, ATIVGAState,
                                ATI_SURFACE_COUNT, 9),
+        VMSTATE_UINT32_V(regs.dp_dst_endian, ATIVGAState, 10),
+        VMSTATE_UINT32_V(regs.dp_src_endian, ATIVGAState, 10),
         VMSTATE_STRUCT(bbi2c, ATIVGAState, 0,
                        vmstate_ati_bitbang_i2c, bitbang_i2c_interface),
         VMSTATE_TIMER(vblank_timer, ATIVGAState),

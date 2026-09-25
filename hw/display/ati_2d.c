@@ -90,6 +90,9 @@ typedef struct {
     bool left_to_right;
     bool top_to_bottom;
     bool need_swap;
+    /* Byte lane XOR for source and destination data in host memory */
+    unsigned int src_swap;
+    unsigned int dst_swap;
     bool solid_brush;
     bool mono_lsb_first;
     bool write_mask_active;
@@ -253,6 +256,15 @@ static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
                         (ctx->host_data_active && !rage128);
     ctx->top_to_bottom = s->regs.dp_cntl & DST_Y_TOP_TO_BOTTOM;
     ctx->need_swap = (HOST_BIG_ENDIAN != s->vga.big_endian_fb);
+    ctx->src_swap = 0;
+    ctx->dst_swap = 0;
+    if (ati_is_rv100_family(s)) {
+        /* Swap modes as byte lane XOR: none, 16-bit, 32-bit, half-dword */
+        static const uint8_t xor[4] = { 0, 1, 3, 2 };
+
+        ctx->src_swap = xor[s->regs.dp_src_endian & 3];
+        ctx->dst_swap = xor[s->regs.dp_dst_endian & 3];
+    }
     ctx->brush_type = (s->regs.dp_datatype & DP_BRUSH_DATATYPE) >> 8;
     ctx->solid_brush =
         ctx->brush_type == (BRUSH_SOLIDCOLOR >> 8) ||
@@ -1223,6 +1235,20 @@ out:
     return success;
 }
 
+/* Permute bytes within each dword of a dword-aligned span */
+static void ati_2d_swap_bytes(uint8_t *buf, uint64_t length, unsigned int swap)
+{
+    for (uint64_t i = 0; i < length; i += 4) {
+        uint8_t word[4] = { 0 };
+        unsigned int n = MIN(length - i, 4);
+
+        memcpy(word, buf + i, n);
+        for (unsigned int j = 0; j < n; j++) {
+            buf[i + j] = word[j ^ swap];
+        }
+    }
+}
+
 static bool ati_2d_surface_read(ATIVGAState *s, const ATI2DCtx *ctx,
                                 bool source, int x, int y,
                                 uint8_t *buf, uint64_t length)
@@ -1232,6 +1258,7 @@ static bool ati_2d_surface_read(ATIVGAState *s, const ATI2DCtx *ctx,
     int stride = source ? ctx->src_stride : ctx->dst_stride;
     uint64_t offset = (uint64_t)y * stride +
                       (uint64_t)x * (ctx->bpp / 8);
+    unsigned int swap = source ? ctx->src_swap : ctx->dst_swap;
 
     if ((source ? ctx->src_tile : ctx->dst_tile) &&
         !(source && ctx->host_data_active)) {
@@ -1241,7 +1268,13 @@ static bool ati_2d_surface_read(ATIVGAState *s, const ATI2DCtx *ctx,
         memcpy(buf, bits + offset, length);
         return true;
     }
-    return ati_r100_gpu_read(s, (uint64_t)address + offset, buf, length);
+    if (!ati_r100_gpu_read(s, (uint64_t)address + offset, buf, length)) {
+        return false;
+    }
+    if (swap && ati_r100_gpu_is_host(s, (uint64_t)address + offset)) {
+        ati_2d_swap_bytes(buf, length, swap);
+    }
+    return true;
 }
 
 static bool ati_2d_surface_write(ATIVGAState *s, const ATI2DCtx *ctx,
@@ -1260,6 +1293,14 @@ static bool ati_2d_surface_write(ATIVGAState *s, const ATI2DCtx *ctx,
         memory_region_set_dirty(&ctx->vga->vram,
                                 ctx->dst_vram_offset + offset, length);
         return true;
+    }
+    if (ctx->dst_swap &&
+        ati_r100_gpu_is_host(s, (uint64_t)ctx->dst_offset + offset)) {
+        g_autofree uint8_t *swapped = g_memdup2(buf, length);
+
+        ati_2d_swap_bytes(swapped, length, ctx->dst_swap);
+        return ati_r100_gpu_write(s, (uint64_t)ctx->dst_offset + offset,
+                                  swapped, length, true);
     }
     return ati_r100_gpu_write(s, (uint64_t)ctx->dst_offset + offset,
                               buf, length, true);

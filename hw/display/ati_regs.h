@@ -285,6 +285,9 @@
 #define CLR_CMP_CLR_SRC                         0x15c4
 #define CLR_CMP_CLR_DST                         0x15c8
 #define CLR_CMP_MASK                            0x15cc
+/* 2D byte swap for destination and source data in host memory */
+#define R100_DP_DST_ENDIAN                      0x15d0
+#define R100_DP_SRC_ENDIAN                      0x15d4
 #define DP_SRC_FRGD_CLR                         0x15d8
 #define DP_SRC_BKGD_CLR                         0x15dc
 #define LEAD_BRES_ERR                           0x1600

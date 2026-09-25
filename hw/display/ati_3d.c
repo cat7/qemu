@@ -494,6 +494,16 @@ static bool r100_gpu_decode(ATIVGAState *s, uint64_t address,
     return true;
 }
 
+/* True if the engine reaches this address over the bus, not in local VRAM */
+bool ati_r100_gpu_is_host(ATIVGAState *s, uint64_t address)
+{
+    AddressSpace *as;
+    uint64_t translated;
+    uint64_t span;
+
+    return r100_gpu_decode(s, address, 1, &as, &translated, &span) && as;
+}
+
 bool ati_r100_gpu_access_valid(ATIVGAState *s, uint64_t address,
                                uint64_t length, bool is_write)
 {

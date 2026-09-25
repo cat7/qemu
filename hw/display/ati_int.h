@@ -115,6 +115,8 @@ typedef struct ATIVGARegs {
     uint32_t dp_brush_frgd_clr;
     uint32_t dp_src_frgd_clr;
     uint32_t dp_src_bkgd_clr;
+    uint32_t dp_dst_endian;
+    uint32_t dp_src_endian;
     uint16_t sc_top;
     uint16_t sc_left;
     uint16_t sc_bottom;
@@ -326,6 +328,7 @@ bool ati_3d_consume_command_work(ATIVGAState *s, uint64_t work);
 bool ati_3d_consume_2d_work(ATIVGAState *s, uint64_t work);
 bool ati_r100_gpu_vram_offset(ATIVGAState *s, uint64_t address,
                               uint64_t length, uint64_t *offset);
+bool ati_r100_gpu_is_host(ATIVGAState *s, uint64_t address);
 bool ati_r100_gpu_access_valid(ATIVGAState *s, uint64_t address,
                                uint64_t length, bool is_write);
 bool ati_r100_gpu_ranges_overlap(ATIVGAState *s, uint64_t first,
