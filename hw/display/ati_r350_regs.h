@@ -860,6 +860,12 @@
 #define R350_PALETTE_30_DATA         0x00b8
 #define R350_MC_FB_LOCATION          0x0148
 #define R350_MC_AGP_LOCATION         0x014c
+#define R350_AIC_CNTL                0x01d0
+#define R350_PCIGART_TRANSLATE_EN    (1u << 0)
+#define R350_AIC_LO_ADDR             0x01dc
+#define R350_AIC_HI_ADDR             0x01e0
+/* PCI GART page table bus address; LE32 entries, one bus page each */
+#define R350_AIC_PT_BASE_R300        0x0ab0
 #define R350_MC_IND_INDEX            0x01f8
 #define R350_MC_IND_DATA             0x01fc
 #define R350_DISPLAY_BASE_ADDR       0x023c

@@ -2477,6 +2477,32 @@ bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr,
     return false;
 }
 
+/*
+ * The card's PCI GART: AIC_LO_ADDR..AIC_HI_ADDR maps page by page
+ * through a table in host memory whose bus address the Mac driver
+ * programs at 0xab0.
+ */
+static bool ati_r350_mc_to_aic(ATIR350State *s, uint32_t addr,
+                               dma_addr_t *bus)
+{
+    uint32_t lo = s->regs[R350_AIC_LO_ADDR >> 2] & ~0xfffu;
+    uint32_t hi = s->regs[R350_AIC_HI_ADDR >> 2];
+    uint32_t entry;
+
+    if (!(s->regs[R350_AIC_CNTL >> 2] & R350_PCIGART_TRANSLATE_EN) ||
+        addr < lo || addr > hi) {
+        return false;
+    }
+    if (pci_dma_read(PCI_DEVICE(s),
+                     (s->regs[R350_AIC_PT_BASE_R300 >> 2] & ~0xfffu) +
+                     ((addr - lo) >> 12) * 4,
+                     &entry, sizeof(entry)) != MEMTX_OK) {
+        return false;
+    }
+    *bus = (le32_to_cpu(entry) & ~0xfffu) | (addr & 0xfff);
+    return true;
+}
+
 static bool ati_r350_mc_to_agp(ATIR350State *s, uint32_t addr,
                                dma_addr_t *bus)
 {
@@ -2501,6 +2527,10 @@ const char *ati_r350_mc_describe(ATIR350State *s, uint32_t addr,
         *target = off;
         return "vram";
     }
+    if (ati_r350_mc_to_aic(s, addr, &bus)) {
+        *target = bus;
+        return "gart";
+    }
     if (ati_r350_mc_to_agp(s, addr, &bus)) {
         *target = bus;
         return "agp";
@@ -2524,7 +2554,9 @@ uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr)
         ati_r350_gl_touch(s, off, 4);
         return ati_r350_vram_ld32(s, off);
     }
-    if (!ati_r350_mc_to_agp(s, addr, &bus)) {
+    if (ati_r350_mc_to_aic(s, addr, &bus)) {
+        /* bus address */
+    } else if (!ati_r350_mc_to_agp(s, addr, &bus)) {
         bus = addr;
     } else if (s->agp_as_valid) {
         address_space_read(&s->agp_as, bus, MEMTXATTRS_UNSPECIFIED,
@@ -2551,7 +2583,9 @@ static void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
         return;
     }
     val = cpu_to_le32(val);
-    if (!ati_r350_mc_to_agp(s, addr, &bus)) {
+    if (ati_r350_mc_to_aic(s, addr, &bus)) {
+        /* bus address */
+    } else if (!ati_r350_mc_to_agp(s, addr, &bus)) {
         bus = addr;
     } else if (s->agp_as_valid) {
         address_space_write(&s->agp_as, bus, MEMTXATTRS_UNSPECIFIED,
