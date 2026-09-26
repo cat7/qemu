@@ -524,7 +524,11 @@
 #define R100_TXFILTER_MIRROR_CLAMP_GL           7
 #define R100_TXFILTER_BORDER_MODE_D3D            BIT(31)
 #define R100_VTX_ST0_NONPARAMETRIC              BIT(8)
+#define R100_VTX_XY_PRE_MULT_1_OVER_W0           BIT(0)
+#define R100_VTX_Z_PRE_MULT_1_OVER_W0            BIT(1)
 #define R100_VTX_ST_NONPARAMETRIC(unit)          BIT(8 + (unit))
+#define R100_VTX_W0_IS_NOT_1_OVER_W0             BIT(16)
+#define R100_VTX_ST_PRE_MULT_1_OVER_W0(unit)     BIT(17 + 2 * (unit))
 #define R100_VPORT_XY_XFORM_ENABLE              BIT(24)
 #define R100_VPORT_Z_XFORM_ENABLE               BIT(25)
 

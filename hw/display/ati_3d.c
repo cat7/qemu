@@ -929,22 +929,40 @@ static bool r100_parse_vertex(const uint32_t *words, unsigned int count,
 static void r100_transform_vertex(ATIVGAState *s, R100Vertex *v)
 {
     uint32_t se_cntl = r100_context_read(&s->r100_3d, R100_SE_CNTL);
-    float reciprocal_w = v->w != 0.0f ? 1.0f / v->w : 1.0f;
+    uint32_t coord_fmt = r100_context_read(&s->r100_3d, R100_SE_COORD_FMT);
+    float one_over_w0 = v->w;
 
+    if (coord_fmt & R100_VTX_W0_IS_NOT_1_OVER_W0) {
+        one_over_w0 = v->w != 0.0f ? 1.0f / v->w : 1.0f;
+    }
+    if (!(coord_fmt & R100_VTX_XY_PRE_MULT_1_OVER_W0)) {
+        v->x *= one_over_w0;
+        v->y *= one_over_w0;
+    }
+    if (!(coord_fmt & R100_VTX_Z_PRE_MULT_1_OVER_W0)) {
+        v->z *= one_over_w0;
+    }
+    for (unsigned int unit = 0; unit < 3; unit++) {
+        if (!(coord_fmt & R100_VTX_ST_PRE_MULT_1_OVER_W0(unit))) {
+            v->s[unit] *= one_over_w0;
+            v->t[unit] *= one_over_w0;
+            v->q[unit] *= one_over_w0;
+        }
+    }
     if (se_cntl & R100_VPORT_XY_XFORM_ENABLE) {
-        v->x = v->x * reciprocal_w *
+        v->x = v->x *
                r100_float(r100_context_read(&s->r100_3d,
                                              R100_SE_VPORT_XSCALE)) +
                r100_float(r100_context_read(&s->r100_3d,
                                              R100_SE_VPORT_XOFFSET));
-        v->y = v->y * reciprocal_w *
+        v->y = v->y *
                r100_float(r100_context_read(&s->r100_3d,
                                              R100_SE_VPORT_YSCALE)) +
                r100_float(r100_context_read(&s->r100_3d,
                                              R100_SE_VPORT_YOFFSET));
     }
     if (se_cntl & R100_VPORT_Z_XFORM_ENABLE) {
-        v->z = v->z * reciprocal_w *
+        v->z = v->z *
                r100_float(r100_context_read(&s->r100_3d,
                                              R100_SE_VPORT_ZSCALE)) +
                r100_float(r100_context_read(&s->r100_3d,
