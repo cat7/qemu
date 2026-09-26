@@ -105,6 +105,7 @@
 #define R300_ME_EXP_BASE2_DX          1
 #define R300_ME_LOG_BASE2_DX          2
 #define R300_ME_LIGHT_COEFF_DX        4
+#define R300_ME_POWER_FUNC_FF         5
 #define R300_ME_RECIP_DX              6
 #define R300_ME_RECIP_FF              7
 #define R300_ME_RECIP_SQRT_DX         8

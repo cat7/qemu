@@ -175,6 +175,13 @@ static bool r300_pvs_math(unsigned opcode, const float a[4], const float b[4],
     case R300_ME_MULTIPLY:
         y = x * b[3];
         break;
+    case R300_ME_POWER_FUNC_FF:
+        /* base in a.w, exponent in b.w; a negative base keeps its sign */
+        y = powf(fabsf(x), b[3]);
+        if (x < 0.0f) {
+            y = -y;
+        }
+        break;
     case R300_ME_EXP_BASE2_FULL_DX:
         y = exp2f(x);
         break;

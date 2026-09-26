@@ -278,6 +278,9 @@ static bool pvs_math(PvsBuf *b, unsigned opcode)
     case R300_ME_MULTIPLY:
         y = "a.w * bb.w";
         break;
+    case R300_ME_POWER_FUNC_FF:
+        y = "a.w < 0.0 ? -pvs_powf(-a.w, bb.w) : pvs_powf(a.w, bb.w)";
+        break;
     case R300_ME_EXP_BASE2_FULL_DX:
         y = "exp2(a.w)";
         break;
