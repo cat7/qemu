@@ -86,12 +86,12 @@ static const USBDescStrings usb_audio_stringtable = {
     [STRING_INPUT_TERMINAL]     = "Audio Output Pipe",
     [STRING_FEATURE_UNIT]       = "Audio Output Volume Control",
     [STRING_OUTPUT_TERMINAL]    = "Audio Output Terminal",
-    [STRING_NULL_STREAM]        = "Audio Output - Disabled",
+    [STRING_NULL_STREAM]        = "Audio Output",
     [STRING_REAL_STREAM]        = "Audio Output - 48 kHz Stereo",
     [STRING_MIC_INPUT_TERMINAL] = "Audio Input Microphone",
     [STRING_MIC_FEATURE_UNIT]   = "Audio Input Volume Control",
     [STRING_MIC_OUTPUT_TERMINAL]= "Audio Input Pipe",
-    [STRING_MIC_NULL_STREAM]    = "Audio Input - Disabled",
+    [STRING_MIC_NULL_STREAM]    = "Audio Input",
     [STRING_MIC_REAL_STREAM]    = "Audio Input - 48 kHz Stereo",
 };
 
