@@ -2953,7 +2953,8 @@ static bool r100_triangle_visible(ATI3DState *r, double area)
 {
     uint32_t se_cntl = r100_context_read(r, R100_SE_CNTL);
     bool ccw_front = !!(se_cntl & BIT(0));
-    bool front = (area < 0.0f) == ccw_front;
+    /* area > 0 is counter-clockwise as displayed, with Y growing downwards */
+    bool front = (area > 0.0f) == ccw_front;
     unsigned int mode = front ? extract32(se_cntl, 3, 2) :
                                 extract32(se_cntl, 1, 2);
 
