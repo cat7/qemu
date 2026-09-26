@@ -62,6 +62,25 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_3d.c', 'ati_dbg.c'), pixman])
 
+# ati_r350_gl.c is the host-GPU rendering backend (phase 2): desktop GL
+# 3.3 core, offscreen -- no window, no QEMU display backend, and
+# deliberately NOT CONFIG_OPENGL, which cannot be enabled on darwin at all
+# (libepoxy there ships no epoxy/egl.h). Two hosts have a real backend:
+# darwin through CGL, and windows through WGL on an invisible window, where
+# opengl32 also supplies the GL 1.1 exports and wglGetProcAddress, gdi32
+# the pixel format and user32 the window. Deliberately NOT sdl: it is an
+# optional dependency and QEMU's own SDL display owns the video subsystem
+# (see the win32 leg's comment in ati_r350_gl.c). Elsewhere the file
+# compiles to a stub that reports there is no backend.
+r350_gl_deps = []
+if host_os == 'darwin'
+  r350_gl_deps += dependency('appleframeworks', modules: 'OpenGL')
+elif host_os == 'windows'
+  r350_gl_deps += [cc.find_library('opengl32'), cc.find_library('gdi32'),
+                   cc.find_library('user32')]
+endif
+system_ss.add(when: 'CONFIG_ATI_R350', if_true: [files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c', 'ati_r350_pvs_glsl.c', 'ati_r350_us.c', 'ati_r350_us_glsl.c', 'ati_r350_gl.c'), r350_gl_deps])
+
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
 

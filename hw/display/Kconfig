@@ -124,6 +124,12 @@ config DPCD
     bool
     select AUX
 
+config ATI_R350
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select EDID
+
 config ATI_VGA
     bool
     default y if PCI_DEVICES
