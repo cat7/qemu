@@ -11,6 +11,7 @@
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pci_bus.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -2525,6 +2526,10 @@ uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr)
     }
     if (!ati_r350_mc_to_agp(s, addr, &bus)) {
         bus = addr;
+    } else if (s->agp_as_valid) {
+        address_space_read(&s->agp_as, bus, MEMTXATTRS_UNSPECIFIED,
+                           &val, sizeof(val));
+        return le32_to_cpu(val);
     }
     pci_dma_read(PCI_DEVICE(s), bus, &val, sizeof(val));
     return le32_to_cpu(val);
@@ -2545,10 +2550,14 @@ static void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
         }
         return;
     }
+    val = cpu_to_le32(val);
     if (!ati_r350_mc_to_agp(s, addr, &bus)) {
         bus = addr;
+    } else if (s->agp_as_valid) {
+        address_space_write(&s->agp_as, bus, MEMTXATTRS_UNSPECIFIED,
+                            &val, sizeof(val));
+        return;
     }
-    val = cpu_to_le32(val);
     pci_dma_write(PCI_DEVICE(s), bus, &val, sizeof(val));
 }
 
@@ -3741,6 +3750,23 @@ void ati_r350_host_cursor(int x, int y, bool on)
     qemu_console_set_mouse(s->con, x, y, on);
 }
 
+/* AGP transactions go through the host bridge's "agp-gart" if it has one */
+static void ati_r350_agp_attach(ATIR350State *s)
+{
+    PCIBus *bus = pci_get_bus(PCI_DEVICE(s));
+    Object *mr;
+
+    if (!bus->qbus.parent) {
+        return;
+    }
+    mr = object_resolve_path_component(OBJECT(bus->qbus.parent),
+                                       "agp-gart[0]");
+    if (mr && object_dynamic_cast(mr, TYPE_MEMORY_REGION)) {
+        address_space_init(&s->agp_as, MEMORY_REGION(mr), "ati-r350-agp");
+        s->agp_as_valid = true;
+    }
+}
+
 static void ati_r350_realize(PCIDevice *dev, Error **errp)
 {
     ATIR350State *s = ATI_R350(dev);
@@ -3916,6 +3942,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                      PCI_AGP_STATUS_RATE2 | PCI_AGP_STATUS_RATE1);
         pci_set_long(dev->wmask + cap + PCI_AGP_COMMAND, 0xffffffffu);
     }
+    ati_r350_agp_attach(s);
 
     memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
 
@@ -4026,6 +4053,10 @@ static void ati_r350_exit(PCIDevice *dev)
     g_free(s->gl_sw);
     g_free(s->gl_texbuf);
     g_free(s->gl_verts);
+    if (s->agp_as_valid) {
+        address_space_destroy(&s->agp_as);
+        s->agp_as_valid = false;
+    }
 }
 
 static const VMStateDescription vmstate_ati_r350 = {

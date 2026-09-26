@@ -270,6 +270,8 @@ struct ATIR350State {
     MemoryRegion vram;        /* 16MB of real VRAM at aperture offset 0 */
     MemoryRegion mmio;        /* BAR2: 16KB register file */
     MemoryRegion io;          /* BAR1: 256-byte I/O register window */
+    AddressSpace agp_as;      /* AGP transactions, via the host's GART */
+    bool agp_as_valid;
     QemuConsole *con;
 
     uint32_t regs[ATI_R350_NUM_REGS];
