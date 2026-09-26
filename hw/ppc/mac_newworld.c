@@ -85,6 +85,9 @@
 #define TBFREQ (25UL * 1000UL * 1000UL)
 #define CLOCKFREQ (900UL * 1000UL * 1000UL)
 #define BUSFREQ (100UL * 1000UL * 1000UL)
+/* PowerMac7,3: 2.0 GHz 970, processor bus at half the core clock */
+#define U3_CLOCKFREQ (2000UL * 1000UL * 1000UL)
+#define U3_BUSFREQ (1000UL * 1000UL * 1000UL)
 
 #define NDRV_VGA_FILENAME "qemu_vga.ndrv"
 
@@ -726,8 +729,10 @@ static void ppc_core99_init(MachineState *machine)
     }
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, tbfreq);
     /* Mac OS X requires a "known good" clock-frequency value; pass it one. */
-    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ, CLOCKFREQ);
-    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ, BUSFREQ);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ,
+                   machine_arch == ARCH_MAC99_U3 ? U3_CLOCKFREQ : CLOCKFREQ);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ,
+                   machine_arch == ARCH_MAC99_U3 ? U3_BUSFREQ : BUSFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
     /* MacOS NDRV VGA driver */
