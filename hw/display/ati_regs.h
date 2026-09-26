@@ -444,6 +444,8 @@
 #define R100_SE_CNTL_STATUS                     0x2140
 #define R100_RE_TOP_LEFT                        0x26c0
 #define R100_RE_MISC                            0x26c4
+#define R100_RB3D_DEPTHCLEARVALUE               0x3230
+#define R100_RB3D_ZMASKOFFSET                   0x3234
 
 #define R100_PP_TEX_0_ENABLE                    BIT(4)
 #define R100_PP_TEX_1_ENABLE                    BIT(5)
@@ -470,6 +472,7 @@
 #define R100_COLOR_TILE_ENABLE                   BIT(16)
 #define R100_COLOR_MICROTILE_ENABLE              BIT(17)
 #define R100_RB3D_Z_WRITE_ENABLE                BIT(30)
+#define R100_RB3D_Z_DECOMPRESSION_ENABLE        BIT(31)
 #define R100_DEPTH_FORMAT_MASK                  0xfU
 #define R100_DEPTH_FORMAT_16BIT_INT_Z           0
 #define R100_DEPTH_FORMAT_24BIT_INT_Z           2
@@ -619,6 +622,7 @@
 #define R100_PACKET3_3D_DRAW_IMMD                0x29
 #define R100_PACKET3_3D_DRAW_INDX                0x2a
 #define R100_PACKET3_3D_LOAD_VBPNTR              0x2f
+#define R100_PACKET3_3D_CLEAR_ZMASK              0x32
 #define R100_PACKET3_3D_DRAW_VBUF_2              0x34
 #define R100_PACKET3_3D_DRAW_IMMD_2              0x35
 #define R100_PACKET3_3D_DRAW_INDX_2              0x36

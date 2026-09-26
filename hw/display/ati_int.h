@@ -46,6 +46,8 @@
 #define ATI_2D_MAX_PIXELS (16U * 1024U * 1024U)
 #define ATI_3D_CONTEXT_DWORDS 128
 #define ATI_3D_FOG_TABLE_ENTRIES 256
+/* RV100 Z mask RAM: 0x1400 blocks of 32 entries, one per 4x2 depth tile */
+#define ATI_3D_ZMASK_ENTRIES (0x1400 * 32)
 #define ATI_3D_MAX_VERTEX_DWORDS 4096
 #define ATI_3D_MAX_VERTEX_ARRAYS 12
 #define ATI_CURSOR_MAX_BYTES (64 * 64 * 4)
@@ -203,6 +205,12 @@ typedef struct ATI3DState {
     uint32_t aic_pt_base;
     uint32_t aic_lo_addr;
     uint32_t aic_hi_addr;
+
+    uint32_t depth_clear_value;
+    uint32_t zmask_offset;
+    /* set entries are cleared tiles that read as depth_clear_value */
+    uint64_t zmask[ATI_3D_ZMASK_ENTRIES / 64];
+    bool zmask_used;
 
     ATI3DVertexArray vertex_array[ATI_3D_MAX_VERTEX_ARRAYS];
     uint32_t vertex_array_count;

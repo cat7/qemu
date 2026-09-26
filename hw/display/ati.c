@@ -2742,7 +2742,7 @@ static int ati_vga_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ati_vga = {
     .name = "ati-vga",
-    .version_id = 10,
+    .version_id = 11,
     .minimum_version_id = 1,
     .pre_save = ati_vga_pre_save,
     .post_load = ati_vga_post_load,
@@ -2802,6 +2802,11 @@ static const VMStateDescription vmstate_ati_vga = {
                                ATI_SURFACE_COUNT, 9),
         VMSTATE_UINT32_V(regs.dp_dst_endian, ATIVGAState, 10),
         VMSTATE_UINT32_V(regs.dp_src_endian, ATIVGAState, 10),
+        VMSTATE_UINT32_V(r100_3d.depth_clear_value, ATIVGAState, 11),
+        VMSTATE_UINT32_V(r100_3d.zmask_offset, ATIVGAState, 11),
+        VMSTATE_UINT64_ARRAY_V(r100_3d.zmask, ATIVGAState,
+                               ATI_3D_ZMASK_ENTRIES / 64, 11),
+        VMSTATE_BOOL_V(r100_3d.zmask_used, ATIVGAState, 11),
         VMSTATE_STRUCT(bbi2c, ATIVGAState, 0,
                        vmstate_ati_bitbang_i2c, bitbang_i2c_interface),
         VMSTATE_TIMER(vblank_timer, ATIVGAState),

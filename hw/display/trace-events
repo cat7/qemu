@@ -150,6 +150,7 @@ ati_mm_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "
 # ati_3d.c
 ati_r100_agp_access(uint64_t addr, uint64_t bus, uint64_t len) "card 0x%"PRIx64" bus 0x%"PRIx64" len 0x%"PRIx64
 ati_cp_packet3_unknown(unsigned int opcode, unsigned int count, uint32_t word0, uint32_t word1, uint32_t word2, uint32_t word3) "opcode=0x%x count=%u first=0x%08"PRIx32",0x%08"PRIx32",0x%08"PRIx32",0x%08"PRIx32
+ati_r100_clear_zmask(uint32_t first, uint32_t blocks, uint32_t mask, uint32_t zmask_offset, uint32_t clear_value, uint32_t zcntl) "first=0x%x blocks=0x%x mask=0x%x zmaskoffset=0x%x clear=0x%x zcntl=0x%x"
 ati_engine_wait(uint64_t addr, int write, uint64_t us) "0x%"PRIx64" write %d waited %"PRIu64" us"
 ati_engine_bql_write(uint64_t addr, uint64_t val) "0x%"PRIx64" <- 0x%"PRIx64
 

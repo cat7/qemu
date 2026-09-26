@@ -204,6 +204,10 @@ typedef struct R100DepthState {
     uint8_t stencil_reference;
     uint8_t stencil_mask;
     uint8_t stencil_writemask;
+    /* cleared Z mask entries are expanded to clear_value on first access */
+    bool zmask;
+    uint32_t zmask_offset;
+    uint32_t clear_value;
 } R100DepthState;
 
 typedef struct R100DrawState {
@@ -270,6 +274,10 @@ static uint32_t *r100_register_ptr(ATI3DState *r, hwaddr addr)
         return &r->re_top_left;
     case R100_RE_MISC:
         return &r->re_misc;
+    case R100_RB3D_DEPTHCLEARVALUE:
+        return &r->depth_clear_value;
+    case R100_RB3D_ZMASKOFFSET:
+        return &r->zmask_offset;
     case R100_SE_VTX_FMT:
         return &r->se_vtx_fmt;
     case R100_SE_VF_CNTL:
@@ -1415,6 +1423,11 @@ static R100DrawState *r100_draw_state_update(ATIVGAState *s,
                                      R100_STENCIL_MASK_SHIFT, 8);
     depth->stencil_writemask = extract32(stencil_refmask,
                                         R100_STENCIL_WRITEMASK_SHIFT, 8);
+    depth->zmask = r->zmask_used &&
+                   (depth->zcntl & R100_RB3D_Z_DECOMPRESSION_ENABLE);
+    depth->zmask_offset = r->zmask_offset;
+    depth->clear_value = r->depth_clear_value &
+                         (depth->cpp == 2 ? 0xffffU : UINT32_MAX);
     draw->coordinate_mask = 0;
     draw->specular_rgb = draw->pp_cntl & R100_PP_SPECULAR_ENABLE;
     draw->specular_alpha = false;
@@ -2722,6 +2735,53 @@ static bool r100_color_pixel_offset(uint32_t pitch_reg, unsigned int pitch,
     return true;
 }
 
+/*
+ * Z mask entry of a depth pixel: one entry per 4x2 tile, 32 entries per
+ * 16x16 block, four blocks per 64x16 macro block, macro blocks in rows of
+ * 16 depth lines.
+ */
+static inline uint32_t r100_zmask_entry(const R100DepthState *depth,
+                                        unsigned int x, unsigned int y)
+{
+    uint32_t macros = DIV_ROUND_UP(depth->pitch, 64);
+
+    return depth->zmask_offset +
+           (((y >> 4) * macros + (x >> 6)) << 7) +
+           (((x >> 4) & 3) << 5) + (((y >> 1) & 7) << 2) + ((x >> 2) & 3);
+}
+
+/* a cleared tile is written out with the clear value before it is used */
+static void r100_zmask_expand(ATIVGAState *s, const R100DrawState *state,
+                              unsigned int x, unsigned int y,
+                              R100DirtyBatch *batch)
+{
+    const R100DepthState *depth = &state->depth;
+    uint32_t entry = r100_zmask_entry(depth, x, y);
+    uint64_t *word;
+    uint64_t bit;
+
+    if (entry >= ATI_3D_ZMASK_ENTRIES) {
+        return;
+    }
+    word = &s->r100_3d.zmask[entry / 64];
+    bit = BIT_ULL(entry % 64);
+    /* tiles in one word lie in several raster stripes */
+    if (!(qatomic_read(word) & bit) ||
+        !(qatomic_fetch_and(word, ~bit) & bit)) {
+        return;
+    }
+    x &= ~3U;
+    y &= ~1U;
+    for (unsigned int row = y; row < y + 2; row++) {
+        for (unsigned int col = x; col < x + 4 && col < depth->pitch; col++) {
+            r100_draw_write_pixel(s, state, (depth->offset & ~0xfU) +
+                                  ((uint64_t)row * depth->pitch + col) *
+                                  depth->cpp, depth->cpp, depth->clear_value,
+                                  batch);
+        }
+    }
+}
+
 static bool r100_fragment(ATIVGAState *s, int x, int y, float z,
                           R100Color color, R100Color specular,
                           const float tex_s[3], const float tex_t[3],
@@ -2812,6 +2872,9 @@ static bool r100_fragment(ATIVGAState *s, int x, int y, float z,
 
         if (!depth_pitch || (unsigned int)x >= depth_pitch) {
             return false;
+        }
+        if (depth->zmask) {
+            r100_zmask_expand(s, state, x, y, batch);
         }
         depth_address = (depth_offset & ~0xfU) +
                         ((uint64_t)y * depth_pitch + x) * depth_cpp;
@@ -3254,6 +3317,8 @@ static void r100_triangle_rows(ATIVGAState *s, const R100Tri *tri,
  */
 /* small stripes keep the last one short: its drawer is waited for */
 #define R100_RASTER_STRIPE_SHIFT 1
+/* a 4x2 Z mask tile never straddles two stripes */
+QEMU_BUILD_BUG_ON(R100_RASTER_STRIPE_SHIFT < 1);
 #define R100_RASTER_MAX_THREADS 8
 #define R100_RASTER_MIN_PX 4096
 
@@ -4988,6 +5053,43 @@ static bool r100_hostdata_blt(ATIVGAState *s, const uint32_t *payload,
     return success;
 }
 
+/*
+ * 3D_CLEAR_ZMASK: first Z mask entry, number of 32-entry blocks, and a
+ * mask of tiles to keep. Cleared tiles read as RB3D_DEPTHCLEARVALUE while
+ * Z decompression is enabled.
+ */
+static bool r100_clear_zmask(ATIVGAState *s, const uint32_t *payload,
+                             unsigned int count)
+{
+    ATI3DState *r = &s->r100_3d;
+    uint64_t first, last;
+
+    if (count != 3) {
+        return false;
+    }
+    trace_ati_r100_clear_zmask(payload[0], payload[1], payload[2],
+                               r->zmask_offset, r->depth_clear_value,
+                               r100_context_read(r, R100_RB3D_ZSTENCILCNTL));
+    if (payload[2]) {
+        qemu_log_mask(LOG_UNIMP,
+                      "ati-r100: 3D_CLEAR_ZMASK tile mask 0x%x ignored\n",
+                      payload[2]);
+    }
+    first = payload[0];
+    last = MIN(first + (uint64_t)payload[1] * 32, ATI_3D_ZMASK_ENTRIES);
+    for (uint64_t entry = first; entry < last;) {
+        uint64_t n = MIN(64 - entry % 64, last - entry);
+
+        r->zmask[entry / 64] |= MAKE_64BIT_MASK(entry % 64, n);
+        entry += n;
+    }
+    if (first < last) {
+        r->zmask_used = true;
+        s->r100_state_generation++;
+    }
+    return true;
+}
+
 static bool r100_process_packet3(ATIVGAState *s, unsigned int opcode,
                                  const uint32_t *payload,
                                  unsigned int count)
@@ -5025,6 +5127,8 @@ static bool r100_process_packet3(ATIVGAState *s, unsigned int opcode,
         return count == 4 && r100_draw_vbuf(s, payload[2], payload[3]);
     case R100_PACKET3_3D_DRAW_VBUF:
         return count >= 2 && r100_draw_vbuf(s, payload[0], payload[1]);
+    case R100_PACKET3_3D_CLEAR_ZMASK:
+        return r100_clear_zmask(s, payload, count);
     case R100_PACKET3_3D_DRAW_VBUF_2:
         return count >= 1 && r100_draw_vbuf(s, r->se_vtx_fmt, payload[0]);
     case R100_PACKET3_3D_RNDR_GEN_PRIM:
