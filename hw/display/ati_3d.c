@@ -886,9 +886,13 @@ static bool r100_parse_vertex(const uint32_t *words, unsigned int count,
         vertex->specular.a = ((packed >> 24) & 0xff) / 255.0f;
     }
 
+    /* each unit's q follows its s and t */
     if (format & R100_VTX_FMT_ST0) {
         vertex->s[0] = r100_float(words[i++]);
         vertex->t[0] = r100_float(words[i++]);
+    }
+    if (format & R100_VTX_FMT_Q0) {
+        vertex->q[0] = r100_float(words[i++]);
     }
     if (format & R100_VTX_FMT_ST1) {
         vertex->s[1] = r100_float(words[i++]);
@@ -908,9 +912,6 @@ static bool r100_parse_vertex(const uint32_t *words, unsigned int count,
         i += 2;
     }
     i += !!(format & R100_VTX_FMT_Q3);
-    if (format & R100_VTX_FMT_Q0) {
-        vertex->q[0] = r100_float(words[i++]);
-    }
     i += extract32(format, 15, 3);
     if (format & R100_VTX_FMT_N0) {
         i += 3;
