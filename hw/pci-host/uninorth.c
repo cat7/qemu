@@ -388,7 +388,7 @@ static const struct {
     { 4, 11, 0x3f },                        /* USB2 */
     { 5, 13, 0x27 }, { 5, 14, 0x28 },       /* ATA-100, FireWire */
     { 6, 15, 0x29 },                        /* GMAC */
-    { 7, 12, 0x11 },                        /* SATA */
+    { 7, 12, 0x00 },                        /* SATA */
 };
 
 static int u3_ht_pci_map_irq(PCIDevice *pci_dev, int irq_num)

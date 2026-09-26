@@ -1,5 +1,9 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# k2-sata.c
+k2_sata_mmio_read(uint64_t addr, unsigned size, uint64_t val) "addr 0x%"PRIx64" size %u val 0x%"PRIx64
+k2_sata_mmio_write(uint64_t addr, unsigned size, uint64_t val) "addr 0x%"PRIx64" size %u val 0x%"PRIx64
+
 # core.c
 # portio
 ide_ioport_read(uint32_t addr, const char *reg, uint32_t val, void *bus, void *s)  "IDE PIO rd @ 0x%"PRIx32" (%s); val 0x%02"PRIx32"; bus %p IDEState %p"

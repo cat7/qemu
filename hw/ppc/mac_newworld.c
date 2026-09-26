@@ -66,6 +66,7 @@
 #include "hw/nvram/fw_cfg.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/ide/k2-sata.h"
 #include "hw/ppc/openpic.h"
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"
@@ -547,23 +548,32 @@ static void ppc_core99_init(MachineState *machine)
 
     if (machine_arch == ARCH_MAC99_U3) {
         /*
-         * The K2 ATA-100, behind the third HT-PCI bridge, takes the first
-         * two IDE drives as master and slave, as a G5's optical drive
-         * shares it with a disk.
+         * As on a G5, the K2 ATA-100 behind the third HT-PCI bridge
+         * holds the optical drives, and the K2 SATA behind the fifth the
+         * hard disks.  IDE drive 0 stays on the ATA-100 so that existing
+         * command lines keep their system disk; the other hard disks go
+         * to SATA ports A and B, then to the ATA-100's free slot.  Drives
+         * given with -device ide-hd,bus=sata.N land where they say.
          */
         DriveInfo *uata_hd[MAX_IDE_DEVS] = {};
-        PCIDevice *uata;
+        DriveInfo *sata_hd[K2_SATA_NUM_PORTS] = {};
+        PCIDevice *uata, *sata;
+        int nuata = 0, nsata = 0;
 
-        for (i = 0, j = 0; i < ARRAY_SIZE(hd); i++) {
+        for (i = 0; i < ARRAY_SIZE(hd); i++) {
             if (!hd[i]) {
                 continue;
             }
-            if (j == MAX_IDE_DEVS) {
-                error_report("mac99: the K2 ATA-100 takes two IDE drives");
+            if (i > 0 && !hd[i]->media_cd && nsata < K2_SATA_NUM_PORTS) {
+                sata_hd[nsata++] = hd[i];
+            } else if (nuata < MAX_IDE_DEVS) {
+                uata_hd[nuata++] = hd[i];
+            } else {
+                error_report("mac99: no IDE slot left for drive %d", i);
                 exit(1);
             }
-            uata_hd[j++] = hd[i];
         }
+
         uata = pci_new(PCI_DEVFN(13, 0), TYPE_K2_UATA);
         pci_realize_and_unref(uata, pci_bridge_get_sec_bus(
                               U3_HT_HOST_BRIDGE(ht_dev)->k2[2]),
@@ -572,6 +582,12 @@ static void ppc_core99_init(MachineState *machine)
                                     qdev_get_gpio_in(pic_dev,
                                                      K2_UATA_DMA_IRQ));
         k2_uata_init_drives(K2_UATA(uata), uata_hd);
+
+        sata = pci_new(PCI_DEVFN(12, 0), TYPE_K2_SATA);
+        pci_realize_and_unref(sata, pci_bridge_get_sec_bus(
+                              U3_HT_HOST_BRIDGE(ht_dev)->k2[4]),
+                              &error_fatal);
+        k2_sata_init_drives(K2_SATA(sata), sata_hd);
     } else {
         /* We only emulate 2 out of 3 IDE controllers for now */
         macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[0]"));

@@ -298,6 +298,9 @@
 
 #define PCI_VENDOR_ID_NVIDIA             0x10de
 
+#define PCI_VENDOR_ID_SERVERWORKS        0x1166
+#define PCI_DEVICE_ID_SERVERWORKS_K2_SATA 0x0240
+
 #define PCI_VENDOR_ID_ASPEED             0x1A03
 
 #endif
