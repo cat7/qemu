@@ -625,10 +625,10 @@ static void ppc_core99_init(MachineState *machine)
     pci_vga_init(pci_bus);
 
     if (!graphic_width) {
-        graphic_width = 800;
+        graphic_width = machine_arch == ARCH_MAC99_U3 ? 1024 : 800;
     }
     if (!graphic_height) {
-        graphic_height = 600;
+        graphic_height = machine_arch == ARCH_MAC99_U3 ? 768 : 600;
     }
     if (!graphic_depth) {
         graphic_depth = 32;
