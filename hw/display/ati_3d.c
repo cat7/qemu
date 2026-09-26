@@ -167,6 +167,13 @@ typedef struct R100TextureState {
     unsigned int route;
     unsigned int max_level;
     bool nonparametric;
+    /* volume: r from unit 2's coordinate set, slices behind each other */
+    bool volume;
+    unsigned int depth;
+    unsigned int rmode;
+    unsigned int r_route;
+    bool r_nonparametric;
+    uint64_t slice_bytes;
     bool valid;
     bool lambda_valid;
     float lambda;
@@ -1312,6 +1319,7 @@ static bool r100_prepare_texture(ATIVGAState *s, unsigned int unit,
     ATI3DState *r = &s->r100_3d;
     uint32_t filter = r100_context_read(r, R100_PP_TXFILTER_0 + unit * 0x18);
     uint32_t coord_fmt = r100_context_read(r, R100_SE_COORD_FMT);
+    uint32_t pp_cntl = r100_context_read(r, R100_PP_CNTL);
 
     memset(texture, 0, sizeof(*texture));
     if (!r100_texture_info(s, unit, texture)) {
@@ -1350,6 +1358,29 @@ static bool r100_prepare_texture(ATIVGAState *s, unsigned int unit,
     texture->level[0] = (R100TextureLevel) {
         texture->width, texture->height, texture->pitch, texture->offset,
     };
+    /* TEX_3D_ENABLE_n: unit n is a volume; unit 2 gives its r and depth */
+    if (unit < 2 && (pp_cntl & (R100_PP_TEX_3D_ENABLE_0 << unit)) &&
+        (pp_cntl & R100_PP_TEX_2_ENABLE)) {
+        uint32_t txformat2 = r100_context_read(r, R100_PP_TXFORMAT_2);
+        uint32_t filter2 = r100_context_read(r, R100_PP_TXFILTER_2);
+
+        texture->r_route = extract32(txformat2, R100_TXFORMAT_ST_ROUTE_SHIFT,
+                                     2);
+        if (texture->r_route >= 3) {
+            return false;
+        }
+        texture->volume = true;
+        texture->depth = 1U << extract32(txformat2, R100_TXFORMAT_WIDTH_SHIFT,
+                                         4);
+        texture->rmode = extract32(filter2, R100_TXFILTER_CLAMP_S_SHIFT, 3);
+        texture->r_nonparametric =
+            coord_fmt & R100_VTX_ST_NONPARAMETRIC(texture->r_route);
+        texture->slice_bytes = (uint64_t)texture->pitch *
+            (texture->block_bytes ? DIV_ROUND_UP(texture->height, 4) :
+                                    texture->height);
+        /* volumes have no mip levels */
+        texture->max_level = 0;
+    }
     for (unsigned int i = 1; i <= texture->max_level; i++) {
         const R100TextureLevel *prev = &texture->level[i - 1];
         R100TextureLevel *level = &texture->level[i];
@@ -1372,6 +1403,9 @@ static uint64_t r100_texture_length(const R100TextureState *texture)
 {
     const R100TextureLevel *last = &texture->level[texture->max_level];
 
+    if (texture->volume) {
+        return texture->slice_bytes * texture->depth;
+    }
     return last->offset - texture->offset +
         (uint64_t)last->pitch * (texture->block_bytes ?
             DIV_ROUND_UP(last->height, 4) : last->height);
@@ -2075,7 +2109,8 @@ static R100Color r100_sample_texture_cached(ATIVGAState *s,
                                             const R100TextureState *texture,
                                             float s_coord, float t_coord,
                                             bool nonparametric,
-                                            unsigned int level, bool linear,
+                                            unsigned int level,
+                                            unsigned int slice, bool linear,
                                             R100TextureBlockCache *cache)
 {
     unsigned int width, height, pitch;
@@ -2088,6 +2123,7 @@ static R100Color r100_sample_texture_cached(ATIVGAState *s,
         cache->sample++;
     }
     r100_texture_level_info(texture, level, &width, &height, &pitch, &offset);
+    offset += (uint64_t)slice * texture->slice_bytes;
     if (nonparametric) {
         u = s_coord * width / texture->width;
         v = t_coord * height / texture->height;
@@ -2148,7 +2184,8 @@ static R100Color r100_sample_texture_cached(ATIVGAState *s,
 static R100Color __attribute__((noinline))
 r100_sample_texture_local(ATIVGAState *s, const R100TextureState *texture,
                           float s_coord, float t_coord, bool nonparametric,
-                          unsigned int level, bool linear)
+                          unsigned int level, unsigned int slice,
+                          bool linear)
 {
     R100TextureBlockCache cache;
 
@@ -2157,14 +2194,16 @@ r100_sample_texture_local(ATIVGAState *s, const R100TextureState *texture,
     cache.next = 0;
     cache.sample = 0;
     return r100_sample_texture_cached(s, texture, s_coord, t_coord,
-                                      nonparametric, level, linear, &cache);
+                                      nonparametric, level, slice, linear,
+                                      &cache);
 }
 
 static R100Color r100_sample_texture_level(ATIVGAState *s,
                                            const R100TextureState *texture,
                                            float s_coord, float t_coord,
                                            bool nonparametric,
-                                           unsigned int level, bool linear,
+                                           unsigned int level,
+                                           unsigned int slice, bool linear,
                                            R100TextureBlockCache *shared_cache)
 {
     /* only block and YUV texels go through a cache */
@@ -2172,11 +2211,42 @@ static R100Color r100_sample_texture_level(ATIVGAState *s,
                           texture->format == R100_TXFORMAT_VYUY422 ||
                           texture->format == R100_TXFORMAT_YVYU422)) {
         return r100_sample_texture_local(s, texture, s_coord, t_coord,
-                                         nonparametric, level, linear);
+                                         nonparametric, level, slice,
+                                         linear);
     }
     return r100_sample_texture_cached(s, texture, s_coord, t_coord,
-                                      nonparametric, level, linear,
+                                      nonparametric, level, slice, linear,
                                       shared_cache);
+}
+
+/* Level 0 of a volume: the two slices around r, blended when linear. */
+static R100Color r100_sample_volume(ATIVGAState *s,
+                                    const R100TextureState *texture,
+                                    float s_coord, float t_coord,
+                                    float r_coord, bool linear,
+                                    R100TextureBlockCache *cache)
+{
+    float w = texture->r_nonparametric ? r_coord : r_coord * texture->depth;
+    R100TextureAxis zaxis;
+    R100Color near, far;
+
+    if (!isfinite(w) || fabsf(w) >= R100_MAX_SAFE_TEXEL_COORD) {
+        return (R100Color) { 1.0f, 1.0f, 1.0f, 1.0f };
+    }
+    zaxis = r100_texture_axis(w, texture->depth, texture->rmode,
+                              texture->d3d_border, linear);
+    near = zaxis.border[0] ? texture->border_color :
+        r100_sample_texture_level(s, texture, s_coord, t_coord,
+                                  texture->nonparametric, 0, zaxis.texel[0],
+                                  linear, cache);
+    if (!linear) {
+        return near;
+    }
+    far = zaxis.border[1] ? texture->border_color :
+        r100_sample_texture_level(s, texture, s_coord, t_coord,
+                                  texture->nonparametric, 0, zaxis.texel[1],
+                                  linear, cache);
+    return r100_color_lerp(near, far, zaxis.fraction);
 }
 
 static R100Color r100_sample_texture(ATIVGAState *s, R100DrawState *draw,
@@ -2233,13 +2303,31 @@ static R100Color r100_sample_texture(ATIVGAState *s, R100DrawState *draw,
         t_coord /= q;
     }
 
+    if (texture->volume) {
+        float r_coord = tex_s[texture->r_route];
+        unsigned int min_texel = min_filter >> 1;
+
+        if (texture->txformat & R100_TXFORMAT_PERSPECTIVE_ENABLE) {
+            float rq = tex_q[texture->r_route];
+
+            if (!isfinite(rq) || rq == 0.0f) {
+                return (R100Color) { 1.0f, 1.0f, 1.0f, 1.0f };
+            }
+            r_coord /= rq;
+        }
+        linear = lambda <= 0.0f ? filter & R100_TXFILTER_MAG_LINEAR :
+                 (min_texel & 1) && min_texel != 3;
+        return r100_sample_volume(s, texture, s_coord, t_coord, r_coord,
+                                  linear, cache);
+    }
+
     /* Two nearest-texel mip modes move the MAG/MIN boundary to lambda 0.5. */
     if (lambda <= ((filter & R100_TXFILTER_MAG_LINEAR) &&
                    (min_filter == R100_TXFILTER_MIN_NEAREST_MIP_NEAREST ||
                     min_filter == R100_TXFILTER_MIN_LINEAR_MIP_NEAREST) ?
                    0.5f : 0.0f)) {
         return r100_sample_texture_level(
-            s, texture, s_coord, t_coord, nonparametric, 0,
+            s, texture, s_coord, t_coord, nonparametric, 0, 0,
             filter & R100_TXFILTER_MAG_LINEAR, cache);
     }
 
@@ -2247,7 +2335,7 @@ static R100Color r100_sample_texture(ATIVGAState *s, R100DrawState *draw,
     case R100_TXFILTER_MIN_NEAREST:
     case R100_TXFILTER_MIN_LINEAR:
         return r100_sample_texture_level(
-            s, texture, s_coord, t_coord, nonparametric, 0,
+            s, texture, s_coord, t_coord, nonparametric, 0, 0,
             min_filter == R100_TXFILTER_MIN_LINEAR, cache);
     case R100_TXFILTER_MIN_NEAREST_MIP_NEAREST:
     case R100_TXFILTER_MIN_NEAREST_MIP_LINEAR:
@@ -2258,7 +2346,8 @@ static R100Color r100_sample_texture(ATIVGAState *s, R100DrawState *draw,
         }
         linear = min_filter == R100_TXFILTER_MIN_NEAREST_MIP_LINEAR;
         return r100_sample_texture_level(s, texture, s_coord, t_coord,
-                                         nonparametric, level, linear, cache);
+                                         nonparametric, level, 0, linear,
+                                         cache);
     case R100_TXFILTER_MIN_LINEAR_MIP_NEAREST:
     case R100_TXFILTER_MIN_LINEAR_MIP_LINEAR:
     {
@@ -2276,19 +2365,20 @@ static R100Color r100_sample_texture(ATIVGAState *s, R100DrawState *draw,
         fraction = lod - level;
         linear = min_filter == R100_TXFILTER_MIN_LINEAR_MIP_LINEAR;
         lower = r100_sample_texture_level(s, texture, s_coord, t_coord,
-                                          nonparametric, level, linear, cache);
+                                          nonparametric, level, 0, linear,
+                                          cache);
         if (level == max_level ||
             (fraction == 0.0f && draw->texture_memory_local)) {
             return lower;
         }
         upper = r100_sample_texture_level(s, texture, s_coord, t_coord,
-                                          nonparametric, level + 1, linear,
-                                          cache);
+                                          nonparametric, level + 1, 0,
+                                          linear, cache);
         return r100_color_lerp(lower, upper, fraction);
     }
     default:
         return r100_sample_texture_level(
-            s, texture, s_coord, t_coord, nonparametric, 0,
+            s, texture, s_coord, t_coord, nonparametric, 0, 0,
             filter & R100_TXFILTER_MAG_LINEAR, cache);
     }
 }
@@ -2606,6 +2696,11 @@ static R100Color r100_texture_pipeline(ATIVGAState *s, R100DrawState *draw,
     unsigned int i;
 
     for (i = 0; i < 3; i++) {
+        /* unit 2 only carries a volume's r */
+        if (i == 2 && (pp_cntl & (R100_PP_TEX_3D_ENABLE_0 |
+                                  R100_PP_TEX_3D_ENABLE_1))) {
+            break;
+        }
         if (pp_cntl & BIT(4 + i)) {
             texture[i] = r100_sample_texture(s, draw, i, tex_s, tex_t, tex_q,
                                              gradients);
