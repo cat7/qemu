@@ -959,6 +959,8 @@
 #define R300_VTE_VPORT_X_OFFSET_ENA   0x00000002
 #define R300_VTE_VPORT_Y_SCALE_ENA    0x00000004
 #define R300_VTE_VPORT_Y_OFFSET_ENA   0x00000008
+#define R300_VTE_VPORT_Z_SCALE_ENA    0x00000010
+#define R300_VTE_VPORT_Z_OFFSET_ENA   0x00000020
 #define R300_VTE_VTX_XY_FMT           0x00000100
 #define R300_VTE_VTX_W0_FMT           0x00000400
 #define R300_VAP_VTX_SIZE             0x20b4
@@ -1047,6 +1049,24 @@
 #define R300_RB3D_AARESOLVE_PITCH     0x4e84
 #define R300_RB3D_AARESOLVE_CTL       0x4e88
 #define R300_AARESOLVE_MODE           (1u << 0)
+#define R300_GB_AA_CONFIG             0x4020
+#define R300_AA_ENABLE                (1u << 0)
+/*
+ * Z buffer. DEPTHPITCH is in pixels, field [13:2] in units of four;
+ * bit 16 macro-tiles the surface in 2 KB blocks and [18:17] micro-tiles
+ * each 32-byte line. DEPTHFORMAT 2 is 24-bit Z over 8-bit stencil.
+ */
+#define R300_ZB_CNTL                  0x4f00
+#define R300_ZB_STENCIL_ENABLE        (1u << 0)
+#define R300_ZB_Z_ENABLE              (1u << 1)
+#define R300_ZB_ZWRITEENABLE          (1u << 2)
+#define R300_ZB_ZSTENCILCNTL          0x4f04
+#define R300_ZB_FORMAT                0x4f10
+#define R300_ZB_FORMAT_24_8           2
+#define R300_ZB_DEPTHOFFSET           0x4f20
+#define R300_ZB_DEPTHPITCH            0x4f24
+#define R300_ZB_MACROTILE             (1u << 16)
+#define R300_ZB_MICROTILE_SHIFT       17
 /*
  * The universal shader's control words and its six instruction banks.
  * The banks are RAM holding many programs at once; US_CONFIG says how

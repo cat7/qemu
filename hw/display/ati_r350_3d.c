@@ -458,6 +458,120 @@ static uint32_t r300_read_dst(ATIR350State *s, const R300DrawState *d,
     return r300_ld32(s, d, addr);
 }
 
+static void r300_st32(ATIR350State *s, const R300DrawState *d,
+                      uint32_t addr, uint32_t val)
+{
+    unsigned xr = ati_r350_vram_xor(s, addr);
+
+    d->vram[(addr + 0) ^ xr] = val & 0xff;
+    d->vram[(addr + 1) ^ xr] = (val >> 8) & 0xff;
+    d->vram[(addr + 2) ^ xr] = (val >> 16) & 0xff;
+    d->vram[(addr + 3) ^ xr] = (val >> 24) & 0xff;
+}
+
+/*
+ * Z buffer addressing. The guest reads the depth buffer back through
+ * the aperture (Chess.app picks a square that way), so the layout is
+ * the one the driver's untiler expects. Measured from the driver's own
+ * reads of a two-sample, macro+micro-tiled 24+8 surface of pitch 704:
+ * pixel (x, y), sample s, sits at
+ *
+ *   ((y >> 3) * (pitch / 32) + (x >> 5)) * 2048
+ *     + x0 << 2 | y0 << 3 | s << 4 | x1 << 5 | y1 << 6 | y2 << 7
+ *     | x2 << 8 | x3 << 9 | x4 << 10          (xN = bit N of x)
+ *
+ * i.e. a 32-byte micro block of 2x2 pixels x 2 samples and a 2 KB macro
+ * block of 16x4 micro blocks. The single-sample form gives the sample
+ * bit back to x (4x2 micro block, 8x8 per macro block); no guest has
+ * read one back, so it is unmeasured.
+ */
+static uint32_t r300_zb_addr(const ATIR350State *s, unsigned x, unsigned y,
+                             unsigned sample)
+{
+    uint32_t a;
+
+    if (!s->zb.macro && !s->zb.micro) {
+        return s->zb.off + ((uint32_t)y * s->zb.pitch + x) * 4;
+    }
+    if (s->zb.aa) {
+        a = ((x & 1) << 2) | ((y & 1) << 3) | (sample << 4);
+        if (s->zb.macro) {
+            a |= (((x >> 1) & 1) << 5) | (((y >> 1) & 3) << 6) |
+                 (((x >> 2) & 7) << 8);
+            a += ((y >> 3) * (s->zb.pitch / 32) + (x >> 5)) * 2048;
+        } else {
+            a += ((y >> 1) * (s->zb.pitch / 2) + (x >> 1)) * 32;
+        }
+    } else {
+        a = ((x & 1) << 2) | (((x >> 1) & 1) << 3) | ((y & 1) << 4);
+        if (s->zb.macro) {
+            a |= (((x >> 2) & 1) << 5) | (((y >> 1) & 3) << 6) |
+                 (((x >> 3) & 3) << 8) | (((y >> 3) & 1) << 10);
+            a += ((y >> 4) * (s->zb.pitch / 32) + (x >> 5)) * 2048;
+        } else {
+            a += ((y >> 1) * (s->zb.pitch / 4) + (x >> 2)) * 32;
+        }
+    }
+    return s->zb.off + a;
+}
+
+/*
+ * Depth test and write for one pixel; false means the fragment is
+ * killed. 24-bit Z sits above the 8 stencil bits, which are kept.
+ */
+static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
+                          unsigned x, unsigned y, float zf)
+{
+    uint32_t addr = r300_zb_addr(s, x, y, 0);
+    uint32_t old, znew, zold;
+    bool pass;
+
+    if (addr + 4 > ATI_R350_VRAM_SIZE) {
+        return true;
+    }
+    old = r300_ld32(s, d, addr);
+    zold = old >> 8;
+    znew = (uint32_t)(MIN(MAX(zf, 0.0f), 1.0f) * 16777215.0f);
+    switch (s->zb.zfunc) {
+    case 0:
+        pass = false;
+        break;
+    case 1:
+        pass = znew < zold;
+        break;
+    case 2:
+        pass = znew <= zold;
+        break;
+    case 3:
+        pass = znew == zold;
+        break;
+    case 4:
+        pass = znew >= zold;
+        break;
+    case 5:
+        pass = znew > zold;
+        break;
+    case 6:
+        pass = znew != zold;
+        break;
+    default:
+        pass = true;
+        break;
+    }
+    if (pass && s->zb.z_wr && znew != zold) {
+        uint32_t val = (znew << 8) | (old & 0xff);
+
+        r300_st32(s, d, addr, val);
+        if (s->zb.aa) {
+            addr = r300_zb_addr(s, x, y, 1);
+            if (addr + 4 <= ATI_R350_VRAM_SIZE) {
+                r300_st32(s, d, addr, val);
+            }
+        }
+    }
+    return pass;
+}
+
 /* the factor codes r300_blend_f() below actually implements */
 static bool r300_blend_known(unsigned code)
 {
@@ -861,6 +975,14 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                     continue;
                 }
             }
+            if (!d->wmask) {
+                /* depth-only pass: nothing to shade */
+                if (s->zb.z_en) {
+                    r300_zb_pixel(s, d, x, y,
+                                  w0 * v0->z + w1 * v1->z + w2 * v2->z);
+                }
+                continue;
+            }
             addr = row + (uint32_t)x * 4;
             if (addr + 4 > ATI_R350_VRAM_SIZE) {
                 continue;
@@ -1054,6 +1176,11 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                     continue;
                 }
             }
+            if (s->zb.z_en &&
+                !r300_zb_pixel(s, d, x, y,
+                               w0 * v0->z + w1 * v1->z + w2 * v2->z)) {
+                continue;
+            }
             if (d->blend) {
                 /*
                  * READ_ENABLE clear means the blender does not fetch
@@ -1137,10 +1264,10 @@ static const float r300_vtx_nowhere = -32768.0f;
  * geometry tens of thousands of pixels outside the render target and
  * filling the window with streaks.
  */
-static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v,
-                           const float *clip)
+static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
+                           R300Vtx *v, const float *clip)
 {
-    float cx, cy, cw;
+    float cx, cy, cz, cw;
 
     if (!d->xform) {
         return;
@@ -1149,12 +1276,15 @@ static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v,
         /* the vertex program computed this position itself */
         cx = clip[0];
         cy = clip[1];
+        cz = clip[2];
         cw = clip[3];
     } else {
         cx = d->mat[0] * v->x + d->mat[1] * v->y +
              d->mat[2] * v->z + d->mat[3] * v->w;
         cy = d->mat[4] * v->x + d->mat[5] * v->y +
              d->mat[6] * v->z + d->mat[7] * v->w;
+        cz = d->mat[8] * v->x + d->mat[9] * v->y +
+             d->mat[10] * v->z + d->mat[11] * v->w;
         cw = d->mat[12] * v->x + d->mat[13] * v->y +
              d->mat[14] * v->z + d->mat[15] * v->w;
     }
@@ -1200,6 +1330,12 @@ static void r300_xform_vtx(const R300DrawState *d, R300Vtx *v,
                          : (cy / cw) * d->vp[2];
     } else {
         v->y = d->vte_yo ? cy / cw + d->vp[3] : cy / cw;
+    }
+    if (s->zb.vte_zs) {
+        v->z = s->zb.vte_zo ? (cz / cw) * d->vp[4] + d->vp[5]
+                            : (cz / cw) * d->vp[4];
+    } else {
+        v->z = s->zb.vte_zo ? cz / cw + d->vp[5] : cz / cw;
     }
     if (!isfinite(v->x) || !isfinite(v->y)) {
         v->x = v->y = r300_vtx_nowhere;
@@ -2564,20 +2700,49 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     }
     {
         uint32_t cm = s->regs[R300_RB3D_COLOR_CHANNEL_MASK >> 2];
+        uint32_t zc = s->regs[R300_ZB_CNTL >> 2];
+        uint32_t zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
+        uint32_t aa = s->regs[R300_GB_AA_CONFIG >> 2];
+        unsigned zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
 
+        s->zb.z_en = false;
+        if (zc & R300_ZB_Z_ENABLE) {
+            if (zfmt != R300_ZB_FORMAT_24_8) {
+                ati_r350_note_gap(s, R350_GAP_ZB_FORMAT, zfmt);
+            } else if ((aa & R300_AA_ENABLE) && (aa & 6)) {
+                /* three, four or six samples: layout unmeasured */
+                ati_r350_note_gap(s, R350_GAP_ZB_FORMAT, 0x10 | (aa & 7));
+            } else if (((zp >> 2) & 0xfff) &&
+                       ati_r350_mc_to_vram(s,
+                           s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
+                           &s->zb.off)) {
+                s->zb.z_en = true;
+                s->zb.z_wr = zc & R300_ZB_ZWRITEENABLE;
+                s->zb.zfunc = s->regs[R300_ZB_ZSTENCILCNTL >> 2] & 7;
+                s->zb.pitch = ((zp >> 2) & 0xfff) * 4;
+                s->zb.macro = zp & R300_ZB_MACROTILE;
+                s->zb.micro = (zp >> R300_ZB_MICROTILE_SHIFT) & 3;
+                s->zb.aa = aa & R300_AA_ENABLE;
+            }
+        }
         if (!(cm & (R300_COLORMASK_BLUE | R300_COLORMASK_GREEN |
                     R300_COLORMASK_RED | R300_COLORMASK_ALPHA))) {
             /*
              * Every channel masked off: the colour buffer discards the
              * quads. Chess's depth-only passes arrive this way, and
-             * shading them smeared a texture across the board.
+             * shading them smeared a texture across the board; they
+             * still write the Z buffer.
              */
-            return false;
+            if (!s->zb.z_en) {
+                return false;
+            }
+            d->wmask = 0;
+        } else {
+            d->wmask = (cm & R300_COLORMASK_ALPHA ? 0xff000000u : 0) |
+                       (cm & R300_COLORMASK_RED   ? 0x00ff0000u : 0) |
+                       (cm & R300_COLORMASK_GREEN ? 0x0000ff00u : 0) |
+                       (cm & R300_COLORMASK_BLUE  ? 0x000000ffu : 0);
         }
-        d->wmask = (cm & R300_COLORMASK_ALPHA ? 0xff000000u : 0) |
-                   (cm & R300_COLORMASK_RED   ? 0x00ff0000u : 0) |
-                   (cm & R300_COLORMASK_GREEN ? 0x0000ff00u : 0) |
-                   (cm & R300_COLORMASK_BLUE  ? 0x000000ffu : 0);
     }
     /*
      * An AA resolve keeps rasterizing over the same geometry but sends
@@ -2846,6 +3011,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
             d->vte_xo = vte & R300_VTE_VPORT_X_OFFSET_ENA;
             d->vte_ys = vte & R300_VTE_VPORT_Y_SCALE_ENA;
             d->vte_yo = vte & R300_VTE_VPORT_Y_OFFSET_ENA;
+            s->zb.vte_zs = vte & R300_VTE_VPORT_Z_SCALE_ENA;
+            s->zb.vte_zo = vte & R300_VTE_VPORT_Z_OFFSET_ENA;
             d->xform = true;
             d->vs_run = d->vs.valid;
             d->vs_color_out = first_color;
@@ -5117,11 +5284,19 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
         r300_cap_draw(s, d, vb, nvtx, prim);
         return;
     }
-    if (s->gl_ctx && nvtx) {
+    if (s->gl_ctx && nvtx && d->wmask) {
         R300GlOutcome o = r300_gl_prims(s, d, vb, nvtx, prim);
 
         if (o == R300_GL_DRAWN) {
-            /* the backend rendered it (and, under verify, so did we) */
+            /*
+             * The backend rendered the colour. The Z buffer is the
+             * CPU's to read, so the depth still goes through the
+             * software path, shading nothing.
+             */
+            if (s->zb.z_en && s->zb.z_wr) {
+                d->wmask = 0;
+                r300_raster_prims(s, d, vb, nvtx, prim);
+            }
             return;
         }
         if (o == R300_GL_NOWORK) {
@@ -5211,9 +5386,9 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
                 r300_trace_texcoord(&d, &fmt, vd, &vb[i]);
             }
             if (d.vs_run && r300_vs_vtx(s, &d, &fmt, vd, &vb[i], clip)) {
-                r300_xform_vtx(&d, &vb[i], clip);
+                r300_xform_vtx(s, &d, &vb[i], clip);
             } else {
-                r300_xform_vtx(&d, &vb[i], NULL);
+                r300_xform_vtx(s, &d, &vb[i], NULL);
             }
         }
         r300_run_prims(s, &d, vb, nvtx, prim);
@@ -5384,11 +5559,11 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                 float clip[4];
 
                 if (r300_vs_vtx(s, &d, &fmt, dw, &vb[i], clip)) {
-                    r300_xform_vtx(&d, &vb[i], clip);
+                    r300_xform_vtx(s, &d, &vb[i], clip);
                     continue;
                 }
             }
-            r300_xform_vtx(&d, &vb[i], NULL);
+            r300_xform_vtx(s, &d, &vb[i], NULL);
         }
         trace_ati_r350_3d_vbuf_vtx((int32_t)(r300_f32(dw[0]) * 1000),
                                    (int32_t)(r300_f32(dw[1]) * 1000),

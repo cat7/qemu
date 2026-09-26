@@ -3339,6 +3339,7 @@ static uint64_t ati_r350_fillwatch_read(void *opaque, hwaddr addr,
             val |= (uint64_t)vram[base + i] << (8 * (size - 1 - i));
         }
     }
+    trace_ati_r350_fillwatch_rd(base, size, val);
     return val;
 }
 
@@ -4171,6 +4172,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_FS_INDIRECT]  = "fragment indirection level",
     [R350_GAP_FS_RS_ROUTE]  = "rasterizer attribute routing",
     [R350_GAP_FS_OUT_FMT]   = "fragment output format",
+    [R350_GAP_ZB_FORMAT]    = "depth buffer format",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)

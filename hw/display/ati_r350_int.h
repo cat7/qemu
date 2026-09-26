@@ -109,6 +109,7 @@ typedef enum ATIR350GapKind {
     R350_GAP_FS_INDIRECT,    /* US_CONFIG names an indirection level */
     R350_GAP_FS_RS_ROUTE,    /* rasterizer routes something we do not emit */
     R350_GAP_FS_OUT_FMT,     /* US_OUT_FMT_0 pixel format not modelled */
+    R350_GAP_ZB_FORMAT,      /* ZB_FORMAT depth format not modelled */
     R350_GAP_MAX
 } ATIR350GapKind;
 
@@ -786,6 +787,22 @@ struct ATIR350State {
     uint32_t pvs_code_slot_valid[R300_PVS_CODE_SLOTS / 32];
     /* dwords ever uploaded to the code region: is there a program at all */
     uint32_t pvs_code_dwords;
+
+    /*
+     * The Z buffer of the draw in hand, decoded from the ZB_* registers
+     * by r300_setup_draw(). Not in R300DrawState: that structure's size
+     * is the draw-capture format's version number.
+     */
+    struct {
+        bool z_en;          /* ZB_CNTL Z_ENABLE */
+        bool z_wr;          /* ZB_CNTL ZWRITEENABLE */
+        bool vte_zs, vte_zo;    /* VAP_VTE_CNTL z scale/offset enables */
+        unsigned zfunc;     /* ZB_ZSTENCILCNTL ZFUNC */
+        uint32_t off;       /* VRAM byte offset, 0x20-aligned */
+        uint32_t pitch;     /* pixels */
+        bool macro, micro;  /* ZB_DEPTHPITCH tiling */
+        bool aa;            /* GB_AA_CONFIG: two samples per pixel */
+    } zb;
 
     /*
      * Phase 2, milestone M4: how much of what real guests upload the
