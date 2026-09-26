@@ -909,6 +909,8 @@ const char *ati_r350_gl_fb_name(ATIR350GlFallback why);
  * is resident, which is always the case with the default gl=off.
  */
 void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why);
+/* reset: give the target back and drop the decoded textures */
+void ati_r350_gl_reset(ATIR350State *s);
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len);
 void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len);
 const char *ati_r350_gl_rel_name(ATIR350GlRel why);

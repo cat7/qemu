@@ -3993,6 +3993,21 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
 }
 
 /*
+ * Device reset. The target goes back and the decoded textures are
+ * dropped. The backend keeps its grow-only colour buffer, and
+ * gl_tex_w/gl_tex_h must keep describing it: zeroing them here left
+ * ati_r350_gl_target() answering "big enough" without ever reporting a
+ * grow, so req.surf_w/surf_h stayed 0 and every offloaded draw after a
+ * warm reboot ran under glViewport(0, 0, 0, 0) -- the flush then wrote
+ * the untouched seed back and the framebuffer never changed.
+ */
+void ati_r350_gl_reset(ATIR350State *s)
+{
+    ati_r350_gl_release(s, R350_GLR_RESET);
+    r300_gl_texdrop(s);
+}
+
+/*
  * A READER of this range: it must see VRAM as the engine left it, so a
  * resident target overlapping it is flushed and given back. Decoded
  * textures are NOT dropped -- reading a texture is what the cache

@@ -3400,11 +3400,8 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
 {
     ATIR350State *s = ATI_R350(obj);
 
-    if (s->gl_ctx) {
-        /* the surface descriptors are about to go: resolve it first */
-        ati_r350_gl_release(s, R350_GLR_RESET);
-        s->gl_tex_w = s->gl_tex_h = 0;
-    }
+    /* the surface descriptors are about to go: resolve the target first */
+    ati_r350_gl_reset(s);
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
     memset(s->palette, 0, sizeof(s->palette));
@@ -3416,6 +3413,36 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     s->i2c_data_len = 0;
     s->i2c_data_pos = 0;
     s->mode_dirty = true;
+
+    /* scanout bookkeeping back to what a cold boot starts from */
+    memset(&s->mode, 0, sizeof(s->mode));
+    memset(&s->crtc_mode, 0, sizeof(s->crtc_mode));
+    s->have_valid_mode = false;
+    memset(s->fb_scan_activity, 0, sizeof(s->fb_scan_activity));
+    memset(s->fb_block_pending, 0, sizeof(s->fb_block_pending));
+    s->fb_scan_counter = 0;
+    s->auto_fb_valid = false;
+    s->auto_fb_pending_valid = false;
+    s->auto_fb_overriding = false;
+    s->force_redraw = true;
+
+    /* CRTC_GEN_CNTL just lost CUR_EN: take the sprite down with it */
+    if (s->hw_cursor_on) {
+        s->hw_cursor_on = false;
+        if (s->con) {
+            qemu_console_set_mouse(s->con, 0, 0, false);
+        }
+    }
+    s->hw_cursor_sum = 0;
+    s->cur_lock = false;
+
+    /* command-stream framing and the host-data accumulator */
+    memset(&s->pm4_fifo, 0, sizeof(s->pm4_fifo));
+    memset(&s->pm4_ring, 0, sizeof(s->pm4_ring));
+    s->pm4_ucode_waddr = 0;
+    s->pm4_ucode_raddr = 0;
+    s->host_data_active = false;
+    memset(&s->hd, 0, sizeof(s->hd));
 
     /* Documented non-zero reset defaults (RRG-G04500-C) */
     s->regs[R350_DAC_CNTL >> 2] = 0x2 |                 /* PS2 output level */
