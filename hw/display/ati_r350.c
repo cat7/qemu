@@ -1910,7 +1910,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_CP_IB_BUFSZ:
         s->regs[base >> 2] = val;
         ati_r350_pm4_indirect(s, s->regs[R350_CP_IB_BASE >> 2] & ~3u,
-                              val & 0x1ffff);
+                              val & 0x7fffff);
         break;
     case R350_PM4_MICROCODE_ADDR:
         s->pm4_ucode_waddr = val & (R350_PM4_MICROCODE_WORDS - 1);
@@ -3206,10 +3206,6 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
 
     trace_ati_r350_pm4_indirect(offset, dwords,
         dwords ? ati_r350_mc_read32(s, offset) : 0);
-    if (dwords > 0x10000) {
-        /* bogus size -- a real IB is at most a few KB */
-        return;
-    }
     for (i = 0; i < dwords; i++) {
         uint32_t val = ati_r350_mc_read32(s, offset + i * 4);
 
