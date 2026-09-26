@@ -1675,6 +1675,22 @@ bool ati_2d_tile_offset(const ATIVGAState *s, uint32_t base, uint32_t pitch,
     return true;
 }
 
+/* 2 KiB macro tile of 8 rows of 256 bytes, addressed by byte column */
+static inline QEMU_ALWAYS_INLINE uint64_t
+r100_macro_tile_offset(unsigned int pitch, unsigned int xbyte, unsigned int y)
+{
+    uint64_t offset;
+
+    offset = (((uint64_t)y >> 3) * (pitch >> 8) + (xbyte >> 8)) << 11;
+    offset += (((y >> 2) ^ (xbyte >> 8)) & 1U) << 10;
+    offset += (((y >> 3) ^ (xbyte >> 7)) & 1U) << 9;
+    offset += (((y >> 1) ^ (xbyte >> 7)) & 1U) << 8;
+    offset += (((y >> 2) ^ (xbyte >> 6)) & 1U) << 7;
+    offset += (y & 1U) << 6;
+    offset += xbyte & 63U;
+    return offset;
+}
+
 static inline QEMU_ALWAYS_INLINE bool
 r100_texture_pixel_offset(uint32_t txoffset, unsigned int pitch,
                           unsigned int cpp, int x, int y,
@@ -1687,29 +1703,27 @@ r100_texture_pixel_offset(uint32_t txoffset, unsigned int pitch,
     uint64_t offset;
 
     if (macro) {
-        /* TODO: Add macro-tile addressing for 8- and 16-bit textures. */
+        if (!micro) {
+            if (pitch < 128) {
+                return false;
+            }
+            *pixel_offset = r100_macro_tile_offset(pitch, (unsigned int)x * cpp,
+                                                   y);
+            return true;
+        }
+        /* TODO: Add macro+micro-tile addressing for 8- and 16-bit textures. */
         if (cpp != 4 || pitch < 128) {
             return false;
         }
-        if (micro) {
-            offset = (((uint64_t)y >> 4) * (pitch >> 7) + (x >> 5)) << 11;
-            offset += ((((y >> 3) ^ (x >> 5)) & 1U) << 10);
-            offset += ((((y >> 4) ^ (x >> 4)) & 1U) << 9);
-            offset += ((((y >> 2) ^ (x >> 4)) & 1U) << 8);
-            offset += ((((y >> 3) ^ (x >> 3)) & 1U) << 7);
-            offset += ((y >> 1) & 1U) << 6;
-            offset += ((x >> 2) & 1U) << 5;
-            offset += (y & 1U) << 4;
-            offset += (x & 3U) << 2;
-        } else {
-            offset = (((uint64_t)y >> 3) * (pitch >> 8) + (x >> 6)) << 11;
-            offset += ((((y >> 2) ^ (x >> 6)) & 1U) << 10);
-            offset += ((((y >> 3) ^ (x >> 5)) & 1U) << 9);
-            offset += ((((y >> 1) ^ (x >> 5)) & 1U) << 8);
-            offset += ((((y >> 2) ^ (x >> 4)) & 1U) << 7);
-            offset += (y & 1U) << 6;
-            offset += (x & 15U) << 2;
-        }
+        offset = (((uint64_t)y >> 4) * (pitch >> 7) + (x >> 5)) << 11;
+        offset += ((((y >> 3) ^ (x >> 5)) & 1U) << 10);
+        offset += ((((y >> 4) ^ (x >> 4)) & 1U) << 9);
+        offset += ((((y >> 2) ^ (x >> 4)) & 1U) << 8);
+        offset += ((((y >> 3) ^ (x >> 3)) & 1U) << 7);
+        offset += ((y >> 1) & 1U) << 6;
+        offset += ((x >> 2) & 1U) << 5;
+        offset += (y & 1U) << 4;
+        offset += (x & 3U) << 2;
         *pixel_offset = offset;
         return true;
     }
@@ -2665,29 +2679,26 @@ static bool r100_color_pixel_offset(uint32_t pitch_reg, unsigned int pitch,
                                          cpp, x, y, pixel_offset);
     }
 
-    /* TODO: Add macro-tile addressing for 8- and 16-bit color targets. */
+    if (!micro) {
+        if (row_bytes < 128) {
+            return false;
+        }
+        *pixel_offset = r100_macro_tile_offset(row_bytes, x * cpp, y);
+        return true;
+    }
+    /* TODO: Add macro+micro-tile addressing for 8- and 16-bit targets. */
     if (cpp != 4 || row_bytes < 128) {
         return false;
     }
-    if (micro) {
-        offset = (((uint64_t)y >> 4) * (row_bytes >> 7) + (x >> 5)) << 11;
-        offset += ((((y >> 3) ^ (x >> 5)) & 1U) << 10);
-        offset += ((((y >> 4) ^ (x >> 4)) & 1U) << 9);
-        offset += ((((y >> 2) ^ (x >> 4)) & 1U) << 8);
-        offset += ((((y >> 3) ^ (x >> 3)) & 1U) << 7);
-        offset += ((y >> 1) & 1U) << 6;
-        offset += ((x >> 2) & 1U) << 5;
-        offset += (y & 1U) << 4;
-        offset += (x & 3U) << 2;
-    } else {
-        offset = (((uint64_t)y >> 3) * (row_bytes >> 8) + (x >> 6)) << 11;
-        offset += ((((y >> 2) ^ (x >> 6)) & 1U) << 10);
-        offset += ((((y >> 3) ^ (x >> 5)) & 1U) << 9);
-        offset += ((((y >> 1) ^ (x >> 5)) & 1U) << 8);
-        offset += ((((y >> 2) ^ (x >> 4)) & 1U) << 7);
-        offset += (y & 1U) << 6;
-        offset += (x & 15U) << 2;
-    }
+    offset = (((uint64_t)y >> 4) * (row_bytes >> 7) + (x >> 5)) << 11;
+    offset += ((((y >> 3) ^ (x >> 5)) & 1U) << 10);
+    offset += ((((y >> 4) ^ (x >> 4)) & 1U) << 9);
+    offset += ((((y >> 2) ^ (x >> 4)) & 1U) << 8);
+    offset += ((((y >> 3) ^ (x >> 3)) & 1U) << 7);
+    offset += ((y >> 1) & 1U) << 6;
+    offset += ((x >> 2) & 1U) << 5;
+    offset += (y & 1U) << 4;
+    offset += (x & 3U) << 2;
     *pixel_offset = offset;
     return true;
 }
