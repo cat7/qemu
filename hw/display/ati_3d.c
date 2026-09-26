@@ -843,6 +843,7 @@ static bool r100_parse_vertex(const uint32_t *words, unsigned int count,
 {
     unsigned int needed = r100_vertex_dwords(format);
     unsigned int i = 0;
+    bool rgba = vf_cntl & R100_VF_COLOR_ORDER_RGBA;
     uint32_t packed;
 
     if (count < needed) {
@@ -857,41 +858,50 @@ static bool r100_parse_vertex(const uint32_t *words, unsigned int count,
     vertex->specular = (R100Color) { 0.0f, 0.0f, 0.0f, 0.0f };
     vertex->q[0] = vertex->q[1] = vertex->q[2] = 1.0f;
 
+    /* COLOR_ORDER names the component order of packed and float colours */
     if (format & R100_VTX_FMT_FPCOLOR) {
-        vertex->color.r = r100_float(words[i++]);
+        float first = r100_float(words[i++]);
+
         vertex->color.g = r100_float(words[i++]);
-        vertex->color.b = r100_float(words[i++]);
+        if (rgba) {
+            vertex->color.r = first;
+            vertex->color.b = r100_float(words[i++]);
+        } else {
+            vertex->color.b = first;
+            vertex->color.r = r100_float(words[i++]);
+        }
     }
     if (format & R100_VTX_FMT_FPALPHA) {
         vertex->color.a = r100_float(words[i++]);
     }
     if (format & R100_VTX_FMT_PKCOLOR) {
         packed = words[i++];
-        if (vf_cntl & R100_VF_COLOR_ORDER_RGBA) {
-            vertex->color.r = (packed & 0xff) / 255.0f;
-            vertex->color.g = ((packed >> 8) & 0xff) / 255.0f;
-            vertex->color.b = ((packed >> 16) & 0xff) / 255.0f;
-        } else {
-            vertex->color.b = (packed & 0xff) / 255.0f;
-            vertex->color.g = ((packed >> 8) & 0xff) / 255.0f;
-            vertex->color.r = ((packed >> 16) & 0xff) / 255.0f;
-        }
-        vertex->color.a = ((packed >> 24) & 0xff) / 255.0f;
+        vertex->color.r = r100_unorm8[(packed >> (rgba ? 0 : 16)) & 0xff];
+        vertex->color.g = r100_unorm8[(packed >> 8) & 0xff];
+        vertex->color.b = r100_unorm8[(packed >> (rgba ? 16 : 0)) & 0xff];
+        vertex->color.a = r100_unorm8[(packed >> 24) & 0xff];
     }
     if (format & R100_VTX_FMT_FPSPEC) {
-        vertex->specular.r = r100_float(words[i++]);
+        float first = r100_float(words[i++]);
+
         vertex->specular.g = r100_float(words[i++]);
-        vertex->specular.b = r100_float(words[i++]);
+        if (rgba) {
+            vertex->specular.r = first;
+            vertex->specular.b = r100_float(words[i++]);
+        } else {
+            vertex->specular.b = first;
+            vertex->specular.r = r100_float(words[i++]);
+        }
     }
     if (format & R100_VTX_FMT_FPFOG) {
         vertex->specular.a = r100_float(words[i++]);
     }
     if (format & R100_VTX_FMT_PKSPEC) {
         packed = words[i++];
-        vertex->specular.b = (packed & 0xff) / 255.0f;
-        vertex->specular.g = ((packed >> 8) & 0xff) / 255.0f;
-        vertex->specular.r = ((packed >> 16) & 0xff) / 255.0f;
-        vertex->specular.a = ((packed >> 24) & 0xff) / 255.0f;
+        vertex->specular.r = r100_unorm8[(packed >> (rgba ? 0 : 16)) & 0xff];
+        vertex->specular.g = r100_unorm8[(packed >> 8) & 0xff];
+        vertex->specular.b = r100_unorm8[(packed >> (rgba ? 16 : 0)) & 0xff];
+        vertex->specular.a = r100_unorm8[(packed >> 24) & 0xff];
     }
 
     /* each unit's q follows its s and t */
