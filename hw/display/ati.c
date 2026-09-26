@@ -2935,6 +2935,12 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
         ati_agp_attach(s);
     }
 
+    if (!s->vga.vram_size_mb) {
+        /* Radeon Mac Edition and Radeon 7000 Mac Edition carry 32 MiB */
+        s->vga.vram_size_mb = s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QY ||
+                              s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QD ?
+                              32 : 16;
+    }
     if (ati_is_rv100_family(s) && s->vga.vram_size_mb < 16) {
         warn_report("Too small video memory for device id");
         s->vga.vram_size_mb = 16;
@@ -3109,7 +3115,7 @@ static void ati_vga_exit(PCIDevice *dev)
 }
 
 static const Property ati_vga_properties[] = {
-    DEFINE_PROP_UINT32("vgamem_mb", ATIVGAState, vga.vram_size_mb, 16),
+    DEFINE_PROP_UINT32("vgamem_mb", ATIVGAState, vga.vram_size_mb, 0),
     DEFINE_PROP_STRING("model", ATIVGAState, model),
     /* AGP capability: on, or auto for a Radeon on an AGP bus */
     DEFINE_PROP_ON_OFF_AUTO("agp", ATIVGAState, agp, ON_OFF_AUTO_OFF),
