@@ -112,6 +112,7 @@ typedef enum ATIR350GapKind {
     R350_GAP_FS_RS_ROUTE,    /* rasterizer routes something we do not emit */
     R350_GAP_FS_OUT_FMT,     /* US_OUT_FMT_0 pixel format not modelled */
     R350_GAP_ZB_FORMAT,      /* ZB_FORMAT depth format not modelled */
+    R350_GAP_CB_FORMAT,      /* COLORFORMAT the rasteriser cannot store */
     R350_GAP_MAX
 } ATIR350GapKind;
 

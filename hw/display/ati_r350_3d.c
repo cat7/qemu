@@ -472,7 +472,7 @@ static inline uint32_t r300_ld32(ATIR350State *s, const R300DrawState *d,
            ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
 }
 
-/* bytes per colour buffer pixel */
+/* bytes per colour buffer pixel, 0 for a reserved COLORFORMAT */
 static unsigned r300_cb_bytes(unsigned fmt)
 {
     switch (fmt) {
@@ -481,9 +481,33 @@ static unsigned r300_cb_bytes(unsigned fmt)
     case R300_COLORFORMAT_ARGB1555:
     case R300_COLORFORMAT_RGB565:
     case R300_COLORFORMAT_ARGB4444:
+    case R300_COLORFORMAT_VYUY:
+    case R300_COLORFORMAT_YVYU:
+    case R300_COLORFORMAT_UV88:
         return 2;
-    default:
+    case R300_COLORFORMAT_ARGB8888:
         return 4;
+    case R300_COLORFORMAT_ARGB16161616:
+        return 8;
+    case R300_COLORFORMAT_ARGB32323232:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+/* the formats r300_read_dst() and r300_write_dst() can store */
+static bool r300_cb_modelled(unsigned fmt)
+{
+    switch (fmt) {
+    case R300_COLORFORMAT_I8:
+    case R300_COLORFORMAT_ARGB1555:
+    case R300_COLORFORMAT_RGB565:
+    case R300_COLORFORMAT_ARGB4444:
+    case R300_COLORFORMAT_ARGB8888:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -2890,6 +2914,14 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     bool vs_live = false;
     unsigned i;
 
+    d->cb_fmt = (colorpitch >> R300_COLORFORMAT_SHIFT) &
+                R300_COLORFORMAT_MASK;
+    d->cb_bpp = r300_cb_bytes(d->cb_fmt);
+    if (!r300_cb_modelled(d->cb_fmt)) {
+        /* drawn as 32bpp it would overrun a narrower buffer */
+        ati_r350_note_gap(s, R350_GAP_CB_FORMAT, d->cb_fmt);
+        return false;
+    }
     d->vram = memory_region_get_ram_ptr(&s->vram);
     d->cb = d->vram;
     d->cb_size = ATI_R350_VRAM_SIZE;
@@ -2907,9 +2939,6 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         ati_r350_note_gap(s, R350_GAP_DEST_OFF_VRAM, 0);
         return false;
     }
-    d->cb_fmt = (colorpitch >> R300_COLORFORMAT_SHIFT) &
-                R300_COLORFORMAT_MASK;
-    d->cb_bpp = r300_cb_bytes(d->cb_fmt);
     {
         static const uint8_t sel_shift[4] = { 24, 16, 8, 0 };
 

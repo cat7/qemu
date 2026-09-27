@@ -4601,6 +4601,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_FS_RS_ROUTE]  = "rasterizer attribute routing",
     [R350_GAP_FS_OUT_FMT]   = "fragment output format",
     [R350_GAP_ZB_FORMAT]    = "depth buffer format",
+    [R350_GAP_CB_FORMAT]    = "colour buffer format",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
