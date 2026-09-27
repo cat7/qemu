@@ -3,6 +3,7 @@
 # k2-sata.c
 k2_sata_mmio_read(uint64_t addr, unsigned size, uint64_t val) "addr 0x%"PRIx64" size %u val 0x%"PRIx64
 k2_sata_mmio_write(uint64_t addr, unsigned size, uint64_t val) "addr 0x%"PRIx64" size %u val 0x%"PRIx64
+k2_sata_irq(int port, int level, uint8_t cmd, uint32_t pending) "port %d level %d ctl 0x%02x pending 0x%x"
 
 # core.c
 # portio

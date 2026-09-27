@@ -11,6 +11,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/irq.h"
 #include "hw/pci/pci.h"
 #include "hw/ide/k2-sata.h"
 #include "migration/vmstate.h"
@@ -76,6 +77,15 @@ static void k2_sata_tf_write(IDEBus *bus, int reg, uint64_t val,
         ide_ioport_write(bus, reg, (val >> 8) & 0xff);
     }
     ide_ioport_write(bus, reg, val & 0xff);
+}
+
+/* A software reset drops the drive's interrupt line */
+static void k2_sata_ctl_write(IDEBus *bus, uint8_t val)
+{
+    if (!(bus->cmd & IDE_CTRL_RESET) && (val & IDE_CTRL_RESET)) {
+        qemu_irq_lower(bus->irq);
+    }
+    ide_ctrl_write(bus, 0, val);
 }
 
 static uint64_t k2_sata_bmdma_read(BMDMAState *bm, hwaddr off, unsigned size)
@@ -227,7 +237,7 @@ static void k2_sata_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         ide_ioport_write(bus, 7, val & 0xff);
         break;
     case K2_SATA_TF_CTL:
-        ide_ctrl_write(bus, 0, val & 0xff);
+        k2_sata_ctl_write(bus, val & 0xff);
         break;
     case K2_SATA_BMDMA_CMD ... K2_SATA_BMDMA_CMD + 3:
         k2_sata_bmdma_write(&s->parent_obj.bmdma[port],
@@ -244,7 +254,7 @@ static void k2_sata_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         s->scontrol[port] = val;
         /* COMRESET: the drive resets and runs its diagnostic */
         if (bus && (val & K2_SATA_SCONTROL_DET) == K2_SATA_DET_RESET) {
-            ide_ctrl_write(bus, 0, bus->cmd | IDE_CTRL_RESET);
+            k2_sata_ctl_write(bus, bus->cmd | IDE_CTRL_RESET);
         }
         break;
     case K2_SATA_SICR1:
@@ -273,8 +283,14 @@ static const MemoryRegionOps k2_sata_mmio_ops = {
 static void k2_sata_set_irq(void *opaque, int port, int level)
 {
     K2SATAState *s = opaque;
+    IDEBus *bus = &s->parent_obj.bus[port];
 
+    /* The FIS that ends a software reset has its interrupt bit clear */
+    if (level && (bus->cmd & IDE_CTRL_RESET)) {
+        return;
+    }
     s->irq_pending = deposit32(s->irq_pending, port, 1, level != 0);
+    trace_k2_sata_irq(port, level, bus->cmd, s->irq_pending);
     pci_set_irq(PCI_DEVICE(s), s->irq_pending != 0);
 }
 
