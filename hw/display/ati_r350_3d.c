@@ -2495,12 +2495,18 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
      * missed, so US_CODE_OFFSET -- the register whose whole purpose is
      * to move a program rather than rewrite it in place -- is in the
      * signature, and every write into an ALU or texture bank clears it.
+     * US_OUT_FMT_0 is compared as well: its component select is decoded
+     * into the program's output permutation, and the same program is
+     * run with different selects (a glyph cache copied out to an I8
+     * buffer selects alpha for every component).
      */
     sig = 1 | ((uint64_t)regs[R300_US_CONFIG >> 2] << 1) |
           ((uint64_t)(regs[R300_US_CODE_OFFSET >> 2] & 0xffffff) << 25);
     if (sig != s->us_sig ||
+        regs[R300_US_OUT_FMT_0 >> 2] != s->us_out_fmt ||
         p->nregs != (regs[R300_US_PIXSIZE >> 2] & 0x1f) + 1) {
         s->us_sig = sig;
+        s->us_out_fmt = regs[R300_US_OUT_FMT_0 >> 2];
         for (i = 0; i < R300_US_CONSTS; i++) {
             unsigned k = (R300_PFS_PARAM_0_X >> 2) + i * 4;
 

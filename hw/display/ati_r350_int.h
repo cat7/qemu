@@ -864,6 +864,7 @@ struct ATIR350State {
      */
     R300UsProgram us_prog;
     uint64_t us_sig;
+    uint32_t us_out_fmt;        /* US_OUT_FMT_0 the decode was made with */
     uint64_t us_draws, us_refused;
     /*
      * The same program as GLSL, for the host-GPU backend, translated
