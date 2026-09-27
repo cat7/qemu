@@ -1081,6 +1081,8 @@
 #define R300_ZB_DEPTHPITCH            0x4f24
 #define R300_ZB_MACROTILE             (1u << 16)
 #define R300_ZB_MICROTILE_SHIFT       17
+#define R300_ZB_DEPTHCLEARVALUE       0x4f28
+#define R300_ZB_ZMASK_PITCH           0x4f34
 /*
  * The universal shader's control words and its six instruction banks.
  * The banks are RAM holding many programs at once; US_CONFIG says how

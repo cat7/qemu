@@ -674,6 +674,59 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
     return pass;
 }
 
+/*
+ * 3D_CLEAR_ZMASK. A zero entry marks its tiles cleared, which reads as
+ * ZB_DEPTHCLEARVALUE; the depth buffer here is kept uncompressed, so
+ * the clear writes that value into the tiles. One dword covers 32x16
+ * pixels (8x4 tiles of 4x4 on two pipes), row-major over
+ * ZB_ZMASK_PITCH pixels: a 640x480 clear is 600 dwords.
+ */
+void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
+                               uint32_t val)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
+    uint32_t clr = s->regs[R300_ZB_DEPTHCLEARVALUE >> 2];
+    unsigned bw = (s->regs[R300_ZB_ZMASK_PITCH >> 2] & 0x3fff) / 32;
+    unsigned smp = (s->regs[R300_GB_AA_CONFIG >> 2] & R300_AA_ENABLE) ? 2 : 1;
+    uint32_t i, off;
+    unsigned x, y, k;
+
+    if (val || !bw || !((zp >> 2) & 0xfff) ||
+        (s->regs[R300_ZB_FORMAT >> 2] & 0xf) != R300_ZB_FORMAT_24_8 ||
+        !ati_r350_mc_to_vram(s, s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
+                             &off)) {
+        return;
+    }
+    s->zb.off = off;
+    s->zb.pitch = ((zp >> 2) & 0xfff) * 4;
+    s->zb.macro = zp & R300_ZB_MACROTILE;
+    s->zb.micro = (zp >> R300_ZB_MICROTILE_SHIFT) & 3;
+    s->zb.aa = smp == 2;
+    n = MIN(n, 0x100000);
+    for (i = first; i < first + n; i++) {
+        unsigned bx = (i % bw) * 32, by = (i / bw) * 16;
+
+        for (y = by; y < by + 16; y++) {
+            for (x = bx; x < bx + 32; x++) {
+                for (k = 0; k < smp; k++) {
+                    uint32_t a = r300_zb_addr(s, x, y, k);
+                    unsigned xr;
+
+                    if (a + 4 > ATI_R350_VRAM_SIZE) {
+                        continue;
+                    }
+                    xr = ati_r350_vram_xor(s, a);
+                    vram[(a + 0) ^ xr] = clr & 0xff;
+                    vram[(a + 1) ^ xr] = (clr >> 8) & 0xff;
+                    vram[(a + 2) ^ xr] = (clr >> 16) & 0xff;
+                    vram[(a + 3) ^ xr] = (clr >> 24) & 0xff;
+                }
+            }
+        }
+    }
+}
+
 /* the factor codes r300_blend_f() below actually implements */
 static bool r300_blend_known(unsigned code)
 {

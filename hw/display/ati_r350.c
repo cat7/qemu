@@ -3271,6 +3271,17 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             }
             p->p3_param_idx++;
             break;
+        case R300_PM4_OPCODE_CLEAR_ZMASK:
+            /* first dword, dword count, value */
+            if (p->p3_param_idx < 3) {
+                p->p3_params[p->p3_param_idx] = val;
+                if (p->p3_param_idx == 2) {
+                    ati_r350_r300_clear_zmask(s, p->p3_params[0],
+                                              p->p3_params[1], val);
+                }
+            }
+            p->p3_param_idx++;
+            break;
         case R300_PM4_OPCODE_DRAW_VBUF_2:
             /* single payload dword: VAP_VF_CNTL for an AOS-array draw */
             if (p->p3_param_idx++ == 0) {
