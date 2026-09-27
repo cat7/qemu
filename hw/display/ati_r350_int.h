@@ -31,6 +31,8 @@
 #include "qemu/bitmap.h"
 #include "hw/i2c/bitbang_i2c.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
+#include "qapi/qapi-types-common.h"
 #include "qom/object.h"
 #include "ati_r350_pvs.h"
 #include "ati_r350_us.h"
@@ -169,6 +171,7 @@ typedef enum ATIR350GlRel {
     R350_GLR_FALLBACK,      /* a draw the offload handed back */
     R350_GLR_BACKEND,       /* the backend declined, mid-draw */
     R350_GLR_RESET,         /* reset, unrealize */
+    R350_GLR_FENCE,         /* a scratch or read pointer write, threaded CP */
     R350_GLR_MAX
 } ATIR350GlRel;
 
@@ -291,6 +294,31 @@ struct ATIR350State {
     uint32_t swap_lo, swap_hi;
     unsigned swap_val;
     bool swap_valid;
+    /* the same memo for the command processor thread */
+    uint32_t eswap_lo, eswap_hi;
+    unsigned eswap_val;
+    bool eswap_valid;
+    /*
+     * Command processor thread. A CPU write of CP_RB_WPTR records the
+     * pointer and wakes it; see "COMMAND PROCESSOR THREAD" in ati_r350.c.
+     */
+    OnOffAuto engine_async;
+    bool engine_on;
+    QemuThread engine_thread;
+    QemuMutex engine_lock;
+    QemuCond engine_cond;
+    QemuEvent engine_idle;
+    VMChangeStateEntry *engine_vmse;
+    bool engine_busy;           /* atomic */
+    bool engine_kick, engine_quit;
+    uint64_t engine_kicks, engine_waits, engine_wait_us, engine_bql_writes;
+    uint64_t engine_ibs, engine_scratch;
+    unsigned engine_rptr_wb;
+    /*
+     * The decoded-texture cache, the scan-block bookkeeping and the VGA
+     * dirty bits it claims are shared by the draw path and the display.
+     */
+    QemuRecMutex gl_tex_lock;
     /* R300 memory-controller indirect register file (MC_IND_INDEX/DATA) */
     uint32_t mc_ind[256];
     /*
@@ -936,6 +964,21 @@ void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap);
  */
 bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len);
 
+bool ati_r350_on_engine(void);
+void ati_r350_engine_wait(ATIR350State *s);
+
+/*
+ * May this thread use the GL target and the command processor's state
+ * right now: always on the engine thread, elsewhere only while it is
+ * idle. It cannot become busy under the BQL, which every other caller
+ * holds.
+ */
+static inline bool ati_r350_gl_mine(ATIR350State *s)
+{
+    return !s->engine_on || ati_r350_on_engine() ||
+           !qatomic_read(&s->engine_busy);
+}
+
 /* something is about to READ this range of VRAM */
 static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
                                      uint32_t len)
@@ -962,6 +1005,11 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
 bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr, uint32_t *off);
 uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr);
 void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val);
+void ati_r350_mc_read_block(ATIR350State *s, uint32_t addr, uint32_t *dst,
+                            unsigned n);
+#define R350_MC_MAP_REGS 7
+void ati_r350_mc_map_save(ATIR350State *s, uint32_t *map);
+bool ati_r350_mc_map_same(ATIR350State *s, const uint32_t *map);
 /*
  * Trace helper: name the window a card address resolves through and
  * return the address it resolves to ("vram" -> a VRAM byte offset,
