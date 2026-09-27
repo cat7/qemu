@@ -22,6 +22,11 @@
 
 #include "exec/target_page.h"
 #include "system/physmem.h"
+#include "system/qtest.h"
+#include "system/runstate.h"
+#include "qemu/main-loop.h"
+#include "qemu/rcu.h"
+#include "qemu/lockable.h"
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
 #include "ati_r350_gl.h"
@@ -200,12 +205,14 @@ static unsigned ati_r350_swap_bits(uint32_t info)
  * winner's bounds, so the walk stops there. With no surface at all the
  * range is bounded only by the surfaces that were stepped over.
  */
-static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off)
+static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off,
+                                  uint32_t *swap_lo, uint32_t *swap_hi,
+                                  unsigned *swap_val, bool *swap_valid)
 {
     uint32_t lo_bound = 0, hi_bound = UINT32_MAX;
     int i;
 
-    s->swap_val = ati_r350_swap_bits(s->regs[R350_SURFACE_CNTL >> 2]);
+    *swap_val = ati_r350_swap_bits(s->regs[R350_SURFACE_CNTL >> 2]);
     for (i = 0; i < 8; i++) {
         uint32_t lo = s->regs[(R350_SURFACE0_LOWER_BOUND +
                                i * R350_SURFACE_STRIDE) >> 2];
@@ -216,7 +223,7 @@ static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off)
             continue;               /* not a live surface */
         }
         if (off >= lo && off <= hi) {
-            s->swap_val = ati_r350_swap_bits(
+            *swap_val = ati_r350_swap_bits(
                 s->regs[(R350_SURFACE0_INFO + i * R350_SURFACE_STRIDE) >> 2]);
             lo_bound = MAX(lo_bound, lo);
             hi_bound = MIN(hi_bound, hi);
@@ -229,9 +236,9 @@ static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off)
             lo_bound = MAX(lo_bound, hi + 1);
         }
     }
-    s->swap_lo = lo_bound;
-    s->swap_hi = hi_bound;
-    s->swap_valid = true;
+    *swap_lo = lo_bound;
+    *swap_hi = hi_bound;
+    *swap_valid = true;
 }
 
 unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
@@ -249,8 +256,17 @@ unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
      * state. The answer is identical either way -- what the memo saves
      * is repeating a 24-register scan for every pixel of every span.
      */
+    if (ati_r350_on_engine()) {
+        /* its own memo: the display resolves concurrently */
+        if (!s->eswap_valid || off < s->eswap_lo || off > s->eswap_hi) {
+            ati_r350_swap_resolve(s, off, &s->eswap_lo, &s->eswap_hi,
+                                  &s->eswap_val, &s->eswap_valid);
+        }
+        return s->eswap_val;
+    }
     if (!s->swap_valid || off < s->swap_lo || off > s->swap_hi) {
-        ati_r350_swap_resolve(s, off);
+        ati_r350_swap_resolve(s, off, &s->swap_lo, &s->swap_hi,
+                              &s->swap_val, &s->swap_valid);
     }
     return s->swap_val;
 }
@@ -600,9 +616,8 @@ static void ati_r350_scan_vram_activity(ATIR350State *s)
     s->fb_scan_counter = 0;
 
     for (i = 0; i < nblocks; i++) {
-        bool dirty = s->fb_block_pending[i];
+        bool dirty = qatomic_xchg(&s->fb_block_pending[i], false);
 
-        s->fb_block_pending[i] = false;
         if (dirty) {
             /*
              * Jump most of the way to the cap on a single hit rather
@@ -635,6 +650,8 @@ static DirtyBitmapSnapshot *ati_r350_take_dirty(ATIR350State *s)
     DirtyBitmapSnapshot *snap;
     int i;
 
+    /* the draw path claims dirty bits for textures; see gl_tex_lock */
+    QEMU_LOCK_GUARD(&s->gl_tex_lock);
     snap = memory_region_snapshot_and_clear_dirty(&s->vram, 0,
                                                    ATI_R350_VRAM_SIZE,
                                                    DIRTY_MEMORY_VGA);
@@ -890,7 +907,9 @@ static bool ati_r350_update_display(void *opaque)
         redraw = true;
     }
     g_free(snap);
-    s->mode = mode;
+    qemu_rec_mutex_lock(&s->gl_tex_lock);
+    s->mode = mode;             /* ati_r350_gl_admit() reads it */
+    qemu_rec_mutex_unlock(&s->gl_tex_lock);
     s->mode_dirty = false;
     if (!redraw) {
         ati_r350_cursor_update(s);
@@ -1388,10 +1407,10 @@ static uint32_t ati_r350_reg_read32(ATIR350State *s, uint32_t base)
         val = s->pm4_buffer_cntl;
         break;
     case R350_CP_RB_RPTR:
-        val = s->pm4_rptr;
+        val = qatomic_read(&s->pm4_rptr);
         break;
     case R350_CP_RB_WPTR:
-        val = s->pm4_wptr;
+        val = qatomic_read(&s->pm4_wptr);
         break;
     case R350_PM4_MICROCODE_DATAH:
         val = s->pm4_microcode[s->pm4_ucode_raddr][0];
@@ -1407,8 +1426,11 @@ static uint32_t ati_r350_reg_read32(ATIR350State *s, uint32_t base)
         val = 0;
         break;
     case R350_RBBM_STATUS:
-        /* engine idle: FIFO fully free, RBBM_ACTIVE and all busy bits clear */
+        /* FIFO fully free; GUI_ACTIVE while the command processor runs */
         val = 0x40 & R350_RBBM_FIFOCNT_MASK;
+        if (qatomic_read(&s->engine_busy)) {
+            val |= 1u << 31;
+        }
         break;
     case R350_RB2D_DSTCACHE_CTLSTAT:
     case R350_RB3D_DSTCACHE_CTLSTAT:
@@ -1464,8 +1486,11 @@ static uint32_t ati_r350_reg_read32(ATIR350State *s, uint32_t base)
         val = s->regs[base >> 2] & 0x3fffffff;
         break;
     case R350_GUI_STAT:
-        /* engine idle, all 64 command FIFO entries free */
+        /* all 64 command FIFO entries free; GUI_ACTIVE while it runs */
         val = 0x40;
+        if (qatomic_read(&s->engine_busy)) {
+            val |= 1u << 31;
+        }
         break;
     case R350_DST_OFFSET:
         val = s->dst_offset_reg;
@@ -1668,9 +1693,20 @@ static void ati_r350_resolve_gui_context(ATIR350State *s)
     }
 }
 
+static bool ati_r350_engine_private_reg(uint32_t base);
+
 static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
                                     uint32_t val)
 {
+    if (ati_r350_on_engine() && !ati_r350_engine_private_reg(base) &&
+        !bql_locked()) {
+        /* display, interrupt, clock and window state belong to the BQL */
+        bql_lock();
+        s->engine_bql_writes++;
+        ati_r350_reg_write32(s, base, val);
+        bql_unlock();
+        return;
+    }
     ati_r350_audit_reg_write(s, base);
 
     /*
@@ -1937,7 +1973,12 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         trace_ati_r350_cp_reg(ati_r350_reg_name(base), val);
         break;
     case R350_SCRATCH_REG_BASE ... R350_SCRATCH_REG_LAST:
-        s->regs[base >> 2] = val;
+        s->engine_scratch++;
+        if (ati_r350_on_engine()) {
+            /* a fence: what was drawn before it is in VRAM first */
+            ati_r350_gl_release(s, R350_GLR_FENCE);
+        }
+        qatomic_store_release(&s->regs[base >> 2], val);
         ati_r350_scratch_writeback(s, (base - R350_SCRATCH_REG_BASE) >> 2);
         break;
     case R300_VAP_PVS_UPLOAD_ADDRESS:
@@ -2009,6 +2050,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_SURFACE0_LOWER_BOUND ... R350_SURFACE7_INFO:
         s->regs[base >> 2] = val;
         s->swap_valid = false;      /* the memoised walk is now stale */
+        s->eswap_valid = false;
         s->force_redraw = true;
         trace_ati_r350_surface(ati_r350_reg_name(base), val);
         break;
@@ -2567,48 +2609,6 @@ uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr)
     return le32_to_cpu(val);
 }
 
-static void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
-{
-    uint32_t off;
-    dma_addr_t bus;
-
-    if (ati_r350_mc_to_vram(s, addr, &off)) {
-        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-
-        if (off + 4 <= ATI_R350_VRAM_SIZE) {
-            ati_r350_gl_dirty(s, off, 4);
-            stl_le_p(vram + off, val);
-            memory_region_set_dirty(&s->vram, off, 4);
-        }
-        return;
-    }
-    val = cpu_to_le32(val);
-    if (ati_r350_mc_to_aic(s, addr, &bus)) {
-        /* bus address */
-    } else if (!ati_r350_mc_to_agp(s, addr, &bus)) {
-        bus = addr;
-    } else if (s->agp_as_valid) {
-        address_space_write(&s->agp_as, bus, MEMTXATTRS_UNSPECIFIED,
-                            &val, sizeof(val));
-        return;
-    }
-    pci_dma_write(PCI_DEVICE(s), bus, &val, sizeof(val));
-}
-
-/*
- * The CP's memory write-backs: the ring read pointer (CP_RB_RPTR_ADDR,
- * unless RB_NO_UPDATE) and any scratch register whose SCRATCH_UMSK bit
- * is set (to SCRATCH_ADDR + 4*n). Drivers poll these in memory rather
- * than reading the registers, so a missing write-back is a silent
- * driver hang.
- */
-/* classic 16x16 arrow: data = black pixels, mask = opaque area */
-static const uint16_t ati_r350_arrow_data[16] = {
-    0x0000, 0x4000, 0x6000, 0x7000, 0x7800, 0x7c00, 0x7e00, 0x7f00,
-    0x7f80, 0x7c00, 0x6c00, 0x4600, 0x0600, 0x0300, 0x0300, 0x0000,
-};
-static const uint16_t ati_r350_arrow_mask[16] = {
-    0xc000, 0xe000, 0xf000, 0xf800, 0xfc00, 0xfe00, 0xff00, 0xff80,
 /* the registers ati_r350_mc_route() depends on */
 static const uint16_t ati_r350_mc_map_regs[R350_MC_MAP_REGS] = {
     R350_MC_FB_LOCATION, R350_MC_AGP_LOCATION, R350_AGP_BASE,
@@ -2698,6 +2698,48 @@ void ati_r350_mc_read_block(ATIR350State *s, uint32_t addr, uint32_t *dst,
     }
 }
 
+static void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
+{
+    uint32_t off;
+    dma_addr_t bus;
+
+    if (ati_r350_mc_to_vram(s, addr, &off)) {
+        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+        if (off + 4 <= ATI_R350_VRAM_SIZE) {
+            ati_r350_gl_dirty(s, off, 4);
+            stl_le_p(vram + off, val);
+            memory_region_set_dirty(&s->vram, off, 4);
+        }
+        return;
+    }
+    val = cpu_to_le32(val);
+    if (ati_r350_mc_to_aic(s, addr, &bus)) {
+        /* bus address */
+    } else if (!ati_r350_mc_to_agp(s, addr, &bus)) {
+        bus = addr;
+    } else if (s->agp_as_valid) {
+        address_space_write(&s->agp_as, bus, MEMTXATTRS_UNSPECIFIED,
+                            &val, sizeof(val));
+        return;
+    }
+    pci_dma_write(PCI_DEVICE(s), bus, &val, sizeof(val));
+}
+
+/*
+ * The CP's memory write-backs: the ring read pointer (CP_RB_RPTR_ADDR,
+ * unless RB_NO_UPDATE) and any scratch register whose SCRATCH_UMSK bit
+ * is set (to SCRATCH_ADDR + 4*n). Drivers poll these in memory rather
+ * than reading the registers, so a missing write-back is a silent
+ * driver hang.
+ */
+/* classic 16x16 arrow: data = black pixels, mask = opaque area */
+static const uint16_t ati_r350_arrow_data[16] = {
+    0x0000, 0x4000, 0x6000, 0x7000, 0x7800, 0x7c00, 0x7e00, 0x7f00,
+    0x7f80, 0x7c00, 0x6c00, 0x4600, 0x0600, 0x0300, 0x0300, 0x0000,
+};
+static const uint16_t ati_r350_arrow_mask[16] = {
+    0xc000, 0xe000, 0xf000, 0xf800, 0xfc00, 0xfe00, 0xff00, 0xff80,
     0xffc0, 0xffe0, 0xfe00, 0xef00, 0xcf00, 0x8780, 0x0780, 0x0380,
 };
 
@@ -2757,7 +2799,7 @@ static uint32_t ati_r350_pm4_read_ring(ATIR350State *s)
         R350_BUF_SWAP_32BIT) {
         val = bswap32(val);
     }
-    s->pm4_rptr = (s->pm4_rptr + 1) & (s->pm4_ring_dwords - 1);
+    qatomic_set(&s->pm4_rptr, (s->pm4_rptr + 1) & (s->pm4_ring_dwords - 1));
     return val;
 }
 
@@ -2773,14 +2815,16 @@ static void ati_r350_pm4_run(ATIR350State *s)
         return;
     }
     ati_r350_pm4_run_ring(s);
-    ati_r350_cp_rptr_writeback(s);
     /*
      * A whole ring is drained inside the guest store that kicked it, so
      * this is the first moment the guest CPU could look at VRAM again --
      * and its loads through the frame-buffer BAR cannot be trapped. See
-     * "GL-OWNED RENDER TARGET" in ati_r350_3d.c.
+     * "GL-OWNED RENDER TARGET" in ati_r350_3d.c. The target goes back
+     * before the read pointer does: the other vCPU, or the guest behind
+     * the command processor thread, may act on the write-back at once.
      */
     ati_r350_gl_release(s, R350_GLR_RING);
+    ati_r350_cp_rptr_writeback(s);
 }
 
 /*
@@ -2797,13 +2841,25 @@ static void ati_r350_pm4_run_ring(ATIR350State *s)
 {
     int guard;
 
-    for (guard = 0; guard < 1000000 && s->pm4_rptr != s->pm4_wptr;
+    s->engine_rptr_wb = 0;
+    for (guard = 0; guard < 1000000 &&
+                    s->pm4_rptr != qatomic_load_acquire(&s->pm4_wptr);
          guard++) {
         uint32_t pos = s->pm4_rptr;
         uint32_t val = ati_r350_pm4_read_ring(s);
 
         trace_ati_r350_pm4_ring_dword(pos, val);
         ati_r350_pm4_parse(s, &s->pm4_ring, val);
+        /*
+         * On the thread the guest refills the ring while it runs: tell
+         * it what has been consumed, between packets and with nothing
+         * left on the GPU.
+         */
+        if (ati_r350_on_engine() && ++s->engine_rptr_wb >= 256 &&
+            !s->pm4_ring.remaining && !s->gl_res) {
+            s->engine_rptr_wb = 0;
+            ati_r350_cp_rptr_writeback(s);
+        }
     }
 }
 
@@ -3302,6 +3358,7 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
 
     trace_ati_r350_pm4_indirect(offset, dwords,
         dwords ? ati_r350_mc_read32(s, offset) : 0);
+    s->engine_ibs++;
     for (i = 0; i < dwords; i++) {
         uint32_t val;
 
@@ -3337,7 +3394,15 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
         trace_ati_r350_pm4_ib_dword(i, val);
         ati_r350_pm4_parse(s, &parser, val);
     }
-    ati_r350_gl_release(s, R350_GLR_IB);
+    /*
+     * Inside the guest store that issued it this is the guest's next
+     * chance to look at VRAM. On the command processor thread it is not:
+     * the guest learns what has finished from a scratch register or the
+     * read pointer, and each of those hands the target back first.
+     */
+    if (!ati_r350_on_engine()) {
+        ati_r350_gl_release(s, R350_GLR_IB);
+    }
 }
 
 /*
@@ -3346,13 +3411,178 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
  * onto the 32-bit register via read-modify-write against the raw
  * stored value.
  */
+/*
+ * COMMAND PROCESSOR THREAD.
+ *
+ * A CPU write of CP_RB_WPTR records the pointer and wakes a thread that
+ * drains the ring without the BQL, so the guest runs on while its
+ * commands draw, as it does beside the chip's own CP. Indirect buffers
+ * the ring names run on the same thread, and so does the GL backend:
+ * its context is made current wherever a draw runs.
+ *
+ * Registers split in two. The engine's own -- the CP, the 2D and 3D
+ * blocks, and the memory-controller windows, surfaces and bus master it
+ * reads while it runs (ati_r350_engine_reg()) -- are what a CPU access
+ * waits for it to go idle before touching, the BQL released while it
+ * waits; so commands complete in order and nothing it uses moves under
+ * it. The read pointer, RBBM_STATUS, GUI_STAT, CP_STAT and the scratch
+ * registers answer at once with its progress. Everything else --
+ * display, cursor, interrupts, clocks -- belongs to the BQL, which a
+ * command stream write to it takes.
+ *
+ * The GL target is the engine's while it runs: a hook on another thread
+ * finds it busy and leaves the target alone (ati_r350_gl_mine()). The
+ * ring and each indirect buffer end with the target handed back, and a
+ * scratch register write or a read pointer write-back hands it back
+ * first, so whatever the guest learns has finished is in VRAM.
+ */
+static __thread bool ati_r350_engine_ctx;
+
+bool ati_r350_on_engine(void)
+{
+    return ati_r350_engine_ctx;
+}
+
+static bool ati_r350_engine_reg(uint32_t base)
+{
+    return base < R350_CLOCK_CNTL_INDEX ||           /* MM_INDEX/DATA */
+           (base >= R350_MC_FB_LOCATION && base <= R350_MC_AGP_LOCATION) ||
+           (base >= R350_AGP_BASE && base <= R350_PCI_GART_PAGE) ||
+           (base >= R350_AIC_CNTL && base <= R350_AIC_HI_ADDR) ||
+           (base >= 0x0700 && base < 0x0800) ||      /* CP */
+           (base >= 0x0a00 && base < 0x0c00) ||      /* BM, GART, surfaces */
+           base >= R350_PM4_FIFO_DATA_EVEN;          /* FIFO, 2D, 3D */
+}
+
+static bool ati_r350_engine_status_reg(uint32_t base)
+{
+    return base == R350_CP_RB_RPTR || base == R350_CP_RB_WPTR ||
+           base == R350_CP_STAT || base == R350_CP_CSQ_STAT ||
+           base == R350_GUI_STAT ||
+           (base >= R350_SCRATCH_REG_BASE && base <= R350_SCRATCH_REG_LAST);
+}
+
+/* registers the command processor writes without the BQL */
+static bool ati_r350_engine_private_reg(uint32_t base)
+{
+    return (base >= 0x0700 && base < 0x0800) ||
+           base >= R350_PM4_FIFO_DATA_EVEN;
+}
+
+/* Wait for the engine to go idle. Called with the BQL, which is released. */
+void ati_r350_engine_wait(ATIR350State *s)
+{
+    int64_t t0;
+
+    if (!s->engine_on || ati_r350_engine_ctx ||
+        !qatomic_load_acquire(&s->engine_busy)) {
+        return;
+    }
+    t0 = get_clock();
+    do {
+        bql_unlock();
+        qemu_event_wait(&s->engine_idle);
+        bql_lock();
+    } while (qatomic_load_acquire(&s->engine_busy));
+    s->engine_waits++;
+    s->engine_wait_us += (get_clock() - t0) / 1000;
+}
+
+static void ati_r350_engine_kick(ATIR350State *s)
+{
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_kick = true;
+    s->engine_kicks++;
+    if (!s->engine_busy) {
+        qemu_event_reset(&s->engine_idle);
+        qatomic_store_release(&s->engine_busy, true);
+    }
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+}
+
+static void *ati_r350_engine_thread(void *opaque)
+{
+    ATIR350State *s = opaque;
+
+    rcu_register_thread();
+    ati_r350_engine_ctx = true;
+    qemu_mutex_lock(&s->engine_lock);
+    for (;;) {
+        while (!s->engine_kick && !s->engine_quit) {
+            qemu_cond_wait(&s->engine_cond, &s->engine_lock);
+        }
+        if (s->engine_quit) {
+            break;
+        }
+        s->engine_kick = false;
+        qemu_mutex_unlock(&s->engine_lock);
+
+        ati_r350_pm4_run(s);
+
+        qemu_mutex_lock(&s->engine_lock);
+        if (!s->engine_kick) {
+            qatomic_store_release(&s->engine_busy, false);
+            qemu_event_set(&s->engine_idle);
+        }
+    }
+    qemu_mutex_unlock(&s->engine_lock);
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void ati_r350_engine_vm_state(void *opaque, bool running,
+                                     RunState state)
+{
+    if (!running) {
+        ati_r350_engine_wait(opaque);
+    }
+}
+
+static void ati_r350_engine_init(ATIR350State *s)
+{
+    qemu_rec_mutex_init(&s->gl_tex_lock);
+    s->engine_on = s->engine_async == ON_OFF_AUTO_ON ||
+                   (s->engine_async == ON_OFF_AUTO_AUTO && !qtest_enabled());
+    if (!s->engine_on) {
+        return;
+    }
+    qemu_mutex_init(&s->engine_lock);
+    qemu_cond_init(&s->engine_cond);
+    qemu_event_init(&s->engine_idle, true);
+    s->engine_vmse = qemu_add_vm_change_state_handler(ati_r350_engine_vm_state,
+                                                      s);
+    qemu_thread_create(&s->engine_thread, "ati-r350-cp",
+                       ati_r350_engine_thread, s, QEMU_THREAD_JOINABLE);
+}
+
+static void ati_r350_engine_fini(ATIR350State *s)
+{
+    if (!s->engine_on) {
+        return;
+    }
+    ati_r350_engine_wait(s);
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_quit = true;
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+    qemu_thread_join(&s->engine_thread);
+    qemu_del_vm_change_state_handler(s->engine_vmse);
+    s->engine_on = false;
+}
+
 static uint64_t ati_r350_mmio_read(void *opaque, hwaddr addr,
                                       unsigned size)
 {
     ATIR350State *s = opaque;
     uint32_t base = addr & 0xfffc;
-    uint32_t val = ati_r350_reg_read32(s, base);
+    uint32_t val;
 
+    if (s->engine_on && qatomic_read(&s->engine_busy) &&
+        ati_r350_engine_reg(base) && !ati_r350_engine_status_reg(base)) {
+        ati_r350_engine_wait(s);
+    }
+    val = ati_r350_reg_read32(s, base);
     val = extract32(val, (addr & 3) * 8, size * 8);
     if (trace_event_get_state_backends(TRACE_ATI_R350_UNK_READ) ||
         trace_event_get_state_backends(TRACE_ATI_R350_REG_READ)) {
@@ -3532,12 +3762,14 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
 {
     ATIR350State *s = ATI_R350(obj);
 
+    ati_r350_engine_wait(s);
     /* the surface descriptors are about to go: resolve the target first */
     ati_r350_gl_reset(s);
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
     memset(s->palette, 0, sizeof(s->palette));
     s->swap_valid = false;          /* the surface registers just went */
+    s->eswap_valid = false;
     s->draw_xr = -1;                /* nothing has been drawn with any */
     s->dac_wr_index = 0;
     s->dac_rd_index = 0;
@@ -4217,6 +4449,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         bitbang_i2c_init(&s->dvi_ddc_i2c, bus);
         s->dvi_ddc_sda = 1;
     }
+    ati_r350_engine_init(s);
 }
 
 static void ati_r350_exit(PCIDevice *dev)
@@ -4224,6 +4457,7 @@ static void ati_r350_exit(PCIDevice *dev)
     ATIR350State *s = ATI_R350(dev);
     unsigned i;
 
+    ati_r350_engine_fini(s);
     timer_free(s->vblank_timer);
     timer_free(s->vblank_end_timer);
     timer_free(s->cursor_timer);
@@ -4249,10 +4483,17 @@ static void ati_r350_exit(PCIDevice *dev)
     }
 }
 
+static int ati_r350_pre_save(void *opaque)
+{
+    ati_r350_engine_wait(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ati_r350 = {
     .name = "ati-radeon9800",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = ati_r350_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, ATIR350State),
         VMSTATE_UINT32_ARRAY(regs, ATIR350State, ATI_R350_NUM_REGS),
@@ -4299,6 +4540,9 @@ static const Property ati_r350_properties[] = {
      * anything at all.
      */
     DEFINE_PROP_BOOL("pvs-glsl", ATIR350State, pvs_glsl, false),
+    /* command processor on its own thread; auto is on except under qtest */
+    DEFINE_PROP_ON_OFF_AUTO("async-engine", ATIR350State, engine_async,
+                            ON_OFF_AUTO_AUTO),
     /*
      * How long a decoded texture may live: "dirty" (the default and the
      * rule the decode depends on), "burst" (the M3 lifetime, kept as
@@ -4516,6 +4760,28 @@ static char *ati_r350_get_us(Object *obj, Error **errp)
  * the acceptance there is a maximum channel delta of 1 with at least
  * 99.9% of pixels at delta 0.
  */
+/*
+ * `engine-stats`: whether the command processor has its own thread, how
+ * often the guest woke it, and how often and how long a CPU register
+ * access waited for it.
+ */
+static char *ati_r350_get_engine(Object *obj, Error **errp)
+{
+    ATIR350State *s = ATI_R350(obj);
+
+    if (!s->engine_on) {
+        return g_strdup("synchronous");
+    }
+    return g_strdup_printf("thread, %s\nkicks %" PRIu64 "\nwaits %" PRIu64
+                           ", %" PRIu64 " us\nbql writes %" PRIu64
+                           "\nindirect buffers %" PRIu64
+                           "\nscratch writes %" PRIu64,
+                           qatomic_read(&s->engine_busy) ? "busy" : "idle",
+                           s->engine_kicks, s->engine_waits,
+                           s->engine_wait_us, s->engine_bql_writes,
+                           s->engine_ibs, s->engine_scratch);
+}
+
 static char *ati_r350_get_gl(Object *obj, Error **errp)
 {
     ATIR350State *s = ATI_R350(obj);
@@ -4612,8 +4878,14 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                " cache hits, %" PRIu64 " linked, %" PRIu64
                                " would not build", ph, pl, pf);
         if (ati_r350_gl_barriers(s->gl_ctx)) {
-            g_string_append_printf(out, "\ntexture barriers: %" PRIu64,
-                                   ati_r350_gl_barriers(s->gl_ctx));
+            uint64_t qu, qf, qw;
+
+            ati_r350_gl_queue_stats(s->gl_ctx, &qu, &qf, &qw);
+            g_string_append_printf(out, "\ntexture barriers: %" PRIu64
+                                   "\ndraw queue: %" PRIu64 " passes in %"
+                                   PRIu64 " flushes, %" PRIu64 " waves",
+                                   ati_r350_gl_barriers(s->gl_ctx),
+                                   qu, qf, qw);
         }
     }
     if (s->gl_addblend) {
@@ -4818,6 +5090,8 @@ static void ati_r350_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_str(klass, "scanout", ati_r350_get_scanout,
                                   NULL);
     object_class_property_add_str(klass, "gl-stats", ati_r350_get_gl, NULL);
+    object_class_property_add_str(klass, "engine-stats",
+                                  ati_r350_get_engine, NULL);
     object_class_property_add_str(klass, "pvs-stats", ati_r350_get_pvs, NULL);
     object_class_property_add_str(klass, "us-stats", ati_r350_get_us, NULL);
     object_class_property_add_str(klass, "palette", ati_r350_get_palette,

@@ -3820,6 +3820,7 @@ static const char *const r300_gl_rel_names[R350_GLR_MAX] = {
     [R350_GLR_FALLBACK] = "draw fell back",
     [R350_GLR_BACKEND]  = "backend declined",
     [R350_GLR_RESET]    = "reset",
+    [R350_GLR_FENCE]    = "fence",
 };
 
 const char *ati_r350_gl_rel_name(ATIR350GlRel why)
@@ -3978,6 +3979,9 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
 {
     uint64_t px;
 
+    if (!ati_r350_gl_mine(s)) {
+        return;         /* the command processor's until it finishes */
+    }
     if (s->gl_texlife == R350_TEXLIFE_BURST) {
         r300_gl_texdrop(s);
     }
@@ -4019,7 +4023,8 @@ void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
 {
     uint32_t lo, hi;
 
-    if (!r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
+    if (!ati_r350_gl_mine(s) ||
+        !r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
         return;
     }
     ati_r350_gl_release(s, R350_GLR_READ);
@@ -4030,6 +4035,7 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
 {
     unsigned k;
 
+    qemu_rec_mutex_lock(&s->gl_tex_lock);
     for (k = 0; s->gl_texlife != R350_TEXLIFE_NEVER &&
                 k < R300_GL_TEXCACHE; k++) {
         if (s->gl_tex[k].live && off < s->gl_tex[k].off + s->gl_tex[k].len &&
@@ -4039,6 +4045,7 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
             s->gl_tex[k].up = false;
         }
     }
+    qemu_rec_mutex_unlock(&s->gl_tex_lock);
     ati_r350_gl_sync(s, off, len);
 }
 
@@ -4408,13 +4415,6 @@ static bool r300_axis_sep(float nx, float ny, const R300Vtx * const a[3],
     return ahi <= blo || bhi <= alo;
 }
 
-static bool r300_tris_overlap(const R300Vtx * const a[3],
-                              const R300Vtx * const b[3])
-{
-    unsigned i;
-
-    for (i = 0; i < 3; i++) {
-        const R300Vtx *p = a[i], *q = a[(i + 1) % 3];
 /*
  * Two triangles with a common edge whose third vertices lie strictly on
  * opposite sides of it are disjoint. The projection test cannot see this
@@ -4458,14 +4458,21 @@ static bool r300_tris_split_by_edge(const R300Vtx * const a[3],
     return false;
 }
 
+static bool r300_tris_overlap(const R300Vtx * const a[3],
+                              const R300Vtx * const b[3])
+{
+    unsigned i;
+
+    if (r300_tris_split_by_edge(a, b)) {
+        return false;
+    }
+    for (i = 0; i < 3; i++) {
+        const R300Vtx *p = a[i], *q = a[(i + 1) % 3];
         const R300Vtx *r = b[i], *t = b[(i + 1) % 3];
 
         if (r300_axis_sep(-(q->y - p->y), q->x - p->x, a, b) ||
             r300_axis_sep(-(t->y - r->y), t->x - r->x, a, b)) {
             return false;
-    if (r300_tris_split_by_edge(a, b)) {
-        return false;
-    }
         }
     }
     return true;
@@ -4724,13 +4731,6 @@ static void r300_gl_rd_rect(const R300DrawState *d, unsigned xr,
  */
 #define R300_GL_TEX_MAX (1024 * 1024)
 
-static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
-                               unsigned unit, uint8_t *rgba)
-{
-    const R300TexUnit *u = &d->tex[unit];
-    int tx, ty;
-
-    for (ty = 0; ty < u->h; ty++) {
 /* r300_texel_chan() scaled back to a byte, which is exactly the byte */
 static inline uint8_t r300_texel_byte(const R300TexUnit *u, uint32_t texel,
                                       unsigned ch)
@@ -4793,15 +4793,22 @@ static bool r300_gl_decode_tex32(ATIR350State *s, const R300DrawState *d,
     return true;
 }
 
+static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit, uint8_t *rgba)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    int tx, ty;
+
+    if (r300_gl_decode_tex32(s, d, unit, rgba)) {
+        return;
+    }
+    for (ty = 0; ty < u->h; ty++) {
         for (tx = 0; tx < u->w; tx++) {
             uint32_t texel = r300_sample_tex(s, d, unit, tx, ty);
             uint8_t *p = rgba + ((size_t)ty * u->w + tx) * 4;
 
             p[0] = (uint8_t)(r300_texel_chan(u, texel, 1) * 255.0f + 0.5f);
             p[1] = (uint8_t)(r300_texel_chan(u, texel, 2) * 255.0f + 0.5f);
-    if (r300_gl_decode_tex32(s, d, unit, rgba)) {
-        return;
-    }
             p[2] = (uint8_t)(r300_texel_chan(u, texel, 3) * 255.0f + 0.5f);
             p[3] = (uint8_t)(r300_texel_chan(u, texel, 0) * 255.0f + 0.5f);
         }
@@ -5376,8 +5383,25 @@ static void r300_trace_rect(ATIR350State *s, const R300DrawState *d,
                            (int)s0, (int)t0, (int)s1, (int)t1);
 }
 
+static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
+                                  const R300Vtx *vb, unsigned nvtx,
+                                  unsigned prim);
+
+/*
+ * The decoded-texture cache and the dirty bits it claims are shared with
+ * the display's refresh, which runs beside the command processor thread.
+ */
 static void r300_run_prims(ATIR350State *s, R300DrawState *d,
                            const R300Vtx *vb, unsigned nvtx, unsigned prim)
+{
+    qemu_rec_mutex_lock(&s->gl_tex_lock);
+    r300_run_prims_locked(s, d, vb, nvtx, prim);
+    qemu_rec_mutex_unlock(&s->gl_tex_lock);
+}
+
+static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
+                                  const R300Vtx *vb, unsigned nvtx,
+                                  unsigned prim)
 {
     if (nvtx && trace_event_get_state_backends(TRACE_ATI_R350_3D_RECT)) {
         r300_trace_rect(s, d, vb, nvtx, prim);
@@ -5635,9 +5659,38 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
+        g_autofree uint32_t *pre = NULL;
+        uint32_t *arr[R300_AOS_MAX] = { NULL };
+        size_t span[R300_AOS_MAX], total = 0;
         R300TexSrc ts[R300_TEXCOORDS];
         uint32_t dw[16];
 
+        /*
+         * Each array outside VRAM is fetched whole before the walk; VRAM
+         * reads are coherency points and stay where they were.
+         */
+        for (a = 0; a < narr; a++) {
+            uint32_t off;
+
+            span[a] = size[a] ? (size_t)(nvtx - 1) * stride[a] + size[a] : 0;
+            if (span[a] && !ati_r350_mc_to_vram(s, addr[a], &off)) {
+                total += span[a];
+            } else {
+                span[a] = 0;
+            }
+        }
+        if (total) {
+            uint32_t *p;
+
+            pre = p = g_new(uint32_t, total);
+            for (a = 0; a < narr; a++) {
+                if (span[a]) {
+                    arr[a] = p;
+                    ati_r350_mc_read_block(s, addr[a], p, span[a]);
+                    p += span[a];
+                }
+            }
+        }
         r300_texcoord_src(&d, vsize, size[0], ts);
         for (i = 0; i < nvtx; i++) {
             unsigned n = 0;
@@ -5704,32 +5757,3 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
         r300_run_prims(s, &d, vb, nvtx, prim);
     }
 }
-        g_autofree uint32_t *pre = NULL;
-        uint32_t *arr[R300_AOS_MAX] = { NULL };
-        size_t span[R300_AOS_MAX], total = 0;
-        /*
-         * Each array outside VRAM is fetched whole before the walk; VRAM
-         * reads are coherency points and stay where they were.
-         */
-        for (a = 0; a < narr; a++) {
-            uint32_t off;
-
-            span[a] = size[a] ? (size_t)(nvtx - 1) * stride[a] + size[a] : 0;
-            if (span[a] && !ati_r350_mc_to_vram(s, addr[a], &off)) {
-                total += span[a];
-            } else {
-                span[a] = 0;
-            }
-        }
-        if (total) {
-            uint32_t *p;
-
-            pre = p = g_new(uint32_t, total);
-            for (a = 0; a < narr; a++) {
-                if (span[a]) {
-                    arr[a] = p;
-                    ati_r350_mc_read_block(s, addr[a], p, span[a]);
-                    p += span[a];
-                }
-            }
-        }
