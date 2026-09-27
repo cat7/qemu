@@ -150,6 +150,7 @@ typedef enum ATIR350GlFallback {
     R350_GLF_BACKEND,       /* the backend itself declined the request */
     R350_GLF_FSPROG,        /* fragment program the translator refused */
     R350_GLF_CBFMT,         /* 16bpp or GART colour buffer */
+    R350_GLF_ZTEST,         /* depth or stencil test */
     R350_GLF_MAX
 } ATIR350GlFallback;
 
@@ -824,14 +825,21 @@ struct ATIR350State {
      * is the draw-capture format's version number.
      */
     struct {
-        bool z_en;          /* ZB_CNTL Z_ENABLE */
+        bool z_en;          /* ZB_CNTL Z_ENABLE or STENCIL_ENABLE */
+        bool z_test;        /* ZB_CNTL Z_ENABLE */
         bool z_wr;          /* ZB_CNTL ZWRITEENABLE */
+        bool s_en;          /* ZB_CNTL STENCIL_ENABLE */
+        bool s_fb;          /* ZB_CNTL STENCIL_FRONT_BACK */
+        uint32_t zsc;       /* ZB_ZSTENCILCNTL */
+        uint8_t s_ref, s_mask, s_wmask;     /* ZB_STENCILREFMASK */
+        unsigned cull;      /* RE_CULL_CNTL, for the primitive in hand */
         bool vte_zs, vte_zo;    /* VAP_VTE_CNTL z scale/offset enables */
         unsigned zfunc;     /* ZB_ZSTENCILCNTL ZFUNC */
         uint32_t off;       /* VRAM byte offset, 0x20-aligned */
         uint32_t pitch;     /* pixels */
         bool macro, micro;  /* ZB_DEPTHPITCH tiling */
         bool aa;            /* GB_AA_CONFIG: two samples per pixel */
+        bool z16;           /* ZB_FORMAT 16-bit Z, no stencil */
     } zb;
 
     /*
@@ -1002,6 +1010,8 @@ static inline void ati_r350_gl_dirty(ATIR350State *s, uint32_t off,
 /* ati_r350_3d.c */
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
 void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
+void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
+                               uint32_t val);
 
 /* ati_r350.c MC-window translation, shared with the engines */
 bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr, uint32_t *off);

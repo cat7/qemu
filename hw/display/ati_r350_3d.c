@@ -663,52 +663,93 @@ static uint32_t r300_zb_addr(const ATIR350State *s, unsigned x, unsigned y,
     return s->zb.off + a;
 }
 
+/* ZFUNC / STENCILFUNC: `a` is the incoming value, `b` the stored one */
+static inline bool r300_zs_cmp(unsigned fn, uint32_t a, uint32_t b)
+{
+    switch (fn) {
+    case 0: return false;
+    case 1: return a < b;
+    case 2: return a <= b;
+    case 3: return a == b;
+    case 4: return a >= b;
+    case 5: return a > b;
+    case 6: return a != b;
+    default: return true;
+    }
+}
+
+static inline uint32_t r300_stencil_op(unsigned op, uint32_t v, uint32_t ref)
+{
+    switch (op) {
+    case 1: return 0;
+    case 2: return ref;
+    case 3: return MIN(v + 1, 0xffu);
+    case 4: return v - (v != 0);
+    case 5: return ~v & 0xff;
+    case 6: return (v + 1) & 0xff;
+    case 7: return (v - 1) & 0xff;
+    default: return v;
+    }
+}
+
 /*
- * Depth test and write for one pixel; false means the fragment is
- * killed. 24-bit Z sits above the 8 stencil bits, which are kept.
+ * Depth and stencil test and write for one pixel; false means the
+ * fragment is killed. 24-bit Z sits above the 8 stencil bits.
  */
 static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
-                          unsigned x, unsigned y, float zf)
+                          unsigned x, unsigned y, float zf, bool back)
 {
     uint32_t addr = r300_zb_addr(s, x, y, 0);
-    uint32_t old, znew, zold;
-    bool pass;
+    uint32_t old, znew, zold, sold, snew, val;
+    bool zpass, spass = true;
 
+    if (s->zb.z16) {
+        /*
+         * 16-bit Z, no stencil. Linear within the pitch: the layout
+         * of a tiled 16-bit surface is unmeasured, and nothing but
+         * this model has been seen to read one.
+         */
+        unsigned xr;
+
+        addr = s->zb.off + ((uint32_t)y * s->zb.pitch + x) * 2;
+        if (addr + 2 > ATI_R350_VRAM_SIZE) {
+            return true;
+        }
+        xr = ati_r350_vram_xor(s, addr);
+        zold = d->vram[addr ^ xr] | (uint32_t)d->vram[(addr + 1) ^ xr] << 8;
+        znew = (uint32_t)(MIN(MAX(zf, 0.0f), 1.0f) * 65535.0f);
+        zpass = !s->zb.z_test || r300_zs_cmp(s->zb.zsc & 7, znew, zold);
+        if (zpass && s->zb.z_wr && znew != zold) {
+            d->vram[addr ^ xr] = znew & 0xff;
+            d->vram[(addr + 1) ^ xr] = znew >> 8;
+        }
+        return zpass;
+    }
     if (addr + 4 > ATI_R350_VRAM_SIZE) {
         return true;
     }
     old = r300_ld32(s, d, addr);
     zold = old >> 8;
+    sold = old & 0xff;
+    snew = sold;
     znew = (uint32_t)(MIN(MAX(zf, 0.0f), 1.0f) * 16777215.0f);
-    switch (s->zb.zfunc) {
-    case 0:
-        pass = false;
-        break;
-    case 1:
-        pass = znew < zold;
-        break;
-    case 2:
-        pass = znew <= zold;
-        break;
-    case 3:
-        pass = znew == zold;
-        break;
-    case 4:
-        pass = znew >= zold;
-        break;
-    case 5:
-        pass = znew > zold;
-        break;
-    case 6:
-        pass = znew != zold;
-        break;
-    default:
-        pass = true;
-        break;
-    }
-    if (pass && s->zb.z_wr && znew != zold) {
-        uint32_t val = (znew << 8) | (old & 0xff);
+    zpass = !s->zb.z_test || r300_zs_cmp(s->zb.zsc & 7, znew, zold);
+    if (s->zb.s_en) {
+        unsigned f = back && s->zb.s_fb ? (s->zb.zsc >> 15) & 0xfff
+                                        : (s->zb.zsc >> 3) & 0xfff;
+        unsigned op;
 
+        spass = r300_zs_cmp(f & 7, s->zb.s_ref & s->zb.s_mask,
+                            sold & s->zb.s_mask);
+        op = !spass ? (f >> 3) & 7 : !zpass ? (f >> 9) & 7 : (f >> 6) & 7;
+        snew = r300_stencil_op(op, sold, s->zb.s_ref);
+        snew = (sold & ~s->zb.s_wmask) | (snew & s->zb.s_wmask);
+    }
+    if (!(spass && zpass && s->zb.z_wr)) {
+        znew = zold;
+    }
+    if (znew != zold || snew != sold) {
+        val = (znew << 8) | snew;
         r300_st32(s, d, addr, val);
         if (s->zb.aa) {
             addr = r300_zb_addr(s, x, y, 1);
@@ -717,7 +758,75 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
             }
         }
     }
-    return pass;
+    return spass && zpass;
+}
+
+/*
+ * 3D_CLEAR_ZMASK. A zero entry marks its tiles cleared, which reads as
+ * ZB_DEPTHCLEARVALUE; the depth buffer here is kept uncompressed, so
+ * the clear writes that value into the tiles. One dword covers 32x16
+ * pixels (8x4 tiles of 4x4 on two pipes), row-major over
+ * ZB_ZMASK_PITCH pixels: a 640x480 clear is 600 dwords.
+ */
+void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
+                               uint32_t val)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
+    uint32_t clr = s->regs[R300_ZB_DEPTHCLEARVALUE >> 2];
+    unsigned bw = (s->regs[R300_ZB_ZMASK_PITCH >> 2] & 0x3fff) / 32;
+    unsigned smp = (s->regs[R300_GB_AA_CONFIG >> 2] & R300_AA_ENABLE) ? 2 : 1;
+    unsigned zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
+    uint32_t i, off;
+    unsigned x, y, k;
+
+    if (val || !bw || !((zp >> 2) & 0xfff) ||
+        (zfmt != R300_ZB_FORMAT_24_8 && zfmt != R300_ZB_FORMAT_16) ||
+        !ati_r350_mc_to_vram(s, s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
+                             &off)) {
+        return;
+    }
+    s->zb.off = off;
+    s->zb.pitch = ((zp >> 2) & 0xfff) * 4;
+    s->zb.macro = zp & R300_ZB_MACROTILE;
+    s->zb.micro = (zp >> R300_ZB_MICROTILE_SHIFT) & 3;
+    s->zb.aa = smp == 2;
+    s->zb.z16 = zfmt == R300_ZB_FORMAT_16;
+    n = MIN(n, 0x100000);
+    for (i = first; i < first + n; i++) {
+        unsigned bx = (i % bw) * 32, by = (i / bw) * 16;
+
+        for (y = by; y < by + 16; y++) {
+            for (x = bx; x < bx + 32; x++) {
+                if (s->zb.z16) {
+                    /* the linear layout r300_zb_pixel() uses */
+                    uint32_t a = off + (y * s->zb.pitch + x) * 2;
+                    unsigned xr;
+
+                    if (a + 2 > ATI_R350_VRAM_SIZE) {
+                        continue;
+                    }
+                    xr = ati_r350_vram_xor(s, a);
+                    vram[a ^ xr] = clr & 0xff;
+                    vram[(a + 1) ^ xr] = (clr >> 8) & 0xff;
+                    continue;
+                }
+                for (k = 0; k < smp; k++) {
+                    uint32_t a = r300_zb_addr(s, x, y, k);
+                    unsigned xr;
+
+                    if (a + 4 > ATI_R350_VRAM_SIZE) {
+                        continue;
+                    }
+                    xr = ati_r350_vram_xor(s, a);
+                    vram[(a + 0) ^ xr] = clr & 0xff;
+                    vram[(a + 1) ^ xr] = (clr >> 8) & 0xff;
+                    vram[(a + 2) ^ xr] = (clr >> 16) & 0xff;
+                    vram[(a + 3) ^ xr] = (clr >> 24) & 0xff;
+                }
+            }
+        }
+    }
 }
 
 /* the factor codes r300_blend_f() below actually implements */
@@ -963,6 +1072,19 @@ static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
     }
 }
 
+/*
+ * area > 0 is clockwise as displayed, Y growing downwards. `cull` is
+ * RE_CULL_CNTL's cull-front, cull-back and clockwise-front bits, plus
+ * bit 3 for a primitive that has no back and bit 4 for a triangle
+ * wound against its strip.
+ */
+static inline bool r300_back_face(unsigned cull, float area)
+{
+    bool cw = (area > 0.0f) != !!(cull & 16);
+
+    return !(cull & 8) && cw != !!(cull & 4);
+}
+
 static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                             const R300Vtx *v0, const R300Vtx *v1,
                             const R300Vtx *v2)
@@ -971,11 +1093,15 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     float inv, dx0, dy0, dx1, dy1, dx2, dy2;
     float a0, b0, c0, a1, b1, c1;
     float tcinv[R300_TEXCOORDS][2] = { { 1.0f, 1.0f } };
-    bool flip, tl0, tl1, tl2;
+    bool flip, tl0, tl1, tl2, back;
     int x0, y0, x1, y1, x, y;
     unsigned n;
 
     if (area == 0.0f) {
+        return;
+    }
+    back = r300_back_face(s->zb.cull, area);
+    if (s->zb.cull & (back ? 2 : 1)) {
         return;
     }
     /*
@@ -1127,7 +1253,8 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 /* depth-only pass: nothing to shade */
                 if (s->zb.z_en) {
                     r300_zb_pixel(s, d, x, y,
-                                  w0 * v0->z + w1 * v1->z + w2 * v2->z);
+                                  w0 * v0->z + w1 * v1->z + w2 * v2->z,
+                                  back);
                 }
                 continue;
             }
@@ -1301,11 +1428,19 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                     continue;
                 }
             }
+            if (s->zb.z_en &&
+                !r300_zb_pixel(s, d, x, y,
+                               w0 * v0->z + w1 * v1->z + w2 * v2->z,
+                               back)) {
+                continue;
+            }
             if (d->discard) {
                 /*
-                 * DISCARD_SRC_PIXELS: kill the fragment outright for
-                 * source values that could not change the destination
-                 * under the configured blend, before it costs a read.
+                 * DISCARD_SRC_PIXELS: skip the colour write for source
+                 * values that could not change the destination under
+                 * the configured blend, before it costs a read. The
+                 * blender runs after the depth and stencil test, so a
+                 * discarded fragment still writes Z.
                  */
                 bool a_zero = ca == 0.0f, a_one = ca == 1.0f;
                 bool rgb_black = cr == 0.0f && cg == 0.0f && cb == 0.0f;
@@ -1338,11 +1473,6 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 if (kill) {
                     continue;
                 }
-            }
-            if (s->zb.z_en &&
-                !r300_zb_pixel(s, d, x, y,
-                               w0 * v0->z + w1 * v1->z + w2 * v2->z)) {
-                continue;
             }
             if (d->blend) {
                 /*
@@ -2957,8 +3087,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         unsigned zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
 
         s->zb.z_en = false;
-        if (zc & R300_ZB_Z_ENABLE) {
-            if (zfmt != R300_ZB_FORMAT_24_8) {
+        if (zc & (R300_ZB_Z_ENABLE | R300_ZB_STENCIL_ENABLE)) {
+            if (zfmt != R300_ZB_FORMAT_24_8 && zfmt != R300_ZB_FORMAT_16) {
                 ati_r350_note_gap(s, R350_GAP_ZB_FORMAT, zfmt);
             } else if ((aa & R300_AA_ENABLE) && (aa & 6)) {
                 /* three, four or six samples: layout unmeasured */
@@ -2967,13 +3097,23 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                        ati_r350_mc_to_vram(s,
                            s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
                            &s->zb.off)) {
+                uint32_t rm = s->regs[R300_ZB_STENCILREFMASK >> 2];
+
                 s->zb.z_en = true;
-                s->zb.z_wr = zc & R300_ZB_ZWRITEENABLE;
-                s->zb.zfunc = s->regs[R300_ZB_ZSTENCILCNTL >> 2] & 7;
+                s->zb.z_test = zc & R300_ZB_Z_ENABLE;
+                s->zb.z_wr = s->zb.z_test && (zc & R300_ZB_ZWRITEENABLE);
+                s->zb.s_en = zc & R300_ZB_STENCIL_ENABLE;
+                s->zb.s_fb = zc & R300_ZB_STENCIL_FRONT_BACK;
+                s->zb.zsc = s->regs[R300_ZB_ZSTENCILCNTL >> 2];
+                s->zb.zfunc = s->zb.z_test ? s->zb.zsc & 7 : 7;
+                s->zb.s_ref = rm & 0xff;
+                s->zb.s_mask = (rm >> 8) & 0xff;
+                s->zb.s_wmask = (rm >> 16) & 0xff;
                 s->zb.pitch = ((zp >> 2) & 0xfff) * 4;
                 s->zb.macro = zp & R300_ZB_MACROTILE;
                 s->zb.micro = (zp >> R300_ZB_MICROTILE_SHIFT) & 3;
                 s->zb.aa = aa & R300_AA_ENABLE;
+                s->zb.z16 = zfmt == R300_ZB_FORMAT_16;
             }
         }
         if (!(cm & (R300_COLORMASK_BLUE | R300_COLORMASK_GREEN |
@@ -3465,6 +3605,9 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
 {
     unsigned i;
 
+    /* points, lines and rectangles are never culled and always front */
+    s->zb.cull = (prim >= 4 && prim <= 7) || (prim >= 13 && prim <= 15)
+                 ? s->regs[R300_RE_CULL_CNTL >> 2] & 7 : 8;
     switch (prim) {
     case 1:     /* point list -- WindowServer's screen composites are
                  * point SPRITES: RE_POINTSIZE gives the width/height
@@ -3561,8 +3704,9 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
             r300_raster_tri(s, d, &vb[0], &vb[i - 1], &vb[i]);
         }
         break;
-    case 6:     /* triangle strip */
+    case 6:     /* triangle strip: every second triangle is wound backwards */
         for (i = 2; i < nvtx; i++) {
+            s->zb.cull = (s->zb.cull & ~16u) | (i & 1) << 4;
             r300_raster_tri(s, d, &vb[i - 2], &vb[i - 1], &vb[i]);
         }
         break;
@@ -5380,6 +5524,10 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if (!d->fs_run || !s->us_glsl_ok) {
         return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
     }
+    /* the GL target has no depth or stencil buffer: the Z buffer is ours */
+    if (s->zb.z_en && (s->zb.s_en || s->zb.zfunc != 7)) {
+        return r300_gl_fallback(s, R350_GLF_ZTEST, prim, nvtx);
+    }
     /*
      * Assemble first: a primitive this path does not know is the
      * commonest fallback and the cheapest one to detect. `vb`/`nvtx`
@@ -5402,6 +5550,29 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     }
     if (!ntri) {
         return r300_gl_fallback(s, R350_GLF_PRIM, prim, nvtx);
+    }
+    if (prim != 8 && prim != 1 &&
+        (s->regs[R300_RE_CULL_CNTL >> 2] & 3)) {
+        /* the triangles r300_raster_prims() would cull, same test */
+        unsigned cull = s->regs[R300_RE_CULL_CNTL >> 2] & 7, j, k = 0;
+
+        for (j = 0; j < ntri; j++) {
+            const unsigned *t = &idx[j * 3];
+            float area = r300_edge(&gvb[t[0]], &gvb[t[1]],
+                                   gvb[t[2]].x, gvb[t[2]].y);
+            unsigned c = cull | (prim == 6 && (t[2] & 1) ? 16 : 0);
+
+            if (area == 0.0f ||
+                (c & (r300_back_face(c, area) ? 2 : 1))) {
+                continue;
+            }
+            memmove(&idx[k * 3], t, 3 * sizeof(*t));
+            k++;
+        }
+        ntri = k;
+        if (!ntri) {
+            return R300_GL_NOWORK;
+        }
     }
     if (!r300_gl_clip(d, &req.sx0, &req.sy0, &req.sx1, &req.sy1)) {
         return r300_gl_fallback(s, R350_GLF_CLIPRULE, prim, nvtx);
@@ -5918,7 +6089,8 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                                narr > 0 ? addr[0] : 0,
                                narr > 1 ? addr[1] : 0);
 
-    if (!nvtx || !vsize || vsize > 16 || nvtx > 4096) {
+    /* NUM_VERTICES is 16 bits; the vertices are fetched to the heap */
+    if (!nvtx || !vsize || vsize > 16) {
         trace_ati_r350_3d_skip(vf, vsize, nvtx);
         return;
     }

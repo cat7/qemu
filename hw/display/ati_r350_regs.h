@@ -1074,19 +1074,34 @@
 /*
  * Z buffer. DEPTHPITCH is in pixels, field [13:2] in units of four;
  * bit 16 macro-tiles the surface in 2 KB blocks and [18:17] micro-tiles
- * each 32-byte line. DEPTHFORMAT 2 is 24-bit Z over 8-bit stencil.
+ * each 32-byte line. DEPTHFORMAT 0 is 16-bit Z, 2 is 24-bit Z over
+ * 8-bit stencil.
  */
 #define R300_ZB_CNTL                  0x4f00
 #define R300_ZB_STENCIL_ENABLE        (1u << 0)
 #define R300_ZB_Z_ENABLE              (1u << 1)
 #define R300_ZB_ZWRITEENABLE          (1u << 2)
+#define R300_ZB_STENCIL_FRONT_BACK    (1u << 4)
+/*
+ * ZSTENCILCNTL: ZFUNC [2:0], then front STENCILFUNC [5:3], STENCILFAIL
+ * [8:6], ZPASS [11:9], ZFAIL [14:12], and the same four for back faces
+ * from bit 15. Functions use the ZFUNC encoding with the reference as
+ * the incoming value; ops are KEEP ZERO REPLACE INCR DECR INVERT
+ * INCR_WRAP DECR_WRAP.
+ */
 #define R300_ZB_ZSTENCILCNTL          0x4f04
+#define R300_ZB_STENCILREFMASK        0x4f08
 #define R300_ZB_FORMAT                0x4f10
+#define R300_ZB_FORMAT_16             0
 #define R300_ZB_FORMAT_24_8           2
 #define R300_ZB_DEPTHOFFSET           0x4f20
 #define R300_ZB_DEPTHPITCH            0x4f24
 #define R300_ZB_MACROTILE             (1u << 16)
 #define R300_ZB_MICROTILE_SHIFT       17
+#define R300_ZB_DEPTHCLEARVALUE       0x4f28
+#define R300_ZB_ZMASK_PITCH           0x4f34
+/* SU_CULL_MODE: cull front, cull back, front face clockwise */
+#define R300_RE_CULL_CNTL             0x42b8
 /*
  * The universal shader's control words and its six instruction banks.
  * The banks are RAM holding many programs at once; US_CONFIG says how
