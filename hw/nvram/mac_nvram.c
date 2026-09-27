@@ -34,6 +34,7 @@
 #include "qemu/cutils.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "qobject/qdict.h"
 #include "trace.h"
 #include <zlib.h> /* for adler32 */
 
@@ -319,6 +320,116 @@ void pmac_format_nvram_core99(MacIONVRAMState *nvr)
 
     stl_be_p(&bank[20], 1);
     stl_be_p(&bank[16], adler32(1, &bank[20], MACIO_NVRAM_SIZE - 20));
+
+    if (nvr->blk &&
+        blk_pwrite(nvr->blk, 0, nvr->size, nvr->data, 0) < 0) {
+        error_report("%s: write of default NVRAM failed", blk_name(nvr->blk));
+    }
+}
+
+/* Length of the CHRP partition at p, 0 if its header is not valid */
+static uint32_t chrp_partition_len(const uint8_t *p)
+{
+    ChrpNvramPartHdr hdr;
+    uint32_t len;
+
+    memcpy(&hdr, p, sizeof(hdr));
+    len = be16_to_cpu(hdr.len) << 4;
+    chrp_nvram_finish_partition(&hdr, len);
+    return hdr.checksum == p[1] ? len : 0;
+}
+
+/* Generation of a valid Core99 bank, 0 if it is not one */
+static uint32_t core99_bank_generation(const uint8_t *bank)
+{
+    if (bank[0] != OSX_NVRAM_SIGNATURE || chrp_partition_len(bank) == 0 ||
+        (uint32_t)ldl_be_p(&bank[16]) !=
+        adler32(1, &bank[20], MACIO_NVRAM_SIZE - 20)) {
+        return 0;
+    }
+    return ldl_be_p(&bank[20]);
+}
+
+/*
+ * True if the bank the firmware will pick (the valid one with the higher
+ * generation, B on a tie) is a valid bank whose partitions tile it and
+ * include the Open Firmware "common" partition.
+ */
+bool pmac_nvram_core99_valid(MacIONVRAMState *nvr)
+{
+    uint32_t gen_a, gen_b, off, len;
+    const uint8_t *bank;
+    bool common = false;
+
+    if (nvr->size != MACIO_NVRAM_FLASH_SIZE) {
+        return false;
+    }
+    gen_a = core99_bank_generation(nvr->data);
+    gen_b = core99_bank_generation(nvr->data + MACIO_NVRAM_SIZE);
+    if (MAX(gen_a, gen_b) == 0) {
+        return false;
+    }
+    bank = nvr->data + (gen_a > gen_b ? 0 : MACIO_NVRAM_SIZE);
+    for (off = 0; off < MACIO_NVRAM_SIZE; off += len) {
+        len = chrp_partition_len(&bank[off]);
+        if (len == 0 || len > MACIO_NVRAM_SIZE - off) {
+            return false;
+        }
+        if (bank[off] == CHRP_NVPART_SYSTEM &&
+            !strncmp((const char *)&bank[off + 4], "common", 12)) {
+            common = true;
+        }
+    }
+    return common;
+}
+
+/*
+ * Open, creating it erased if absent or empty, a default NVRAM backing
+ * file. A file of any other size is left alone and NULL returned.
+ */
+BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size,
+                                      uint8_t fill)
+{
+    BlockBackend *blk;
+    Error *local_err = NULL;
+    QDict *options;
+    struct stat st;
+    int fd;
+
+    fd = qemu_open_old(filename, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        warn_report("could not open NVRAM image '%s': %s",
+                    filename, strerror(errno));
+        return NULL;
+    }
+    if (fstat(fd, &st) < 0) {
+        st.st_size = -1;
+    }
+    if (st.st_size == 0) {
+        g_autofree uint8_t *blank = g_malloc(size);
+
+        memset(blank, fill, size);
+        if (write(fd, blank, size) != size) {
+            st.st_size = -1;
+        } else {
+            st.st_size = size;
+        }
+    }
+    close(fd);
+    if (st.st_size != size) {
+        warn_report("NVRAM image '%s' is not %u bytes, not using it",
+                    filename, size);
+        return NULL;
+    }
+
+    options = qdict_new();
+    qdict_put_str(options, "driver", "raw");
+    blk = blk_new_open(filename, NULL, options, BDRV_O_RDWR, &local_err);
+    if (!blk) {
+        warn_report_err(local_err);
+        return NULL;
+    }
+    return blk;
 }
 
 /* Set up NVRAM with OF and OSX partitions */
