@@ -73,6 +73,8 @@
 
 #include "qemu/osdep.h"
 #include "ati_r350_gl.h"
+#include <float.h>
+#include <math.h>
 
 #if defined(CONFIG_DARWIN) || defined(_WIN32)
 
@@ -696,9 +698,17 @@ struct R350GlCtx {
     struct { int x0, y0, x1, y1; } wr[R350_GL_WRITTEN];
     unsigned nwr;
     uint64_t barriers;
+    /* draws deferred into waves; see "THE DRAW QUEUE" */
+    struct R350GlUnit *q;
+    unsigned nq;
+    float *qv;
+    size_t nqv, qv_cap;
+    bool q_prebarrier;
+    uint64_t q_units, q_flushes, q_waves;
     char desc[128];
 };
 
+static void gl_flush_queue(R350GlCtx *g);
 
 /*
  * Attaching a texture to the framebuffer ends the render pass on this
@@ -1164,6 +1174,19 @@ static void gl_prog_locs(R350GlProg *p)
  * where the interpreter computes the same thing this text does. So a
  * failed link costs correctness nothing and is counted.
  */
+/* the linked program for this request if there is one, without linking */
+static bool gl_prog_cached(R350GlCtx *g, const R350GlReq *r, bool add)
+{
+    unsigned k;
+
+    for (k = 0; k < R350_GL_PROGSLOTS; k++) {
+        if (g->prog[k].key == r->us_key && g->prog[k].add == add) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static R350GlProg *gl_prog_for(R350GlCtx *g, const R350GlReq *r, bool add)
 {
     const char *err = NULL;
@@ -1304,6 +1327,7 @@ void ati_r350_gl_close(R350GlCtx *g)
         unsigned k;
 
         r350_gl_makecurrent(&g->plat);
+        gl_flush_queue(g);
         glDeleteTextures(1, &g->dst);
         glDeleteTextures(1, &g->acc);
         glDeleteTextures(R350_GL_TEXSLOTS + 1, g->tex);
@@ -1323,6 +1347,8 @@ void ati_r350_gl_close(R350GlCtx *g)
         r350_gl_plat_close(&g->plat);
     }
     g_free(g->stage);
+    g_free(g->q);
+    g_free(g->qv);
     g_free(g);
 }
 
@@ -1347,6 +1373,14 @@ void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
 uint64_t ati_r350_gl_barriers(R350GlCtx *g)
 {
     return g ? g->barriers : 0;
+}
+
+void ati_r350_gl_queue_stats(R350GlCtx *g, uint64_t *units, uint64_t *flushes,
+                             uint64_t *waves)
+{
+    *units = g ? g->q_units : 0;
+    *flushes = g ? g->q_flushes : 0;
+    *waves = g ? g->q_waves : 0;
 }
 
 /*
@@ -1401,6 +1435,7 @@ bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
         return false;
     }
     r350_gl_makecurrent(&g->plat);
+    gl_flush_queue(g);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g->cbuf);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -1463,6 +1498,10 @@ bool ati_r350_gl_seed(R350GlCtx *g, int x0, int y0, int w, int h,
             o[3] = p[3 ^ xr];           /* A */
         }
     }
+    /*
+     * No queue flush: a seed only ever covers pixels outside what was
+     * seeded before, and every queued draw lies inside that.
+     */
     r350_gl_makecurrent(&g->plat);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g->cbuf);
@@ -1487,6 +1526,7 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
     }
     st = gl_stage(g, (size_t)w * h * 4);
     r350_gl_makecurrent(&g->plat);
+    gl_flush_queue(g);
     gl_attach(g, g->cbuf);
     glReadPixels(x0, y0, w, h, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, st);
     for (y = 0; y < h; y++) {
@@ -1503,6 +1543,315 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
     ok = glGetError() == GL_NO_ERROR;
     r350_gl_done(&g->plat);
     return ok;
+}
+
+/*
+ * THE DRAW QUEUE.
+ *
+ * With the texture barrier, a draw costs a couple of microseconds, and a
+ * barrier -- a new render pass, which on this host is a new Metal command
+ * buffer -- about fifty. A run of translucent overlapping quads takes one
+ * barrier per quad in submission order. It needs far fewer: only draws
+ * that overlap have an order to keep. So draws are queued and put in
+ * waves: each goes after the latest earlier draw it overlaps -- one wave
+ * later if either of the two reads the destination, the same wave (and
+ * after it, since a wave is emitted in submission order) if neither
+ * does. A wave is one pass; a barrier separates waves. Every pixel still
+ * sees the draws that cover it in submission order, each reading what the
+ * one before it left, so the result is the one the draws would give one
+ * by one.
+ *
+ * "Overlaps" is a rectangle test on the pixels a draw can cover: those
+ * whose centres lie inside its vertices' extent, widened by a margin for
+ * the vertex transform's rounding, within its scissor. A pass of a
+ * self-overlapping draw is queued as a draw of its own.
+ *
+ * The queue is emptied before anything else touches the colour buffer or
+ * a texture a queued draw samples, and before a program is linked --
+ * except a seed, which only writes pixels no queued draw covers.
+ */
+#define R350_GL_QUEUE 1024
+#define R350_GL_QUEUE_VERTS (256 * 1024)
+
+typedef struct R350GlUnit {
+    const R350GlProg *p;
+    unsigned first, count;
+    int rx0, ry0, rx1, ry1;             /* pixels it may write */
+    int sx0, sy0, sx1, sy1;             /* its scissor */
+    bool reads;
+    int wave;
+    int surf_w, surf_h;
+    unsigned tex_slot;                  /* > R350_GL_TEXSLOTS: white */
+    int tex_w, tex_h, clamp_s, clamp_t, textured;
+    uint32_t wmask;
+    int alpha_test, af_func, discard;
+    float af_ref;
+    int blend, blend_read;
+    int src_factor, dst_factor, comb_fcn;
+    int a_src_factor, a_dst_factor, a_comb_fcn;
+    float k_r, k_g, k_b, k_a;
+    bool usk;
+    float usk_v[R350_GL_USK * 4];
+} R350GlUnit;
+
+static bool gl_rect_meet(int ax0, int ay0, int ax1, int ay1,
+                         int bx0, int by0, int bx1, int by1)
+{
+    return ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1;
+}
+
+static bool gl_queue_uses_slot(R350GlCtx *g, unsigned slot)
+{
+    unsigned k;
+
+    for (k = 0; k < g->nq; k++) {
+        if (g->q[k].tex_slot == slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void gl_emit(R350GlCtx *g, const R350GlUnit *u, const R350GlUnit *prev)
+{
+    const R350GlProg *p = u->p;
+
+    if (!prev || prev->p != p) {
+        glUseProgram(p->prog);
+    }
+    if (p->u_usk >= 0 && u->usk) {
+        glUniform4fv(p->u_usk, R350_GL_USK, u->usk_v);
+    }
+    if (!prev || prev->surf_w != u->surf_w || prev->surf_h != u->surf_h) {
+        glViewport(0, 0, u->surf_w, u->surf_h);
+    }
+    if (!prev || prev->tex_slot != u->tex_slot) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, u->tex_slot <= R350_GL_TEXSLOTS
+                      ? g->tex[u->tex_slot] : g->white);
+    }
+    glUniform4f(p->u_rect, 0.0f, 0.0f, (float)u->surf_w, (float)u->surf_h);
+    glUniform2f(p->u_org, 0.0f, 0.0f);
+    glUniform2i(p->u_texsize, u->tex_w, u->tex_h);
+    glUniform2i(p->u_clamp, u->clamp_s, u->clamp_t);
+    glUniform1i(p->u_textured, u->textured);
+    glUniform1i(p->u_alphatest, u->alpha_test);
+    glUniform1i(p->u_affunc, u->af_func);
+    glUniform1f(p->u_afref, u->af_ref);
+    glUniform1i(p->u_discard, u->discard);
+    glUniform1i(p->u_blend, u->blend);
+    glUniform1i(p->u_blendread, u->blend_read);
+    glUniform3i(p->u_cfac, u->src_factor, u->dst_factor, u->comb_fcn);
+    glUniform3i(p->u_afac, u->a_src_factor, u->a_dst_factor, u->a_comb_fcn);
+    glUniform4f(p->u_konst, u->k_r, u->k_g, u->k_b, u->k_a);
+    glScissor(u->sx0, u->sy0, MAX(u->sx1 - u->sx0, 0),
+              MAX(u->sy1 - u->sy0, 0));
+    glColorMask(!!(u->wmask & 0x00ff0000), !!(u->wmask & 0x0000ff00),
+                !!(u->wmask & 0x000000ff), !!(u->wmask & 0xff000000));
+    glDrawArrays(GL_TRIANGLES, (GLint)u->first, (GLsizei)u->count);
+}
+
+static void gl_flush_queue(R350GlCtx *g)
+{
+    const R350GlUnit *prev = NULL;
+    int w, maxw = 0;
+    unsigned k;
+
+    if (!g->nq) {
+        return;
+    }
+    for (k = 0; k < g->nq; k++) {
+        maxw = MAX(maxw, g->q[k].wave);
+    }
+    gl_attach(g, g->cbuf);
+    glBindVertexArray(g->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(float) * g->nqv),
+                 g->qv, GL_STREAM_DRAW);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g->cbuf);
+    glEnable(GL_SCISSOR_TEST);
+    if (g->q_prebarrier) {
+        gl_barrier(g);
+    }
+    for (w = 0; w <= maxw; w++) {
+        if (w) {
+            gl_barrier(g);
+        }
+        for (k = 0; k < g->nq; k++) {
+            const R350GlUnit *u = &g->q[k];
+
+            if (u->wave == w) {
+                gl_emit(g, u, prev);
+                gl_wrote(g, u->rx0, u->ry0, u->rx1, u->ry1);
+                prev = u;
+            }
+        }
+    }
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDisable(GL_SCISSOR_TEST);
+    glActiveTexture(GL_TEXTURE0);
+    g->q_flushes++;
+    g->q_waves += maxw + 1;
+    g->nq = 0;
+    g->nqv = 0;
+    g->q_prebarrier = false;
+}
+
+/* queue one pass of a draw: vertices [v0, v0 + nv) of the request */
+static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
+                            const R350GlProg *p, unsigned v0, unsigned nv,
+                            unsigned slot)
+{
+    R350GlUnit *u;
+    float fx0 = FLT_MAX, fy0 = FLT_MAX, fx1 = -FLT_MAX, fy1 = -FLT_MAX;
+    size_t need = (size_t)nv * R350_GL_VSTRIDE;
+    unsigned k;
+
+    if (g->nq == R350_GL_QUEUE || g->nqv + need > g->qv_cap) {
+        gl_flush_queue(g);
+        if (need > g->qv_cap) {
+            g->qv_cap = MAX(need, (size_t)R350_GL_QUEUE_VERTS);
+            g->qv = g_renew(float, g->qv, g->qv_cap);
+        }
+    }
+    if (!g->q) {
+        g->q = g_new(R350GlUnit, R350_GL_QUEUE);
+    }
+    u = &g->q[g->nq];
+    memcpy(g->qv + g->nqv, r->verts + (size_t)v0 * R350_GL_VSTRIDE,
+           need * sizeof(float));
+    for (k = 0; k < nv; k++) {
+        const float *v = r->verts + (size_t)(v0 + k) * R350_GL_VSTRIDE;
+
+        fx0 = MIN(fx0, v[0]); fx1 = MAX(fx1, v[0]);
+        fy0 = MIN(fy0, v[1]); fy1 = MAX(fy1, v[1]);
+    }
+    u->p = p;
+    u->first = g->nqv / R350_GL_VSTRIDE;
+    u->count = nv;
+    u->sx0 = MAX(r->sx0, r->x0);
+    u->sy0 = MAX(r->sy0, r->y0);
+    u->sx1 = MIN(r->sx1, r->x0 + r->w);
+    u->sy1 = MIN(r->sy1, r->y0 + r->h);
+    /*
+     * The pixels whose centres lie inside the extent, give or take a
+     * sixteenth of a pixel for the vertex transform's rounding.
+     */
+    u->rx0 = MAX(u->sx0, (int)ceilf(fx0 - 0.5f - 0.0625f));
+    u->ry0 = MAX(u->sy0, (int)ceilf(fy0 - 0.5f - 0.0625f));
+    u->rx1 = MIN(u->sx1, (int)floorf(fx1 - 0.5f + 0.0625f) + 1);
+    u->ry1 = MIN(u->sy1, (int)floorf(fy1 - 0.5f + 0.0625f) + 1);
+    if (!isfinite(fx0) || !isfinite(fy0) || !isfinite(fx1) ||
+        !isfinite(fy1)) {
+        u->rx0 = u->sx0; u->ry0 = u->sy0;
+        u->rx1 = u->sx1; u->ry1 = u->sy1;
+    }
+    u->reads = r->blend && r->blend_read;
+    u->surf_w = r->surf_w;
+    u->surf_h = r->surf_h;
+    u->tex_slot = slot;
+    u->tex_w = r->tex_w[0];
+    u->tex_h = r->tex_h[0];
+    u->clamp_s = r->clamp_s[0];
+    u->clamp_t = r->clamp_t[0];
+    u->textured = r->textured & 1;
+    u->wmask = r->wmask;
+    u->alpha_test = r->alpha_test;
+    u->af_func = r->af_func;
+    u->af_ref = r->af_ref;
+    u->discard = r->discard;
+    u->blend = r->blend;
+    u->blend_read = r->blend_read;
+    u->src_factor = r->src_factor;
+    u->dst_factor = r->dst_factor;
+    u->comb_fcn = r->comb_fcn;
+    u->a_src_factor = r->a_src_factor;
+    u->a_dst_factor = r->a_dst_factor;
+    u->a_comb_fcn = r->a_comb_fcn;
+    u->k_r = r->k_r; u->k_g = r->k_g; u->k_b = r->k_b; u->k_a = r->k_a;
+    u->usk = r->us_konst != NULL;
+    if (u->usk) {
+        memcpy(u->usk_v, r->us_konst, sizeof(u->usk_v));
+    }
+    u->wave = 0;
+    if (u->rx1 > u->rx0 && u->ry1 > u->ry0) {
+        for (k = 0; k < g->nq; k++) {
+            const R350GlUnit *e = &g->q[k];
+
+            if (gl_rect_meet(u->rx0, u->ry0, u->rx1, u->ry1,
+                             e->rx0, e->ry0, e->rx1, e->ry1)) {
+                /*
+                 * A pass may sample a pixel no draw in it writes, or one
+                 * that only the sampling fragment writes; so a pair of
+                 * which either reads is a barrier apart.
+                 */
+                u->wave = MAX(u->wave, e->wave +
+                                       (u->reads || e->reads ? 1 : 0));
+            }
+        }
+        if (u->reads && !u->wave) {
+            /* what was drawn before the queue */
+            for (k = 0; k < g->nwr && !g->q_prebarrier; k++) {
+                g->q_prebarrier = gl_rect_meet(u->rx0, u->ry0, u->rx1, u->ry1,
+                                               g->wr[k].x0, g->wr[k].y0,
+                                               g->wr[k].x1, g->wr[k].y1);
+            }
+        }
+    }
+    g->nqv += need;
+    g->nq++;
+    g->q_units++;
+}
+
+static bool gl_enqueue(R350GlCtx *g, const R350GlReq *r)
+{
+    const R350GlProg *p;
+    unsigned slot = R350_GL_TEXSLOTS + 1, k;
+
+    if (!gl_prog_cached(g, r, false)) {
+        gl_flush_queue(g);              /* a link may evict a queued one */
+    }
+    p = gl_prog_for(g, r, false);
+    if (!p) {
+        return false;
+    }
+    if ((r->textured & 1) && r->tex_slot[0] <= R350_GL_TEXSLOTS) {
+        slot = r->tex_slot[0];
+        if (r->tex_fresh[0] && r->tex[0]) {
+            if (gl_queue_uses_slot(g, slot)) {
+                gl_flush_queue(g);
+            }
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g->tex[slot]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            if (g->tex_w[slot] == r->tex_w[0] &&
+                g->tex_h[slot] == r->tex_h[0]) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->tex_w[0],
+                                r->tex_h[0], GL_RGBA_INTEGER,
+                                GL_UNSIGNED_BYTE, r->tex[0]);
+            } else {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->tex_w[0],
+                             r->tex_h[0], 0, GL_RGBA_INTEGER,
+                             GL_UNSIGNED_BYTE, r->tex[0]);
+                g->tex_w[slot] = r->tex_w[0];
+                g->tex_h[slot] = r->tex_h[0];
+            }
+        } else if (g->tex_w[slot] != r->tex_w[0] ||
+                   g->tex_h[slot] != r->tex_h[0]) {
+            return false;               /* see ati_r350_gl_draw() */
+        }
+    }
+    if (r->npass > 1) {
+        for (k = 0; k < r->npass; k++) {
+            gl_enqueue_pass(g, r, p, r->pass[k], r->pass[k + 1] - r->pass[k],
+                            slot);
+        }
+    } else {
+        gl_enqueue_pass(g, r, p, 0, r->nvert, slot);
+    }
+    return glGetError() == GL_NO_ERROR;
 }
 
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
@@ -1524,6 +1873,12 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      * the win32 leg's threading comment.
      */
     r350_gl_makecurrent(&g->plat);
+    if (g->barrier && !r->add_blend && !r->out) {
+        ok = gl_enqueue(g, r);
+        r350_gl_done(&g->plat);
+        return ok;
+    }
+    gl_flush_queue(g);
 
     p = gl_prog_for(g, r, r->add_blend);
     if (!p) {
@@ -1780,6 +2135,12 @@ void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
 uint64_t ati_r350_gl_barriers(R350GlCtx *g)
 {
     return 0;
+}
+
+void ati_r350_gl_queue_stats(R350GlCtx *g, uint64_t *units, uint64_t *flushes,
+                             uint64_t *waves)
+{
+    *units = *flushes = *waves = 0;
 }
 
 #endif /* CONFIG_DARWIN || _WIN32 */
