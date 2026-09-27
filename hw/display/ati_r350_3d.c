@@ -1382,11 +1382,19 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                     continue;
                 }
             }
+            if (s->zb.z_en &&
+                !r300_zb_pixel(s, d, x, y,
+                               w0 * v0->z + w1 * v1->z + w2 * v2->z,
+                               back)) {
+                continue;
+            }
             if (d->discard) {
                 /*
-                 * DISCARD_SRC_PIXELS: kill the fragment outright for
-                 * source values that could not change the destination
-                 * under the configured blend, before it costs a read.
+                 * DISCARD_SRC_PIXELS: skip the colour write for source
+                 * values that could not change the destination under
+                 * the configured blend, before it costs a read. The
+                 * blender runs after the depth and stencil test, so a
+                 * discarded fragment still writes Z.
                  */
                 bool a_zero = ca == 0.0f, a_one = ca == 1.0f;
                 bool rgb_black = cr == 0.0f && cg == 0.0f && cb == 0.0f;
@@ -1419,12 +1427,6 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 if (kill) {
                     continue;
                 }
-            }
-            if (s->zb.z_en &&
-                !r300_zb_pixel(s, d, x, y,
-                               w0 * v0->z + w1 * v1->z + w2 * v2->z,
-                               back)) {
-                continue;
             }
             if (d->blend) {
                 /*
