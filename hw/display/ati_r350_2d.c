@@ -107,6 +107,13 @@ static unsigned ati_r350_host_swap_xor(ATIR350State *s)
                              R350_GUI_HOST_SWAP_MASK);
 }
 
+/* the order a buffer the engine bus-masters INTO is to be left in */
+static unsigned ati_r350_host_dst_swap_xor(ATIR350State *s)
+{
+    return ati_r350_swap_xor(s->regs[R350_GUI_HOST_DST_SWAP_CNTL >> 2] &
+                             R350_GUI_HOST_SWAP_MASK);
+}
+
 /* RBBM_GUICNTL.HOST_DATA_SWAP: the order the CPU PUSHES dwords in. */
 static unsigned ati_r350_host_data_swap_xor(ATIR350State *s)
 {
@@ -209,7 +216,28 @@ static void ati_r350_2d_write_pixel(ATIR350State *s, uint32_t offset,
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
     unsigned xr;
 
-    if (x < 0 || y < 0 || addr + bpp / 8 > ATI_R350_VRAM_SIZE) {
+    if (x < 0 || y < 0) {
+        return;
+    }
+    if (addr + bpp / 8 > ATI_R350_VRAM_SIZE) {
+        /*
+         * Card address outside VRAM: surface page-out to GART, the
+         * mirror of the page-in in ati_r350_2d_read_pixel().
+         */
+        unsigned sx = ati_r350_host_dst_swap_xor(s);
+        unsigned lane = addr & 3, n = bpp / 8, i;
+        uint32_t dw;
+
+        if (bpp == 24 || lane + n > 4) {
+            return;
+        }
+        dw = n == 4 ? 0 : ati_r350_mc_read32(s, addr & ~3u);
+        for (i = 0; i < n; i++) {
+            unsigned sh = ((lane + i) ^ sx) * 8;
+
+            dw = (dw & ~(0xffu << sh)) | (((color >> (i * 8)) & 0xff) << sh);
+        }
+        ati_r350_mc_write32(s, addr & ~3u, dw);
         return;
     }
     if (addr >= 0xd000 && addr < 0xe000) {
@@ -387,6 +415,8 @@ static void ati_r350_2d_do_blt(ATIR350State *s)
     bool left_to_right = s->dp_cntl & R350_DST_X_LEFT_TO_RIGHT;
     bool top_to_bottom = s->dp_cntl & R350_DST_Y_TOP_TO_BOTTOM;
     bool overlaps;
+    bool rop_dst = rop != 0xcc && rop != 0x33 && rop != 0xf0 &&
+                   rop != 0x00 && rop != 0xff;
     int width = s->dst_width;
     int height = s->dst_height;
     uint32_t dst_stride, src_stride;
@@ -480,8 +510,9 @@ static void ati_r350_2d_do_blt(ATIR350State *s)
                                                       src_stride, sx, sy,
                                                       bpp);
             }
-            dst_pixel = ati_r350_2d_read_pixel(s, s->dst_offset,
-                                                  dst_stride, dx, dy, bpp);
+            dst_pixel = rop_dst ? ati_r350_2d_read_pixel(s, s->dst_offset,
+                                                         dst_stride, dx, dy,
+                                                         bpp) : 0;
             result = ati_r350_apply_rop3(rop, src_pixel, dst_pixel,
                                             pat_pixel);
             ati_r350_2d_write_pixel(s, s->dst_offset, dst_stride, dx, dy,

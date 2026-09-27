@@ -146,6 +146,7 @@ typedef enum ATIR350GlFallback {
     R350_GLF_SURFACE,       /* target too large, or it would not resize */
     R350_GLF_BACKEND,       /* the backend itself declined the request */
     R350_GLF_FSPROG,        /* fragment program the translator refused */
+    R350_GLF_CBFMT,         /* 16bpp or GART colour buffer */
     R350_GLF_MAX
 } ATIR350GlFallback;
 
@@ -960,6 +961,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
 /* ati_r350.c MC-window translation, shared with the engines */
 bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr, uint32_t *off);
 uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr);
+void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val);
 /*
  * Trace helper: name the window a card address resolves through and
  * return the address it resolves to ("vram" -> a VRAM byte offset,

@@ -2567,7 +2567,7 @@ uint32_t ati_r350_mc_read32(ATIR350State *s, uint32_t addr)
     return le32_to_cpu(val);
 }
 
-static void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
+void ati_r350_mc_write32(ATIR350State *s, uint32_t addr, uint32_t val)
 {
     uint32_t off;
     dma_addr_t bus;
@@ -4298,6 +4298,7 @@ static const char *const ati_r350_gl_fb_names[R350_GLF_MAX] = {
     [R350_GLF_SURFACE]  = "render target size",
     [R350_GLF_BACKEND]  = "backend declined",
     [R350_GLF_FSPROG]   = "fragment program refused",
+    [R350_GLF_CBFMT]    = "16bpp or GART colour buffer",
 };
 
 const char *ati_r350_gl_fb_name(ATIR350GlFallback why)

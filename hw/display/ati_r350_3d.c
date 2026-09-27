@@ -58,6 +58,12 @@ typedef struct R300Vtx {
      * readers cannot tell.
      */
     float tc[R300_TEXCOORDS][2];
+    /*
+     * Each set's four components as the vertex stage produced them, in
+     * the guest's units, with no size scaling and no divide by q: what
+     * the rasterizer interpolates for a set no fetch reads.
+     */
+    float tcr[R300_TEXCOORDS][4];
 } R300Vtx;
 
 /*
@@ -118,6 +124,8 @@ typedef struct R300DrawState {
     bool vte_ys, vte_yo;
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
+    unsigned cb_fmt;        /* RB3D_COLORPITCH0 COLORFORMAT */
+    unsigned cb_bpp;        /* bytes per colour buffer pixel: 2 or 4 */
     uint32_t wmask;         /* RB3D_COLOR_CHANNEL_MASK as an ARGB byte mask */
     bool resolve;           /* colour buffer in AA-resolve mode */
     uint32_t res_off;       /* the buffer being resolved FROM */
@@ -156,8 +164,20 @@ typedef struct R300DrawState {
      * exactly this many, so a single-texture draw pays nothing.
      */
     unsigned ntc;
+    /* sets read by no LD/PROJ/LODBIAS: the frame gets tcr, all four */
+    unsigned tc_raw;
     float flat_r, flat_g, flat_b, flat_a;
     uint8_t *vram;
+    /*
+     * The colour buffer's bytes: VRAM, or for a buffer in GART a host
+     * copy of rows [0, cb_size / dst_pitch) at card address cb_card,
+     * swapped by COLORENDIAN (cb_xr) rather than the aperture.
+     */
+    uint8_t *cb;
+    uint32_t cb_size;
+    uint32_t cb_card;
+    unsigned cb_xr;
+    bool cb_host;
 } R300DrawState;
 
 /*
@@ -436,26 +456,85 @@ static inline uint32_t r300_ld32(ATIR350State *s, const R300DrawState *d,
  * bytes per pixel meant a dirty-bitmap update for every pixel of every
  * triangle, which for a full-screen blended quad is 786432 of them.
  */
-static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
-                           uint32_t addr, uint32_t argb)
+/* 16bpp colour buffer pixel <-> ARGB8888 */
+static uint32_t r300_cb_unpack16(unsigned fmt, uint32_t v)
 {
-    unsigned xr;
+    uint32_t a, r, g, b;
 
-    if (d->wmask != 0xffffffff) {
-        /* masked-off channels keep whatever the destination holds */
-        argb = (argb & d->wmask) | (r300_ld32(s, d, addr) & ~d->wmask);
+    switch (fmt) {
+    case R300_COLORFORMAT_RGB565:
+        a = 0xff;
+        r = r300_c5to8((v >> 11) & 0x1f);
+        g = ((v >> 5) & 0x3f) << 2 | ((v >> 9) & 3);
+        b = r300_c5to8(v & 0x1f);
+        break;
+    case R300_COLORFORMAT_ARGB4444:
+        a = ((v >> 12) & 0xf) * 0x11;
+        r = ((v >> 8) & 0xf) * 0x11;
+        g = ((v >> 4) & 0xf) * 0x11;
+        b = (v & 0xf) * 0x11;
+        break;
+    default:                                    /* ARGB1555 */
+        a = (v >> 15) & 1 ? 0xff : 0;
+        r = r300_c5to8((v >> 10) & 0x1f);
+        g = r300_c5to8((v >> 5) & 0x1f);
+        b = r300_c5to8(v & 0x1f);
+        break;
     }
-    xr = ati_r350_vram_xor(s, addr);
-    d->vram[(addr + 0) ^ xr] = argb & 0xff;
-    d->vram[(addr + 1) ^ xr] = (argb >> 8) & 0xff;
-    d->vram[(addr + 2) ^ xr] = (argb >> 16) & 0xff;
-    d->vram[(addr + 3) ^ xr] = (argb >> 24) & 0xff;
+    return a << 24 | r << 16 | g << 8 | b;
+}
+
+static uint32_t r300_cb_pack16(unsigned fmt, uint32_t argb)
+{
+    uint32_t a = argb >> 24, r = (argb >> 16) & 0xff;
+    uint32_t g = (argb >> 8) & 0xff, b = argb & 0xff;
+
+    switch (fmt) {
+    case R300_COLORFORMAT_RGB565:
+        return (r >> 3) << 11 | (g >> 2) << 5 | b >> 3;
+    case R300_COLORFORMAT_ARGB4444:
+        return (a >> 4) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | b >> 4;
+    default:                                    /* ARGB1555 */
+        return (a >> 7) << 15 | (r >> 3) << 10 | (g >> 3) << 5 | b >> 3;
+    }
 }
 
 static uint32_t r300_read_dst(ATIR350State *s, const R300DrawState *d,
                               uint32_t addr)
 {
-    return r300_ld32(s, d, addr);
+    unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+
+    if (d->cb_bpp == 4) {
+        return (uint32_t)d->cb[addr ^ xr] |
+               ((uint32_t)d->cb[(addr + 1) ^ xr] << 8) |
+               ((uint32_t)d->cb[(addr + 2) ^ xr] << 16) |
+               ((uint32_t)d->cb[(addr + 3) ^ xr] << 24);
+    }
+    return r300_cb_unpack16(d->cb_fmt, (uint32_t)d->cb[addr ^ xr] |
+                            (uint32_t)d->cb[(addr + 1) ^ xr] << 8);
+}
+
+static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
+                           uint32_t addr, uint32_t argb)
+{
+    unsigned xr;
+    uint32_t v;
+
+    if (d->wmask != 0xffffffff) {
+        /* masked-off channels keep whatever the destination holds */
+        argb = (argb & d->wmask) | (r300_read_dst(s, d, addr) & ~d->wmask);
+    }
+    xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+    if (d->cb_bpp == 2) {
+        v = r300_cb_pack16(d->cb_fmt, argb);
+        d->cb[addr ^ xr] = v & 0xff;
+        d->cb[(addr + 1) ^ xr] = (v >> 8) & 0xff;
+        return;
+    }
+    d->cb[(addr + 0) ^ xr] = argb & 0xff;
+    d->cb[(addr + 1) ^ xr] = (argb >> 8) & 0xff;
+    d->cb[(addr + 2) ^ xr] = (argb >> 16) & 0xff;
+    d->cb[(addr + 3) ^ xr] = (argb >> 24) & 0xff;
 }
 
 static void r300_st32(ATIR350State *s, const R300DrawState *d,
@@ -764,7 +843,7 @@ static void r300_us_sample(void *ctx, unsigned unit, bool proj,
  * upload and wrong for the rest.
  */
 static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
-                                 const float tc[R300_TEXCOORDS][2],
+                                 const float tc[R300_TEXCOORDS][4],
                                  const float col[2][4])
 {
     const R300UsProgram *p = d->fs;
@@ -802,7 +881,7 @@ static inline void r300_fs_frame(const R300DrawState *d, R300UsRegs *f,
         if (p->rs.tex_reg[n] >= 0) {
             float *r = f->r[p->rs.tex_reg[n]];
 
-            r[0] = tc[n][0]; r[1] = tc[n][1]; r[2] = 0.0f; r[3] = 1.0f;
+            r[0] = tc[n][0]; r[1] = tc[n][1]; r[2] = tc[n][2]; r[3] = tc[n][3];
         }
     }
     for (n = 0; n < R300_US_RS_COLS; n++) {
@@ -983,8 +1062,8 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 }
                 continue;
             }
-            addr = row + (uint32_t)x * 4;
-            if (addr + 4 > ATI_R350_VRAM_SIZE) {
+            addr = row + (uint32_t)x * d->cb_bpp;
+            if (addr + d->cb_bpp > d->cb_size) {
                 continue;
             }
             if (!dirty) {
@@ -1004,10 +1083,10 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                  * fragment instead destroys the source.
                  */
                 uint32_t src = d->res_off + (uint32_t)y * d->res_pitch +
-                               (uint32_t)x * 4;
+                               (uint32_t)x * d->cb_bpp;
 
-                if (src + 4 <= ATI_R350_VRAM_SIZE) {
-                    r300_write_dst(s, d, addr, r300_ld32(s, d, src));
+                if (src + d->cb_bpp <= ATI_R350_VRAM_SIZE) {
+                    r300_write_dst(s, d, addr, r300_read_dst(s, d, src));
                 }
                 continue;
             }
@@ -1077,8 +1156,8 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 } else {
                     R300SampleCtx sc = { s, d };
                     R300UsRegs f;
-                    float tc[R300_TEXCOORDS][2];
-                    unsigned k;
+                    float tc[R300_TEXCOORDS][4];
+                    unsigned k, c;
 
                     /*
                      * The further coordinate sets are interpolated only
@@ -1097,14 +1176,29 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                      */
                     tc[0][0] = ts * tcinv[0][0];
                     tc[0][1] = tt * tcinv[0][1];
+                    tc[0][2] = 0.0f;
+                    tc[0][3] = 1.0f;
                     for (k = 1; k < d->ntc; k++) {
                         tc[k][0] = (w0 * v0->tc[k][0] + w1 * v1->tc[k][0] +
                                     w2 * v2->tc[k][0]) * tcinv[k][0];
                         tc[k][1] = (w0 * v0->tc[k][1] + w1 * v1->tc[k][1] +
                                     w2 * v2->tc[k][1]) * tcinv[k][1];
+                        tc[k][2] = 0.0f;
+                        tc[k][3] = 1.0f;
                     }
                     for (; k < R300_TEXCOORDS; k++) {
-                        tc[k][0] = tc[k][1] = 0.0f;
+                        tc[k][0] = tc[k][1] = tc[k][2] = 0.0f;
+                        tc[k][3] = 1.0f;
+                    }
+                    for (k = 0; d->tc_raw && k < d->ntc; k++) {
+                        if (!(d->tc_raw & (1u << k))) {
+                            continue;
+                        }
+                        for (c = 0; c < 4; c++) {
+                            tc[k][c] = w0 * v0->tcr[k][c] +
+                                       w1 * v1->tcr[k][c] +
+                                       w2 * v2->tcr[k][c];
+                        }
                     }
                     r300_fs_frame(d, &f, tc, col);
                     r300_us_run(d->fs, &f, r300_us_sample, &sc);
@@ -1224,7 +1318,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                   (uint32_t)(MIN(MAX(cb, 0.0f), 1.0f) * 255.0f);
             r300_write_dst(s, d, addr, out);
         }
-        if (dirty) {
+        if (dirty && !d->cb_host) {
             /*
              * One dirty update for the row's whole written extent. The
              * range can cover a few pixels the span skipped after
@@ -1233,7 +1327,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
              * change and never the other way round.
              */
             uint64_t lo = dirty_lo & ~7ull;
-            uint64_t hi = (dirty_hi + 4 + 7) & ~7ull;
+            uint64_t hi = (dirty_hi + d->cb_bpp + 7) & ~7ull;
 
             memory_region_set_dirty(&s->vram, lo, hi - lo);
         }
@@ -1595,6 +1689,14 @@ static void r300_load_vtx(const R300DrawState *d, const R300VtxFmt *f,
     v->a = d->flat_a;
     v->r1 = v->g1 = v->b1 = v->a1 = 0.0f;
     memset(v->tc, 0, sizeof(v->tc));
+    {
+        unsigned k;
+
+        for (k = 0; k < R300_TEXCOORDS; k++) {
+            v->tcr[k][0] = v->tcr[k][1] = v->tcr[k][2] = 0.0f;
+            v->tcr[k][3] = 1.0f;
+        }
+    }
     /*
      * Everything below reads the vertex as one flat block whose first
      * four dwords are the position, which is only true when the
@@ -1955,6 +2057,10 @@ static void r300_vs_texcoord(const R300DrawState *d, R300Vtx *v,
     const R300TexUnit *u = &d->tex[d->tc_unit[set]];
     float s = c[0], t = c[1], q = c[3];
 
+    v->tcr[set][0] = c[0];
+    v->tcr[set][1] = c[1];
+    v->tcr[set][2] = c[2];
+    v->tcr[set][3] = c[3];
     if (!isfinite(s) || !isfinite(t)) {
         return;
     }
@@ -2540,11 +2646,29 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
      * ntc 1 and unit 0, which is the arithmetic it always had.
      */
     d->ntc = 1;
+    d->tc_raw = 0;
     for (i = 0; i < R300_TEXCOORDS; i++) {
         d->tc_unit[i] = 0;
         if (p->rs.tex_reg[i] >= 0) {
             d->ntc = i + 1;
+            d->tc_raw |= 1u << i;
         }
+    }
+    for (i = 0; d->fs_run && i < p->ntex; i++) {
+        const R300UsTex *t = &p->tex[i];
+        unsigned k;
+
+        if (t->op == R300_US_TEXOP_NOP || t->op == R300_US_TEXOP_TEXKILL) {
+            continue;
+        }
+        for (k = 0; k < d->ntc; k++) {
+            if (p->rs.tex_reg[k] == t->src) {
+                d->tc_raw &= ~(1u << k);
+            }
+        }
+    }
+    if (!d->fs_run) {
+        d->tc_raw = 0;
     }
     for (i = 0; d->fs_run && i < p->ntex; i++) {
         const R300UsTex *t = &p->tex[i];
@@ -2673,6 +2797,40 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
  * vertex count), the rest is vertex data laid out VAP_VTX_SIZE dwords
  * per vertex.
  */
+/* largest GART colour buffer staged per draw */
+#define R300_CB_GART_MAX (16 * 1024 * 1024)
+
+/*
+ * A colour buffer in GART: the driver renders surface page-outs there.
+ * Only what the draw can use is noted here -- the pitch and the rows up
+ * to the scissor's bottom -- and r300_run_prims() stages those rows.
+ */
+static bool r300_cb_gart(ATIR350State *s, R300DrawState *d,
+                         uint32_t colorpitch)
+{
+    static const uint8_t endian_xr[4] = { 0, 1, 3, 2 };
+    uint32_t card = s->regs[R300_RB3D_COLOROFFSET0 >> 2] & ~0x1fu;
+    unsigned fmt = (colorpitch >> R300_COLORFORMAT_SHIFT) &
+                   R300_COLORFORMAT_MASK;
+    unsigned bpp = (fmt == R300_COLORFORMAT_ARGB1555 ||
+                    fmt == R300_COLORFORMAT_RGB565 ||
+                    fmt == R300_COLORFORMAT_ARGB4444) ? 2 : 4;
+    uint32_t pitch = (colorpitch & 0x3fff) * bpp;
+    uint32_t sc = s->regs[R300_SC_SCISSOR1 >> 2];
+    int rows = (int)((sc >> 13) & 0x1fff) - R300_SCISSOR_OFFSET + 1;
+    uint64_t size = (uint64_t)pitch * (rows > 0 ? rows : 0);
+
+    if (!sc || !size || size > R300_CB_GART_MAX) {
+        return false;
+    }
+    d->cb_host = true;
+    d->cb_card = card;
+    d->cb_size = size;
+    d->cb_xr = endian_xr[(colorpitch >> R300_COLORENDIAN_SHIFT) & 3];
+    d->dst_off = 0;
+    return true;
+}
+
 static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                             unsigned vsize)
 {
@@ -2682,8 +2840,12 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     unsigned i;
 
     d->vram = memory_region_get_ram_ptr(&s->vram);
+    d->cb = d->vram;
+    d->cb_size = ATI_R350_VRAM_SIZE;
+    d->cb_host = false;
     if (!ati_r350_mc_to_vram(s, s->regs[R300_RB3D_COLOROFFSET0 >> 2] & ~0x1fu,
-                             &d->dst_off)) {
+                             &d->dst_off) &&
+        !r300_cb_gart(s, d, colorpitch)) {
         /*
          * Colour buffer outside VRAM. Nothing here can render into it,
          * but say so rather than dropping the draw without a word: a
@@ -2694,7 +2856,19 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         ati_r350_note_gap(s, R350_GAP_DEST_OFF_VRAM, 0);
         return false;
     }
-    d->dst_pitch = (colorpitch & 0x3fff) * 4;
+    d->cb_fmt = (colorpitch >> R300_COLORFORMAT_SHIFT) &
+                R300_COLORFORMAT_MASK;
+    switch (d->cb_fmt) {
+    case R300_COLORFORMAT_ARGB1555:
+    case R300_COLORFORMAT_RGB565:
+    case R300_COLORFORMAT_ARGB4444:
+        d->cb_bpp = 2;
+        break;
+    default:
+        d->cb_bpp = 4;
+        break;
+    }
+    d->dst_pitch = (colorpitch & 0x3fff) * d->cb_bpp;
     if (!d->dst_pitch) {
         return false;
     }
@@ -2751,12 +2925,16 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * and the write mask all keep applying unchanged.
      */
     d->resolve = s->regs[R300_RB3D_AARESOLVE_CTL >> 2] & R300_AARESOLVE_MODE;
+    if (d->resolve && d->cb_host) {
+        ati_r350_note_gap(s, R350_GAP_DEST_OFF_VRAM, 1);
+        return false;
+    }
     d->res_off = 0;
     d->res_pitch = 0;
     if (d->resolve) {
         uint32_t roff;
         uint32_t rpitch = ((s->regs[R300_RB3D_AARESOLVE_PITCH >> 2] >> 1) &
-                           0x1fff) * 2 * 4;
+                           0x1fff) * 2 * d->cb_bpp;
 
         if (!ati_r350_mc_to_vram(s,
                                  s->regs[R300_RB3D_AARESOLVE_OFFSET >> 2] &
@@ -3320,10 +3498,16 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
             v3.x = vb[i + 1].x + vb[i + 2].x - vb[i].x;
             v3.y = vb[i + 1].y + vb[i + 2].y - vb[i].y;
             for (k = 0; k < R300_TEXCOORDS; k++) {
+                unsigned c;
+
                 v3.tc[k][0] = vb[i + 1].tc[k][0] + vb[i + 2].tc[k][0] -
                               vb[i].tc[k][0];
                 v3.tc[k][1] = vb[i + 1].tc[k][1] + vb[i + 2].tc[k][1] -
                               vb[i].tc[k][1];
+                for (c = 0; c < 4; c++) {
+                    v3.tcr[k][c] = vb[i + 1].tcr[k][c] +
+                                   vb[i + 2].tcr[k][c] - vb[i].tcr[k][c];
+                }
             }
             r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
             r300_raster_tri(s, d, &vb[i + 1], &v3, &vb[i + 2]);
@@ -3532,7 +3716,7 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
      * quietly stored an approximation would be worse than a short one,
      * because the harness reading it cannot tell the two apart.
      */
-    if (d->resolve ||
+    if (d->resolve || d->cb_bpp != 4 || d->cb_host ||
         !r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1, NULL) ||
         (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0) > s->cap_max_px ||
         !r300_cap_xor(s, d->dst_off + (uint32_t)y0 * d->dst_pitch,
@@ -5051,6 +5235,9 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * the draw capture uses -- the bounding box widened by a pixel and
      * clipped exactly the way r300_raster_tri() clips its scan.
      */
+    if (d->cb_bpp != 4 || d->cb_host) {
+        return r300_gl_fallback(s, R350_GLF_CBFMT, prim, nvtx);
+    }
     if ((d->dst_off | d->dst_pitch) & 3) {
         return r300_gl_fallback(s, R350_GLF_ALIGN, prim, nvtx);
     }
@@ -5265,6 +5452,24 @@ static void r300_trace_rect(ATIR350State *s, const R300DrawState *d,
                            (int)s0, (int)t0, (int)s1, (int)t1);
 }
 
+/* rasterize into a GART colour buffer through a staged host copy */
+static void r300_raster_gart(ATIR350State *s, R300DrawState *d,
+                             const R300Vtx *vb, unsigned nvtx, unsigned prim)
+{
+    g_autofree uint8_t *buf = g_malloc(d->cb_size);
+    uint32_t i;
+
+    for (i = 0; i + 4 <= d->cb_size; i += 4) {
+        stl_le_p(buf + i, ati_r350_mc_read32(s, d->cb_card + i));
+    }
+    d->cb = buf;
+    r300_raster_prims(s, d, vb, nvtx, prim);
+    for (i = 0; i + 4 <= d->cb_size; i += 4) {
+        ati_r350_mc_write32(s, d->cb_card + i, ldl_le_p(buf + i));
+    }
+    d->cb = d->vram;
+}
+
 static void r300_run_prims(ATIR350State *s, R300DrawState *d,
                            const R300Vtx *vb, unsigned nvtx, unsigned prim)
 {
@@ -5328,6 +5533,10 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
     }
     /* the software rasterizer writes VRAM the GPU copy shadows */
     ati_r350_gl_release(s, R350_GLR_FALLBACK);
+    if (d->cb_host) {
+        r300_raster_gart(s, d, vb, nvtx, prim);
+        return;
+    }
     r300_raster_prims(s, d, vb, nvtx, prim);
 }
 

@@ -410,6 +410,12 @@
  * in CoreGraphics ARGB surfaces carry 2.
  */
 #define R350_GUI_HOST_SWAP_CNTL      0x15d4
+/*
+ * The same codes for a blit whose DESTINATION is host memory (a surface
+ * page-out). Mac OS X 10.5's display-mode switch: 4 of 4 page-out
+ * BITBLTs write 2 here and 0 to 0x15d4, 167 of 167 page-ins write 0 here.
+ */
+#define R350_GUI_HOST_DST_SWAP_CNTL  0x15d0
 #define R350_GUI_HOST_SWAP_MASK      0x00000003
 /*
  * ...and the OTHER end of the same job: the byte-swap control for data
@@ -1035,6 +1041,13 @@
 #define R300_COLORMASK_ALPHA          (1u << 3)
 #define R300_RB3D_COLOROFFSET0        0x4e28
 #define R300_RB3D_COLORPITCH0         0x4e38
+#define R300_COLORENDIAN_SHIFT        19
+#define R300_COLORFORMAT_SHIFT        21
+#define R300_COLORFORMAT_MASK         0xf
+#define R300_COLORFORMAT_ARGB1555     3
+#define R300_COLORFORMAT_RGB565       4
+#define R300_COLORFORMAT_ARGB8888     6
+#define R300_COLORFORMAT_ARGB4444     15
 /*
  * Anti-aliasing resolve. With AARESOLVE_MODE set the colour buffer is
  * the SOURCE of the draw, not its destination: the render backend
