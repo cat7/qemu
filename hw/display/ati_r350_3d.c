@@ -5861,7 +5861,8 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                                narr > 0 ? addr[0] : 0,
                                narr > 1 ? addr[1] : 0);
 
-    if (!nvtx || !vsize || vsize > 16 || nvtx > 4096) {
+    /* NUM_VERTICES is 16 bits; the vertices are fetched to the heap */
+    if (!nvtx || !vsize || vsize > 16) {
         trace_ati_r350_3d_skip(vf, vsize, nvtx);
         return;
     }
