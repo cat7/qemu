@@ -4330,6 +4330,12 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
      */
     memory_region_init_io(&s->io, obj, &ati_r350_mmio_ops, s,
                           "ati-r350-io", ATI_R350_IO_SIZE);
+    /*
+     * A register access waiting for the command processor releases the
+     * BQL; another vCPU may access the registers meanwhile.
+     */
+    s->mmio.disable_reentrancy_guard = true;
+    s->io.disable_reentrancy_guard = true;
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_PREFETCH, &s->aper);
