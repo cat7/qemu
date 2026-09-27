@@ -5582,7 +5582,8 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
 
                 for (c = 0; c < size[a] && n < 16; c++) {
                     uint32_t card = addr[a] + (i * stride[a] + c) * 4;
-                    uint32_t val = ati_r350_mc_read32(s, card);
+                    uint32_t val = arr[a] ? arr[a][i * stride[a] + c]
+                                          : ati_r350_mc_read32(s, card);
                     uint32_t off;
 
                     if (swap && !ati_r350_mc_to_vram(s, card, &off)) {
@@ -5638,3 +5639,32 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
         r300_run_prims(s, &d, vb, nvtx, prim);
     }
 }
+        g_autofree uint32_t *pre = NULL;
+        uint32_t *arr[R300_AOS_MAX] = { NULL };
+        size_t span[R300_AOS_MAX], total = 0;
+        /*
+         * Each array outside VRAM is fetched whole before the walk; VRAM
+         * reads are coherency points and stay where they were.
+         */
+        for (a = 0; a < narr; a++) {
+            uint32_t off;
+
+            span[a] = size[a] ? (size_t)(nvtx - 1) * stride[a] + size[a] : 0;
+            if (span[a] && !ati_r350_mc_to_vram(s, addr[a], &off)) {
+                total += span[a];
+            } else {
+                span[a] = 0;
+            }
+        }
+        if (total) {
+            uint32_t *p;
+
+            pre = p = g_new(uint32_t, total);
+            for (a = 0; a < narr; a++) {
+                if (span[a]) {
+                    arr[a] = p;
+                    ati_r350_mc_read_block(s, addr[a], p, span[a]);
+                    p += span[a];
+                }
+            }
+        }

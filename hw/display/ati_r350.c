@@ -2609,6 +2609,95 @@ static const uint16_t ati_r350_arrow_data[16] = {
 };
 static const uint16_t ati_r350_arrow_mask[16] = {
     0xc000, 0xe000, 0xf000, 0xf800, 0xfc00, 0xfe00, 0xff00, 0xff80,
+/* the registers ati_r350_mc_route() depends on */
+static const uint16_t ati_r350_mc_map_regs[R350_MC_MAP_REGS] = {
+    R350_MC_FB_LOCATION, R350_MC_AGP_LOCATION, R350_AGP_BASE,
+    R350_AIC_CNTL, R350_AIC_LO_ADDR, R350_AIC_HI_ADDR, R350_AIC_PT_BASE_R300,
+};
+
+void ati_r350_mc_map_save(ATIR350State *s, uint32_t *map)
+{
+    unsigned k;
+
+    for (k = 0; k < R350_MC_MAP_REGS; k++) {
+        map[k] = s->regs[ati_r350_mc_map_regs[k] >> 2];
+    }
+}
+
+bool ati_r350_mc_map_same(ATIR350State *s, const uint32_t *map)
+{
+    unsigned k;
+
+    for (k = 0; k < R350_MC_MAP_REGS; k++) {
+        if (map[k] != s->regs[ati_r350_mc_map_regs[k] >> 2]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* where a card address goes: VRAM, a PCI bus address, or the AGP space */
+enum { R350_MC_VRAM, R350_MC_PCI, R350_MC_AGP };
+
+static int ati_r350_mc_route(ATIR350State *s, uint32_t addr, dma_addr_t *bus)
+{
+    uint32_t off;
+
+    if (ati_r350_mc_to_vram(s, addr, &off)) {
+        *bus = off;
+        return R350_MC_VRAM;
+    }
+    if (ati_r350_mc_to_aic(s, addr, bus)) {
+        return R350_MC_PCI;
+    }
+    if (!ati_r350_mc_to_agp(s, addr, bus)) {
+        *bus = addr;
+        return R350_MC_PCI;
+    }
+    return s->agp_as_valid ? R350_MC_AGP : R350_MC_PCI;
+}
+
+/*
+ * `n` consecutive dwords of card address space, as ati_r350_mc_read32()
+ * reads them one at a time. A run inside one 4 KiB page whose two ends
+ * take the same route to contiguous bus addresses is read with one
+ * translation; VRAM, whose reads have a coherency hook, and anything
+ * else go dword by dword.
+ */
+void ati_r350_mc_read_block(ATIR350State *s, uint32_t addr, uint32_t *dst,
+                            unsigned n)
+{
+    while (n) {
+        unsigned run = (addr & 3) ? 1
+                       : MIN(n, (0x1000 - (addr & 0xfff)) / 4);
+        dma_addr_t b0 = 0, b1 = 0;
+        int k0 = ati_r350_mc_route(s, addr, &b0);
+        int k1 = ati_r350_mc_route(s, addr + (run - 1) * 4, &b1);
+        unsigned i;
+
+        if (k0 == R350_MC_VRAM || k0 != k1 ||
+            b1 - b0 != (dma_addr_t)(run - 1) * 4) {
+            for (i = 0; i < run; i++) {
+                dst[i] = ati_r350_mc_read32(s, addr + i * 4);
+            }
+        } else {
+            memset(dst, 0, run * 4);
+            if (k0 == R350_MC_AGP) {
+                address_space_read(&s->agp_as, b0, MEMTXATTRS_UNSPECIFIED,
+                                   dst, run * 4);
+            } else {
+                pci_dma_read(PCI_DEVICE(s), b0, dst, run * 4);
+            }
+            for (i = 0; i < run; i++) {
+                dst[i] = le32_to_cpu(dst[i]);
+            }
+        }
+        dst += run;
+        addr += run * 4;
+        n -= run;
+    }
+}
+
     0xffc0, 0xffe0, 0xfe00, 0xef00, 0xcf00, 0x8780, 0x0780, 0x0380,
 };
 
@@ -3208,12 +3297,31 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
     ATIR350PM4Parser parser = { 0 };
     bool swap = (s->regs[R350_CP_RB_CNTL >> 2] & R350_BUF_SWAP_MASK) ==
                 R350_BUF_SWAP_32BIT;
-    uint32_t i;
+    uint32_t buf[1024], map[R350_MC_MAP_REGS];
+    uint32_t i, have = 0, base = 0;
 
     trace_ati_r350_pm4_indirect(offset, dwords,
         dwords ? ati_r350_mc_read32(s, offset) : 0);
     for (i = 0; i < dwords; i++) {
-        uint32_t val = ati_r350_mc_read32(s, offset + i * 4);
+        uint32_t val;
+
+        /*
+         * Fetched ahead a chunk at a time. A packet that reprograms the
+         * memory controller's windows discards what was fetched under
+         * the old ones.
+         */
+        if (i - base >= have || !ati_r350_mc_map_same(s, map)) {
+            uint32_t off;
+
+            base = i;
+            have = MIN(dwords - i, (uint32_t)ARRAY_SIZE(buf));
+            if (ati_r350_mc_to_vram(s, offset + i * 4, &off)) {
+                have = 1;       /* VRAM reads are coherency points */
+            }
+            ati_r350_mc_map_save(s, map);
+            ati_r350_mc_read_block(s, offset + i * 4, buf, have);
+        }
+        val = buf[i - base];
 
         /*
          * CP_RB_CNTL's BUF_SWAP swapper sits on the CP's fetch port,

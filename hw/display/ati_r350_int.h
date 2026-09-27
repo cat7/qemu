@@ -995,3 +995,8 @@ unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off);
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off);
 
 #endif /* ATI_R350_INT_H */
+void ati_r350_mc_read_block(ATIR350State *s, uint32_t addr, uint32_t *dst,
+                            unsigned n);
+#define R350_MC_MAP_REGS 7
+void ati_r350_mc_map_save(ATIR350State *s, uint32_t *map);
+bool ati_r350_mc_map_same(ATIR350State *s, const uint32_t *map);
