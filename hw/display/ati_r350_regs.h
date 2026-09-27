@@ -1047,6 +1047,7 @@
 #define R300_COLORFORMAT_ARGB1555     3
 #define R300_COLORFORMAT_RGB565       4
 #define R300_COLORFORMAT_ARGB8888     6
+#define R300_COLORFORMAT_I8           9
 #define R300_COLORFORMAT_ARGB4444     15
 /*
  * Anti-aliasing resolve. With AARESOLVE_MODE set the colour buffer is
@@ -1096,6 +1097,7 @@
 #define R300_US_CODE_ADDR_0           0x4610
 #define R300_US_TEX_INST_0            0x4620
 #define R300_US_OUT_FMT_0             0x46a4
+#define R300_US_OUT_C0_SEL_SHIFT      8     /* 0 A, 1 R, 2 G, 3 B */
 #define R300_US_ALU_RGB_ADDR_0        0x46c0
 #define R300_US_ALU_ALPHA_ADDR_0      0x47c0
 #define R300_US_ALU_RGB_INST_0        0x48c0

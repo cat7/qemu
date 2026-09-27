@@ -125,7 +125,8 @@ typedef struct R300DrawState {
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
     unsigned cb_fmt;        /* RB3D_COLORPITCH0 COLORFORMAT */
-    unsigned cb_bpp;        /* bytes per colour buffer pixel: 2 or 4 */
+    unsigned cb_bpp;        /* bytes per colour buffer pixel: 1, 2 or 4 */
+    unsigned cb_sel;        /* I8: bit position of the stored channel */
     uint32_t wmask;         /* RB3D_COLOR_CHANNEL_MASK as an ARGB byte mask */
     bool resolve;           /* colour buffer in AA-resolve mode */
     uint32_t res_off;       /* the buffer being resolved FROM */
@@ -449,6 +450,21 @@ static inline uint32_t r300_ld32(ATIR350State *s, const R300DrawState *d,
            ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
 }
 
+/* bytes per colour buffer pixel */
+static unsigned r300_cb_bytes(unsigned fmt)
+{
+    switch (fmt) {
+    case R300_COLORFORMAT_I8:
+        return 1;
+    case R300_COLORFORMAT_ARGB1555:
+    case R300_COLORFORMAT_RGB565:
+    case R300_COLORFORMAT_ARGB4444:
+        return 2;
+    default:
+        return 4;
+    }
+}
+
 /*
  * Both take the destination address the caller already computed for the
  * span, and neither marks the region dirty: that is done once per row by
@@ -504,6 +520,9 @@ static uint32_t r300_read_dst(ATIR350State *s, const R300DrawState *d,
 {
     unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
 
+    if (d->cb_bpp == 1) {
+        return d->cb[addr ^ xr] * 0x01010101u;
+    }
     if (d->cb_bpp == 4) {
         return (uint32_t)d->cb[addr ^ xr] |
                ((uint32_t)d->cb[(addr + 1) ^ xr] << 8) |
@@ -525,6 +544,10 @@ static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
         argb = (argb & d->wmask) | (r300_read_dst(s, d, addr) & ~d->wmask);
     }
     xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+    if (d->cb_bpp == 1) {
+        d->cb[addr ^ xr] = argb >> d->cb_sel;
+        return;
+    }
     if (d->cb_bpp == 2) {
         v = r300_cb_pack16(d->cb_fmt, argb);
         d->cb[addr ^ xr] = v & 0xff;
@@ -2812,9 +2835,7 @@ static bool r300_cb_gart(ATIR350State *s, R300DrawState *d,
     uint32_t card = s->regs[R300_RB3D_COLOROFFSET0 >> 2] & ~0x1fu;
     unsigned fmt = (colorpitch >> R300_COLORFORMAT_SHIFT) &
                    R300_COLORFORMAT_MASK;
-    unsigned bpp = (fmt == R300_COLORFORMAT_ARGB1555 ||
-                    fmt == R300_COLORFORMAT_RGB565 ||
-                    fmt == R300_COLORFORMAT_ARGB4444) ? 2 : 4;
+    unsigned bpp = r300_cb_bytes(fmt);
     uint32_t pitch = (colorpitch & 0x3fff) * bpp;
     uint32_t sc = s->regs[R300_SC_SCISSOR1 >> 2];
     int rows = (int)((sc >> 13) & 0x1fff) - R300_SCISSOR_OFFSET + 1;
@@ -2858,15 +2879,12 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     }
     d->cb_fmt = (colorpitch >> R300_COLORFORMAT_SHIFT) &
                 R300_COLORFORMAT_MASK;
-    switch (d->cb_fmt) {
-    case R300_COLORFORMAT_ARGB1555:
-    case R300_COLORFORMAT_RGB565:
-    case R300_COLORFORMAT_ARGB4444:
-        d->cb_bpp = 2;
-        break;
-    default:
-        d->cb_bpp = 4;
-        break;
+    d->cb_bpp = r300_cb_bytes(d->cb_fmt);
+    {
+        static const uint8_t sel_shift[4] = { 24, 16, 8, 0 };
+
+        d->cb_sel = sel_shift[(s->regs[R300_US_OUT_FMT_0 >> 2] >>
+                               R300_US_OUT_C0_SEL_SHIFT) & 3];
     }
     d->dst_pitch = (colorpitch & 0x3fff) * d->cb_bpp;
     if (!d->dst_pitch) {
