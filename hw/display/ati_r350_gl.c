@@ -91,6 +91,8 @@
  *   r350_gl_plat_close(pl)            destroy it
  *   r350_gl_makecurrent(pl)           take it for this thread
  *   r350_gl_done(pl)                  give it back
+ *   r350_gl_plat_has_barrier()        GL_NV_texture_barrier is offered
+ *   r350_gl_barrier()                 glTextureBarrierNV
  *
  * r350_gl_done() is the only member of that list that is not obvious,
  * and it exists because WGL needs it: see the threading comment in the
@@ -102,6 +104,7 @@
 #define GL_SILENCE_DEPRECATION 1
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
+#include <OpenGL/gl3ext.h>
 
 #define R350_GL_BACKEND_NAME "CGL offscreen"
 
@@ -156,6 +159,26 @@ static inline void r350_gl_makecurrent(R350GlPlat *pl)
 static inline void r350_gl_done(R350GlPlat *pl)
 {
     (void)pl;
+}
+
+static bool r350_gl_plat_has_barrier(void)
+{
+    GLint n = 0, i;
+
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (i = 0; i < n; i++) {
+        const char *e = (const char *)glGetStringi(GL_EXTENSIONS, i);
+
+        if (e && !strcmp(e, "GL_NV_texture_barrier")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline void r350_gl_barrier(void)
+{
+    glTextureBarrierNV();
 }
 
 #else /* _WIN32 */
@@ -596,6 +619,16 @@ static inline void r350_gl_done(R350GlPlat *pl)
     wglMakeCurrent(NULL, NULL);
 }
 
+/* the destination is copied instead */
+static bool r350_gl_plat_has_barrier(void)
+{
+    return false;
+}
+
+static inline void r350_gl_barrier(void)
+{
+}
+
 #endif /* CONFIG_DARWIN */
 
 /*
@@ -651,8 +684,80 @@ struct R350GlCtx {
     /* staging for the two swapper orders GL cannot produce directly */
     uint8_t *stage;
     size_t stage_sz;
+    /* the texture attached to `fbo`; 0 when unknown */
+    GLuint att;
+    /*
+     * GL_NV_texture_barrier: the blend samples the colour buffer itself.
+     * `wr` holds the rectangles rendered or uploaded into it since the
+     * last barrier, merged into one once there are too many to keep; a
+     * draw reading inside any of them is preceded by a barrier.
+     */
+    bool barrier;
+    struct { int x0, y0, x1, y1; } wr[R350_GL_WRITTEN];
+    unsigned nwr;
+    uint64_t barriers;
     char desc[128];
 };
+
+
+/*
+ * Attaching a texture to the framebuffer ends the render pass on this
+ * host even when it is the one already attached, and a pass is a Metal
+ * command buffer. So it is done only when the texture changes.
+ */
+static void gl_attach(R350GlCtx *g, GLuint tex)
+{
+    if (g->att != tex) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, tex, 0);
+        g->att = tex;
+    }
+}
+
+/* the colour buffer changed over [x0,x1) x [y0,y1) */
+static void gl_wrote(R350GlCtx *g, int x0, int y0, int x1, int y1)
+{
+    unsigned k;
+
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+    if (g->nwr == R350_GL_WRITTEN) {
+        for (k = 1; k < g->nwr; k++) {
+            g->wr[0].x0 = MIN(g->wr[0].x0, g->wr[k].x0);
+            g->wr[0].y0 = MIN(g->wr[0].y0, g->wr[k].y0);
+            g->wr[0].x1 = MAX(g->wr[0].x1, g->wr[k].x1);
+            g->wr[0].y1 = MAX(g->wr[0].y1, g->wr[k].y1);
+        }
+        g->nwr = 1;
+    }
+    g->wr[g->nwr].x0 = x0;
+    g->wr[g->nwr].y0 = y0;
+    g->wr[g->nwr].x1 = x1;
+    g->wr[g->nwr].y1 = y1;
+    g->nwr++;
+}
+
+static void gl_barrier(R350GlCtx *g)
+{
+    r350_gl_barrier();
+    g->barriers++;
+    g->nwr = 0;
+}
+
+/* make what was written visible to a read of [x0,x1) x [y0,y1) */
+static void gl_before_read(R350GlCtx *g, int x0, int y0, int x1, int y1)
+{
+    unsigned k;
+
+    for (k = 0; k < g->nwr; k++) {
+        if (x0 < g->wr[k].x1 && g->wr[k].x0 < x1 &&
+            y0 < g->wr[k].y1 && g->wr[k].y0 < y1) {
+            gl_barrier(g);
+            return;
+        }
+    }
+}
 
 static const char *vs_src =
 "#version 330 core\n"
@@ -1121,6 +1226,7 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     glBindVertexArray(g->vao);
     glGenBuffers(1, &g->vbo);
     glGenFramebuffers(1, &g->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
     glGenTextures(1, &g->cbuf);
     glGenTextures(R350_GL_TEXSLOTS + 1, g->tex);
     glGenTextures(1, &g->white);
@@ -1175,9 +1281,11 @@ R350GlCtx *ati_r350_gl_open(const char **err)
         }
     }
 
-    snprintf(g->desc, sizeof(g->desc), R350_GL_BACKEND_NAME ", %s / GLSL %s",
+    g->barrier = r350_gl_plat_has_barrier();
+    snprintf(g->desc, sizeof(g->desc), R350_GL_BACKEND_NAME ", %s / GLSL %s%s",
              (const char *)glGetString(GL_VERSION),
-             (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
+             (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION),
+             g->barrier ? ", texture barrier" : "");
     if (glGetError() != GL_NO_ERROR) {
         ati_r350_gl_close(g);
         *err = "GL reported an error while setting the backend up";
@@ -1234,6 +1342,11 @@ void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
     *hits = g ? g->prog_hits : 0;
     *links = g ? g->prog_links : 0;
     *failed = g ? g->prog_failed : 0;
+}
+
+uint64_t ati_r350_gl_barriers(R350GlCtx *g)
+{
+    return g ? g->barriers : 0;
 }
 
 /*
@@ -1311,9 +1424,9 @@ bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
                  GL_UNSIGNED_BYTE, NULL);
-    glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, g->cbuf, 0);
+    g->att = 0;
+    gl_attach(g, g->cbuf);
+    gl_wrote(g, 0, 0, w, h);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
         glGetError() != GL_NO_ERROR) {
         g->fb_w = g->fb_h = 0;
@@ -1355,6 +1468,7 @@ bool ati_r350_gl_seed(R350GlCtx *g, int x0, int y0, int w, int h,
     glBindTexture(GL_TEXTURE_2D, g->cbuf);
     glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, w, h, GL_RGBA_INTEGER,
                     GL_UNSIGNED_BYTE, st);
+    gl_wrote(g, x0, y0, x0 + w, y0 + h);
     ok = glGetError() == GL_NO_ERROR;
     r350_gl_done(&g->plat);
     return ok;
@@ -1373,9 +1487,7 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
     }
     st = gl_stage(g, (size_t)w * h * 4);
     r350_gl_makecurrent(&g->plat);
-    glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, g->cbuf, 0);
+    gl_attach(g, g->cbuf);
     glReadPixels(x0, y0, w, h, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, st);
     for (y = 0; y < h; y++) {
         uint8_t *p = base + (size_t)(y0 + y) * pitch + (size_t)x0 * 4;
@@ -1423,9 +1535,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     if (p->u_usk >= 0 && r->us_konst) {
         glUniform4fv(p->u_usk, R350_GL_USK, r->us_konst);
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, g->cbuf, 0);
+    gl_attach(g, g->cbuf);
     /*
      * The whole target, not the draw's rectangle. Device coordinates are
      * therefore target coordinates throughout: u_rect maps them to NDC
@@ -1446,9 +1556,21 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      */
     if (r->blend && r->blend_read && !r->add_blend) {
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, g->dst);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, r->x0, r->y0,
-                            r->x0, r->y0, r->w, r->h);
+        if (g->barrier) {
+            /*
+             * The colour buffer is sampled where it is written. Within
+             * one pass no pixel is covered twice, which is the case the
+             * extension defines; what earlier draws and passes left is
+             * made visible by a barrier, taken only when the rectangle
+             * this draw reads was written since the last one.
+             */
+            glBindTexture(GL_TEXTURE_2D, g->cbuf);
+            gl_before_read(g, r->x0, r->y0, r->x0 + r->w, r->y0 + r->h);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, g->dst);
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, r->x0, r->y0,
+                                r->x0, r->y0, r->w, r->h);
+        }
     }
 
     glActiveTexture(GL_TEXTURE0);
@@ -1544,8 +1666,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
          * floor(255*f(src)) and GL adds it to a byte, which is the same
          * chain, one integer step per primitive.
          */
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, g->acc, 0);
+        gl_attach(g, g->acc);
         glUseProgram(g->ui2n);
         glBindVertexArray(g->vao_blit);
         glActiveTexture(GL_TEXTURE2);
@@ -1563,8 +1684,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
         glDisable(GL_BLEND);
 
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, g->cbuf, 0);
+        gl_attach(g, g->cbuf);
         glUseProgram(g->n2ui);
         glBindVertexArray(g->vao_blit);
         glActiveTexture(GL_TEXTURE2);
@@ -1575,11 +1695,15 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
         glUseProgram(p->prog);
         glBindVertexArray(g->vao);
         glActiveTexture(GL_TEXTURE0);
+        /* the copy back covers the whole viewport */
+        gl_wrote(g, 0, 0, r->surf_w, r->surf_h);
     } else if (r->npass > 1) {
         unsigned k;
 
         for (k = 0; k < r->npass; k++) {
-            if (k) {
+            if (k && g->barrier) {
+                gl_barrier(g);
+            } else if (k) {
                 glActiveTexture(GL_TEXTURE1);
                 glBindTexture(GL_TEXTURE_2D, g->dst);
                 glCopyTexSubImage2D(GL_TEXTURE_2D, 0, r->x0, r->y0,
@@ -1597,6 +1721,8 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
         glReadPixels(r->x0, r->y0, r->w, r->h, GL_RGBA_INTEGER,
                      GL_UNSIGNED_BYTE, r->out);
     }
+
+    gl_wrote(g, r->x0, r->y0, r->x0 + r->w, r->y0 + r->h);
 
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_SCISSOR_TEST);
@@ -1649,6 +1775,11 @@ void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
                             uint64_t *failed)
 {
     *hits = *links = *failed = 0;
+}
+
+uint64_t ati_r350_gl_barriers(R350GlCtx *g)
+{
+    return 0;
 }
 
 #endif /* CONFIG_DARWIN || _WIN32 */

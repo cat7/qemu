@@ -4611,6 +4611,10 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
         g_string_append_printf(out, "\nfragment shaders: %" PRIu64
                                " cache hits, %" PRIu64 " linked, %" PRIu64
                                " would not build", ph, pl, pf);
+        if (ati_r350_gl_barriers(s->gl_ctx)) {
+            g_string_append_printf(out, "\ntexture barriers: %" PRIu64,
+                                   ati_r350_gl_barriers(s->gl_ctx));
+        }
     }
     if (s->gl_addblend) {
         /*

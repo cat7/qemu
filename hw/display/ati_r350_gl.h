@@ -97,6 +97,9 @@
 /* US_ALU_CONST vectors a translated fragment program may name */
 #define R350_GL_USK 32
 
+/* rectangles the texture-barrier bookkeeping keeps apart */
+#define R350_GL_WRITTEN 32
+
 typedef struct R350GlReq {
     /*
      * Every coordinate below is a coordinate IN THE RESIDENT TARGET,
@@ -260,5 +263,6 @@ const char *ati_r350_gl_describe(R350GlCtx *g);
 /* the fragment-shader cache: hits, links, and programs that would not build */
 void ati_r350_gl_prog_stats(R350GlCtx *g, uint64_t *hits, uint64_t *links,
                             uint64_t *failed);
+uint64_t ati_r350_gl_barriers(R350GlCtx *g);
 
 #endif /* ATI_R350_GL_H */
