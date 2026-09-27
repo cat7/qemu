@@ -81,6 +81,7 @@ typedef struct R300TexUnit {
     unsigned code;          /* TX_FORMAT1 TXFORMAT, to tell the widths apart */
     unsigned sel[4];        /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t;  /* TX_FILTER0 clamp modes (0 = repeat) */
+    unsigned lanes;         /* TX_OFFSET ENDIAN_SWAP as a byte-lane xor */
 } R300TexUnit;
 
 typedef struct R300DrawState {
@@ -313,6 +314,26 @@ static inline uint32_t r300_texel_16x4(uint32_t lo, uint32_t hi)
     return r300_pack_xyzw(lo >> 8, lo >> 24, hi >> 8, hi >> 24);
 }
 
+/*
+ * TX_OFFSET's ENDIAN_SWAP applies to a texture fetched over the bus,
+ * as COLORENDIAN does to a colour buffer in GART; in VRAM the surface
+ * swapper decides the byte order. 16-bit, 32-bit and half-dword swaps
+ * are the lane xors 1, 3 and 2 within each dword.
+ */
+static inline uint32_t r300_lane_xor32(uint32_t v, unsigned x)
+{
+    switch (x) {
+    case 1:
+        return ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu);
+    case 2:
+        return (v << 16) | (v >> 16);
+    case 3:
+        return bswap32(v);
+    default:
+        return v;
+    }
+}
+
 static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
                                 unsigned unit, int tx, int ty)
 {
@@ -355,8 +376,8 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
             a = ((uint8_t *)memory_region_get_ram_ptr(&s->vram))
                 [off ^ (ati_r350_vram_xor(s, off) & 3)];
         } else {
-            a = (ati_r350_mc_read32(s, addr & ~3u) >> ((addr & 3) * 8))
-                & 0xff;
+            a = (ati_r350_mc_read32(s, addr & ~3u) >>
+                 (((addr ^ u->lanes) & 3) * 8)) & 0xff;
         }
         return a;
     }
@@ -374,8 +395,8 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
         uint32_t v;
 
         if (!ati_r350_mc_to_vram(s, addr, &off)) {
-            v = (ati_r350_mc_read32(s, addr & ~3u) >>
-                 ((addr & 2) * 8)) & 0xffff;
+            v = (r300_lane_xor32(ati_r350_mc_read32(s, addr & ~3u),
+                                 u->lanes) >> ((addr & 2) * 8)) & 0xffff;
         } else if (off + 2 > ATI_R350_VRAM_SIZE) {
             return 0;
         } else {
@@ -398,8 +419,9 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
             return r300_texel_16x4(ati_r350_vram_ld32(s, off),
                                    ati_r350_vram_ld32(s, off + 4));
         }
-        return r300_texel_16x4(ati_r350_mc_read32(s, addr),
-                               ati_r350_mc_read32(s, addr + 4));
+        return r300_texel_16x4(
+            r300_lane_xor32(ati_r350_mc_read32(s, addr), u->lanes),
+            r300_lane_xor32(ati_r350_mc_read32(s, addr + 4), u->lanes));
     }
     if (ati_r350_mc_to_vram(s, addr, &off)) {
         if (off + 4 > ATI_R350_VRAM_SIZE) {
@@ -408,7 +430,7 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
         return ati_r350_vram_ld32(s, off);
     }
     /* texture staged in GART/system memory */
-    return ati_r350_mc_read32(s, addr);
+    return r300_lane_xor32(ati_r350_mc_read32(s, addr), u->lanes);
 }
 
 /*
@@ -2744,6 +2766,7 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
  */
 static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
 {
+    static const uint8_t endian_lanes[4] = { 0, 1, 3, 2 };
     R300TexUnit *u = &d->tex[unit];
     uint32_t txfmt0 = s->regs[(R300_TX_FORMAT0_0 >> 2) + unit];
     uint32_t txfmt1 = s->regs[(R300_TX_FORMAT1_0 >> 2) + unit];
@@ -2754,6 +2777,8 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
 
     u->en = d->textured && (s->regs[R300_TX_ENABLE >> 2] & (1u << unit));
     u->off = s->regs[(R300_TX_OFFSET_0 >> 2) + unit] & ~0x1fu;
+    u->lanes = endian_lanes[s->regs[(R300_TX_OFFSET_0 >> 2) + unit] &
+                            R300_TXO_ENDIAN_MASK];
     u->w = (txfmt0 & 0x7ff) + 1;
     u->h = ((txfmt0 >> 11) & 0x7ff) + 1;
     /*
@@ -4979,12 +5004,16 @@ static bool r300_gl_decode_tex32(ATIR350State *s, const R300DrawState *d,
         if (!ati_r350_mc_to_vram(s, a, &off) &&
             !ati_r350_mc_to_vram(s, end, &off) && end >= a) {
             ati_r350_mc_read_block(s, a, row, u->w);
+            for (tx = 0; u->lanes && tx < u->w; tx++) {
+                row[tx] = r300_lane_xor32(row[tx], u->lanes);
+            }
         } else {
             for (tx = 0; tx < u->w; tx++) {
                 uint32_t ta = a + (uint32_t)tx * 4;
 
                 if (!ati_r350_mc_to_vram(s, ta, &off)) {
-                    row[tx] = ati_r350_mc_read32(s, ta);
+                    row[tx] = r300_lane_xor32(ati_r350_mc_read32(s, ta),
+                                              u->lanes);
                 } else {
                     row[tx] = off + 4 > ATI_R350_VRAM_SIZE
                               ? 0 : r300_ld32(s, d, off);

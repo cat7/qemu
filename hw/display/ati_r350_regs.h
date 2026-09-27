@@ -1007,6 +1007,7 @@
 #define R300_TX_SEL_ZERO              4
 #define R300_TX_SEL_ONE               5
 #define R300_TX_OFFSET_0              0x4540
+#define R300_TXO_ENDIAN_MASK          0x3     /* ENDIAN_SWAP [1:0] */
 /*
  * Colour and alpha blend control. The two registers share the factor
  * and combine fields; only CBLEND carries the enables. Mac OS X sets
