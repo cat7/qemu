@@ -2422,6 +2422,18 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
                                   s->regs[R350_AMCGPIO_EN_MIR >> 2], val);
         break;
     default:
+        /*
+         * The fragment decode is cached on the control words; a new
+         * instruction, slot range or rasterizer route has to drop it.
+         */
+        if (s->regs[base >> 2] != val &&
+            ((base >= R300_RS_INST_COUNT && base <= R300_RS_INST_0 + 0x3c) ||
+             (base >= R300_US_CODE_ADDR_0 &&
+              base <= R300_US_TEX_INST_0 + 0x7c) ||
+             (base >= R300_US_ALU_RGB_ADDR_0 &&
+              base <= R300_US_ALU_ALPHA_INST_0 + 0xfc))) {
+            s->us_sig = 0;
+        }
         s->regs[base >> 2] = val;
         break;
     }

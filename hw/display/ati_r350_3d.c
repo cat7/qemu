@@ -2511,12 +2511,11 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
     unsigned i, tc_named = 0;
 
     /*
-     * One decode per program, not per draw: the signature is the four
-     * control words, which is what selects the slots. A guest that
-     * rewrites an in-range instruction without touching them would be
-     * missed, so US_CODE_OFFSET -- the register whose whole purpose is
-     * to move a program rather than rewrite it in place -- is in the
-     * signature, and every write into an ALU or texture bank clears it.
+     * One decode per program, not per draw: the signature is US_CONFIG
+     * and US_CODE_OFFSET -- the register whose whole purpose is to move
+     * a program rather than rewrite it in place. A changed write to
+     * US_CODE_ADDR_*, an ALU or texture bank, or the RS_INST/RS_IP
+     * routing clears it (ati_r350_reg_write32()).
      * US_OUT_FMT_0 is compared as well: its component select is decoded
      * into the program's output permutation, and the same program is
      * run with different selects (a glyph cache copied out to an I8
