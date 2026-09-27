@@ -657,6 +657,28 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
     uint32_t old, znew, zold, sold, snew, val;
     bool zpass, spass = true;
 
+    if (s->zb.z16) {
+        /*
+         * 16-bit Z, no stencil. Linear within the pitch: the layout
+         * of a tiled 16-bit surface is unmeasured, and nothing but
+         * this model has been seen to read one.
+         */
+        unsigned xr;
+
+        addr = s->zb.off + ((uint32_t)y * s->zb.pitch + x) * 2;
+        if (addr + 2 > ATI_R350_VRAM_SIZE) {
+            return true;
+        }
+        xr = ati_r350_vram_xor(s, addr);
+        zold = d->vram[addr ^ xr] | (uint32_t)d->vram[(addr + 1) ^ xr] << 8;
+        znew = (uint32_t)(MIN(MAX(zf, 0.0f), 1.0f) * 65535.0f);
+        zpass = !s->zb.z_test || r300_zs_cmp(s->zb.zsc & 7, znew, zold);
+        if (zpass && s->zb.z_wr && znew != zold) {
+            d->vram[addr ^ xr] = znew & 0xff;
+            d->vram[(addr + 1) ^ xr] = znew >> 8;
+        }
+        return zpass;
+    }
     if (addr + 4 > ATI_R350_VRAM_SIZE) {
         return true;
     }
@@ -708,11 +730,12 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
     uint32_t clr = s->regs[R300_ZB_DEPTHCLEARVALUE >> 2];
     unsigned bw = (s->regs[R300_ZB_ZMASK_PITCH >> 2] & 0x3fff) / 32;
     unsigned smp = (s->regs[R300_GB_AA_CONFIG >> 2] & R300_AA_ENABLE) ? 2 : 1;
+    unsigned zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
     uint32_t i, off;
     unsigned x, y, k;
 
     if (val || !bw || !((zp >> 2) & 0xfff) ||
-        (s->regs[R300_ZB_FORMAT >> 2] & 0xf) != R300_ZB_FORMAT_24_8 ||
+        (zfmt != R300_ZB_FORMAT_24_8 && zfmt != R300_ZB_FORMAT_16) ||
         !ati_r350_mc_to_vram(s, s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
                              &off)) {
         return;
@@ -722,12 +745,26 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
     s->zb.macro = zp & R300_ZB_MACROTILE;
     s->zb.micro = (zp >> R300_ZB_MICROTILE_SHIFT) & 3;
     s->zb.aa = smp == 2;
+    s->zb.z16 = zfmt == R300_ZB_FORMAT_16;
     n = MIN(n, 0x100000);
     for (i = first; i < first + n; i++) {
         unsigned bx = (i % bw) * 32, by = (i / bw) * 16;
 
         for (y = by; y < by + 16; y++) {
             for (x = bx; x < bx + 32; x++) {
+                if (s->zb.z16) {
+                    /* the linear layout r300_zb_pixel() uses */
+                    uint32_t a = off + (y * s->zb.pitch + x) * 2;
+                    unsigned xr;
+
+                    if (a + 2 > ATI_R350_VRAM_SIZE) {
+                        continue;
+                    }
+                    xr = ati_r350_vram_xor(s, a);
+                    vram[a ^ xr] = clr & 0xff;
+                    vram[(a + 1) ^ xr] = (clr >> 8) & 0xff;
+                    continue;
+                }
                 for (k = 0; k < smp; k++) {
                     uint32_t a = r300_zb_addr(s, x, y, k);
                     unsigned xr;
@@ -2996,7 +3033,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
 
         s->zb.z_en = false;
         if (zc & (R300_ZB_Z_ENABLE | R300_ZB_STENCIL_ENABLE)) {
-            if (zfmt != R300_ZB_FORMAT_24_8) {
+            if (zfmt != R300_ZB_FORMAT_24_8 && zfmt != R300_ZB_FORMAT_16) {
                 ati_r350_note_gap(s, R350_GAP_ZB_FORMAT, zfmt);
             } else if ((aa & R300_AA_ENABLE) && (aa & 6)) {
                 /* three, four or six samples: layout unmeasured */
@@ -3021,6 +3058,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                 s->zb.macro = zp & R300_ZB_MACROTILE;
                 s->zb.micro = (zp >> R300_ZB_MICROTILE_SHIFT) & 3;
                 s->zb.aa = aa & R300_AA_ENABLE;
+                s->zb.z16 = zfmt == R300_ZB_FORMAT_16;
             }
         }
         if (!(cm & (R300_COLORMASK_BLUE | R300_COLORMASK_GREEN |

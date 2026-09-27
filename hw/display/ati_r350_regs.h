@@ -1068,7 +1068,8 @@
 /*
  * Z buffer. DEPTHPITCH is in pixels, field [13:2] in units of four;
  * bit 16 macro-tiles the surface in 2 KB blocks and [18:17] micro-tiles
- * each 32-byte line. DEPTHFORMAT 2 is 24-bit Z over 8-bit stencil.
+ * each 32-byte line. DEPTHFORMAT 0 is 16-bit Z, 2 is 24-bit Z over
+ * 8-bit stencil.
  */
 #define R300_ZB_CNTL                  0x4f00
 #define R300_ZB_STENCIL_ENABLE        (1u << 0)
@@ -1085,6 +1086,7 @@
 #define R300_ZB_ZSTENCILCNTL          0x4f04
 #define R300_ZB_STENCILREFMASK        0x4f08
 #define R300_ZB_FORMAT                0x4f10
+#define R300_ZB_FORMAT_16             0
 #define R300_ZB_FORMAT_24_8           2
 #define R300_ZB_DEPTHOFFSET           0x4f20
 #define R300_ZB_DEPTHPITCH            0x4f24

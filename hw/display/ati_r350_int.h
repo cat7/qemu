@@ -838,6 +838,7 @@ struct ATIR350State {
         uint32_t pitch;     /* pixels */
         bool macro, micro;  /* ZB_DEPTHPITCH tiling */
         bool aa;            /* GB_AA_CONFIG: two samples per pixel */
+        bool z16;           /* ZB_FORMAT 16-bit Z, no stencil */
     } zb;
 
     /*
