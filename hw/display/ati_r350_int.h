@@ -149,6 +149,7 @@ typedef enum ATIR350GlFallback {
     R350_GLF_BACKEND,       /* the backend itself declined the request */
     R350_GLF_FSPROG,        /* fragment program the translator refused */
     R350_GLF_CBFMT,         /* 16bpp or GART colour buffer */
+    R350_GLF_ZTEST,         /* depth or stencil test */
     R350_GLF_MAX
 } ATIR350GlFallback;
 
@@ -823,8 +824,14 @@ struct ATIR350State {
      * is the draw-capture format's version number.
      */
     struct {
-        bool z_en;          /* ZB_CNTL Z_ENABLE */
+        bool z_en;          /* ZB_CNTL Z_ENABLE or STENCIL_ENABLE */
+        bool z_test;        /* ZB_CNTL Z_ENABLE */
         bool z_wr;          /* ZB_CNTL ZWRITEENABLE */
+        bool s_en;          /* ZB_CNTL STENCIL_ENABLE */
+        bool s_fb;          /* ZB_CNTL STENCIL_FRONT_BACK */
+        uint32_t zsc;       /* ZB_ZSTENCILCNTL */
+        uint8_t s_ref, s_mask, s_wmask;     /* ZB_STENCILREFMASK */
+        unsigned cull;      /* RE_CULL_CNTL, for the primitive in hand */
         bool vte_zs, vte_zo;    /* VAP_VTE_CNTL z scale/offset enables */
         unsigned zfunc;     /* ZB_ZSTENCILCNTL ZFUNC */
         uint32_t off;       /* VRAM byte offset, 0x20-aligned */
