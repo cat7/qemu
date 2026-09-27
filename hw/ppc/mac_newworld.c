@@ -54,6 +54,8 @@
 #include "hw/ppc/ppc.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/nvram/mac_nvram.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
 #include "hw/core/boards.h"
 #include "hw/pci-host/uninorth.h"
 #include "hw/pci-host/u3_dart.h"
@@ -683,6 +685,16 @@ static void ppc_core99_init(MachineState *machine)
         qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_FLASH_SIZE);
         qdev_prop_set_uint32(dev, "it_shift", 0);
         qdev_prop_set_bit(dev, "flash", true);
+        if (!MACIO_NVRAM(dev)->blk) {
+            DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
+            BlockBackend *blk = dinfo ? blk_by_legacy_dinfo(dinfo) :
+                macio_nvram_default_blk("nvram.img", MACIO_NVRAM_FLASH_SIZE,
+                                        0xff);
+
+            if (blk) {
+                qdev_prop_set_drive(dev, "drive", blk);
+            }
+        }
     } else {
         qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
         qdev_prop_set_uint32(dev, "it_shift", 1);
@@ -691,7 +703,13 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
     if (machine_arch == ARCH_MAC99_U3) {
-        pmac_format_nvram_core99(nvr);
+        /* Keep what the file holds unless the firmware could not use it */
+        if (!pmac_nvram_core99_valid(nvr)) {
+            if (nvr->blk && nvr->data[0] != 0xff) {
+                warn_report("NVRAM image holds no valid bank, reformatting it");
+            }
+            pmac_format_nvram_core99(nvr);
+        }
     } else {
         pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
     }
