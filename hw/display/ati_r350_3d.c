@@ -4415,11 +4415,57 @@ static bool r300_tris_overlap(const R300Vtx * const a[3],
 
     for (i = 0; i < 3; i++) {
         const R300Vtx *p = a[i], *q = a[(i + 1) % 3];
+/*
+ * Two triangles with a common edge whose third vertices lie strictly on
+ * opposite sides of it are disjoint. The projection test cannot see this
+ * once the edge is not axis-aligned: the two endpoints' projections onto
+ * the edge's own normal differ by a rounding, so the halves of a rotated
+ * quad read as overlapping. Ties and near-collinear thirds are left to
+ * the projection test.
+ */
+static bool r300_tris_split_by_edge(const R300Vtx * const a[3],
+                                    const R300Vtx * const b[3])
+{
+    unsigned i, j;
+
+    for (i = 0; i < 3; i++) {
+        const R300Vtx *p = a[i], *q = a[(i + 1) % 3], *ra = a[(i + 2) % 3];
+
+        for (j = 0; j < 3; j++) {
+            const R300Vtx *u = b[j], *v = b[(j + 1) % 3];
+            const R300Vtx *rb = b[(j + 2) % 3];
+            float ex, ey, oa, ob, la, lb, len;
+
+            if (!((u->x == p->x && u->y == p->y &&
+                   v->x == q->x && v->y == q->y) ||
+                  (u->x == q->x && u->y == q->y &&
+                   v->x == p->x && v->y == p->y))) {
+                continue;
+            }
+            ex = q->x - p->x;
+            ey = q->y - p->y;
+            oa = ex * (ra->y - p->y) - ey * (ra->x - p->x);
+            ob = ex * (rb->y - p->y) - ey * (rb->x - p->x);
+            len = fabsf(ex) + fabsf(ey);
+            la = len * (fabsf(ra->x - p->x) + fabsf(ra->y - p->y));
+            lb = len * (fabsf(rb->x - p->x) + fabsf(rb->y - p->y));
+            if (fabsf(oa) <= la * 0.0001f || fabsf(ob) <= lb * 0.0001f) {
+                return false;
+            }
+            return (oa > 0.0f) != (ob > 0.0f);
+        }
+    }
+    return false;
+}
+
         const R300Vtx *r = b[i], *t = b[(i + 1) % 3];
 
         if (r300_axis_sep(-(q->y - p->y), q->x - p->x, a, b) ||
             r300_axis_sep(-(t->y - r->y), t->x - r->x, a, b)) {
             return false;
+    if (r300_tris_split_by_edge(a, b)) {
+        return false;
+    }
         }
     }
     return true;
