@@ -4731,12 +4731,77 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
     int tx, ty;
 
     for (ty = 0; ty < u->h; ty++) {
+/* r300_texel_chan() scaled back to a byte, which is exactly the byte */
+static inline uint8_t r300_texel_byte(const R300TexUnit *u, uint32_t texel,
+                                      unsigned ch)
+{
+    unsigned sel = u->sel[ch];
+
+    if (sel == R300_TX_SEL_ONE) {
+        return 255;
+    }
+    if (sel > R300_TX_SEL_W) {
+        return 0;
+    }
+    return (texel >> (sel * 8)) & 0xff;
+}
+
+/*
+ * The 32bpp case of the loop below without the per-texel sampler: the
+ * coordinates are in range, so neither wrap nor clamp applies, and a row
+ * outside VRAM is fetched with one translation per page.
+ */
+static bool r300_gl_decode_tex32(ATIR350State *s, const R300DrawState *d,
+                                 unsigned unit, uint8_t *rgba)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    g_autofree uint32_t *row = NULL;
+    int tx, ty;
+
+    if (u->bpp != 32 || u->w <= 0 || u->h <= 0) {
+        return false;
+    }
+    row = g_new(uint32_t, u->w);
+    for (ty = 0; ty < u->h; ty++) {
+        uint32_t a = u->off + (uint32_t)ty * u->pitch;
+        uint32_t end = a + (uint32_t)(u->w - 1) * 4;
+        uint32_t off;
+        uint8_t *p = rgba + (size_t)ty * u->w * 4;
+
+        if (!ati_r350_mc_to_vram(s, a, &off) &&
+            !ati_r350_mc_to_vram(s, end, &off) && end >= a) {
+            ati_r350_mc_read_block(s, a, row, u->w);
+        } else {
+            for (tx = 0; tx < u->w; tx++) {
+                uint32_t ta = a + (uint32_t)tx * 4;
+
+                if (!ati_r350_mc_to_vram(s, ta, &off)) {
+                    row[tx] = ati_r350_mc_read32(s, ta);
+                } else {
+                    row[tx] = off + 4 > ATI_R350_VRAM_SIZE
+                              ? 0 : r300_ld32(s, d, off);
+                }
+            }
+        }
+        for (tx = 0; tx < u->w; tx++, p += 4) {
+            p[0] = r300_texel_byte(u, row[tx], 1);
+            p[1] = r300_texel_byte(u, row[tx], 2);
+            p[2] = r300_texel_byte(u, row[tx], 3);
+            p[3] = r300_texel_byte(u, row[tx], 0);
+        }
+    }
+    return true;
+}
+
         for (tx = 0; tx < u->w; tx++) {
             uint32_t texel = r300_sample_tex(s, d, unit, tx, ty);
             uint8_t *p = rgba + ((size_t)ty * u->w + tx) * 4;
 
             p[0] = (uint8_t)(r300_texel_chan(u, texel, 1) * 255.0f + 0.5f);
             p[1] = (uint8_t)(r300_texel_chan(u, texel, 2) * 255.0f + 0.5f);
+    if (r300_gl_decode_tex32(s, d, unit, rgba)) {
+        return;
+    }
             p[2] = (uint8_t)(r300_texel_chan(u, texel, 3) * 255.0f + 0.5f);
             p[3] = (uint8_t)(r300_texel_chan(u, texel, 0) * 255.0f + 0.5f);
         }
