@@ -2778,8 +2778,10 @@ static void ati_r350_pm4_parse(ATIR350State *s,
     /* val is a data dword for the packet currently in flight */
     switch (p->type) {
     case 0:
-        trace_ati_r350_pm4_reg(p->reg & 0xfffc,
-                                  ati_r350_reg_name(p->reg & 0xfffc), val);
+        if (trace_event_get_state_backends(TRACE_ATI_R350_PM4_REG)) {
+            trace_ati_r350_pm4_reg(p->reg & 0xfffc,
+                                   ati_r350_reg_name(p->reg & 0xfffc), val);
+        }
         ati_r350_reg_write32(s, p->reg & 0xfffc, val);
         if (!p->one_reg) {
             p->reg += 4;
@@ -2787,12 +2789,16 @@ static void ati_r350_pm4_parse(ATIR350State *s,
         break;
     case 1:
         if (p->remaining == 2) {
-            trace_ati_r350_pm4_reg(p->p1_reg1 & 0xfffc,
-                ati_r350_reg_name(p->p1_reg1 & 0xfffc), val);
+            if (trace_event_get_state_backends(TRACE_ATI_R350_PM4_REG)) {
+                trace_ati_r350_pm4_reg(p->p1_reg1 & 0xfffc,
+                    ati_r350_reg_name(p->p1_reg1 & 0xfffc), val);
+            }
             ati_r350_reg_write32(s, p->p1_reg1 & 0xfffc, val);
         } else {
-            trace_ati_r350_pm4_reg(p->p1_reg2 & 0xfffc,
-                ati_r350_reg_name(p->p1_reg2 & 0xfffc), val);
+            if (trace_event_get_state_backends(TRACE_ATI_R350_PM4_REG)) {
+                trace_ati_r350_pm4_reg(p->p1_reg2 & 0xfffc,
+                    ati_r350_reg_name(p->p1_reg2 & 0xfffc), val);
+            }
             ati_r350_reg_write32(s, p->p1_reg2 & 0xfffc, val);
         }
         break;
@@ -3240,11 +3246,14 @@ static uint64_t ati_r350_mmio_read(void *opaque, hwaddr addr,
     uint32_t val = ati_r350_reg_read32(s, base);
 
     val = extract32(val, (addr & 3) * 8, size * 8);
-    if (ati_r350_reg_name(base)[0] == '?') {
-        trace_ati_r350_unk_read(size, addr, val);
-    } else {
-        trace_ati_r350_reg_read(size, addr, ati_r350_reg_name(base),
-                                   val);
+    if (trace_event_get_state_backends(TRACE_ATI_R350_UNK_READ) ||
+        trace_event_get_state_backends(TRACE_ATI_R350_REG_READ)) {
+        if (ati_r350_reg_name(base)[0] == '?') {
+            trace_ati_r350_unk_read(size, addr, val);
+        } else {
+            trace_ati_r350_reg_read(size, addr, ati_r350_reg_name(base),
+                                    val);
+        }
     }
     return val;
 }
@@ -3256,11 +3265,26 @@ static void ati_r350_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     uint32_t base = addr & 0xfffc;
     uint32_t val = data;
 
-    if (ati_r350_reg_name(base)[0] == '?') {
-        trace_ati_r350_unk_write(size, addr, data);
-    } else {
-        trace_ati_r350_reg_write(size, addr, ati_r350_reg_name(base),
-                                    data);
+    if (trace_event_get_state_backends(TRACE_ATI_R350_UNK_WRITE) ||
+        trace_event_get_state_backends(TRACE_ATI_R350_REG_WRITE)) {
+        if (ati_r350_reg_name(base)[0] == '?') {
+            trace_ati_r350_unk_write(size, addr, data);
+        } else {
+            trace_ati_r350_reg_write(size, addr, ati_r350_reg_name(base),
+                                     data);
+        }
+    }
+    if (s->engine_on) {
+        if (base == R350_CP_RB_WPTR && size == 4 && !(addr & 3)) {
+            s->regs[base >> 2] = val;
+            qatomic_store_release(&s->pm4_wptr, s->pm4_ring_dwords ?
+                                  val & (s->pm4_ring_dwords - 1) : val);
+            ati_r350_engine_kick(s);
+            return;
+        }
+        if (qatomic_read(&s->engine_busy) && ati_r350_engine_reg(base)) {
+            ati_r350_engine_wait(s);
+        }
     }
     if (size != 4 || (addr & 3)) {
         /*

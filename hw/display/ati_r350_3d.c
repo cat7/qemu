@@ -5552,12 +5552,15 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                      * re-reading memory (which would change what the
                      * trace observes).
                      */
-                    uint64_t target;
-                    const char *win = ati_r350_mc_describe(s, addr[a],
-                                                           &target);
+                    if (trace_event_get_state_backends(
+                            TRACE_ATI_R350_3D_VBUF_AOS_SRC)) {
+                        uint64_t target;
+                        const char *win = ati_r350_mc_describe(s, addr[a],
+                                                               &target);
 
-                    trace_ati_r350_3d_vbuf_aos_src(a, size[a], stride[a],
-                                                   addr[a], win, target);
+                        trace_ati_r350_3d_vbuf_aos_src(a, size[a], stride[a],
+                                                       addr[a], win, target);
+                    }
                     trace_ati_r350_3d_vbuf_aos_dw(a,
                         n > base ? dw[base] : 0,
                         n > base + 1 ? dw[base + 1] : 0,
