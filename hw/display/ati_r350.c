@@ -650,11 +650,18 @@ static DirtyBitmapSnapshot *ati_r350_take_dirty(ATIR350State *s)
     DirtyBitmapSnapshot *snap;
     int i;
 
-    /* the draw path claims dirty bits for textures; see gl_tex_lock */
-    QEMU_LOCK_GUARD(&s->gl_tex_lock);
+    /*
+     * Not under gl_tex_lock: under TCG the snapshot waits for every vCPU
+     * to finish its translation block, and a vCPU may be waiting for the
+     * command processor thread, which may be waiting for that lock. The
+     * bitmap operations are atomic; a range admitted in between is at
+     * worst dropped again by gl_epoch().
+     */
     snap = memory_region_snapshot_and_clear_dirty(&s->vram, 0,
                                                    ATI_R350_VRAM_SIZE,
                                                    DIRTY_MEMORY_VGA);
+    /* the draw path claims dirty bits for textures; see gl_tex_lock */
+    QEMU_LOCK_GUARD(&s->gl_tex_lock);
     for (i = 0; i < nblocks; i++) {
         if (!s->fb_block_pending[i] &&
             memory_region_snapshot_get_dirty(&s->vram, snap,
