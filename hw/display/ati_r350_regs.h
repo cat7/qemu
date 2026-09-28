@@ -997,6 +997,8 @@
 /* TXFORMAT codes this model decodes; the rest are counted as a gap */
 #define R300_TX_FMT_8                 0x00    /* one 8-bit component */
 #define R300_TX_FMT_8_8               0x03    /* two: X low byte, Y high */
+#define R300_TX_FMT_5_6_5             0x06    /* X[4:0] Y[10:5] Z[15:11] */
+#define R300_TX_FMT_4_4_4_4           0x0a    /* four 4-bit, X the low nibble */
 #define R300_TX_FMT_1_5_5_5           0x0b    /* X[4:0] Y[9:5] Z[14:10] W[15] */
 #define R300_TX_FMT_8_8_8_8           0x0c    /* four, X the low byte */
 #define R300_TX_FMT_16_16_16_16       0x0e    /* four 16-bit, X the low half */

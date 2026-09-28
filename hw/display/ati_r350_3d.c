@@ -303,6 +303,22 @@ static inline uint32_t r300_texel_1555(uint32_t v)
                           (v >> 15) & 1 ? 0xff : 0);
 }
 
+/* TX_FMT_5_6_5 (code 0x6): no W component, read as one */
+static inline uint32_t r300_texel_565(uint32_t v)
+{
+    uint32_t y = (v >> 5) & 0x3f;
+
+    return r300_pack_xyzw(r300_c5to8(v & 0x1f), (y << 2) | (y >> 4),
+                          r300_c5to8((v >> 11) & 0x1f), 0xff);
+}
+
+/* TX_FMT_4_4_4_4 (code 0xa) */
+static inline uint32_t r300_texel_4444(uint32_t v)
+{
+    return r300_pack_xyzw((v & 0xf) * 0x11, ((v >> 4) & 0xf) * 0x11,
+                          ((v >> 8) & 0xf) * 0x11, ((v >> 12) & 0xf) * 0x11);
+}
+
 /*
  * TX_FMT_16_16_16_16 (code 0xe, 64 bits per texel), from the two dwords
  * in ascending address order: Component0 is the low half of the first,
@@ -404,7 +420,16 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
             v = (uint32_t)d->vram[off ^ xr] |
                 ((uint32_t)d->vram[(off + 1) ^ xr] << 8);
         }
-        return u->code == R300_TX_FMT_1_5_5_5 ? r300_texel_1555(v) : v;
+        switch (u->code) {
+        case R300_TX_FMT_1_5_5_5:
+            return r300_texel_1555(v);
+        case R300_TX_FMT_5_6_5:
+            return r300_texel_565(v);
+        case R300_TX_FMT_4_4_4_4:
+            return r300_texel_4444(v);
+        default:
+            return v;
+        }
     }
     if (u->bpp == 64) {
         /*
@@ -2939,8 +2964,9 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
      * [4:0]): 0 is TX_FMT_8, the single-component format window drop
      * shadows arrive in (TX_FORMAT1=0x00124000); 3 is TX_FMT_8_8, the
      * two-component luminance/alpha sprite Flurry.saver's particles
-     * are drawn with; 0xb is TX_FMT_1_5_5_5, which Abstract.saver
-     * asks for; 0xc is TX_FMT_8_8_8_8, what the compositor and most
+     * are drawn with; 0x6 is TX_FMT_5_6_5 and 0xa TX_FMT_4_4_4_4;
+     * 0xb is TX_FMT_1_5_5_5, which Abstract.saver asks for; 0xc is
+     * TX_FMT_8_8_8_8, what the compositor and most
      * apps use; 0xe is TX_FMT_16_16_16_16, which RSS Visualizer.saver
      * asks for. r300_sample_tex() hands all of them to the component
      * select as four bytes, so one selector implementation serves
@@ -2955,6 +2981,8 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
         u->bpp = 8;
         break;
     case R300_TX_FMT_8_8:
+    case R300_TX_FMT_5_6_5:
+    case R300_TX_FMT_4_4_4_4:
     case R300_TX_FMT_1_5_5_5:
         u->bpp = 16;
         break;
