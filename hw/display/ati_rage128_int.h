@@ -147,18 +147,22 @@ typedef struct ATIRage128Job {
 
 /*
  * Parallel rasterisation. Triangles are queued until the draw state is
- * about to change, then the batch's rows are split into contiguous
- * bands of absolute screen rows and each band is drawn by a different
- * thread; the submitting thread draws band 0 and waits for the rest, so
- * the batch is complete before anything else runs.
+ * about to change, then the batch's rows are cut into stripes of
+ * 1 << ATI_RAGE128_RASTER_STRIPE_SHIFT rows, and the submitting thread
+ * and the workers it wakes take stripes one at a time from a shared
+ * counter until none is left, so the batch is complete before anything
+ * else runs.
  *
- * Within a band the triangles are drawn in submission order, and a row
- * belongs to one band whichever triangle covers it, so every pixel is
+ * Within a stripe the triangles are drawn in submission order, and a row
+ * belongs to one stripe whichever triangle covers it, so every pixel is
  * written by one thread in the order it would have been written
- * serially. Every band runs the same code over the same setup, so the
+ * serially. Every stripe runs the same code over the same setup, so the
  * pixels are bit for bit the ones the serial loop produced.
  */
 #define ATI_RAGE128_RASTER_MAX_THREADS 8
+
+/* small stripes keep the last one short: its drawer is waited for */
+#define ATI_RAGE128_RASTER_STRIPE_SHIFT 1
 
 /*
  * Below this many pixels in the bounding box a triangle is drawn
@@ -173,21 +177,24 @@ typedef struct ATIRage128RasterWorker {
     struct ATIRage128State *s;
     QemuThread thread;
     QemuSemaphore start;
-    int band;
+    uint32_t job;                     /* the batch it was woken for */
 } ATIRage128RasterWorker;
 
 typedef struct ATIRage128Raster {
     unsigned threads;                 /* property: 0 = auto from host cpus */
     unsigned nworkers;                /* live helpers, 0 = always serial */
     bool quit;
-    QemuSemaphore done;
-    /* the batch the bands are drawing, and the rows each one owns */
+    /* the batch the stripes are drawing */
     ATIRage128Vertex tri[ATI_RAGE128_RASTER_QUEUE][3];
+    int tri_y0[ATI_RAGE128_RASTER_QUEUE];  /* rows each one can touch */
+    int tri_y1[ATI_RAGE128_RASTER_QUEUE];
     unsigned ntri;                    /* queued, not yet flushed */
-    unsigned batch;                   /* handed to the bands */
-    unsigned nbands;
-    int band_y0[ATI_RAGE128_RASTER_MAX_THREADS];
-    int band_y1[ATI_RAGE128_RASTER_MAX_THREADS];
+    unsigned batch;                   /* handed to the stripes */
+    int top;                          /* first row of stripe 0 */
+    uint32_t job;
+    /* job << 32 | last stripe << 16 | next stripe to take */
+    uint64_t next;
+    unsigned stripes_done;
     double qy0, qy1, qpx;             /* the queue's rows and bbox pixels */
     /* how the split is actually landing; read with the raster-stats property */
     uint64_t tri_serial;              /* drawn on the submitting thread alone */
