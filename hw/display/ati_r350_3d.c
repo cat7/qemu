@@ -272,16 +272,41 @@ typedef struct R300RasterWorker {
     ATIR350SwapMemo memo;
 } R300RasterWorker;
 
+/* a batch is flushed at this many triangles even inside its packet */
+#define R300_RASTER_QUEUE_MAX 65536
+/* rows per bin of the batch's per-row-range triangle index */
+#define R300_RASTER_BIN_SHIFT 6
+#define R300_RASTER_BINS (8192 >> R300_RASTER_BIN_SHIFT)
+/* vertices per block of the batch's own vertex store */
+#define R300_RASTER_VTX_BLOCK 1024
+/* a stripe never straddles two bins */
+QEMU_BUILD_BUG_ON(R300_RASTER_BIN_SHIFT < R300_RASTER_STRIPE_SHIFT);
+
 typedef struct R300Raster {
     R300RasterWorker worker[R300_RASTER_MAX_THREADS - 1];
     unsigned nworkers;
     bool quit;
-    /* the primitive in hand: 0 undecided, 1 may split, -1 serial */
-    int ok;
+    /* the primitive's triangles are being queued rather than drawn */
+    bool queueing;
     const R300DrawState *d;
     R300RasterTri *tri;
     unsigned ntri, cap;
-    int y0, y1;                 /* rows the job spans, inclusive */
+    uint64_t px;                /* bounding-box pixels queued */
+    int y0, y1;                 /* rows the batch spans, inclusive */
+    /*
+     * The batch's triangles by bin of rows, each bin's in submission
+     * order: bin b's are bin_tri[bin_at[b]] .. bin_tri[bin_at[b + 1] - 1].
+     */
+    unsigned bin_at[R300_RASTER_BINS + 1];
+    unsigned *bin_tri;
+    size_t bin_cap;
+    /*
+     * Vertices the primitive walk made up -- sprite and line corners, a
+     * rectangle's fourth -- kept until the batch is drawn. Blocks never
+     * move, so a queued triangle's pointers stay good.
+     */
+    R300Vtx **vblk;
+    unsigned nvblk, vblk_cur, vblk_used;
     uint32_t job;
     /* job << 32 | last stripe << 16 | next stripe to take */
     uint64_t next;
@@ -3733,10 +3758,11 @@ static void r300_raster_stripes(ATIR350State *s, R300Raster *q, uint32_t job)
     while ((stripe = r300_raster_take(q, job)) >= 0) {
         int first = stripe << R300_RASTER_STRIPE_SHIFT;
         int last = first + (1 << R300_RASTER_STRIPE_SHIFT) - 1;
+        unsigned bin = first >> R300_RASTER_BIN_SHIFT;
         unsigned i;
 
-        for (i = 0; i < q->ntri; i++) {
-            const R300RasterTri *t = &q->tri[i];
+        for (i = q->bin_at[bin]; i < q->bin_at[bin + 1]; i++) {
+            const R300RasterTri *t = &q->tri[q->bin_tri[i]];
 
             if (t->y1 >= first && t->y0 <= last) {
                 r300_raster_tri(s, q->d, t->v[0], t->v[1], t->v[2],
@@ -3798,11 +3824,11 @@ static inline bool r300_ranges_meet(uint64_t a0, uint64_t a1,
 }
 
 /*
- * May the primitive in hand be split, drawing rows [y0, y1] of about
- * `px` pixels? Everything a worker would read from the bus is copied to
- * the host here, and a draw that reads bytes it also writes is not
- * split: the order of that read and that write is the serial one only
- * when a single thread draws.
+ * May the batch in hand be split, drawing rows [y0, y1] of about `px`
+ * pixels? Everything a worker would read from the bus is copied to the
+ * host here, and a draw that reads bytes it also writes is not split:
+ * the order of that read and that write is the serial one only when a
+ * single thread draws.
  */
 static bool r300_raster_prepare(ATIR350State *s, R300Raster *q,
                                 const R300DrawState *d, int y0, int y1,
@@ -3814,9 +3840,6 @@ static bool r300_raster_prepare(ATIR350State *s, R300Raster *q,
     uint64_t w0 = 0, w1 = 0, z0 = 0, z1 = 0;
     unsigned u;
 
-    if (s->cap_fp) {
-        return false;               /* the capture stays serial */
-    }
     if (d->wmask && !d->cb_host) {
         w0 = d->dst_off + (uint64_t)y0 * d->dst_pitch;
         w1 = d->dst_off + rows * d->dst_pitch;
@@ -3831,7 +3854,7 @@ static bool r300_raster_prepare(ATIR350State *s, R300Raster *q,
         uint64_t r0 = d->res_off + (uint64_t)y0 * d->res_pitch;
         uint64_t r1 = d->res_off + rows * d->res_pitch;
 
-        if (r300_ranges_meet(r0, r1, w0, w1) ||
+        if (d->cb_host || r300_ranges_meet(r0, r1, w0, w1) ||
             r300_ranges_meet(r0, r1, z0, z1)) {
             return false;
         }
@@ -3873,38 +3896,149 @@ static bool r300_raster_prepare(ATIR350State *s, R300Raster *q,
     return true;
 }
 
+/* index the batch's triangles by the bins of rows they touch */
+static void r300_raster_bin(R300Raster *q)
+{
+    unsigned i, b, n = 0;
+
+    memset(q->bin_at, 0, sizeof(q->bin_at));
+    for (i = 0; i < q->ntri; i++) {
+        for (b = q->tri[i].y0 >> R300_RASTER_BIN_SHIFT;
+             b <= q->tri[i].y1 >> R300_RASTER_BIN_SHIFT; b++) {
+            q->bin_at[b + 1]++;
+            n++;
+        }
+    }
+    for (b = 0; b < R300_RASTER_BINS; b++) {
+        q->bin_at[b + 1] += q->bin_at[b];
+    }
+    if (q->bin_cap < n) {
+        q->bin_cap = MAX(n, q->bin_cap * 2);
+        g_free(q->bin_tri);
+        q->bin_tri = g_new(unsigned, q->bin_cap);
+    }
+    for (i = 0; i < q->ntri; i++) {
+        for (b = q->tri[i].y0 >> R300_RASTER_BIN_SHIFT;
+             b <= q->tri[i].y1 >> R300_RASTER_BIN_SHIFT; b++) {
+            q->bin_tri[q->bin_at[b]++] = i;
+        }
+    }
+    /* each bin's cursor ended at the next bin's start: shift back */
+    for (b = R300_RASTER_BINS; b > 0; b--) {
+        q->bin_at[b] = q->bin_at[b - 1];
+    }
+    q->bin_at[0] = 0;
+}
+
+/* Draw everything queued, in submission order per pixel. */
+static void r300_raster_flush(ATIR350State *s)
+{
+    R300Raster *q = s->raster;
+    const R300DrawState *d = q->d;
+    unsigned i, n = q->ntri;
+    unsigned stripes, helpers;
+
+    if (!n) {
+        return;
+    }
+    stripes = (q->y1 >> R300_RASTER_STRIPE_SHIFT) -
+              (q->y0 >> R300_RASTER_STRIPE_SHIFT) + 1;
+    helpers = MIN(q->nworkers, stripes - 1);
+    if (helpers && (q->px < R300_RASTER_MIN_PX ||
+                    !r300_raster_prepare(s, q, d, q->y0, q->y1, q->px))) {
+        helpers = 0;
+    }
+    if (!helpers) {
+        s->raster_tri_serial += n;
+        for (i = 0; i < n; i++) {
+            const R300RasterTri *t = &q->tri[i];
+
+            r300_raster_tri(s, d, t->v[0], t->v[1], t->v[2], t->cull,
+                            INT_MIN, INT_MAX);
+        }
+    } else {
+        s->raster_tri_split += n;
+        r300_raster_bin(q);
+        r300_raster_run(s, q, helpers);
+    }
+    q->ntri = 0;
+    q->px = 0;
+    q->vblk_cur = 0;
+    q->vblk_used = 0;
+}
+
+/*
+ * Where the primitive walk may keep `n` vertices it made up: the batch's
+ * own store while queueing, since the triangles naming them are drawn
+ * later, and the caller's copy otherwise.
+ */
+static const R300Vtx *r300_keep(ATIR350State *s, const R300Vtx *v,
+                                unsigned n)
+{
+    R300Raster *q = s->raster;
+    R300Vtx *p;
+
+    if (!q || !q->queueing) {
+        return v;
+    }
+    if (q->ntri >= R300_RASTER_QUEUE_MAX) {
+        /* the caller holds none of the store: it may start over */
+        r300_raster_flush(s);
+    }
+    if (q->nvblk && q->vblk_used + n > R300_RASTER_VTX_BLOCK) {
+        q->vblk_cur++;
+        q->vblk_used = 0;
+    }
+    if (q->vblk_cur == q->nvblk) {
+        q->vblk = g_renew(R300Vtx *, q->vblk, q->nvblk + 1);
+        q->vblk[q->nvblk++] = g_new(R300Vtx, R300_RASTER_VTX_BLOCK);
+    }
+    p = q->vblk[q->vblk_cur] + q->vblk_used;
+    q->vblk_used += n;
+    memcpy(p, v, n * sizeof(*v));
+    return p;
+}
+
+/*
+ * Queue a primitive's triangles from here on, when there is a pool to
+ * draw them and nothing that must watch them drawn one by one.
+ */
 static void r300_raster_begin(ATIR350State *s, const R300DrawState *d)
 {
-    if (s->raster) {
-        s->raster->ok = 0;
-        s->raster->d = d;
+    R300Raster *q = s->raster;
+
+    if (q && !s->cap_fp) {
+        q->queueing = true;
+        q->d = d;
     }
 }
 
+/* The primitive is walked: nothing it queued outlives it. */
 static void r300_raster_end(ATIR350State *s)
 {
     R300Raster *q = s->raster;
     unsigned u;
 
-    if (q) {
-        for (u = 0; u < R300_TEX_UNITS; u++) {
-            q->shadowed[u] = false;
-        }
-        q->ok = 0;
-        q->d = NULL;
+    if (!q || !q->queueing) {
+        return;
     }
+    r300_raster_flush(s);
+    for (u = 0; u < R300_TEX_UNITS; u++) {
+        q->shadowed[u] = false;
+    }
+    q->queueing = false;
+    q->d = NULL;
 }
 
-/* one triangle of a primitive, split across the threads if it pays */
+/* one triangle of a primitive: queued for the batch, or drawn here */
 static void r300_tri(ATIR350State *s, const R300DrawState *d,
                      const R300Vtx *v0, const R300Vtx *v1, const R300Vtx *v2,
                      unsigned cull)
 {
     R300Raster *q = s->raster;
-    int x0, y0, x1, y1, stripes;
-    uint64_t px;
+    int x0, y0, x1, y1;
 
-    if (!q || q->ok < 0) {
+    if (!q || !q->queueing) {
         s->raster_tri_serial++;
         r300_raster_tri(s, d, v0, v1, v2, cull, INT_MIN, INT_MAX);
         return;
@@ -3913,36 +4047,24 @@ static void r300_tri(ATIR350State *s, const R300DrawState *d,
     if (x1 <= x0 || y1 <= y0) {
         return;                     /* the scan is empty */
     }
-    px = (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
-    stripes = ((y1 - 1) >> R300_RASTER_STRIPE_SHIFT) -
-              (y0 >> R300_RASTER_STRIPE_SHIFT) + 1;
-    if (px < R300_RASTER_MIN_PX || stripes < 2) {
-        s->raster_tri_serial++;
-        r300_raster_tri(s, d, v0, v1, v2, cull, INT_MIN, INT_MAX);
-        return;
+    if (q->ntri == q->cap) {
+        q->cap = MAX(q->cap * 2, 64);
+        q->tri = g_renew(R300RasterTri, q->tri, q->cap);
     }
-    if (!q->ok) {
-        q->ok = r300_raster_prepare(s, q, d, MAX(d->sc_y0, 0),
-                                    MIN(d->sc_y1, 8190), px) ? 1 : -1;
-        if (q->ok < 0) {
-            s->raster_tri_serial++;
-            r300_raster_tri(s, d, v0, v1, v2, cull, INT_MIN, INT_MAX);
-            return;
-        }
-    }
-    if (!q->cap) {
-        q->cap = 1;
-        q->tri = g_new(R300RasterTri, q->cap);
-    }
-    q->tri[0] = (R300RasterTri) {
+    q->tri[q->ntri++] = (R300RasterTri) {
         .v = { v0, v1, v2 }, .cull = cull, .y0 = y0, .y1 = y1 - 1,
     };
-    q->ntri = 1;
-    q->y0 = y0;
-    q->y1 = y1 - 1;
-    s->raster_tri_split++;
-    r300_raster_run(s, q, MIN(q->nworkers, (unsigned)stripes - 1));
-    q->ntri = 0;
+    q->px += (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+    q->y0 = q->ntri == 1 ? y0 : MIN(q->y0, y0);
+    q->y1 = q->ntri == 1 ? y1 - 1 : MAX(q->y1, y1 - 1);
+    if (q->ntri >= R300_RASTER_QUEUE_MAX && !q->vblk_cur && !q->vblk_used) {
+        /*
+         * The draw state is the packet's throughout, so a batch may end
+         * anywhere inside it. A primitive that makes up vertices ends
+         * it in r300_keep() instead, where the caller holds none.
+         */
+        r300_raster_flush(s);
+    }
 }
 
 void ati_r350_raster_init(ATIR350State *s)
@@ -3995,6 +4117,11 @@ void ati_r350_raster_fini(ATIR350State *s)
     for (i = 0; i < R300_TEX_UNITS; i++) {
         g_free(q->shadow[i]);
     }
+    for (i = 0; i < q->nvblk; i++) {
+        g_free(q->vblk[i]);
+    }
+    g_free(q->vblk);
+    g_free(q->bin_tri);
     g_free(q->tri);
     g_free(q);
     s->raster = NULL;
@@ -4013,6 +4140,7 @@ static void r300_raster_line(ATIR350State *s, const R300DrawState *d,
     float len = sqrtf(dx * dx + dy * dy);
     float nx, ny;
     R300Vtx q[4];
+    const R300Vtx *k;
     int c;
 
     if (len < 0.000001f) {
@@ -4028,8 +4156,9 @@ static void r300_raster_line(ATIR350State *s, const R300DrawState *d,
     q[1].x = b->x + nx; q[1].y = b->y + ny;
     q[2].x = b->x - nx; q[2].y = b->y - ny;
     q[3].x = a->x - nx; q[3].y = a->y - ny;
-    r300_tri(s, d, &q[0], &q[1], &q[2], cull);
-    r300_tri(s, d, &q[0], &q[2], &q[3], cull);
+    k = r300_keep(s, q, 4);
+    r300_tri(s, d, &k[0], &k[1], &k[2], cull);
+    r300_tri(s, d, &k[0], &k[2], &k[3], cull);
 }
 
 static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
@@ -4084,6 +4213,7 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
         }
         for (i = 0; i < nvtx && sx > 0.0f && sy > 0.0f; i++) {
             R300Vtx q[4];
+            const R300Vtx *k;
             int c;
 
             for (c = 0; c < 4; c++) {
@@ -4101,8 +4231,9 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
             q[2].tc[0][0] = s1; q[2].tc[0][1] = t1;
             q[3].x = q[0].x; q[3].y = q[2].y;
             q[3].tc[0][0] = s0; q[3].tc[0][1] = t1;
-            r300_tri(s, d, &q[0], &q[1], &q[2], cull);
-            r300_tri(s, d, &q[0], &q[2], &q[3], cull);
+            k = r300_keep(s, q, 4);
+            r300_tri(s, d, &k[0], &k[1], &k[2], cull);
+            r300_tri(s, d, &k[0], &k[2], &k[3], cull);
         }
         break;
     }
@@ -4164,7 +4295,8 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
                 }
             }
             r300_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2], cull);
-            r300_tri(s, d, &vb[i + 1], &v3, &vb[i + 2], cull);
+            r300_tri(s, d, &vb[i + 1], r300_keep(s, &v3, 1), &vb[i + 2],
+                     cull);
         }
         break;
     case 14:    /* quad strip: each further vertex pair closes a quad
