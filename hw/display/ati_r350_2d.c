@@ -62,13 +62,20 @@ static int ati_r350_bpp_from_datatype(uint32_t datatype)
 {
     switch (datatype & 0xf) {
     case 2:
+    case 7:                     /* RGB332 */
+    case 8:                     /* Y8 */
+    case 9:                     /* RGB8 */
         return 8;
     case 3:
     case 4:
+    case 11:                    /* VYUY422 */
+    case 12:                    /* YVYU422 */
+    case 15:                    /* ARGB4444 */
         return 16;
     case 5:
         return 24;
     case 6:
+    case 14:                    /* AYUV444 */
         return 32;
     default:
         return 0;
@@ -616,31 +623,57 @@ static int ati_r350_blend_factor(unsigned f, int sc, int sa, int dc,
     }
 }
 
-/* Read a destination pixel as 8-bit ARGB regardless of surface depth. */
-static uint32_t ati_r350_dst_to_argb(uint32_t px, int bpp)
+static uint32_t ati_r350_expand5(uint32_t v)
 {
-    switch (bpp) {
-    case 16:
+    return (v << 3) | (v >> 2);
+}
+
+/* Read a destination pixel of DP datatype `dt` as 8-bit ARGB. */
+static uint32_t ati_r350_dst_to_argb(uint32_t px, unsigned dt)
+{
+    switch (dt) {
+    case 3:
+        return (px & 0x8000 ? 0xff000000 : 0) |
+               ati_r350_expand5((px >> 10) & 0x1f) << 16 |
+               ati_r350_expand5((px >> 5) & 0x1f) << 8 |
+               ati_r350_expand5(px & 0x1f);
+    case 4:
         return 0xff000000 | (((px >> 11) & 0x1f) << 19) |
                (((px >> 5) & 0x3f) << 10) | ((px & 0x1f) << 3);
-    case 24:
+    case 5:
         return 0xff000000 | (px & 0xffffff);
-    case 32:
+    case 6:
         return px;
+    case 15:
+        return ((px >> 12) & 0xf) * 0x11000000u |
+               ((px >> 8) & 0xf) * 0x110000u |
+               ((px >> 4) & 0xf) * 0x1100u | (px & 0xf) * 0x11u;
     default:
         return 0xff000000 | px;
     }
 }
 
-static uint32_t ati_r350_argb_to_dst(uint32_t argb, int bpp)
+static uint32_t ati_r350_argb_to_dst(uint32_t argb, unsigned dt)
 {
-    switch (bpp) {
-    case 16:
+    switch (dt) {
+    case 3:
+        return (argb >> 31) << 15 | ((argb >> 19) & 0x1f) << 10 |
+               ((argb >> 11) & 0x1f) << 5 | ((argb >> 3) & 0x1f);
+    case 4:
         return (((argb >> 19) & 0x1f) << 11) | (((argb >> 10) & 0x3f) << 5) |
                ((argb >> 3) & 0x1f);
+    case 15:
+        return (argb >> 28) << 12 | ((argb >> 20) & 0xf) << 8 |
+               ((argb >> 12) & 0xf) << 4 | ((argb >> 4) & 0xf);
     default:
         return argb;
     }
+}
+
+/* the destination datatypes the scaler converts to */
+static bool ati_r350_scale_dst_ok(unsigned dt)
+{
+    return (dt >= 2 && dt <= 6) || dt == 15;
 }
 
 typedef struct ATIR350ScaleOp {
@@ -650,6 +683,7 @@ typedef struct ATIR350ScaleOp {
     unsigned dt;
     uint32_t dst_off, dst_stride;     /* stride in bytes */
     int bpp;
+    unsigned dst_dt;                  /* DP datatype */
     int sc_left, sc_top, sc_right, sc_bottom;
     unsigned src_factor, dst_factor;  /* R350_ALPHA_BLEND_* */
 } ATIR350ScaleOp;
@@ -671,7 +705,8 @@ static void ati_r350_2d_scale_run(ATIR350State *s,
     vram = memory_region_get_ram_ptr(&s->vram);
     trace_ati_r350_scale(op->dst_x, op->dst_y, op->w, op->h, op->src_off,
                             op->src_pitch, op->x_inc, op->y_inc, op->dt);
-    if (!op->bpp || !op->dst_stride || !op->x_inc || !op->y_inc ||
+    if (!op->bpp || !ati_r350_scale_dst_ok(op->dst_dt) ||
+        !op->dst_stride || !op->x_inc || !op->y_inc ||
         !op->src_pitch || op->w <= 0 || op->h <= 0) {
         return;
     }
@@ -753,11 +788,11 @@ static void ati_r350_2d_scale_run(ATIR350State *s,
                 src |= 0xff000000;      /* no alpha in the source */
             }
             if (!blend) {
-                out = ati_r350_argb_to_dst(src, op->bpp);
+                out = ati_r350_argb_to_dst(src, op->dst_dt);
             } else {
                 uint32_t dst = ati_r350_dst_to_argb(
                     ati_r350_2d_read_pixel(s, op->dst_off, op->dst_stride,
-                                              dx, dy, op->bpp), op->bpp);
+                                              dx, dy, op->bpp), op->dst_dt);
                 int sa = src >> 24, da = dst >> 24;
                 int c, shift;
 
@@ -772,7 +807,7 @@ static void ati_r350_2d_scale_run(ATIR350State *s,
 
                     out |= (uint32_t)MIN(v, 255) << shift;
                 }
-                out = ati_r350_argb_to_dst(out, op->bpp);
+                out = ati_r350_argb_to_dst(out, op->dst_dt);
             }
             ati_r350_2d_write_pixel(s, op->dst_off, op->dst_stride, dx, dy,
                                        op->bpp, out);
@@ -805,6 +840,7 @@ void ati_r350_2d_scale(ATIR350State *s, const uint32_t *pkt)
     uint32_t dpo = pkt[R350_SCALE_PKT_DST_PITCH_OFF];
 
     op.bpp = ati_r350_bpp_from_dp_datatype(s);
+    op.dst_dt = s->dp_datatype & R350_DP_DST_DATATYPE;
     op.dst_x = (dst_xy >> 16) & 0x3fff;
     op.dst_y = dst_xy & 0x3fff;
     op.w = dst_hw & 0x3fff;
@@ -849,6 +885,7 @@ void ati_r350_2d_scale_regs(ATIR350State *s)
         return;
     }
     op.bpp = ati_r350_bpp_from_dp_datatype(s);
+    op.dst_dt = s->dp_datatype & R350_DP_DST_DATATYPE;
     op.dst_x = (dst_xy >> 16) & 0x3fff;
     op.dst_y = dst_xy & 0x3fff;
     op.w = dst_hw & 0x3fff;
