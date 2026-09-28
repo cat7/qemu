@@ -849,6 +849,16 @@ struct ATIR350State {
     } zb;
 
     /*
+     * Parallel rasterisation, ati_r350_3d.c. `raster_threads` counts the
+     * threads that draw, the submitting one included: 0 for half the
+     * host's cores, 1 to draw serially. NULL `raster` draws serially.
+     */
+    struct R300Raster *raster;
+    uint32_t raster_threads;
+    uint64_t raster_tri_split;      /* triangles drawn across threads */
+    uint64_t raster_tri_serial;     /* ... and on the submitting thread */
+
+    /*
      * Phase 2, milestone M4: how much of what real guests upload the
      * GLSL translation in ati_r350_pvs_glsl.c can express. Armed by the
      * "pvs-glsl" property and otherwise never entered, because the
@@ -1020,6 +1030,8 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
 void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
 void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                                uint32_t val);
+void ati_r350_raster_init(ATIR350State *s);
+void ati_r350_raster_fini(ATIR350State *s);
 
 /* ati_r350.c MC-window translation, shared with the engines */
 bool ati_r350_mc_to_vram(ATIR350State *s, uint32_t addr, uint32_t *off);

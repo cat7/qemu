@@ -22,6 +22,9 @@
 #include <math.h>
 #include "hw/pci/pci_device.h"
 #include "system/physmem.h"
+#include "qemu/rcu.h"
+#include "qemu/thread.h"
+#include "qemu/units.h"
 #include "exec/target_page.h"
 #include "ati_r350_int.h"
 #include "ati_r350_regs.h"
@@ -229,6 +232,85 @@ QEMU_BUILD_BUG_ON(R350_GL_TEXUNITS != R300_TEX_UNITS);
 QEMU_BUILD_BUG_ON(R350_GL_TEXCOORDS > R300_TEXCOORDS);
 QEMU_BUILD_BUG_ON(R350_CAP_TEX_UNITS != R300_TEX_UNITS);
 
+/*
+ * PARALLEL RASTERISATION. A primitive's triangles are drawn in stripes
+ * of 1 << R300_RASTER_STRIPE_SHIFT absolute screen rows, which the
+ * submitting thread and the workers take in turn until none is left. A
+ * pixel belongs to one stripe whichever triangle covers it, and a stripe
+ * is drawn by one thread with its triangles in submission order, so
+ * every pixel is written in the order it was serially and comes out bit
+ * for bit the same. Colour, Z and stencil stores are byte-granular and a
+ * pixel's bytes are its own, so two stripes never share a byte.
+ *
+ * Workers read the draw state and the triangles and write VRAM or the
+ * staged colour buffer; they take no lock and never reach the bus. The
+ * submitting thread holds whatever it held for the draw and waits for
+ * the workers without taking anything else. Bus-memory textures are
+ * copied to the host before a split, and a draw that reads what it
+ * writes is drawn serially.
+ */
+#define R300_RASTER_MAX_THREADS 8
+/* small stripes keep the last one short: its drawer is waited for */
+#define R300_RASTER_STRIPE_SHIFT 1
+/* below this many bounding-box pixels the wakeup costs more */
+#define R300_RASTER_MIN_PX 4096
+/* bus-memory texture copied per draw */
+#define R300_SHADOW_MIN_BYTES (256 * KiB)
+#define R300_SHADOW_MAX_BYTES (32 * MiB)
+
+typedef struct R300RasterTri {
+    const R300Vtx *v[3];
+    unsigned cull;
+    int y0, y1;                 /* rows it can touch, inclusive */
+} R300RasterTri;
+
+typedef struct R300RasterWorker {
+    ATIR350State *s;
+    QemuThread thread;
+    QemuSemaphore start;
+    uint32_t job;               /* the job it was last woken for */
+    ATIR350SwapMemo memo;
+} R300RasterWorker;
+
+typedef struct R300Raster {
+    R300RasterWorker worker[R300_RASTER_MAX_THREADS - 1];
+    unsigned nworkers;
+    bool quit;
+    /* the primitive in hand: 0 undecided, 1 may split, -1 serial */
+    int ok;
+    const R300DrawState *d;
+    R300RasterTri *tri;
+    unsigned ntri, cap;
+    int y0, y1;                 /* rows the job spans, inclusive */
+    uint32_t job;
+    /* job << 32 | last stripe << 16 | next stripe to take */
+    uint64_t next;
+    unsigned stripes_done;
+    /* bus-memory textures of the primitive in hand, as host copies */
+    uint32_t *shadow[R300_TEX_UNITS];
+    size_t shadow_size[R300_TEX_UNITS];
+    uint32_t shadow_base[R300_TEX_UNITS];
+    uint32_t shadow_dw[R300_TEX_UNITS];
+    bool shadowed[R300_TEX_UNITS];
+} R300Raster;
+
+/*
+ * A texture dword outside VRAM: the host copy while one is in force,
+ * the bus otherwise.
+ */
+static inline uint32_t r300_tex_bus32(ATIR350State *s, unsigned unit,
+                                      uint32_t addr)
+{
+    R300Raster *q = s->raster;
+
+    if (q && q->shadowed[unit]) {
+        uint32_t i = (addr - q->shadow_base[unit]) >> 2;
+
+        return i < q->shadow_dw[unit] ? q->shadow[unit][i] : 0;
+    }
+    return ati_r350_mc_read32(s, addr);
+}
+
 static inline float r300_f32(uint32_t v)
 {
     union { uint32_t u; float f; } c = { .u = v };
@@ -392,7 +474,7 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
             a = ((uint8_t *)memory_region_get_ram_ptr(&s->vram))
                 [off ^ (ati_r350_vram_xor(s, off) & 3)];
         } else {
-            a = (ati_r350_mc_read32(s, addr & ~3u) >>
+            a = (r300_tex_bus32(s, unit, addr & ~3u) >>
                  (((addr ^ u->lanes) & 3) * 8)) & 0xff;
         }
         return a;
@@ -411,7 +493,7 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
         uint32_t v;
 
         if (!ati_r350_mc_to_vram(s, addr, &off)) {
-            v = (r300_lane_xor32(ati_r350_mc_read32(s, addr & ~3u),
+            v = (r300_lane_xor32(r300_tex_bus32(s, unit, addr & ~3u),
                                  u->lanes) >> ((addr & 2) * 8)) & 0xffff;
         } else if (off + 2 > ATI_R350_VRAM_SIZE) {
             return 0;
@@ -445,8 +527,8 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
                                    ati_r350_vram_ld32(s, off + 4));
         }
         return r300_texel_16x4(
-            r300_lane_xor32(ati_r350_mc_read32(s, addr), u->lanes),
-            r300_lane_xor32(ati_r350_mc_read32(s, addr + 4), u->lanes));
+            r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes),
+            r300_lane_xor32(r300_tex_bus32(s, unit, addr + 4), u->lanes));
     }
     if (ati_r350_mc_to_vram(s, addr, &off)) {
         if (off + 4 > ATI_R350_VRAM_SIZE) {
@@ -455,7 +537,7 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
         return ati_r350_vram_ld32(s, off);
     }
     /* texture staged in GART/system memory */
-    return r300_lane_xor32(ati_r350_mc_read32(s, addr), u->lanes);
+    return r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes);
 }
 
 /*
@@ -1110,6 +1192,26 @@ static inline bool r300_back_face(unsigned cull, float area)
     return !(cull & 8) && cw != !!(cull & 4);
 }
 
+/* the pixels a triangle's scan covers: [x0, x1) x [y0, y1) */
+static inline void r300_tri_bounds(const R300DrawState *d,
+                                   const R300Vtx *v0, const R300Vtx *v1,
+                                   const R300Vtx *v2, int *x0, int *y0,
+                                   int *x1, int *y1)
+{
+    *x0 = (int)floorf(MIN(v0->x, MIN(v1->x, v2->x)));
+    *y0 = (int)floorf(MIN(v0->y, MIN(v1->y, v2->y)));
+    *x1 = (int)ceilf(MAX(v0->x, MAX(v1->x, v2->x)));
+    *y1 = (int)ceilf(MAX(v0->y, MAX(v1->y, v2->y)));
+    *x0 = MAX(*x0, MAX(d->sc_x0, 0));
+    *y0 = MAX(*y0, MAX(d->sc_y0, 0));
+    /*
+     * scissor right/bottom are inclusive; the VRAM bound in the pixel
+     * helpers is the real limit beyond that
+     */
+    *x1 = MIN(*x1, MIN(d->sc_x1 + 1, 8191));
+    *y1 = MIN(*y1, MIN(d->sc_y1 + 1, 8191));
+}
+
 /*
  * One triangle, over the screen rows [ylo, yhi] only. `cull` is the
  * r300_back_face() word for this triangle. Every pixel depends on the
@@ -1202,16 +1304,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     b1 = dx1 * inv;
     c1 = (dy1 * v2->x - dx1 * v2->y) * inv;
 
-    x0 = (int)floorf(MIN(v0->x, MIN(v1->x, v2->x)));
-    y0 = (int)floorf(MIN(v0->y, MIN(v1->y, v2->y)));
-    x1 = (int)ceilf(MAX(v0->x, MAX(v1->x, v2->x)));
-    y1 = (int)ceilf(MAX(v0->y, MAX(v1->y, v2->y)));
-    x0 = MAX(x0, MAX(d->sc_x0, 0));
-    y0 = MAX(y0, MAX(d->sc_y0, 0));
-    /* scissor right/bottom are inclusive; the VRAM bound in the pixel
-     * helpers is the real limit beyond that */
-    x1 = MIN(x1, MIN(d->sc_x1 + 1, 8191));
-    y1 = MIN(y1, MIN(d->sc_y1 + 1, 8191));
+    r300_tri_bounds(d, v0, v1, v2, &x0, &y0, &x1, &y1);
     y0 = MAX(y0, ylo);
     if (yhi < y1) {
         y1 = yhi + 1;
@@ -3608,12 +3701,303 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     return true;
 }
 
-/* one triangle of a primitive, all of its rows */
+/*
+ * Take a stripe of the given job, or -1 once they are all taken. The job
+ * and its stripes share one word, so a thread that wakes late finds its
+ * job over and takes nothing: the submitting thread waits only for the
+ * stripes being drawn.
+ */
+static int r300_raster_take(R300Raster *q, uint32_t job)
+{
+    uint64_t next = qatomic_load_acquire(&q->next);
+
+    for (;;) {
+        uint64_t seen;
+
+        if (next >> 32 != job ||
+            extract64(next, 0, 16) > extract64(next, 16, 16)) {
+            return -1;
+        }
+        seen = qatomic_cmpxchg(&q->next, next, next + 1);
+        if (seen == next) {
+            return extract64(next, 0, 16);
+        }
+        next = seen;
+    }
+}
+
+static void r300_raster_stripes(ATIR350State *s, R300Raster *q, uint32_t job)
+{
+    int stripe;
+
+    while ((stripe = r300_raster_take(q, job)) >= 0) {
+        int first = stripe << R300_RASTER_STRIPE_SHIFT;
+        int last = first + (1 << R300_RASTER_STRIPE_SHIFT) - 1;
+        unsigned i;
+
+        for (i = 0; i < q->ntri; i++) {
+            const R300RasterTri *t = &q->tri[i];
+
+            if (t->y1 >= first && t->y0 <= last) {
+                r300_raster_tri(s, q->d, t->v[0], t->v[1], t->v[2],
+                                t->cull, first, last);
+            }
+        }
+        qatomic_inc(&q->stripes_done);
+    }
+}
+
+static void *r300_raster_thread(void *opaque)
+{
+    R300RasterWorker *w = opaque;
+    ATIR350State *s = w->s;
+    R300Raster *q = s->raster;
+
+    /* stripes resolve VRAM and mark it dirty inside RCU read sections */
+    rcu_register_thread();
+    ati_r350_swap_memo_bind(&w->memo);
+    for (;;) {
+        qemu_sem_wait(&w->start);
+        if (qatomic_read(&q->quit)) {
+            break;
+        }
+        r300_raster_stripes(s, q, qatomic_load_acquire(&w->job));
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
+/* Draw the job's stripes with the submitting thread and `helpers` more. */
+static void r300_raster_run(ATIR350State *s, R300Raster *q, unsigned helpers)
+{
+    int first = q->y0 >> R300_RASTER_STRIPE_SHIFT;
+    int last = q->y1 >> R300_RASTER_STRIPE_SHIFT;
+    unsigned stripes = last - first + 1;
+    unsigned i;
+
+    q->job++;
+    qatomic_set(&q->stripes_done, 0);
+    for (i = 0; i < helpers; i++) {
+        qatomic_store_release(&q->worker[i].job, q->job);
+    }
+    qatomic_store_release(&q->next, (uint64_t)q->job << 32 |
+                                    (uint64_t)last << 16 | first);
+    for (i = 0; i < helpers; i++) {
+        qemu_sem_post(&q->worker[i].start);
+    }
+    r300_raster_stripes(s, q, q->job);
+    while (qatomic_load_acquire(&q->stripes_done) < stripes) {
+        cpu_relax();
+    }
+}
+
+static inline bool r300_ranges_meet(uint64_t a0, uint64_t a1,
+                                    uint64_t b0, uint64_t b1)
+{
+    return a0 < b1 && b0 < a1;
+}
+
+/*
+ * May the primitive in hand be split, drawing rows [y0, y1] of about
+ * `px` pixels? Everything a worker would read from the bus is copied to
+ * the host here, and a draw that reads bytes it also writes is not
+ * split: the order of that read and that write is the serial one only
+ * when a single thread draws.
+ */
+static bool r300_raster_prepare(ATIR350State *s, R300Raster *q,
+                                const R300DrawState *d, int y0, int y1,
+                                uint64_t px)
+{
+    uint64_t limit = MIN(MAX(px * 4, R300_SHADOW_MIN_BYTES),
+                         R300_SHADOW_MAX_BYTES);
+    uint64_t rows = (uint64_t)y1 + 1;
+    uint64_t w0 = 0, w1 = 0, z0 = 0, z1 = 0;
+    unsigned u;
+
+    if (s->cap_fp) {
+        return false;               /* the capture stays serial */
+    }
+    if (d->wmask && !d->cb_host) {
+        w0 = d->dst_off + (uint64_t)y0 * d->dst_pitch;
+        w1 = d->dst_off + rows * d->dst_pitch;
+    }
+    if (s->zb.z_en) {
+        /* every byte a tiled layout can place above row y1 */
+        z0 = s->zb.off;
+        z1 = s->zb.off + QEMU_ALIGN_UP(rows, 16) * s->zb.pitch *
+                         (s->zb.z16 ? 2 : 4) * (s->zb.aa ? 2 : 1);
+    }
+    if (d->resolve) {
+        uint64_t r0 = d->res_off + (uint64_t)y0 * d->res_pitch;
+        uint64_t r1 = d->res_off + rows * d->res_pitch;
+
+        if (r300_ranges_meet(r0, r1, w0, w1) ||
+            r300_ranges_meet(r0, r1, z0, z1)) {
+            return false;
+        }
+    }
+    for (u = 0; u < R300_TEX_UNITS; u++) {
+        const R300TexUnit *t = &d->tex[u];
+        uint32_t len, first, last;
+
+        if (!t->en) {
+            continue;
+        }
+        if (t->w <= 0 || t->h <= 0) {
+            return false;
+        }
+        len = (uint32_t)(t->h - 1) * t->pitch + (uint32_t)t->w * (t->bpp / 8);
+        if (ati_r350_mc_to_vram(s, t->off, &first) &&
+            ati_r350_mc_to_vram(s, t->off + len - 1, &last) &&
+            last == first + len - 1) {
+            if (r300_ranges_meet(first, first + len, w0, w1) ||
+                r300_ranges_meet(first, first + len, z0, z1)) {
+                return false;
+            }
+            continue;
+        }
+        if (len > limit) {
+            return false;
+        }
+        if (q->shadow_size[u] < len + 4) {
+            g_free(q->shadow[u]);
+            q->shadow_size[u] = len + 4;
+            q->shadow[u] = g_malloc(q->shadow_size[u]);
+        }
+        q->shadow_base[u] = t->off & ~3u;
+        q->shadow_dw[u] = (len + 3) / 4;
+        ati_r350_mc_read_block(s, q->shadow_base[u], q->shadow[u],
+                               q->shadow_dw[u]);
+        q->shadowed[u] = true;
+    }
+    return true;
+}
+
+static void r300_raster_begin(ATIR350State *s, const R300DrawState *d)
+{
+    if (s->raster) {
+        s->raster->ok = 0;
+        s->raster->d = d;
+    }
+}
+
+static void r300_raster_end(ATIR350State *s)
+{
+    R300Raster *q = s->raster;
+    unsigned u;
+
+    if (q) {
+        for (u = 0; u < R300_TEX_UNITS; u++) {
+            q->shadowed[u] = false;
+        }
+        q->ok = 0;
+        q->d = NULL;
+    }
+}
+
+/* one triangle of a primitive, split across the threads if it pays */
 static void r300_tri(ATIR350State *s, const R300DrawState *d,
                      const R300Vtx *v0, const R300Vtx *v1, const R300Vtx *v2,
                      unsigned cull)
 {
-    r300_raster_tri(s, d, v0, v1, v2, cull, INT_MIN, INT_MAX);
+    R300Raster *q = s->raster;
+    int x0, y0, x1, y1, stripes;
+    uint64_t px;
+
+    if (!q || q->ok < 0) {
+        s->raster_tri_serial++;
+        r300_raster_tri(s, d, v0, v1, v2, cull, INT_MIN, INT_MAX);
+        return;
+    }
+    r300_tri_bounds(d, v0, v1, v2, &x0, &y0, &x1, &y1);
+    if (x1 <= x0 || y1 <= y0) {
+        return;                     /* the scan is empty */
+    }
+    px = (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+    stripes = ((y1 - 1) >> R300_RASTER_STRIPE_SHIFT) -
+              (y0 >> R300_RASTER_STRIPE_SHIFT) + 1;
+    if (px < R300_RASTER_MIN_PX || stripes < 2) {
+        s->raster_tri_serial++;
+        r300_raster_tri(s, d, v0, v1, v2, cull, INT_MIN, INT_MAX);
+        return;
+    }
+    if (!q->ok) {
+        q->ok = r300_raster_prepare(s, q, d, MAX(d->sc_y0, 0),
+                                    MIN(d->sc_y1, 8190), px) ? 1 : -1;
+        if (q->ok < 0) {
+            s->raster_tri_serial++;
+            r300_raster_tri(s, d, v0, v1, v2, cull, INT_MIN, INT_MAX);
+            return;
+        }
+    }
+    if (!q->cap) {
+        q->cap = 1;
+        q->tri = g_new(R300RasterTri, q->cap);
+    }
+    q->tri[0] = (R300RasterTri) {
+        .v = { v0, v1, v2 }, .cull = cull, .y0 = y0, .y1 = y1 - 1,
+    };
+    q->ntri = 1;
+    q->y0 = y0;
+    q->y1 = y1 - 1;
+    s->raster_tri_split++;
+    r300_raster_run(s, q, MIN(q->nworkers, (unsigned)stripes - 1));
+    q->ntri = 0;
+}
+
+void ati_r350_raster_init(ATIR350State *s)
+{
+    unsigned want = s->raster_threads;
+    R300Raster *q;
+    unsigned i;
+
+    if (!want) {
+        unsigned cpus = g_get_num_processors();
+
+        /* leave the vCPUs and the main loop room */
+        want = cpus > 2 ? cpus / 2 : 1;
+    }
+    want = MIN(want, R300_RASTER_MAX_THREADS);
+    if (want <= 1) {
+        return;
+    }
+    q = g_new0(R300Raster, 1);
+    s->raster = q;
+    for (i = 0; i < want - 1; i++) {
+        R300RasterWorker *w = &q->worker[i];
+        char name[24];
+
+        w->s = s;
+        qemu_sem_init(&w->start, 0);
+        snprintf(name, sizeof(name), "ati-r350-raster%u", i);
+        qemu_thread_create(&w->thread, name, r300_raster_thread, w,
+                           QEMU_THREAD_JOINABLE);
+    }
+    q->nworkers = want - 1;
+}
+
+void ati_r350_raster_fini(ATIR350State *s)
+{
+    R300Raster *q = s->raster;
+    unsigned i;
+
+    if (!q) {
+        return;
+    }
+    qatomic_set(&q->quit, true);
+    for (i = 0; i < q->nworkers; i++) {
+        qemu_sem_post(&q->worker[i].start);
+    }
+    for (i = 0; i < q->nworkers; i++) {
+        qemu_thread_join(&q->worker[i].thread);
+        qemu_sem_destroy(&q->worker[i].start);
+    }
+    for (i = 0; i < R300_TEX_UNITS; i++) {
+        g_free(q->shadow[i]);
+    }
+    g_free(q->tri);
+    g_free(q);
+    s->raster = NULL;
 }
 
 /*
@@ -3656,6 +4040,7 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
     unsigned cull = (prim >= 4 && prim <= 7) || (prim >= 13 && prim <= 15)
                     ? s->regs[R300_RE_CULL_CNTL >> 2] & 7 : 8;
 
+    r300_raster_begin(s, d);
     switch (prim) {
     case 1:     /* point list -- WindowServer's screen composites are
                  * point SPRITES: RE_POINTSIZE gives the width/height
@@ -3801,6 +4186,7 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
         ati_r350_note_gap(s, R350_GAP_PRIM, prim);
         break;
     }
+    r300_raster_end(s);
 }
 
 /*

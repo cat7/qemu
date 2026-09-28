@@ -4526,6 +4526,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         bitbang_i2c_init(&s->dvi_ddc_i2c, bus);
         s->dvi_ddc_sda = 1;
     }
+    ati_r350_raster_init(s);
     ati_r350_engine_init(s);
 }
 
@@ -4535,6 +4536,7 @@ static void ati_r350_exit(PCIDevice *dev)
     unsigned i;
 
     ati_r350_engine_fini(s);
+    ati_r350_raster_fini(s);
     timer_free(s->vblank_timer);
     timer_free(s->vblank_end_timer);
     timer_free(s->cursor_timer);
@@ -4628,6 +4630,10 @@ static const Property ati_r350_properties[] = {
      * cache lifetime block in ati_r350_3d.c.
      */
     DEFINE_PROP_STRING("gl-texlife", ATIR350State, gl_texlife_path),
+    /* threads a draw's rows are split across: 0 = auto, 1 = serial */
+    DEFINE_PROP_UINT32("raster-threads", ATIR350State, raster_threads, 0),
+    DEFINE_PROP_UINT64("x-raster-split", ATIR350State, raster_tri_split, 0),
+    DEFINE_PROP_UINT64("x-raster-serial", ATIR350State, raster_tri_serial, 0),
     DEFINE_EDID_PROPERTIES(ATIR350State, edid_info),
 };
 
