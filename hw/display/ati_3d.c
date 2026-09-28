@@ -4606,18 +4606,8 @@ static bool r100_bitblt_brush_dwords(uint32_t gui, unsigned int *dwords)
         *dwords = 3;
         return true;
     case 10:
-        switch (dst_type) {
-        case 2:
-            bytes_per_pixel = 1;
-            break;
-        case 3:
-        case 4:
-            bytes_per_pixel = 2;
-            break;
-        case 6:
-            bytes_per_pixel = 4;
-            break;
-        default:
+        bytes_per_pixel = ati_2d_datatype_bpp(dst_type, false) / 8;
+        if (!bytes_per_pixel) {
             return false;
         }
         *dwords = 16 * bytes_per_pixel;
@@ -4653,7 +4643,7 @@ static bool r100_2d_settings_info(const uint32_t *payload,
     settings->gui = payload[0];
     dst_type = extract32(settings->gui, 8, 4);
     settings->brush = extract32(settings->gui, 4, 4);
-    if ((dst_type != 2 && dst_type != 3 && dst_type != 4 && dst_type != 6) ||
+    if (!ati_2d_datatype_bpp(dst_type, false) ||
         !r100_bitblt_brush_dwords(settings->gui,
                                   &settings->brush_dwords)) {
         return false;
@@ -4927,7 +4917,8 @@ static bool r100_nextchar(ATIVGAState *s, const uint32_t *payload,
 {
     uint32_t source = s->regs.dp_mix & DP_SRC_SOURCE;
     uint32_t source_type = s->regs.dp_datatype & DP_SRC_DATATYPE;
-    uint32_t destination_type = s->regs.dp_datatype & DP_DST_DATATYPE;
+    unsigned int destination_bpp =
+        ati_2d_datatype_bpp(s->regs.dp_datatype & DP_DST_DATATYPE, false);
     uint64_t row_bits;
     unsigned int width;
     unsigned int height;
@@ -4937,7 +4928,7 @@ static bool r100_nextchar(ATIVGAState *s, const uint32_t *payload,
         (source != DP_SRC_HOST && source != DP_SRC_HOST_BYTEALIGN) ||
         (source_type != SRC_MONO_FRGD_BKGD &&
          source_type != SRC_MONO_FRGD && source_type != SRC_COLOR) ||
-        destination_type < DST_8BPP || destination_type > DST_32BPP) {
+        !destination_bpp) {
         return false;
     }
     width = extract32(payload[1], 0, 14);
@@ -4946,11 +4937,7 @@ static bool r100_nextchar(ATIVGAState *s, const uint32_t *payload,
         return false;
     }
     if (source_type == SRC_COLOR) {
-        unsigned int bytes_per_pixel = destination_type == DST_8BPP ? 1 :
-                                       destination_type <= DST_16BPP ? 2 :
-                                       destination_type == DST_24BPP ? 3 : 4;
-
-        row_bits = (uint64_t)width * bytes_per_pixel * 8;
+        row_bits = (uint64_t)width * destination_bpp;
     } else {
         row_bits = source == DP_SRC_HOST_BYTEALIGN ?
                    QEMU_ALIGN_UP(width, 8) : width;
@@ -5105,8 +5092,7 @@ static bool r100_hostdata_blt(ATIVGAState *s, const uint32_t *payload,
     datatype = s->regs.dp_datatype;
     mix = s->regs.dp_mix;
     guicntl = s->regs.rbbm_guicntl;
-    dst_bits = extract32(settings.gui, 8, 4);
-    dst_bits = dst_bits == 6 ? 32 : dst_bits == 2 ? 8 : 16;
+    dst_bits = ati_2d_datatype_bpp(extract32(settings.gui, 8, 4), false);
     if (indexed) {
         /* Expanded pixels use the existing ROP/clipping/write-mask path. */
         s->regs.dp_datatype =

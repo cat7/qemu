@@ -352,6 +352,7 @@ bool ati_2d_reg_read(ATIVGAState *s, hwaddr addr, uint64_t *value,
                      unsigned int size);
 bool ati_2d_reg_write(ATIVGAState *s, hwaddr addr, uint64_t value,
                       unsigned int size);
+unsigned int ati_2d_datatype_bpp(unsigned int datatype, bool bpp24);
 void ati_2d_complete(ATIVGAState *s);
 void ati_2d_blt(ATIVGAState *s);
 void ati_2d_polyline(ATIVGAState *s, const uint32_t *points,

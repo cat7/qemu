@@ -15,27 +15,42 @@
 #include "ui/console.h"
 #include "ui/rect.h"
 
-static int ati_bpp_from_datatype(const ATIVGAState *s)
+/* DP datatype code to bits per pixel, 0 for no such 2D format */
+unsigned int ati_2d_datatype_bpp(unsigned int datatype, bool bpp24)
 {
-    switch (s->regs.dp_datatype & 0xf) {
+    switch (datatype) {
     case 2:
+    case 7:                     /* RGB332 */
+    case 8:                     /* Y8 */
+    case 9:                     /* RGB8 */
         return 8;
     case 3:
     case 4:
+    case 11:                    /* VYUY422 */
+    case 12:                    /* YVYU422 */
+    case 15:                    /* ARGB4444 */
         return 16;
     case 5:
-        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
-            return 24;
-        }
-        break;
+        return bpp24 ? 24 : 0;
     case 6:
+    case 14:                    /* AYUV444 */
         return 32;
     default:
-        break;
+        return 0;
     }
-    qemu_log_mask(LOG_UNIMP, "Unknown dst datatype %d\n",
-                  s->regs.dp_datatype & 0xf);
-    return 0;
+}
+
+static int ati_bpp_from_datatype(const ATIVGAState *s)
+{
+    unsigned int datatype = s->regs.dp_datatype & 0xf;
+    unsigned int bpp = ati_2d_datatype_bpp(datatype,
+                                           s->dev_id ==
+                                           PCI_DEVICE_ID_ATI_RAGE128_PF);
+
+    if (!bpp) {
+        qemu_log_mask(LOG_UNIMP, "Unknown dst datatype %d\n", datatype);
+    }
+    return bpp;
 }
 
 static uint32_t ati_pixel_mask(unsigned int bpp)
@@ -2392,9 +2407,11 @@ static uint32_t ati_2d_scale_blend(uint32_t a, uint32_t b,
     uint32_t result = 0;
     unsigned int shift = 0;
 
-    while (shift < (datatype == 3 ? 15 : datatype == 4 ? 16 : 32)) {
+    while (shift < (datatype == 3 ? 15 : datatype == 4 ||
+                    datatype == 15 ? 16 : 32)) {
         unsigned int bits = datatype == 3 ? 5 :
-                            datatype == 4 ? (shift == 5 ? 6 : 5) : 8;
+                            datatype == 4 ? (shift == 5 ? 6 : 5) :
+                            datatype == 15 ? 4 : 8;
         uint32_t mask = (1U << bits) - 1;
         uint64_t top = ((a >> shift) & mask) * (65536 - fx) +
                        ((b >> shift) & mask) * fx;
@@ -2428,7 +2445,9 @@ static void ati_2d_stretch(ATIVGAState *s)
         (uint64_t)sw * sh > ATI_2D_MAX_PIXELS ||
         (uint64_t)dw * dh > ATI_2D_MAX_PIXELS ||
         ((s->regs.scale_3d_datatype & 15) &&
-         (s->regs.scale_3d_datatype & 15) != datatype)) {
+         (s->regs.scale_3d_datatype & 15) != datatype) ||
+        /* packed 4:2:2 pixels do not filter channel by channel */
+        datatype == 11 || datatype == 12) {
         return;
     }
     setup_2d_blt_ctx(s, &ctx);
