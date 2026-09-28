@@ -580,6 +580,26 @@ const char *ati_rage128_reg_name(uint32_t base);
  */
 void ati_rage128_audit_reg_write(ATIRage128State *s, uint32_t base);
 
+/*
+ * A card-address range the 2D engine reads or writes through its own
+ * offset registers (DST/SRC_PITCH_OFFSET, SCALE_OFFSET_0). Card address
+ * a in [base, base + len) is host byte ptr[a - base]. Unbounced: all of
+ * local VRAM (base 0, len ATI_RAGE128_VRAM_SIZE). Bounced: a copy of a
+ * range that leaves local VRAM, read in through the PCI GART window.
+ */
+typedef struct ATIRage128Span {
+    uint8_t *ptr;
+    uint32_t base, len;
+    bool bounced;
+} ATIRage128Span;
+
+void ati_rage128_2d_span_get(ATIRage128State *s, ATIRage128Span *sp,
+                             uint32_t base, uint64_t len);
+/* write card addresses [lo, hi) of a bounced span back */
+void ati_rage128_2d_span_put(ATIRage128State *s, const ATIRage128Span *sp,
+                             uint32_t lo, uint32_t hi);
+void ati_rage128_2d_span_release(ATIRage128Span *sp);
+
 /* ati_rage128_2d.c */
 void ati_rage128_2d_blt(ATIRage128State *s);
 void ati_rage128_2d_flush_dirty(ATIRage128State *s);

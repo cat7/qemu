@@ -2787,6 +2787,111 @@ static void ati_rage128_card_read_block(ATIRage128State *s, uint32_t addr,
     }
 }
 
+/* bus address of the GART page behind card address @addr, 0 if unmapped */
+static uint32_t ati_rage128_gart_page(ATIRage128State *s, uint32_t addr)
+{
+    uint32_t gart_base = s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu;
+    uint32_t idx = (addr >> 12) & (R128_PCIGART_TABLE_ENTRIES - 1);
+    uint32_t entry;
+
+    if (!gart_base) {
+        return 0;
+    }
+    pci_dma_read(PCI_DEVICE(s), gart_base + idx * 4, &entry, sizeof(entry));
+    return le32_to_cpu(entry) & ~0xfffu;
+}
+
+/*
+ * Copy @len bytes between @buf and card space at @addr: local VRAM below
+ * ATI_RAGE128_VRAM_SIZE, the GART window above it, as for
+ * ati_rage128_card_read32(). Unmapped GART pages read as zero and drop
+ * writes.
+ */
+static void ati_rage128_card_copy(ATIRage128State *s, uint32_t addr,
+                                  uint8_t *buf, uint32_t len, bool write)
+{
+    while (len) {
+        uint32_t n;
+
+        if (addr < ATI_RAGE128_VRAM_SIZE) {
+            n = MIN(len, ATI_RAGE128_VRAM_SIZE - addr);
+            if (write) {
+                memcpy(s->vram_ptr + addr, buf, n);
+                memory_region_set_dirty(&s->vram, addr, n);
+            } else {
+                memcpy(buf, s->vram_ptr + addr, n);
+            }
+        } else {
+            uint32_t page = ati_rage128_gart_page(s, addr);
+
+            n = MIN(len, 0x1000 - (addr & 0xfff));
+            if (page && write) {
+                pci_dma_write(PCI_DEVICE(s), page | (addr & 0xfff), buf, n);
+            } else if (page) {
+                pci_dma_read(PCI_DEVICE(s), page | (addr & 0xfff), buf, n);
+            } else if (!write) {
+                memset(buf, 0, n);
+            }
+        }
+        addr += n;
+        buf += n;
+        len -= n;
+    }
+}
+
+/*
+ * A range that fits local VRAM, or that the GART cannot back (no table,
+ * longer than the window, past 4GB), is left unbounced: out-of-VRAM
+ * accesses then read zero and drop, as before.
+ */
+void ati_rage128_2d_span_get(ATIRage128State *s, ATIRage128Span *sp,
+                             uint32_t base, uint64_t len)
+{
+    uint64_t end = (uint64_t)base + len;
+
+    sp->ptr = s->vram_ptr;
+    sp->base = 0;
+    sp->len = ATI_RAGE128_VRAM_SIZE;
+    sp->bounced = false;
+    if (!len || end <= ATI_RAGE128_VRAM_SIZE ||
+        len > ATI_RAGE128_VRAM_SIZE || end > (1ull << 32) ||
+        !(s->regs[R128_PCI_GART_PAGE >> 2] & ~0xfffu)) {
+        return;
+    }
+    sp->ptr = g_malloc(len);
+    sp->base = base;
+    sp->len = len;
+    sp->bounced = true;
+    ati_rage128_card_copy(s, base, sp->ptr, len, false);
+}
+
+void ati_rage128_2d_span_put(ATIRage128State *s, const ATIRage128Span *sp,
+                             uint32_t lo, uint32_t hi)
+{
+    uint64_t end = (uint64_t)sp->base + sp->len;
+
+    if (!sp->bounced) {
+        return;
+    }
+    lo = MAX(lo, sp->base);
+    if (hi > end) {
+        hi = end;
+    }
+    if (lo < hi) {
+        ati_rage128_card_copy(s, lo, sp->ptr + (lo - sp->base), hi - lo,
+                              true);
+    }
+}
+
+void ati_rage128_2d_span_release(ATIRage128Span *sp)
+{
+    if (sp->bounced) {
+        g_free(sp->ptr);
+    }
+    sp->ptr = NULL;
+    sp->bounced = false;
+}
+
 static uint32_t ati_rage128_pm4_read_ring(ATIRage128State *s)
 {
     bool gart = s->pm4_buffer_addr & R128_AGP_OFFSET_FLAG;

@@ -204,6 +204,28 @@ static inline bool ati_rage128_vram_st(uint8_t *vram, uint32_t addr, int bpp,
     return true;
 }
 
+static inline uint32_t ati_rage128_span_ld(const ATIRage128Span *sp,
+                                           uint32_t addr, int bpp)
+{
+    uint32_t rel = addr - sp->base;
+
+    if ((uint64_t)rel + bpp / 8 > sp->len) {
+        return 0;
+    }
+    return ati_rage128_vram_ld(sp->ptr, rel, bpp);
+}
+
+static inline bool ati_rage128_span_st(const ATIRage128Span *sp,
+                                       uint32_t addr, int bpp, uint32_t color)
+{
+    uint32_t rel = addr - sp->base;
+
+    if ((uint64_t)rel + bpp / 8 > sp->len) {
+        return false;
+    }
+    return ati_rage128_vram_st(sp->ptr, rel, bpp, color);
+}
+
 /* the byte range [lo, hi) a row loop has stored to so far */
 typedef struct ATIRage128DirtySpan {
     uint32_t lo, hi;
@@ -413,7 +435,7 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     int height = s->dst_height;
     uint32_t dst_stride, src_stride;
     int sc_left, sc_top, sc_right, sc_bottom;
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    ATIRage128Span src_sp, dst_sp;
     unsigned bypp = bpp / 8;
     ATIRage128DirtySpan span = ATI_RAGE128_DIRTY_SPAN_INIT;
     int x, y;
@@ -490,6 +512,23 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
         top_to_bottom = s->dst_y <= s->src_y;
     }
 
+    /*
+     * The offsets are card addresses and may lie in the GART window past
+     * local VRAM. Resolve each rectangle's byte range once per blit.
+     */
+    ati_rage128_2d_span_get(s, &dst_sp, s->dst_offset +
+                            s->dst_y * dst_stride + s->dst_x * bypp,
+                            (uint64_t)(height - 1) * dst_stride +
+                            (uint64_t)width * bypp);
+    if (rop != 0xf0) {
+        ati_rage128_2d_span_get(s, &src_sp, s->src_offset +
+                                s->src_y * src_stride + s->src_x * bypp,
+                                (uint64_t)(height - 1) * src_stride +
+                                (uint64_t)width * bypp);
+    } else {
+        ati_rage128_2d_span_get(s, &src_sp, 0, 0);
+    }
+
     for (y = 0; y < height; y++) {
         int dy = top_to_bottom ? (int)s->dst_y + y
                                : (int)s->dst_y + height - 1 - y;
@@ -517,13 +556,13 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
                 continue;
             }
             if (rop != 0xf0) {
-                src_pixel = ati_rage128_vram_ld(vram, s->src_offset +
+                src_pixel = ati_rage128_span_ld(&src_sp, s->src_offset +
                                                 (uint32_t)sy * src_stride +
                                                 (uint32_t)sx * bypp, bpp);
             }
             daddr = s->dst_offset + (uint32_t)dy * dst_stride +
                     (uint32_t)dx * bypp;
-            dst_pixel = ati_rage128_vram_ld(vram, daddr, bpp);
+            dst_pixel = ati_rage128_span_ld(&dst_sp, daddr, bpp);
             if (cmp_on_dst &&
                 !ati_rage128_clr_cmp_draw(cmp_fn_dst,
                                           (dst_pixel & cmp_mask) == cmp_dst)) {
@@ -539,12 +578,19 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
             if (wmask != pixmask) {
                 result = (result & wmask) | (dst_pixel & ~wmask);
             }
-            if (ati_rage128_vram_st(vram, daddr, bpp, result)) {
+            if (ati_rage128_span_st(&dst_sp, daddr, bpp, result)) {
                 ati_rage128_span_add(&span, daddr, bypp);
             }
         }
-        ati_rage128_span_flush(s, &span);
+        if (dst_sp.bounced) {
+            ati_rage128_2d_span_put(s, &dst_sp, span.lo, span.hi);
+            span = (ATIRage128DirtySpan)ATI_RAGE128_DIRTY_SPAN_INIT;
+        } else {
+            ati_rage128_span_flush(s, &span);
+        }
     }
+    ati_rage128_2d_span_release(&src_sp);
+    ati_rage128_2d_span_release(&dst_sp);
 }
 
 
@@ -706,7 +752,8 @@ typedef struct ATIRage128ScaleOp {
 static void ati_rage128_2d_scale_run(ATIRage128State *s,
                                      const ATIRage128ScaleOp *op)
 {
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    ATIRage128Span src_sp;
+    uint32_t row_bytes;
     bool blend = !(op->src_factor == R128_ALPHA_BLEND_ONE &&
                    op->dst_factor == R128_ALPHA_BLEND_ZERO);
     int src_bpp, x, y;
@@ -740,19 +787,25 @@ static void ati_rage128_2d_scale_run(ATIRage128State *s,
         trace_ati_rage128_scale_blend(op->src_factor, op->dst_factor);
     }
 
+    /* SCALE_OFFSET_0 is a card address, as for ati_rage128_2d_do_blt() */
+    row_bytes = op->src_pitch * (uint32_t)src_bpp;
+    ati_rage128_2d_span_get(s, &src_sp, op->src_off,
+                            ((((uint64_t)(op->h - 1) * op->y_inc) >> 12) + 1) *
+                            row_bytes);
+
     for (y = 0; y < op->h; y++) {
         int dy = op->dst_y + y;
         uint32_t sy = ((uint32_t)y * op->y_inc) >> 12;
+        uint32_t rel = op->src_off - src_sp.base + sy * row_bytes;
         const uint8_t *row;
 
         if (dy < op->sc_top || dy > op->sc_bottom) {
             continue;
         }
-        row = vram + op->src_off + sy * op->src_pitch * (uint32_t)src_bpp;
-        if (op->src_off + (sy + 1) * op->src_pitch * (uint32_t)src_bpp >
-            ATI_RAGE128_VRAM_SIZE) {
+        if ((uint64_t)rel + row_bytes > src_sp.len) {
             break;
         }
+        row = src_sp.ptr + rel;
         for (x = 0; x < op->w; x++) {
             int dx = op->dst_x + x;
             uint32_t sx = ((uint32_t)x * op->x_inc) >> 12;
@@ -795,6 +848,7 @@ static void ati_rage128_2d_scale_run(ATIRage128State *s,
                                        op->bpp, out);
         }
     }
+    ati_rage128_2d_span_release(&src_sp);
 }
 
 /*
