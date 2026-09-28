@@ -206,13 +206,12 @@ static unsigned ati_r350_swap_bits(uint32_t info)
  * range is bounded only by the surfaces that were stepped over.
  */
 static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off,
-                                  uint32_t *swap_lo, uint32_t *swap_hi,
-                                  unsigned *swap_val, bool *swap_valid)
+                                  ATIR350SwapMemo *m)
 {
     uint32_t lo_bound = 0, hi_bound = UINT32_MAX;
     int i;
 
-    *swap_val = ati_r350_swap_bits(s->regs[R350_SURFACE_CNTL >> 2]);
+    m->val = ati_r350_swap_bits(s->regs[R350_SURFACE_CNTL >> 2]);
     for (i = 0; i < 8; i++) {
         uint32_t lo = s->regs[(R350_SURFACE0_LOWER_BOUND +
                                i * R350_SURFACE_STRIDE) >> 2];
@@ -223,7 +222,7 @@ static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off,
             continue;               /* not a live surface */
         }
         if (off >= lo && off <= hi) {
-            *swap_val = ati_r350_swap_bits(
+            m->val = ati_r350_swap_bits(
                 s->regs[(R350_SURFACE0_INFO + i * R350_SURFACE_STRIDE) >> 2]);
             lo_bound = MAX(lo_bound, lo);
             hi_bound = MIN(hi_bound, hi);
@@ -236,9 +235,17 @@ static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off,
             lo_bound = MAX(lo_bound, hi + 1);
         }
     }
-    *swap_lo = lo_bound;
-    *swap_hi = hi_bound;
-    *swap_valid = true;
+    m->lo = lo_bound;
+    m->hi = hi_bound;
+    m->valid = true;
+}
+
+/* the memo ati_r350_vram_xor() uses on this thread; NULL = the display's */
+static __thread ATIR350SwapMemo *ati_r350_thread_memo;
+
+void ati_r350_swap_memo_bind(ATIR350SwapMemo *memo)
+{
+    ati_r350_thread_memo = memo;
 }
 
 unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
@@ -252,23 +259,21 @@ unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
      * address 0x90010000 -- comparing against the card address matched
      * nothing, so no swap was applied and white came out yellow.
      *
-     * The walk itself is memoised: see the comment on `swap_lo` in the
-     * state. The answer is identical either way -- what the memo saves
-     * is repeating a 24-register scan for every pixel of every span.
+     * The walk itself is memoised, one memo per thread that resolves:
+     * the display, the command processor and each raster worker run
+     * concurrently. The answer is identical either way.
      */
-    if (ati_r350_on_engine()) {
-        /* its own memo: the display resolves concurrently */
-        if (!s->eswap_valid || off < s->eswap_lo || off > s->eswap_hi) {
-            ati_r350_swap_resolve(s, off, &s->eswap_lo, &s->eswap_hi,
-                                  &s->eswap_val, &s->eswap_valid);
-        }
-        return s->eswap_val;
+    ATIR350SwapMemo *m = ati_r350_thread_memo;
+    uint32_t gen = qatomic_read(&s->swap_gen);
+
+    if (!m) {
+        m = &s->swap;
     }
-    if (!s->swap_valid || off < s->swap_lo || off > s->swap_hi) {
-        ati_r350_swap_resolve(s, off, &s->swap_lo, &s->swap_hi,
-                              &s->swap_val, &s->swap_valid);
+    if (!m->valid || m->gen != gen || off < m->lo || off > m->hi) {
+        ati_r350_swap_resolve(s, off, m);
+        m->gen = gen;
     }
-    return s->swap_val;
+    return m->val;
 }
 
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off)
@@ -2091,8 +2096,8 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_SURFACE_CNTL:
     case R350_SURFACE0_LOWER_BOUND ... R350_SURFACE7_INFO:
         s->regs[base >> 2] = val;
-        s->swap_valid = false;      /* the memoised walk is now stale */
-        s->eswap_valid = false;
+        /* the memoised walks are now stale */
+        qatomic_set(&s->swap_gen, s->swap_gen + 1);
         s->force_redraw = true;
         trace_ati_r350_surface(ati_r350_reg_name(base), val);
         break;
@@ -3572,6 +3577,7 @@ static void *ati_r350_engine_thread(void *opaque)
 
     rcu_register_thread();
     ati_r350_engine_ctx = true;
+    ati_r350_swap_memo_bind(&s->eswap);
     qemu_mutex_lock(&s->engine_lock);
     for (;;) {
         while (!s->engine_kick && !s->engine_quit) {
@@ -3833,8 +3839,8 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
     ati_r350_palette_reset(s);
-    s->swap_valid = false;          /* the surface registers just went */
-    s->eswap_valid = false;
+    /* the surface registers just went */
+    qatomic_set(&s->swap_gen, s->swap_gen + 1);
     s->draw_xr = -1;                /* nothing has been drawn with any */
     s->dac_wr_index = 0;
     s->dac_rd_index = 0;

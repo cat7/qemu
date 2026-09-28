@@ -261,6 +261,22 @@ typedef struct ATIR350PM4Parser {
     uint32_t p3_total;       /* payload dwords the packet3 declared */
 } ATIR350PM4Parser;
 
+/*
+ * Memo for ati_r350_vram_xor(). Resolving the swapper means walking
+ * eight surface descriptors, three registers each, and the software
+ * rasterizer asks two or three times for every pixel it touches -- which
+ * is why the surface walk sat second and third in a profile of a stalled
+ * guest. `lo`..`hi` is the offset range over which the walk provably
+ * cannot give a different answer than `val`, so a hit costs two
+ * comparisons. A memo belongs to one thread.
+ */
+typedef struct ATIR350SwapMemo {
+    uint32_t lo, hi;
+    uint32_t gen;               /* the device's swap_gen it was resolved at */
+    unsigned val;
+    bool valid;
+} ATIR350SwapMemo;
+
 typedef struct ATIR350Mode {
     uint32_t width;
     uint32_t height;
@@ -284,22 +300,13 @@ struct ATIR350State {
     uint32_t regs[ATI_R350_NUM_REGS];
     uint32_t plls[ATI_R350_NUM_PLLS];
     /*
-     * Memo for ati_r350_vram_xor(). Resolving the swapper means walking
-     * eight surface descriptors, three registers each, and the software
-     * rasterizer asks two or three times for every pixel it touches --
-     * which is why the surface walk sat second and third in a profile of
-     * a stalled guest. `swap_lo`..`swap_hi` is the offset range over
-     * which the walk provably cannot give a different answer than
-     * `swap_val`, so a hit costs two comparisons. Any write to a surface
-     * register clears `swap_valid`.
+     * Memos for ati_r350_vram_xor(): the display's, and the command
+     * processor thread's. Raster workers keep their own. Any write to a
+     * surface register bumps `swap_gen`, which stales all of them.
      */
-    uint32_t swap_lo, swap_hi;
-    unsigned swap_val;
-    bool swap_valid;
-    /* the same memo for the command processor thread */
-    uint32_t eswap_lo, eswap_hi;
-    unsigned eswap_val;
-    bool eswap_valid;
+    ATIR350SwapMemo swap;
+    ATIR350SwapMemo eswap;
+    uint32_t swap_gen;
     /*
      * Command processor thread. A CPU write of CP_RB_WPTR records the
      * pointer and wakes it; see "COMMAND PROCESSOR THREAD" in ati_r350.c.
@@ -832,7 +839,6 @@ struct ATIR350State {
         bool s_fb;          /* ZB_CNTL STENCIL_FRONT_BACK */
         uint32_t zsc;       /* ZB_ZSTENCILCNTL */
         uint8_t s_ref, s_mask, s_wmask;     /* ZB_STENCILREFMASK */
-        unsigned cull;      /* RE_CULL_CNTL, for the primitive in hand */
         bool vte_zs, vte_zo;    /* VAP_VTE_CNTL z scale/offset enables */
         unsigned zfunc;     /* ZB_ZSTENCILCNTL ZFUNC */
         uint32_t off;       /* VRAM byte offset, 0x20-aligned */
@@ -975,6 +981,8 @@ void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap);
 bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len);
 
 bool ati_r350_on_engine(void);
+/* ati_r350_vram_xor() on this thread uses `memo` from now on */
+void ati_r350_swap_memo_bind(ATIR350SwapMemo *memo);
 void ati_r350_engine_wait(ATIR350State *s);
 
 /*

@@ -1110,9 +1110,16 @@ static inline bool r300_back_face(unsigned cull, float area)
     return !(cull & 8) && cw != !!(cull & 4);
 }
 
+/*
+ * One triangle, over the screen rows [ylo, yhi] only. `cull` is the
+ * r300_back_face() word for this triangle. Every pixel depends on the
+ * triangle and on nothing but its own position, so drawing the rows in
+ * pieces draws exactly the pixels drawing them at once does.
+ */
 static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                             const R300Vtx *v0, const R300Vtx *v1,
-                            const R300Vtx *v2)
+                            const R300Vtx *v2, unsigned cull,
+                            int ylo, int yhi)
 {
     float area = r300_edge(v0, v1, v2->x, v2->y);
     float inv, dx0, dy0, dx1, dy1, dx2, dy2;
@@ -1125,8 +1132,8 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     if (area == 0.0f) {
         return;
     }
-    back = r300_back_face(s->zb.cull, area);
-    if (s->zb.cull & (back ? 2 : 1)) {
+    back = r300_back_face(cull, area);
+    if (cull & (back ? 2 : 1)) {
         return;
     }
     /*
@@ -1205,6 +1212,10 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
      * helpers is the real limit beyond that */
     x1 = MIN(x1, MIN(d->sc_x1 + 1, 8191));
     y1 = MIN(y1, MIN(d->sc_y1 + 1, 8191));
+    y0 = MAX(y0, ylo);
+    if (yhi < y1) {
+        y1 = yhi + 1;
+    }
 
     for (y = y0; y < y1; y++) {
         float py = y + 0.5f;
@@ -3597,13 +3608,22 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
     return true;
 }
 
+/* one triangle of a primitive, all of its rows */
+static void r300_tri(ATIR350State *s, const R300DrawState *d,
+                     const R300Vtx *v0, const R300Vtx *v1, const R300Vtx *v2,
+                     unsigned cull)
+{
+    r300_raster_tri(s, d, v0, v1, v2, cull, INT_MIN, INT_MAX);
+}
+
 /*
  * One line segment, expanded to a quad a pixel wide across its own
  * direction and handed to the triangle rasterizer so it picks up the
  * same texturing, blending and clipping as everything else.
  */
 static void r300_raster_line(ATIR350State *s, const R300DrawState *d,
-                             const R300Vtx *a, const R300Vtx *b)
+                             const R300Vtx *a, const R300Vtx *b,
+                             unsigned cull)
 {
     float dx = b->x - a->x, dy = b->y - a->y;
     float len = sqrtf(dx * dx + dy * dy);
@@ -3624,18 +3644,18 @@ static void r300_raster_line(ATIR350State *s, const R300DrawState *d,
     q[1].x = b->x + nx; q[1].y = b->y + ny;
     q[2].x = b->x - nx; q[2].y = b->y - ny;
     q[3].x = a->x - nx; q[3].y = a->y - ny;
-    r300_raster_tri(s, d, &q[0], &q[1], &q[2]);
-    r300_raster_tri(s, d, &q[0], &q[2], &q[3]);
+    r300_tri(s, d, &q[0], &q[1], &q[2], cull);
+    r300_tri(s, d, &q[0], &q[2], &q[3], cull);
 }
 
 static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
                               const R300Vtx *vb, unsigned nvtx, unsigned prim)
 {
     unsigned i;
-
     /* points, lines and rectangles are never culled and always front */
-    s->zb.cull = (prim >= 4 && prim <= 7) || (prim >= 13 && prim <= 15)
-                 ? s->regs[R300_RE_CULL_CNTL >> 2] & 7 : 8;
+    unsigned cull = (prim >= 4 && prim <= 7) || (prim >= 13 && prim <= 15)
+                    ? s->regs[R300_RE_CULL_CNTL >> 2] & 7 : 8;
+
     switch (prim) {
     case 1:     /* point list -- WindowServer's screen composites are
                  * point SPRITES: RE_POINTSIZE gives the width/height
@@ -3696,46 +3716,46 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
             q[2].tc[0][0] = s1; q[2].tc[0][1] = t1;
             q[3].x = q[0].x; q[3].y = q[2].y;
             q[3].tc[0][0] = s0; q[3].tc[0][1] = t1;
-            r300_raster_tri(s, d, &q[0], &q[1], &q[2]);
-            r300_raster_tri(s, d, &q[0], &q[2], &q[3]);
+            r300_tri(s, d, &q[0], &q[1], &q[2], cull);
+            r300_tri(s, d, &q[0], &q[2], &q[3], cull);
         }
         break;
     }
     case 2:     /* line list */
         for (i = 0; i + 2 <= nvtx; i += 2) {
-            r300_raster_line(s, d, &vb[i], &vb[i + 1]);
+            r300_raster_line(s, d, &vb[i], &vb[i + 1], cull);
         }
         break;
     case 3:     /* line strip */
         for (i = 1; i < nvtx; i++) {
-            r300_raster_line(s, d, &vb[i - 1], &vb[i]);
+            r300_raster_line(s, d, &vb[i - 1], &vb[i], cull);
         }
         break;
     case 12:    /* line loop: a strip that closes back on itself */
         for (i = 1; i < nvtx; i++) {
-            r300_raster_line(s, d, &vb[i - 1], &vb[i]);
+            r300_raster_line(s, d, &vb[i - 1], &vb[i], cull);
         }
         if (nvtx > 2) {
-            r300_raster_line(s, d, &vb[nvtx - 1], &vb[0]);
+            r300_raster_line(s, d, &vb[nvtx - 1], &vb[0], cull);
         }
         break;
     case 4:     /* triangle list */
     case 7:     /* TRI_TYPE2: a triangle list with its own vertex
                  * routing; the assembly into triangles is the same */
         for (i = 0; i + 3 <= nvtx; i += 3) {
-            r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
+            r300_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2], cull);
         }
         break;
     case 5:     /* triangle fan */
     case 15:    /* polygon: fan-assembled, convex by definition here */
         for (i = 2; i < nvtx; i++) {
-            r300_raster_tri(s, d, &vb[0], &vb[i - 1], &vb[i]);
+            r300_tri(s, d, &vb[0], &vb[i - 1], &vb[i], cull);
         }
         break;
     case 6:     /* triangle strip: every second triangle is wound backwards */
         for (i = 2; i < nvtx; i++) {
-            s->zb.cull = (s->zb.cull & ~16u) | (i & 1) << 4;
-            r300_raster_tri(s, d, &vb[i - 2], &vb[i - 1], &vb[i]);
+            r300_tri(s, d, &vb[i - 2], &vb[i - 1], &vb[i],
+                     (cull & ~16u) | (i & 1) << 4);
         }
         break;
     case 8:     /* rectangle list: three corners, fourth implied */
@@ -3758,22 +3778,22 @@ static void r300_raster_prims(ATIR350State *s, R300DrawState *d,
                                    vb[i + 2].tcr[k][c] - vb[i].tcr[k][c];
                 }
             }
-            r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
-            r300_raster_tri(s, d, &vb[i + 1], &v3, &vb[i + 2]);
+            r300_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2], cull);
+            r300_tri(s, d, &vb[i + 1], &v3, &vb[i + 2], cull);
         }
         break;
     case 14:    /* quad strip: each further vertex pair closes a quad
                  * against the previous pair (Chess.app draws its board
                  * and pieces almost entirely out of these) */
         for (i = 2; i + 2 <= nvtx; i += 2) {
-            r300_raster_tri(s, d, &vb[i - 2], &vb[i - 1], &vb[i + 1]);
-            r300_raster_tri(s, d, &vb[i - 2], &vb[i + 1], &vb[i]);
+            r300_tri(s, d, &vb[i - 2], &vb[i - 1], &vb[i + 1], cull);
+            r300_tri(s, d, &vb[i - 2], &vb[i + 1], &vb[i], cull);
         }
         break;
     case 13:    /* quad list */
         for (i = 0; i + 4 <= nvtx; i += 4) {
-            r300_raster_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2]);
-            r300_raster_tri(s, d, &vb[i], &vb[i + 2], &vb[i + 3]);
+            r300_tri(s, d, &vb[i], &vb[i + 1], &vb[i + 2], cull);
+            r300_tri(s, d, &vb[i], &vb[i + 2], &vb[i + 3], cull);
         }
         break;
     default:
