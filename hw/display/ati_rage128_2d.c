@@ -416,6 +416,8 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint8_t *src_vram = vram, *dst_vram = vram;
     uint32_t src_base = 0, dst_base = 0;
+    uint32_t src_limit = ATI_RAGE128_VRAM_SIZE;
+    uint32_t dst_limit = ATI_RAGE128_VRAM_SIZE;
     uint8_t *src_bounce = NULL, *dst_bounce = NULL;
     bool dst_is_bounced = false;
     unsigned bypp = bpp / 8;
@@ -459,6 +461,7 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
             if (src_bounce) {
                 src_vram = src_bounce;
                 src_base = s->src_offset;
+                src_limit = (uint32_t)span64;
             } else if (p) {
                 src_vram = p - s->src_offset;
             }
@@ -474,6 +477,7 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
         if (dst_bounce) {
             dst_vram = dst_bounce;
             dst_base = s->dst_offset;
+            dst_limit = dst_bytes;
             dst_is_bounced = true;
         } else if (p) {
             dst_vram = p - s->dst_offset;
@@ -560,14 +564,21 @@ static void ati_rage128_2d_do_blt(ATIRage128State *s)
                 continue;
             }
             if (rop != 0xf0) {
-                src_pixel = ati_rage128_vram_ld(src_vram,
-                                                s->src_offset - src_base +
-                                                (uint32_t)sy * src_stride +
-                                                (uint32_t)sx * bypp, bpp);
+                uint32_t saddr_rel = s->src_offset - src_base +
+                                     (uint32_t)sy * src_stride +
+                                     (uint32_t)sx * bypp;
+
+                if ((uint64_t)saddr_rel + bypp <= src_limit) {
+                    src_pixel = ati_rage128_vram_ld(src_vram, saddr_rel, bpp);
+                }
             }
             daddr = s->dst_offset + (uint32_t)dy * dst_stride +
                     (uint32_t)dx * bypp;
             daddr_rel = daddr - dst_base;
+            /* a bounce holds only the rows the blit covers */
+            if ((uint64_t)daddr_rel + bypp > dst_limit) {
+                continue;
+            }
             dst_pixel = ati_rage128_vram_ld(dst_vram, daddr_rel, bpp);
             if (cmp_on_dst &&
                 !ati_rage128_clr_cmp_draw(cmp_fn_dst,
