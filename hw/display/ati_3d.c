@@ -66,11 +66,12 @@
 
 #define R100_CONTEXT_BASE 0x1c00
 #define R100_CONTEXT_END  0x1dff
-#define R100_MAX_DRAW_VERTICES 16384
-#define R100_MAX_DRAW_PIXELS (16U * 1024U * 1024U)
+/* per draw; far more than the chip fills in a frame */
+#define R100_MAX_DRAW_PIXELS (1U << 28)
 #define R100_MAX_RING_DWORDS (1U << 20)
-#define R100_MAX_COMMAND_WORK (2U * R100_MAX_RING_DWORDS)
-#define R100_MAX_PACKET_DWORDS (1U << 14)
+/* per top-level packet, with the indirect buffers it calls */
+#define R100_MAX_COMMAND_WORK (1U << 28)
+#define R100_MAX_BLIT_WORK (1U << 28)
 #define R100_VERTEX_WORK_OVERHEAD 8U
 #define R100_MAX_VERTEX_COMPONENTS 64
 #define R100_MAX_SAFE_SCREEN_COORD 1048576.0f
@@ -4119,6 +4120,7 @@ static void r100_draw_vertices(ATIVGAState *s, R100Vertex *vertices,
     R100DrawState draw = { .valid = false };
     unsigned int i;
 
+    s->r100_3d.draw_budget_remaining = R100_MAX_DRAW_PIXELS;
     if (!r100_draw_state_supported(s, vertices, count, primitive)) {
         s->r100_3d.rejected_commands++;
         goto out;
@@ -4251,8 +4253,8 @@ static bool r100_draw_immediate(ATIVGAState *s, uint32_t format,
 
     if (!ati_has_rv100_3d(s) ||
         (vf_cntl & R100_VF_PRIM_WALK_MASK) != R100_VF_PRIM_WALK_DATA ||
-        vertex_count == 0 || vertex_count > R100_MAX_DRAW_VERTICES ||
-        vertex_size == 0 || vertex_count > word_count / vertex_size ||
+        vertex_count == 0 || vertex_size == 0 ||
+        vertex_count > word_count / vertex_size ||
         vertex_count * vertex_size != word_count) {
         s->r100_3d.rejected_commands++;
         return false;
@@ -4373,8 +4375,8 @@ static bool r100_draw_vbuf(ATIVGAState *s, uint32_t format,
 
     if (!ati_has_rv100_3d(s) || r->vertex_array_count == 0 ||
         (vf_cntl & R100_VF_PRIM_WALK_MASK) != R100_VF_PRIM_WALK_LIST ||
-        vertex_count == 0 || vertex_count > R100_MAX_DRAW_VERTICES ||
-        vertex_size == 0 || vertex_size > R100_MAX_VERTEX_COMPONENTS ||
+        vertex_count == 0 || vertex_size == 0 ||
+        vertex_size > R100_MAX_VERTEX_COMPONENTS ||
         !r100_consume_command_work(
             r, (uint64_t)vertex_count *
                (vertex_size + R100_VERTEX_WORK_OVERHEAD))) {
@@ -4412,9 +4414,8 @@ static bool r100_draw_indexed(ATIVGAState *s, uint32_t format,
 
     if (!ati_has_rv100_3d(s) || !r->vertex_array_count ||
         (vf_cntl & R100_VF_PRIM_WALK_MASK) != R100_VF_PRIM_WALK_IND ||
-        !vertex_count || vertex_count > R100_MAX_DRAW_VERTICES ||
-        index_dwords != expected_dwords || vertex_size == 0 ||
-        vertex_size > R100_MAX_VERTEX_COMPONENTS ||
+        !vertex_count || index_dwords != expected_dwords ||
+        vertex_size == 0 || vertex_size > R100_MAX_VERTEX_COMPONENTS ||
         !r100_consume_command_work(
             r, (uint64_t)vertex_count *
                (vertex_size + R100_VERTEX_WORK_OVERHEAD))) {
@@ -5303,6 +5304,14 @@ static void r100_ring_progress(ATIVGAState *s, const R100Stream *stream)
     }
 }
 
+/* A rejected packet is skipped; a stream stops where packets are lost. */
+static bool r100_packet_rejected(ATI3DState *r, bool outermost)
+{
+    r->rejected_commands++;
+    /* a spent budget ends the top-level packet and what it called */
+    return !outermost && r->command_budget_exhausted;
+}
+
 static bool r100_process_stream(ATIVGAState *s, R100Stream *stream)
 {
     ATI3DState *r = &s->r100_3d;
@@ -5316,21 +5325,19 @@ static bool r100_process_stream(ATIVGAState *s, R100Stream *stream)
         r->rejected_commands++;
         return false;
     }
-    if (outermost) {
-        r->draw_budget_remaining = R100_MAX_DRAW_PIXELS;
-        r->command_work_remaining = R100_MAX_COMMAND_WORK;
-        r->blit_work_remaining = ATI_2D_MAX_PIXELS;
-        r->command_budget_exhausted = false;
-    }
     r->processing_depth++;
     while (stream->remaining) {
         uint32_t *payload;
         uint32_t header;
         unsigned int type;
         unsigned int count;
-        unsigned int max_count = ATI_3D_MAX_VERTEX_DWORDS;
         unsigned int i;
 
+        if (outermost) {
+            r->command_work_remaining = R100_MAX_COMMAND_WORK;
+            r->blit_work_remaining = R100_MAX_BLIT_WORK;
+            r->command_budget_exhausted = false;
+        }
         if (stream->ring && !stream->host && ati_engine_ctx) {
             r100_ring_progress(s, stream);
         }
@@ -5351,27 +5358,18 @@ static bool r100_process_stream(ATIVGAState *s, R100Stream *stream)
                 ok = false;
                 break;
             }
-            if (!r100_packet0_write(s, (header & 0x7ffU) << 2, first) ||
-                !r100_packet0_write(s, ((header >> 11) & 0x7ffU) << 2,
-                                    second)) {
+            if ((!r100_packet0_write(s, (header & 0x7ffU) << 2, first) ||
+                 !r100_packet0_write(s, ((header >> 11) & 0x7ffU) << 2,
+                                     second)) &&
+                r100_packet_rejected(r, outermost)) {
                 ok = false;
                 break;
             }
             continue;
         }
 
-        if (type == R100_CP_PACKET3 &&
-            (extract32(header, 8, 8) == R100_PACKET3_CNTL_HOSTDATA_BLT ||
-             extract32(header, 8, 8) == R100_PACKET3_NEXT_CHAR ||
-             extract32(header, 8, 8) == R100_PACKET3_PLY_NEXTSCAN ||
-             extract32(header, 8, 8) == R100_PACKET3_CNTL_POLYSCANLINES ||
-             extract32(header, 8, 8) == R100_PACKET3_CNTL_POLYLINE ||
-             extract32(header, 8, 8) == R100_PACKET3_CNTL_PAINT_MULTI ||
-             extract32(header, 8, 8) == R100_PACKET3_CNTL_BITBLT_MULTI)) {
-            max_count = R100_MAX_PACKET_DWORDS;
-        }
         count = extract32(header, R100_CP_PACKET_COUNT_SHIFT, 14) + 1;
-        if (count > stream->remaining || count > max_count) {
+        if (count > stream->remaining) {
             ok = false;
             break;
         }
@@ -5394,30 +5392,25 @@ static bool r100_process_stream(ATIVGAState *s, R100Stream *stream)
 
             for (i = 0; i < count; i++) {
                 if (!r100_packet0_write(s, reg, payload[i])) {
-                    ok = false;
                     break;
                 }
                 if (!one_reg) {
                     reg += 4;
                 }
             }
-            if (!ok) {
-                break;
-            }
-        } else if (type == R100_CP_PACKET3) {
-            if (!r100_process_packet3(s, extract32(header, 8, 8),
-                                      payload, count)) {
+            if (i < count && r100_packet_rejected(r, outermost)) {
                 ok = false;
                 break;
             }
-        } else {
+        } else if (!r100_process_packet3(s, extract32(header, 8, 8),
+                                         payload, count) &&
+                   r100_packet_rejected(r, outermost)) {
             ok = false;
             break;
         }
     }
     r->processing_depth--;
     if (outermost) {
-        r->draw_budget_remaining = 0;
         r->command_work_remaining = 0;
         r->blit_work_remaining = 0;
         r->command_budget_exhausted = false;
@@ -5484,6 +5477,7 @@ static void r100_process_ring(ATIVGAState *s)
     }
     s->engine_rptr_wb = 0;
     if (!r100_process_stream(s, &stream)) {
+        /* the packet boundaries are lost: resume at the write pointer */
         qatomic_store_release(&r->cp_rb_rptr, wptr);
     } else {
         qatomic_store_release(&r->cp_rb_rptr, stream.pos & mask);
@@ -5796,21 +5790,13 @@ static void r100_pio_write(ATIVGAState *s, uint32_t value)
 static void r100_port_submit(ATIVGAState *s)
 {
     ATI3DState *r = &s->r100_3d;
-    bool owns_budget;
 
     if (!r->port_data_expected ||
         r->port_data_count < r->port_data_expected) {
         return;
     }
-    owns_budget = r->processing_depth == 0;
-    if (owns_budget) {
-        r->draw_budget_remaining = R100_MAX_DRAW_PIXELS;
-    }
     r100_draw_immediate(s, r->se_vtx_fmt, r->se_vf_cntl,
                         r->port_data, r->port_data_expected);
-    if (owns_budget) {
-        r->draw_budget_remaining = 0;
-    }
     r->port_data_count = 0;
 }
 
