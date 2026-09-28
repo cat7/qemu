@@ -2228,25 +2228,25 @@ static R100Color r100_sample_volume(ATIVGAState *s,
 {
     float w = texture->r_nonparametric ? r_coord : r_coord * texture->depth;
     R100TextureAxis zaxis;
-    R100Color near, far;
+    R100Color lo, hi;
 
     if (!isfinite(w) || fabsf(w) >= R100_MAX_SAFE_TEXEL_COORD) {
         return (R100Color) { 1.0f, 1.0f, 1.0f, 1.0f };
     }
     zaxis = r100_texture_axis(w, texture->depth, texture->rmode,
                               texture->d3d_border, linear);
-    near = zaxis.border[0] ? texture->border_color :
+    lo = zaxis.border[0] ? texture->border_color :
         r100_sample_texture_level(s, texture, s_coord, t_coord,
                                   texture->nonparametric, 0, zaxis.texel[0],
                                   linear, cache);
     if (!linear) {
-        return near;
+        return lo;
     }
-    far = zaxis.border[1] ? texture->border_color :
+    hi = zaxis.border[1] ? texture->border_color :
         r100_sample_texture_level(s, texture, s_coord, t_coord,
                                   texture->nonparametric, 0, zaxis.texel[1],
                                   linear, cache);
-    return r100_color_lerp(near, far, zaxis.fraction);
+    return r100_color_lerp(lo, hi, zaxis.fraction);
 }
 
 static R100Color r100_sample_texture(ATIVGAState *s, R100DrawState *draw,
@@ -5706,8 +5706,6 @@ static uint32_t r100_packet_dwords(uint32_t header)
         return extract32(header, R100_CP_PACKET_COUNT_SHIFT, 14) + 2;
     }
 }
-
-static void ati_engine_kick(ATIVGAState *s);
 
 /*
  * With the engine thread, a PIO dword goes into the engine's queue and
