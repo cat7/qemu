@@ -2627,10 +2627,10 @@ void ati_rage128_raster_init(ATIRage128State *s)
     unsigned i;
 
     if (want == 0) {
-        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        unsigned cpus = g_get_num_processors();
 
         /* leave the vCPUs and the main loop room; never more than half */
-        want = cpus > 2 ? (unsigned)(cpus / 2) : 1;
+        want = cpus > 2 ? cpus / 2 : 1;
     }
     want = MIN(want, ATI_RAGE128_RASTER_MAX_THREADS);
     if (want <= 1) {
