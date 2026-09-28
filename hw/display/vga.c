@@ -1695,7 +1695,7 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
             break;
         }
     }
-    if (s->direct_palette && bits >= 16) {
+    if (s->direct_palette && bits >= 15) {
         full_update |= update_direct_lut(s);
         force_shadow |= s->direct_lut_on;
     }
@@ -1860,7 +1860,7 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
                 if (p) {
                     memcpy(d, p, disp_width * sizeof(uint32_t));
                 }
-                if (s->direct_lut_on && bits >= 16) {
+                if (s->direct_lut_on && bits >= 15) {
                     vga_direct_lut_line(s, d, disp_width);
                 }
                 if (s->cursor_draw_line)
