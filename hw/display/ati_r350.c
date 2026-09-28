@@ -309,12 +309,42 @@ static void ati_r350_draw_8bpp(ATIR350State *s, DisplaySurface *ds,
     }
 }
 
+static void ati_r350_palette_reset(ATIR350State *s)
+{
+    int i;
+
+    for (i = 0; i < 256; i++) {
+        s->palette[i][0] = i;
+        s->palette[i][1] = i;
+        s->palette[i][2] = i;
+    }
+}
+
+static bool ati_r350_palette_identity(ATIR350State *s)
+{
+    int i;
+
+    for (i = 0; i < 256; i++) {
+        if (s->palette[i][0] != i || s->palette[i][1] != i ||
+            s->palette[i][2] != i) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * 15/16bpp look each component up in the palette too: a 5-bit one at
+ * entry c << 3, a 6-bit one at c << 2. With the identity ramp the plain
+ * bit expansion is kept.
+ */
 static void ati_r350_draw_16bpp(ATIR350State *s, DisplaySurface *ds,
                                    const ATIR350Mode *mode, bool rgb565)
 {
     uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                    mode->fb_offset;
     unsigned xr = ati_r350_vram_xor(s, mode->fb_offset);
+    bool lut = !ati_r350_palette_identity(s);
     uint32_t *dst;
     int x, y;
 
@@ -330,15 +360,20 @@ static void ati_r350_draw_16bpp(ATIR350State *s, DisplaySurface *ds,
                 r = ((pixel >> 11) & 0x1f) << 3;
                 g = ((pixel >> 5) & 0x3f) << 2;
                 b = (pixel & 0x1f) << 3;
-                g |= g >> 6;
             } else {                        /* RGB555 */
                 r = ((pixel >> 10) & 0x1f) << 3;
                 g = ((pixel >> 5) & 0x1f) << 3;
                 b = (pixel & 0x1f) << 3;
-                g |= g >> 5;
             }
-            r |= r >> 5;
-            b |= b >> 5;
+            if (lut) {
+                r = s->palette[r][0];
+                g = s->palette[g][1];
+                b = s->palette[b][2];
+            } else {
+                g |= rgb565 ? g >> 6 : g >> 5;
+                r |= r >> 5;
+                b |= b >> 5;
+            }
             dst[x] = 0xff000000u | ((uint32_t)r << 16) |
                      ((uint32_t)g << 8) | b;
         }
@@ -3797,7 +3832,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     ati_r350_gl_reset(s);
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
-    memset(s->palette, 0, sizeof(s->palette));
+    ati_r350_palette_reset(s);
     s->swap_valid = false;          /* the surface registers just went */
     s->eswap_valid = false;
     s->draw_xr = -1;                /* nothing has been drawn with any */
