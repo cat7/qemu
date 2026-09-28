@@ -1108,6 +1108,57 @@ static int update_palette256(VGACommonState *s)
     return full_update;
 }
 
+/*
+ * The per-component lookup of direct-colour scanout: an 8-bit component
+ * selects its own entry, a 5-bit one entry c << 3, a 6-bit one c << 2,
+ * which is where the stock line functions put them. An identity ramp,
+ * 8-bit or 6-bit, is left out.
+ */
+static int update_direct_lut(VGACommonState *s)
+{
+    uint8_t lut[3][256];
+    bool identity = true;
+    int i, c;
+
+    for (i = 0; i < 256; i++) {
+        for (c = 0; c < 3; c++) {
+            uint8_t v = s->palette[i * 3 + c];
+
+            if (v != i && v != i >> 2) {
+                identity = false;
+            }
+            lut[c][i] = s->dac_8bit ? v : c6_to_8(v);
+        }
+    }
+    if (identity) {
+        if (!s->direct_lut_on) {
+            return 0;
+        }
+        s->direct_lut_on = false;
+        return 1;
+    }
+    if (s->direct_lut_on && !memcmp(lut, s->direct_lut, sizeof(lut))) {
+        return 0;
+    }
+    memcpy(s->direct_lut, lut, sizeof(lut));
+    s->direct_lut_on = true;
+    return 1;
+}
+
+static void vga_direct_lut_line(VGACommonState *s, uint8_t *d, int width)
+{
+    uint32_t *p = (uint32_t *)d;
+    int x;
+
+    for (x = 0; x < width; x++) {
+        uint32_t v = p[x];
+
+        p[x] = rgb_to_pixel32(s->direct_lut[0][(v >> 16) & 0xff],
+                              s->direct_lut[1][(v >> 8) & 0xff],
+                              s->direct_lut[2][v & 0xff]);
+    }
+}
+
 static void vga_get_params(VGACommonState *s,
                            VGADisplayParams *params)
 {
@@ -1644,6 +1695,10 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
             break;
         }
     }
+    if (s->direct_palette && bits >= 16) {
+        full_update |= update_direct_lut(s);
+        force_shadow |= s->direct_lut_on;
+    }
 
     /* Horizontal pel panning bit 3 is only used in text mode.  */
     hpel = bits <= 8 ? s->params.hpel & 7 : 0;
@@ -1804,6 +1859,9 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
                 p = vga_draw_line(s, d, addr, width, hpel);
                 if (p) {
                     memcpy(d, p, disp_width * sizeof(uint32_t));
+                }
+                if (s->direct_lut_on && bits >= 16) {
+                    vga_direct_lut_line(s, d, disp_width);
                 }
                 if (s->cursor_draw_line)
                     s->cursor_draw_line(s, d, y);

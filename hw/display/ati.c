@@ -2957,6 +2957,8 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     }
     vga->vbe_legacy_mode_switch = true;
     vga->vbe_keep_legacy_regs = true;
+    /* the Radeon DAC looks direct-colour components up in the palette */
+    vga->direct_palette = ati_is_rv100_family(s);
     vga_init(vga, OBJECT(s), pci_address_space(dev),
              pci_address_space_io(dev), true);
     vga->con = qemu_graphic_console_create(DEVICE(s), 0, &ati_graphic_ops, s);
@@ -3078,6 +3080,12 @@ static void ati_vga_reset(DeviceState *dev)
     s->mode = VGA_MODE;
     s->vga.big_endian_fb = s->vga.default_endian_fb;
     s->vga.force_shadow = false;
+    if (s->vga.direct_palette) {
+        /* the direct-colour gamma ramp starts as the identity */
+        for (unsigned int i = 0; i < sizeof(s->vga.palette); i++) {
+            s->vga.palette[i] = i / 3;
+        }
+    }
     s->cursor_width = 0;
     s->cursor_height = 0;
     s->cursor_mode = 0;

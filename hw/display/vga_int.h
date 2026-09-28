@@ -145,6 +145,10 @@ typedef struct VGACommonState {
     uint32_t last_depth; /* in bits */
     bool last_byteswap;
     bool force_shadow;
+    /* direct-colour pixels go through the palette, one entry per component */
+    bool direct_palette;
+    bool direct_lut_on;
+    uint8_t direct_lut[3][256];
     uint8_t cursor_start, cursor_end;
     bool cursor_visible_phase;
     int64_t cursor_blink_time;
