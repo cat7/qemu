@@ -3672,7 +3672,7 @@ void ati_3d_raster_init(ATIVGAState *s)
     R100Raster *q;
 
     if (!want) {
-        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        unsigned cpus = g_get_num_processors();
 
         /* leave the vCPUs and the main loop room */
         want = cpus > 2 ? cpus / 2 : 1;
