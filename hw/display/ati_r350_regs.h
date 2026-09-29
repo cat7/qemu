@@ -1013,6 +1013,31 @@
 #define R300_TX_SEL_ONE               5
 #define R300_TX_OFFSET_0              0x4540
 #define R300_TXO_ENDIAN_MASK          0x3     /* ENDIAN_SWAP [1:0] */
+#define R300_TXO_MACRO_TILE           (1u << 2)
+#define R300_TXO_MICRO_TILE_SHIFT     3       /* [4:3], 2 = square (16bpp) */
+/* TX_FORMAT0: NUM_LEVELS [29:26], the index of the smallest level */
+#define R300_TX_NUM_LEVELS_SHIFT      26
+#define R300_TX_NUM_LEVELS_MASK       0xf
+/*
+ * TX_FILTER0: clamp modes S/T/R in [8:0], MAG_FILTER [10:9], MIN_FILTER
+ * [12:11] (1 point, 2 linear, 3 anisotropic), MIP_FILTER [14:13] (0
+ * none, 1 point, 2 linear), MAX_MIP_LEVEL [20:17] and MAX_ANISO [23:21]
+ * (0 = 1:1 ... 4 = 16:1).
+ */
+#define R300_TX_MAG_SHIFT             9
+#define R300_TX_MIN_SHIFT             11
+#define R300_TX_MIP_SHIFT             13
+#define R300_TX_MAX_MIP_SHIFT         17
+#define R300_TX_ANISO_SHIFT           21
+#define R300_TX_FILTER_POINT          1
+#define R300_TX_FILTER_LINEAR         2
+#define R300_TX_FILTER_ANISO          3
+/* TX_FILTER1: LOD_BIAS s4.5 in [12:3]; MACRO_SWITCH selects the RV350 rule */
+#define R300_TX_FILTER1_0             0x4440
+#define R300_TX_LOD_BIAS_SHIFT        3
+#define R300_TX_LOD_BIAS_MASK         0x3ff
+#define R300_TX_MACRO_SWITCH          (1u << 22)
+#define R300_TX_BORDER_COLOR_0        0x45c0
 /*
  * Colour and alpha blend control. The two registers share the factor
  * and combine fields; only CBLEND carries the enables. Mac OS X sets

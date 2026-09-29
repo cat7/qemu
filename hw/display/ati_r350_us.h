@@ -240,10 +240,12 @@ typedef struct R300UsLevel {
  * free of device state, so the fetch arrives as a callback: `coord` is
  * the frame register the texture instruction names -- s, t, r, q in the
  * units the caller established -- and `texel` receives R, G, B, A.
- * `proj` distinguishes PROJ from LD.
+ * `proj` distinguishes PROJ from LD; `src` is the register's index, which
+ * tells the caller whether the coordinate is an interpolated one.
  */
 typedef void (*R300UsSampleFn)(void *ctx, unsigned unit, bool proj,
-                               const float coord[4], float texel[4]);
+                               unsigned src, const float coord[4],
+                               float texel[4]);
 
 /*
  * Which frame register the rasterizer drops each interpolated quantity
