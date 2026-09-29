@@ -146,6 +146,12 @@ static void us_decode_alu(R300UsAlu *a, uint32_t rgb_addr, uint32_t rgb_inst,
  * routes TEX_PTR 0, 4, 7. RS_INST_COUNT says how many of the
  * instructions are live; a multi-tap filter reads six or seven.
  *
+ * A set with no components takes no room in the packet, and the vertex
+ * stage writes the declared sets as consecutive outputs, so the model
+ * numbers sets by their place among the declared ones: the title and
+ * control strips declare 0x804 (4, 0, 0, 4) and route TEX_PTR 0 and 4,
+ * which is sets 0 and 1.
+ *
  * A TEX_PTR that does not start a declared set would be a partial or
  * misaligned route into the packet, which this model does not build, so
  * it stays a gap rather than being rounded to a set.
@@ -156,18 +162,24 @@ static void us_decode_rs(R300UsRs *rs, R300UsGaps *gaps,
 {
     unsigned n, ninst = (rs_inst_count & R300_RS_INST_COUNT_MASK) + 1;
     unsigned ncol = 0;
-    unsigned set_ptr[R300_TEXCOORDS], ptr_sum = 0;
+    unsigned set_ptr[R300_TEXCOORDS], ptr_sum = 0, nset = 0;
 
     /*
-     * Where each set starts in the packet: the sets are packed with the
-     * component counts VAP_OUTPUT_VTX_FMT_1 declares. A zero register
-     * declares nothing, and each set is then taken as four floats.
+     * Where each declared set starts in the packet: the sets are packed
+     * with the component counts VAP_OUTPUT_VTX_FMT_1 declares. A zero
+     * register declares nothing, and each set is then taken as four
+     * floats.
      */
     for (n = 0; n < R300_TEXCOORDS; n++) {
         unsigned cnt = (vtx_fmt1 >> (n * 3)) & 7;
 
-        set_ptr[n] = cnt ? ptr_sum : ~0u;
-        ptr_sum += cnt;
+        if (cnt) {
+            set_ptr[nset++] = ptr_sum;
+            ptr_sum += cnt;
+        }
+    }
+    for (; nset < R300_TEXCOORDS; nset++) {
+        set_ptr[nset] = ~0u;
     }
 
     for (n = 0; n < R300_TEXCOORDS; n++) {
