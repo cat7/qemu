@@ -55,6 +55,7 @@ struct MacIONVRAMState {
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);
 void pmac_format_nvram_core99(MacIONVRAMState *nvr);
 bool pmac_nvram_core99_valid(MacIONVRAMState *nvr);
+void pmac_nvram_core99_set_prom_env(MacIONVRAMState *nvr);
 BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size,
                                       uint8_t fill);
 

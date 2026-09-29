@@ -34,6 +34,7 @@
 #include "qemu/cutils.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "system/system.h"
 #include "qobject/qdict.h"
 #include "trace.h"
 #include <zlib.h> /* for adler32 */
@@ -381,6 +382,84 @@ bool pmac_nvram_core99_valid(MacIONVRAMState *nvr)
         }
     }
     return common;
+}
+
+/* True if the -prom-env list sets the variable of the "name=value" var */
+static bool prom_env_sets(const char *var)
+{
+    const char *eq = strchr(var, '=');
+    unsigned int i;
+
+    for (i = 0; eq && i < nb_prom_envs; i++) {
+        if (!strncmp(prom_envs[i], var, eq - var + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Set the -prom-env variables in the "common" partition of the live bank
+ * of a valid Core99 NVRAM, in place of any of the same name.
+ */
+void pmac_nvram_core99_set_prom_env(MacIONVRAMState *nvr)
+{
+    g_autofree uint8_t *buf = NULL;
+    uint32_t gen_a, gen_b, off, len, size, pos, p, n;
+    uint8_t *bank, *vars;
+    unsigned int i;
+
+    if (!nb_prom_envs || !pmac_nvram_core99_valid(nvr)) {
+        return;
+    }
+    gen_a = core99_bank_generation(nvr->data);
+    gen_b = core99_bank_generation(nvr->data + MACIO_NVRAM_SIZE);
+    bank = nvr->data + (gen_a > gen_b ? 0 : MACIO_NVRAM_SIZE);
+    for (off = 0; ; off += len) {
+        len = chrp_partition_len(&bank[off]);
+        if (bank[off] == CHRP_NVPART_SYSTEM &&
+            !strncmp((const char *)&bank[off + 4], "common", 12)) {
+            break;
+        }
+    }
+    vars = &bank[off + sizeof(ChrpNvramPartHdr)];
+    size = len - sizeof(ChrpNvramPartHdr);
+    buf = g_malloc0(size);
+
+    pos = 0;
+    for (p = 0; p < size && vars[p]; p += n + 1) {
+        n = strnlen((const char *)&vars[p], size - p);
+        if (n == size - p) {
+            break;
+        }
+        if (prom_env_sets((const char *)&vars[p])) {
+            continue;
+        }
+        if (pos + n + 1 >= size) {
+            goto full;
+        }
+        memcpy(&buf[pos], &vars[p], n + 1);
+        pos += n + 1;
+    }
+    for (i = 0; i < nb_prom_envs; i++) {
+        n = strlen(prom_envs[i]);
+        if (pos + n + 1 >= size) {
+            goto full;
+        }
+        memcpy(&buf[pos], prom_envs[i], n + 1);
+        pos += n + 1;
+    }
+
+    memcpy(vars, buf, size);
+    stl_be_p(&bank[16], adler32(1, &bank[20], MACIO_NVRAM_SIZE - 20));
+    if (nvr->blk && blk_pwrite(nvr->blk, bank - nvr->data, MACIO_NVRAM_SIZE,
+                               bank, 0) < 0) {
+        error_report("%s: write of NVRAM failed", blk_name(nvr->blk));
+    }
+    return;
+
+full:
+    warn_report("NVRAM has no room for the -prom-env variables");
 }
 
 /*

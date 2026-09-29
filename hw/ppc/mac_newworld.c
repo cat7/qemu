@@ -698,13 +698,17 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
     if (machine_arch == ARCH_MAC99_U3) {
-        /* Keep what the file holds unless the firmware could not use it */
+        /*
+         * Keep what the file holds unless the firmware could not use it;
+         * -prom-env variables override the saved ones
+         */
         if (!pmac_nvram_core99_valid(nvr)) {
             if (nvr->blk && nvr->data[0] != 0xff) {
                 warn_report("NVRAM image holds no valid bank, reformatting it");
             }
             pmac_format_nvram_core99(nvr);
         }
+        pmac_nvram_core99_set_prom_env(nvr);
     } else {
         pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
     }
