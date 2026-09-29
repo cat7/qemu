@@ -958,9 +958,9 @@
  * VAP:VAP_VTE_CNTL) -- a guest that hands the engine coordinates
  * already in screen units turns the offset off and leaves the scale at
  * 1.0, and applying SE_VPORT_?OFFSET anyway displaces the whole draw.
- * Bit 8 VTX_XY_FMT and bit 10 VTX_W0_FMT describe the perspective
- * divide the model always performs; every capture we hold reads them
- * 0 and 1 respectively, which is exactly that divide.
+ * Bits 8-10 VTX_XY_FMT, VTX_Z_FMT and VTX_W0_FMT say which divides the
+ * setup engine still owes: the usual 3D draw sets W0_FMT alone, and
+ * pre-transformed vertices come with all three clear (w is 1/w).
  */
 #define R300_VAP_VTE_CNTL             0x20b0
 #define R300_VTE_VPORT_X_SCALE_ENA    0x00000001
@@ -970,6 +970,7 @@
 #define R300_VTE_VPORT_Z_SCALE_ENA    0x00000010
 #define R300_VTE_VPORT_Z_OFFSET_ENA   0x00000020
 #define R300_VTE_VTX_XY_FMT           0x00000100
+#define R300_VTE_VTX_Z_FMT            0x00000200
 #define R300_VTE_VTX_W0_FMT           0x00000400
 #define R300_VAP_VTX_SIZE             0x20b4
 #define R300_TX_ENABLE                0x4104

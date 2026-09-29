@@ -1733,7 +1733,8 @@ static const float r300_vtx_nowhere = -32768.0f;
 static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
                            R300Vtx *v, const float *clip)
 {
-    float cx, cy, cz, cw;
+    uint32_t f = s->zb.vte_fmt;
+    float cx, cy, cz, cw, zw;
 
     if (!d->xform) {
         v->w = 1.0f;
@@ -1770,7 +1771,6 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
         v->x = v->y = r300_vtx_nowhere;
         return;
     }
-    v->w = 1.0f / cw;
     /*
      * The viewport's scale and offset are enabled per component, and a
      * guest that is already handing over screen coordinates turns the
@@ -1787,6 +1787,29 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
      * the two would round in between and move pixels in every draw
      * this model has ever got right.
      */
+    zw = cw;
+    v->w = 1.0f / cw;
+    if ((f & (R300_VTE_VTX_XY_FMT | R300_VTE_VTX_W0_FMT)) !=
+        R300_VTE_VTX_W0_FMT) {
+        /*
+         * VTX_XY_FMT: x and y already carry the divide. VTX_W0_FMT
+         * clear: the w handed over is 1/w already, so the divide is a
+         * multiply by it.
+         */
+        float rw = (f & R300_VTE_VTX_W0_FMT) ? 1.0f / cw : cw;
+
+        if (!(f & R300_VTE_VTX_XY_FMT)) {
+            cx *= rw;
+            cy *= rw;
+        }
+        if (!(f & R300_VTE_VTX_Z_FMT)) {
+            cz *= rw;
+        }
+        cw = zw = 1.0f;
+        v->w = rw;
+    } else if (f & R300_VTE_VTX_Z_FMT) {
+        zw = 1.0f;          /* z already carries the divide */
+    }
     if (d->vte_xs) {
         v->x = d->vte_xo ? (cx / cw) * d->vp[0] + d->vp[1]
                          : (cx / cw) * d->vp[0];
@@ -1800,10 +1823,10 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
         v->y = d->vte_yo ? cy / cw + d->vp[3] : cy / cw;
     }
     if (s->zb.vte_zs) {
-        v->z = s->zb.vte_zo ? (cz / cw) * d->vp[4] + d->vp[5]
-                            : (cz / cw) * d->vp[4];
+        v->z = s->zb.vte_zo ? (cz / zw) * d->vp[4] + d->vp[5]
+                            : (cz / zw) * d->vp[4];
     } else {
-        v->z = s->zb.vte_zo ? cz / cw + d->vp[5] : cz / cw;
+        v->z = s->zb.vte_zo ? cz / zw + d->vp[5] : cz / zw;
     }
     if (!isfinite(v->x) || !isfinite(v->y)) {
         v->x = v->y = r300_vtx_nowhere;
@@ -3573,19 +3596,14 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
             }
             vte = s->regs[R300_VAP_VTE_CNTL >> 2];
             /*
-             * The two format bits describe the perspective divide this
-             * model performs unconditionally: XY_FMT clear means the
-             * setup engine still has to divide x and y by w, and
-             * W0_FMT set means the w it was handed is w rather than
-             * 1/w. Every draw in every capture reads them that way.
-             * Anything else would need a different divide, so say so
-             * rather than transform the vertex wrongly in silence.
+             * The format bits say which divides the setup engine still
+             * owes: XY_FMT / Z_FMT clear, divide that coordinate;
+             * W0_FMT set, the w handed over is w and not 1/w. The usual
+             * draw is W0_FMT alone; pre-transformed vertices come with
+             * all three clear (w is 1/w, typically 1).
              */
-            if ((vte & (R300_VTE_VTX_XY_FMT | R300_VTE_VTX_W0_FMT)) !=
-                R300_VTE_VTX_W0_FMT) {
-                ati_r350_note_gap(s, R350_GAP_VTE_FMT,
-                                  (vte >> 8) & (R350_GAP_SLOTS - 1));
-            }
+            s->zb.vte_fmt = vte & (R300_VTE_VTX_XY_FMT | R300_VTE_VTX_Z_FMT |
+                                   R300_VTE_VTX_W0_FMT);
             d->vte_xs = vte & R300_VTE_VPORT_X_SCALE_ENA;
             d->vte_xo = vte & R300_VTE_VPORT_X_OFFSET_ENA;
             d->vte_ys = vte & R300_VTE_VPORT_Y_SCALE_ENA;

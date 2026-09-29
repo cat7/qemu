@@ -95,7 +95,6 @@ typedef enum ATIR350GapKind {
     R350_GAP_VS_DST_FILE,    /* PVS destination register file not modelled */
     R350_GAP_TEX_SWIZZLE,    /* TX_FORMAT1 component select not modelled */
     R350_GAP_AOS_ARRAYS,     /* more vertex arrays bound than we fetch */
-    R350_GAP_VTE_FMT,        /* VAP_VTE_CNTL vertex format bit not modelled */
     /*
      * VAP_PROG_STREAM_CNTL element format not unpacked. Indexed by the
      * DATA_TYPE code itself for a type this model cannot fetch, and by
@@ -840,6 +839,7 @@ struct ATIR350State {
         uint32_t zsc;       /* ZB_ZSTENCILCNTL */
         uint8_t s_ref, s_mask, s_wmask;     /* ZB_STENCILREFMASK */
         bool vte_zs, vte_zo;    /* VAP_VTE_CNTL z scale/offset enables */
+        uint32_t vte_fmt;   /* VAP_VTE_CNTL VTX_XY/Z/W0_FMT bits */
         unsigned zfunc;     /* ZB_ZSTENCILCNTL ZFUNC */
         uint32_t off;       /* VRAM byte offset, 0x20-aligned */
         uint32_t pitch;     /* pixels */
@@ -1029,9 +1029,9 @@ static inline void ati_r350_gl_dirty(ATIR350State *s, uint32_t off,
 /* ati_r350_3d.c */
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
 void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
+void ati_r350_r300_draw_indx(ATIR350State *s, const uint32_t *dw, unsigned n);
 void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                                uint32_t val);
-void ati_r350_r300_draw_indx(ATIR350State *s, const uint32_t *dw, unsigned n);
 void ati_r350_raster_init(ATIR350State *s);
 void ati_r350_raster_fini(ATIR350State *s);
 
