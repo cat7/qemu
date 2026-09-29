@@ -6397,8 +6397,23 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
                                unsigned unit, uint8_t *rgba)
 {
     const R300TexUnit *u = &d->tex[unit];
+    uint8_t *p = rgba + (size_t)u->w * u->h * 4;
+    unsigned l;
     int tx, ty;
 
+    /* the levels after the first, one after another behind it */
+    for (l = 1; l < u->nlev; l++) {
+        for (ty = 0; ty < u->lh[l]; ty++) {
+            for (tx = 0; tx < u->lw[l]; tx++, p += 4) {
+                uint32_t texel = r300_tex_lvl_texel(s, d, unit, l, tx, ty);
+
+                p[0] = r300_texel_byte(u, texel, 1);
+                p[1] = r300_texel_byte(u, texel, 2);
+                p[2] = r300_texel_byte(u, texel, 3);
+                p[3] = r300_texel_byte(u, texel, 0);
+            }
+        }
+    }
     if (r300_gl_decode_tex32(s, d, unit, rgba)) {
         return;
     }
@@ -6413,6 +6428,29 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
             p[3] = (uint8_t)(r300_texel_chan(u, texel, 0) * 255.0f + 0.5f);
         }
     }
+}
+
+/* a unit's filter state in the backend's terms; see ati_r350_gl.h */
+static void r300_gl_filt(const R300TexUnit *u, R350GlReq *r, unsigned i)
+{
+    int *f = r->filt[i];
+
+    f[0] = u->filt;
+    f[1] = u->need_lod;
+    f[2] = u->mag;
+    f[3] = u->min;
+    f[4] = u->mip;
+    f[5] = u->aniso_l2;
+    f[6] = u->first;
+    f[7] = u->last;
+    f[8] = u->bias;
+    f[9] = u->wl2;
+    f[10] = u->hl2;
+    r->levels[i] = u->nlev;
+    r->border[i][0] = r300_texel_byte(u, u->border, 1);
+    r->border[i][1] = r300_texel_byte(u, u->border, 2);
+    r->border[i][2] = r300_texel_byte(u, u->border, 3);
+    r->border[i][3] = r300_texel_byte(u, u->border, 0);
 }
 
 /* everything the decode above depends on, and nothing else */
@@ -6430,7 +6468,9 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
            s->gl_tex[k].sel[0] == u->sel[0] &&
            s->gl_tex[k].sel[1] == u->sel[1] &&
            s->gl_tex[k].sel[2] == u->sel[2] &&
-           s->gl_tex[k].sel[3] == u->sel[3];
+           s->gl_tex[k].sel[3] == u->sel[3] &&
+           s->gl_tex[k].nlev == u->nlev &&
+           s->gl_tex[k].lay == u->loff[u->nlev - 1] - u->off;
 }
 
 /*
@@ -6447,12 +6487,12 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     const R300TexUnit *u = &d->tex[unit];
     uint32_t off, len;
     unsigned k, victim = 0, xr = 0;
-    size_t need = (size_t)u->w * u->h * 4;
+    size_t need = u->ltexels * 4;
 
     *slot = R350_GL_TEXSLOTS;           /* the scratch: uploaded every time */
     *fresh = 1;
 
-    len = (uint32_t)u->h * u->pitch;
+    len = u->chain;
     /*
      * Not cacheable, so decoded into the scratch: too big to keep, no
      * range to invalidate on, or -- new with the dirty guard -- a range
@@ -6520,6 +6560,8 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     for (k = 0; k < 4; k++) {
         s->gl_tex[victim].sel[k] = u->sel[k];
     }
+    s->gl_tex[victim].nlev = u->nlev;
+    s->gl_tex[victim].lay = u->loff[u->nlev - 1] - u->off;
     s->gl_tex[victim].used = ++s->gl_tex_seq;
     s->gl_tex[victim].epoch = s->gl_epoch;
     s->gl_tex[victim].npg = r300_gl_pages(s, off, len);
@@ -6856,6 +6898,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         if (!n || n > R300_GL_TEX_MAX) {
             return r300_gl_fallback(s, R350_GLF_TEXTURE, prim, nvtx);
         }
+        n = d->tex[i].ltexels;
         texels = MAX(texels, n);
     }
 
@@ -6919,6 +6962,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         req.tex_h[i] = d->tex[i].h;
         req.clamp_s[i] = d->tex[i].clamp_s;
         req.clamp_t[i] = d->tex[i].clamp_t;
+        r300_gl_filt(&d->tex[i], &req, i);
         req.textured |= d->tex[i].en ? (1u << i) : 0;
     }
     req.wmask = d->wmask;

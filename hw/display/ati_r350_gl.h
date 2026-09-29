@@ -158,6 +158,17 @@ typedef struct R350GlReq {
     int tex_w[R350_GL_TEXUNITS], tex_h[R350_GL_TEXUNITS];
     /* TX_FILTER0 clamp modes; <= 1 is repeat */
     int clamp_s[R350_GL_TEXUNITS], clamp_t[R350_GL_TEXUNITS];
+    /*
+     * Filtering, for a unit whose `filt[u][0]` is set: `tex` then holds
+     * `levels` images, level l being max(w >> l, 1) x max(h >> l, 1),
+     * one after another, and the shader samples them as the device's
+     * r300_tex_filter() does. filt = { on, need_lod, mag, min, mip,
+     * log2 max aniso, first level, last level, LOD bias (1/256), floor
+     * log2 w, floor log2 h }; `border` is the border colour as RGBA.
+     */
+    int levels[R350_GL_TEXUNITS];
+    int filt[R350_GL_TEXUNITS][11];
+    uint8_t border[R350_GL_TEXUNITS][4];
     uint32_t textured;
 
     uint32_t wmask;             /* RB3D_COLOR_CHANNEL_MASK as an ARGB mask */

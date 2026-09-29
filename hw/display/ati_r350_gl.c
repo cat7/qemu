@@ -244,6 +244,9 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_NEAREST                      0x2600
 #define GL_TEXTURE_MAG_FILTER           0x2800
 #define GL_TEXTURE_MIN_FILTER           0x2801
+#define GL_NEAREST_MIPMAP_NEAREST       0x2700
+#define GL_TEXTURE_BASE_LEVEL           0x813C
+#define GL_TEXTURE_MAX_LEVEL            0x813D
 #define GL_FUNC_ADD                     0x8006
 #define GL_RGBA8                        0x8058
 #define GL_TEXTURE0                     0x84C0
@@ -320,6 +323,7 @@ static void (APIENTRY *glShaderSource)(GLuint, GLsizei,
 static void (APIENTRY *glUniform1f)(GLint, GLfloat);
 static void (APIENTRY *glUniform1fv)(GLint, GLsizei, const GLfloat *);
 static void (APIENTRY *glUniform1i)(GLint, GLint);
+static void (APIENTRY *glUniform1iv)(GLint, GLsizei, const GLint *);
 static void (APIENTRY *glUniform2f)(GLint, GLfloat, GLfloat);
 static void (APIENTRY *glUniform2i)(GLint, GLint, GLint);
 static void (APIENTRY *glUniform3i)(GLint, GLint, GLint, GLint);
@@ -386,6 +390,7 @@ static const struct {
     R350_GL_PROC(glUniform1f),
     R350_GL_PROC(glUniform1fv),
     R350_GL_PROC(glUniform1i),
+    R350_GL_PROC(glUniform1iv),
     R350_GL_PROC(glUniform2f),
     R350_GL_PROC(glUniform2i),
     R350_GL_PROC(glUniform3i),
@@ -642,12 +647,16 @@ static inline void r350_gl_barrier(void)
  * resolves to -1, and glUniform on -1 is defined to do nothing, so both
  * are fed by the same code below.
  */
+/* unit 0's filter uniform: the request's filt[0][], border RGBA, pad */
+#define R350_GL_TF 16
+
 typedef struct R350GlProg {
     GLuint prog;
     GLint u_rect, u_org, u_texsize, u_clamp, u_textured;
     GLint u_alphatest, u_affunc, u_afref, u_discard;
     GLint u_blend, u_blendread, u_cfac, u_afac, u_konst;
     GLint u_usk;
+    GLint u_tf;
 } R350GlProg;
 
 /*
@@ -680,6 +689,7 @@ struct R350GlCtx {
     /* uploaded textures by caller slot, plus the scratch at the end */
     GLuint tex[R350_GL_TEXSLOTS + 1];
     int tex_w[R350_GL_TEXSLOTS + 1], tex_h[R350_GL_TEXSLOTS + 1];
+    int tex_nl[R350_GL_TEXSLOTS + 1];   /* mip levels specified */
     GLuint white;                   /* the 1x1 an untextured draw samples */
     /* the resident target's size; a request smaller than it reuses it */
     int fb_w, fb_h;
@@ -861,6 +871,7 @@ static const char *fs_src =
 "uniform vec2 u_org;\n"
 "uniform ivec2 u_texsize;\n"
 "uniform ivec2 u_clamp;\n"
+"uniform int u_tf[16];\n"
 "uniform int u_textured;\n"
 "uniform int u_alphatest;\n"
 "uniform int u_affunc;\n"
@@ -902,6 +913,166 @@ static const char *fs_src =
 "    return s + d;\n"
 "}\n"
 "\n"
+/*
+ * r300_tex_filter() and its helpers in ati_r350_3d.c, operation for
+ * operation: the same clamps, the same integer LOD and weights, and the
+ * same one-rounding-per-statement arithmetic on the floats, so a filtered
+ * texel matches the device's bit for bit whenever the derivatives do.
+ * u_tf = { on, need_lod, mag, min, mip, log2 aniso, first, last, bias,
+ * log2 w, log2 h, border r, g, b, a }.
+ */
+"float tc_pre(float c, int n, int m)\n"
+"{\n"
+"    precise float r = c;\n"
+"    if (m == 3 || m == 5 || m == 7) r = abs(r);\n"
+"    if (m == 4 || m == 5) r = min(max(r, 0.0), float(n));\n"
+"    return min(max(r, -16777216.0), 16777216.0);\n"
+"}\n"
+"\n"
+"int tc_mod(int i, int n)\n"
+"{\n"
+"    return i >= 0 ? i % n : n - 1 - (-1 - i) % n;\n"
+"}\n"
+"\n"
+"int tc_idx(int i, int n, int m, bool pt)\n"
+"{\n"
+"    if (m == 0) return tc_mod(i, n);\n"
+"    if (m == 1) {\n"
+"        int r = tc_mod(i, 2 * n);\n"
+"        return r >= n ? 2 * n - 1 - r : r;\n"
+"    }\n"
+"    if (m == 2 || m == 3 || ((m == 4 || m == 5) && pt))\n"
+"        return clamp(i, 0, n - 1);\n"
+"    return i < 0 || i >= n ? -1 : i;\n"
+"}\n"
+"\n"
+"uvec4 tfetch(int l, int i, int j)\n"
+"{\n"
+"    if (i < 0 || j < 0)\n"
+"        return uvec4(u_tf[11], u_tf[12], u_tf[13], u_tf[14]);\n"
+"    return texelFetch(u_tex, ivec2(i, j), l);\n"
+"}\n"
+"\n"
+"uvec4 tlerp(uvec4 a, uvec4 b, int f)\n"
+"{\n"
+"    return uvec4((ivec4(a) * (256 - f) + ivec4(b) * f + 128) >> 8);\n"
+"}\n"
+"\n"
+"uvec4 tlevel(int l, float fs, float ft, bool lin)\n"
+"{\n"
+"    int w = max(u_texsize.x >> l, 1), h = max(u_texsize.y >> l, 1);\n"
+"    precise float ss = tc_pre(ldexp(fs, -min(l, u_tf[9])), w, u_clamp.x);\n"
+"    precise float tt = tc_pre(ldexp(ft, -min(l, u_tf[10])), h, u_clamp.y);\n"
+"    if (!lin)\n"
+"        return tfetch(l, tc_idx(int(floor(ss)), w, u_clamp.x, true),\n"
+"                      tc_idx(int(floor(tt)), h, u_clamp.y, true));\n"
+"    precise float fx = ss - 0.5;\n"
+"    precise float fy = tt - 0.5;\n"
+"    precise float x0 = floor(fx);\n"
+"    precise float y0 = floor(fy);\n"
+"    precise float qx = fx - x0;\n"
+"    precise float qy = fy - y0;\n"
+"    int wx = int(qx * 256.0 + 0.5);\n"
+"    int wy = int(qy * 256.0 + 0.5);\n"
+"    int i0 = int(x0), j0 = int(y0);\n"
+"    if (wx == 256) { i0++; wx = 0; }\n"
+"    if (wy == 256) { j0++; wy = 0; }\n"
+"    int i1 = tc_idx(i0 + 1, w, u_clamp.x, false);\n"
+"    int j1 = tc_idx(j0 + 1, h, u_clamp.y, false);\n"
+"    i0 = tc_idx(i0, w, u_clamp.x, false);\n"
+"    j0 = tc_idx(j0, h, u_clamp.y, false);\n"
+"    uvec4 t00 = tfetch(l, i0, j0);\n"
+"    uvec4 t10 = wx != 0 ? tfetch(l, i1, j0) : t00;\n"
+"    if (wy == 0) return wx != 0 ? tlerp(t00, t10, wx) : t00;\n"
+"    uvec4 t01 = tfetch(l, i0, j1);\n"
+"    uvec4 t11 = wx != 0 ? tfetch(l, i1, j1) : t01;\n"
+"    ivec4 top = ivec4(t00) * (256 - wx) + ivec4(t10) * wx;\n"
+"    ivec4 bot = ivec4(t01) * (256 - wx) + ivec4(t11) * wx;\n"
+"    return uvec4((top * (256 - wy) + bot * wy + 32768) >> 16);\n"
+"}\n"
+"\n"
+"uvec4 tmip(int lod, float fs, float ft)\n"
+"{\n"
+"    bool lin = u_tf[3] != 1;\n"
+"    int lo = min(max(lod, u_tf[6] * 256), u_tf[7] * 256);\n"
+"    if (u_tf[4] == 1)\n"
+"        return tlevel(min((lo + 128) >> 8, u_tf[7]), fs, ft, lin);\n"
+"    int l = lo >> 8;\n"
+"    if (u_tf[4] != 2 || l >= u_tf[7] || (lo & 255) == 0)\n"
+"        return tlevel(l, fs, ft, lin);\n"
+"    return tlerp(tlevel(l, fs, ft, lin), tlevel(l + 1, fs, ft, lin),\n"
+"                 lo & 255);\n"
+"}\n"
+"\n"
+"int tlog2(float v)\n"
+"{\n"
+"    if (!(v > 0.0)) return -65536;\n"
+"    uint b = floatBitsToUint(v);\n"
+"    if (b >= 0x7f800000u) return 65536;\n"
+"    return (int(b >> 23) - 127) * 256 + int((b >> 15) & 0xffu);\n"
+"}\n"
+"\n"
+"uvec4 tfilter(float fs, float ft, vec4 der)\n"
+"{\n"
+"    int lod = 0, nl = 0;\n"
+"    precise float ax = 0.0, ay = 0.0;\n"
+"    if (u_tf[1] != 0) {\n"
+"        precise float m = der.x * der.x;\n"
+"        precise float n = der.y * der.y;\n"
+"        precise float px = m + n;\n"
+"        m = der.z * der.z;\n"
+"        n = der.w * der.w;\n"
+"        precise float py = m + n;\n"
+"        if (u_tf[3] == 3) {\n"
+"            int lmaj = tlog2(px >= py ? px : py);\n"
+"            int lmin = tlog2(px >= py ? py : px);\n"
+"            nl = min(max(((lmaj - lmin) / 2 + 255) >> 8, 0), u_tf[5]);\n"
+"            lod = (lmaj >> 1) - nl * 256;\n"
+"            ax = px >= py ? der.x : der.z;\n"
+"            ay = px >= py ? der.y : der.w;\n"
+"        } else {\n"
+"            lod = tlog2(px >= py ? px : py) >> 1;\n"
+"        }\n"
+"        lod += u_tf[8];\n"
+"    }\n"
+"    if (lod <= 0) return tlevel(u_tf[6], fs, ft, u_tf[2] != 1);\n"
+"    if (nl == 0) return tmip(lod, fs, ft);\n"
+"    int N = 1 << nl;\n"
+"    uvec4 sum = uvec4(0u);\n"
+"    for (int k = 0; k < N; k++) {\n"
+"        precise float ok = float(2 * k + 1 - N) / float(2 * N);\n"
+"        precise float ds = ax * ok;\n"
+"        precise float dt = ay * ok;\n"
+"        precise float s1 = fs + ds;\n"
+"        precise float t1 = ft + dt;\n"
+"        sum += tmip(lod, s1, t1);\n"
+"    }\n"
+"    return (sum + uint(N >> 1)) >> uint(nl);\n"
+"}\n"
+"\n"
+/* r300_tc_der() */
+"void tc_der(vec3 ga, vec3 gb, float t0, float t1, float t2, float v,\n"
+"            float iq, out float dx, out float dy)\n"
+"{\n"
+"    precise float e0 = t0 - v;\n"
+"    precise float e1 = t1 - v;\n"
+"    precise float e2 = t2 - v;\n"
+"    precise float m0 = ga.x * e0;\n"
+"    precise float m1 = ga.y * e1;\n"
+"    precise float m2 = ga.z * e2;\n"
+"    precise float r = m0 + m1;\n"
+"    r = r + m2;\n"
+"    precise float rx = r * iq;\n"
+"    m0 = gb.x * e0;\n"
+"    m1 = gb.y * e1;\n"
+"    m2 = gb.z * e2;\n"
+"    r = m0 + m1;\n"
+"    r = r + m2;\n"
+"    precise float ry = r * iq;\n"
+"    dx = rx;\n"
+"    dy = ry;\n"
+"}\n"
+"\n"
 "void main()\n"
 "{\n"
 "    precise vec4 c;\n"
@@ -924,11 +1095,13 @@ static const char *fs_src =
  * Perspective-correct weights when the corners' 1/w differ, as
  * r300_raster_tri() computes them.
  */
-"    if (f_inv.y != f_inv.z || f_inv.z != f_inv.w) {\n"
+"    precise float iq = 1.0;\n"
+"    bool persp = f_inv.y != f_inv.z || f_inv.z != f_inv.w;\n"
+"    if (persp) {\n"
 "        precise float pq0 = w0 * f_inv.y;\n"
 "        precise float pq1 = w1 * f_inv.z;\n"
 "        precise float pq2 = w2 * f_inv.w;\n"
-"        precise float iq = 1.0 / (pq0 + pq1 + pq2);\n"
+"        iq = 1.0 / (pq0 + pq1 + pq2);\n"
 "        w0 = pq0 * iq; w1 = pq1 * iq; w2 = pq2 * iq;\n"
 "    }\n"
 "    c = fma(vec4(w2), f_c2, fma(vec4(w1), f_c1, w0 * f_c0));\n"
@@ -948,7 +1121,30 @@ static const char *fs_src =
  */
 "    precise vec4 c1 = fma(vec4(w2), f_s2, fma(vec4(w1), f_s1, w0 * f_s0));\n"
 "    vec4 texel = vec4(1.0);\n"
-"    if (u_textured != 0) {\n"
+"    if (u_textured != 0 && u_tf[0] != 0) {\n"
+"        vec4 der = vec4(0.0);\n"
+"        if (u_tf[1] != 0) {\n"
+/* r300_raster_tri()'s ga/gb */
+"            precise float a0 = -(f_p2.y - f_p1.y) * f_inv.x;\n"
+"            precise float b0 = (f_p2.x - f_p1.x) * f_inv.x;\n"
+"            precise float a1 = -(f_p0.y - f_p2.y) * f_inv.x;\n"
+"            precise float b1 = (f_p0.x - f_p2.x) * f_inv.x;\n"
+"            precise vec3 ga = vec3(a0, a1, -(a0 + a1));\n"
+"            precise vec3 gb = vec3(b0, b1, -(b0 + b1));\n"
+"            if (persp) {\n"
+"                ga = ga * f_inv.yzw;\n"
+"                gb = gb * f_inv.yzw;\n"
+"            }\n"
+"            float dx, dy;\n"
+"            tc_der(ga, gb, f_t0.x, f_t1.x, f_t2.x, ts, iq, dx, dy);\n"
+"            der.x = dx; der.z = dy;\n"
+"            tc_der(ga, gb, f_t0.y, f_t1.y, f_t2.y, tt, iq, dx, dy);\n"
+"            der.y = dx; der.w = dy;\n"
+"        }\n"
+"        uvec4 tu = tfilter(ts, tt, der);\n"
+"        texel = vec4(u_n255[int(tu.r)], u_n255[int(tu.g)],\n"
+"                     u_n255[int(tu.b)], u_n255[int(tu.a)]);\n"
+"    } else if (u_textured != 0) {\n"
 "        int tx = int(ts);\n"
 "        int ty = int(tt);\n"
 "        if (u_clamp.x <= 1 && u_texsize.x > 0) {\n"
@@ -1175,6 +1371,7 @@ static void gl_prog_locs(R350GlProg *p)
     p->u_afac = glGetUniformLocation(p->prog, "u_afac");
     p->u_konst = glGetUniformLocation(p->prog, "u_konst");
     p->u_usk = glGetUniformLocation(p->prog, "USK");
+    p->u_tf = glGetUniformLocation(p->prog, "u_tf");
 }
 
 /*
@@ -1596,6 +1793,7 @@ typedef struct R350GlUnit {
     int surf_w, surf_h;
     unsigned tex_slot;                  /* > R350_GL_TEXSLOTS: white */
     int tex_w, tex_h, clamp_s, clamp_t, textured;
+    GLint tf[R350_GL_TF];
     uint32_t wmask;
     int alpha_test, af_func, discard;
     float af_ref;
@@ -1606,6 +1804,59 @@ typedef struct R350GlUnit {
     bool usk;
     float usk_v[R350_GL_USK * 4];
 } R350GlUnit;
+
+/* the unit-0 filter uniform: `filt`, then the border colour */
+static void gl_tf(const R350GlReq *r, GLint *tf)
+{
+    unsigned k;
+
+    for (k = 0; k < 11; k++) {
+        tf[k] = r->filt[0][k];
+    }
+    for (k = 0; k < 4; k++) {
+        tf[11 + k] = r->border[0][k];
+    }
+    tf[15] = 0;
+}
+
+static int gl_levels(const R350GlReq *r)
+{
+    return r->filt[0][0] ? MAX(r->levels[0], 1) : 1;
+}
+
+/*
+ * Unit 0's texture into the bound object: every level the request
+ * carries, each max(w >> l, 1) x max(h >> l, 1). The shader reads them
+ * with texelFetch, which needs the chain complete, not filterable.
+ */
+static void gl_upload_tex(R350GlCtx *g, unsigned slot, const R350GlReq *r)
+{
+    int nl = gl_levels(r), l;
+    bool same = g->tex_w[slot] == r->tex_w[0] &&
+                g->tex_h[slot] == r->tex_h[0] && g->tex_nl[slot] == nl;
+    const uint8_t *p = r->tex[0];
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    nl > 1 ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, nl - 1);
+    for (l = 0; l < nl; l++) {
+        int w = MAX(r->tex_w[0] >> l, 1), h = MAX(r->tex_h[0] >> l, 1);
+
+        if (same) {
+            glTexSubImage2D(GL_TEXTURE_2D, l, 0, 0, w, h, GL_RGBA_INTEGER,
+                            GL_UNSIGNED_BYTE, p);
+        } else {
+            glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8UI, w, h, 0,
+                         GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, p);
+        }
+        p += (size_t)w * h * 4;
+    }
+    g->tex_w[slot] = r->tex_w[0];
+    g->tex_h[slot] = r->tex_h[0];
+    g->tex_nl[slot] = nl;
+}
 
 static bool gl_rect_meet(int ax0, int ay0, int ax1, int ay1,
                          int bx0, int by0, int bx1, int by1)
@@ -1647,6 +1898,7 @@ static void gl_emit(R350GlCtx *g, const R350GlUnit *u, const R350GlUnit *prev)
     glUniform2f(p->u_org, 0.0f, 0.0f);
     glUniform2i(p->u_texsize, u->tex_w, u->tex_h);
     glUniform2i(p->u_clamp, u->clamp_s, u->clamp_t);
+    glUniform1iv(p->u_tf, R350_GL_TF, u->tf);
     glUniform1i(p->u_textured, u->textured);
     glUniform1i(p->u_alphatest, u->alpha_test);
     glUniform1i(p->u_affunc, u->af_func);
@@ -1768,6 +2020,7 @@ static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
     u->tex_h = r->tex_h[0];
     u->clamp_s = r->clamp_s[0];
     u->clamp_t = r->clamp_t[0];
+    gl_tf(r, u->tf);
     u->textured = r->textured & 1;
     u->wmask = r->wmask;
     u->alpha_test = r->alpha_test;
@@ -1837,22 +2090,10 @@ static bool gl_enqueue(R350GlCtx *g, const R350GlReq *r)
             }
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g->tex[slot]);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            if (g->tex_w[slot] == r->tex_w[0] &&
-                g->tex_h[slot] == r->tex_h[0]) {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->tex_w[0],
-                                r->tex_h[0], GL_RGBA_INTEGER,
-                                GL_UNSIGNED_BYTE, r->tex[0]);
-            } else {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->tex_w[0],
-                             r->tex_h[0], 0, GL_RGBA_INTEGER,
-                             GL_UNSIGNED_BYTE, r->tex[0]);
-                g->tex_w[slot] = r->tex_w[0];
-                g->tex_h[slot] = r->tex_h[0];
-            }
+            gl_upload_tex(g, slot, r);
         } else if (g->tex_w[slot] != r->tex_w[0] ||
-                   g->tex_h[slot] != r->tex_h[0]) {
+                   g->tex_h[slot] != r->tex_h[0] ||
+                   g->tex_nl[slot] != gl_levels(r)) {
             return false;               /* see ati_r350_gl_draw() */
         }
     }
@@ -1947,21 +2188,10 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 
         glBindTexture(GL_TEXTURE_2D, g->tex[sl]);
         if (r->tex_fresh[0] && r->tex[0]) {
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            if (g->tex_w[sl] == r->tex_w[0] && g->tex_h[sl] == r->tex_h[0]) {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r->tex_w[0],
-                                r->tex_h[0], GL_RGBA_INTEGER,
-                                GL_UNSIGNED_BYTE, r->tex[0]);
-            } else {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8UI, r->tex_w[0],
-                             r->tex_h[0], 0, GL_RGBA_INTEGER,
-                             GL_UNSIGNED_BYTE, r->tex[0]);
-                g->tex_w[sl] = r->tex_w[0];
-                g->tex_h[sl] = r->tex_h[0];
-            }
+            gl_upload_tex(g, sl, r);
         } else if (g->tex_w[sl] != r->tex_w[0] ||
-                   g->tex_h[sl] != r->tex_h[0]) {
+                   g->tex_h[sl] != r->tex_h[0] ||
+                   g->tex_nl[sl] != gl_levels(r)) {
             /*
              * The caller said the slot was current and it is not. That
              * can only be a bookkeeping error, and rendering from the
@@ -1984,6 +2214,12 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     glUniform2f(p->u_org, 0.0f, 0.0f);
     glUniform2i(p->u_texsize, r->tex_w[0], r->tex_h[0]);
     glUniform2i(p->u_clamp, r->clamp_s[0], r->clamp_t[0]);
+    {
+        GLint tf[R350_GL_TF];
+
+        gl_tf(r, tf);
+        glUniform1iv(p->u_tf, R350_GL_TF, tf);
+    }
     glUniform1i(p->u_textured, r->textured & 1);
     glUniform1i(p->u_alphatest, r->alpha_test);
     glUniform1i(p->u_affunc, r->af_func);
