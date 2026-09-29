@@ -2823,13 +2823,31 @@ static QEMUCursor *ati_r350_builtin_arrow(void)
     return c;
 }
 
+/*
+ * RB_RPTR_SWAP (CP_RB_RPTR_ADDR bits 1:0) swaps the write-back like
+ * BUF_SWAP: 1 = bytes in each half, 2 = whole dword, 3 = halves. The
+ * Panther driver asks for 2 and reads the pointer with a plain load.
+ */
 static void ati_r350_cp_rptr_writeback(ATIR350State *s)
 {
     uint32_t cntl = s->regs[R350_CP_RB_CNTL >> 2];
-    uint32_t addr = s->regs[R350_CP_RB_RPTR_ADDR >> 2] & ~3u;
+    uint32_t reg = s->regs[R350_CP_RB_RPTR_ADDR >> 2];
+    uint32_t addr = reg & ~R350_RB_RPTR_SWAP_MASK;
+    uint32_t val = s->pm4_rptr;
 
     if (!(cntl & R350_RB_NO_UPDATE) && addr) {
-        ati_r350_mc_write32(s, addr, s->pm4_rptr);
+        switch (reg & R350_RB_RPTR_SWAP_MASK) {
+        case 1:
+            val = ((val & 0x00ff00ffu) << 8) | ((val >> 8) & 0x00ff00ffu);
+            break;
+        case 2:
+            val = bswap32(val);
+            break;
+        case 3:
+            val = (val << 16) | (val >> 16);
+            break;
+        }
+        ati_r350_mc_write32(s, addr, val);
     }
 }
 

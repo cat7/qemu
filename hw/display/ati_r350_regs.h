@@ -920,6 +920,8 @@
 #define R350_BUF_SWAP_32BIT          (2u << 16)
 #define R350_RB_NO_UPDATE            (1u << 27)
 #define R350_RB_RPTR_WR_ENA          (1u << 31)
+/* CP_RB_RPTR_ADDR */
+#define R350_RB_RPTR_SWAP_MASK       3u
 /* RBBM_STATUS */
 #define R350_RBBM_FIFOCNT_MASK       0x7f
 #define R350_RBBM_ACTIVE             (1u << 31)
