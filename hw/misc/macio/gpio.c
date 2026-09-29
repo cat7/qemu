@@ -40,11 +40,13 @@ enum MacioGPIORegisterBits {
     OUT_ENABLE = 4,
 };
 
-/* Soft-reset registers of CPU0-3; the K2 has two CPUs */
+/* Soft-reset registers of CPU0-3 */
 static const uint8_t keylargo_cpu_reset[MACIO_GPIO_MAX_CPUS] = {
     0x5b, 0x5c, 0x67, 0x68
 };
-static const uint8_t k2_cpu_reset[MACIO_GPIO_MAX_CPUS] = { 0x71, 0x72 };
+static const uint8_t k2_cpu_reset[MACIO_GPIO_MAX_CPUS] = {
+    0x71, 0x72, 0x73, 0x74
+};
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 {

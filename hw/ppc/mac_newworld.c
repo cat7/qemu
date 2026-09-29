@@ -451,11 +451,6 @@ static void ppc_core99_init(MachineState *machine)
                      machine->smp.cpus);
         exit(1);
     }
-    /* The K2 has soft-reset lines for two CPUs */
-    if (machine_arch == ARCH_MAC99_U3 && machine->smp.cpus > 2) {
-        error_report("mac99: a 970 machine takes at most 2 CPUs");
-        exit(1);
-    }
 
     /* init basic PC hardware */
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
