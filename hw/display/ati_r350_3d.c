@@ -6420,12 +6420,12 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
     for (ty = 0; ty < u->h; ty++) {
         for (tx = 0; tx < u->w; tx++) {
             uint32_t texel = r300_sample_tex(s, d, unit, tx, ty);
-            uint8_t *p = rgba + ((size_t)ty * u->w + tx) * 4;
+            uint8_t *px = rgba + ((size_t)ty * u->w + tx) * 4;
 
-            p[0] = (uint8_t)(r300_texel_chan(u, texel, 1) * 255.0f + 0.5f);
-            p[1] = (uint8_t)(r300_texel_chan(u, texel, 2) * 255.0f + 0.5f);
-            p[2] = (uint8_t)(r300_texel_chan(u, texel, 3) * 255.0f + 0.5f);
-            p[3] = (uint8_t)(r300_texel_chan(u, texel, 0) * 255.0f + 0.5f);
+            px[0] = (uint8_t)(r300_texel_chan(u, texel, 1) * 255.0f + 0.5f);
+            px[1] = (uint8_t)(r300_texel_chan(u, texel, 2) * 255.0f + 0.5f);
+            px[2] = (uint8_t)(r300_texel_chan(u, texel, 3) * 255.0f + 0.5f);
+            px[3] = (uint8_t)(r300_texel_chan(u, texel, 0) * 255.0f + 0.5f);
         }
     }
 }
