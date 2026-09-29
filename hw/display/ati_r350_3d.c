@@ -75,6 +75,9 @@ typedef struct R300Vtx {
  * block; everything the sampler and the GL decode need is resolved into
  * here once per draw.
  */
+/* NUM_LEVELS counts to 11: a 2048-texel level 0 and eleven halvings */
+#define R300_TEX_LEVELS 12
+
 typedef struct R300TexUnit {
     bool en;                /* TX_ENABLE names this unit */
     uint32_t off;           /* card address of texture level 0 */
@@ -85,6 +88,25 @@ typedef struct R300TexUnit {
     unsigned sel[4];        /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t;  /* TX_FILTER0 clamp modes (0 = repeat) */
     unsigned lanes;         /* TX_OFFSET ENDIAN_SWAP as a byte-lane xor */
+    /*
+     * Filtering. A unit with `filt` clear samples one texel of level 0
+     * through r300_sample_tex() exactly as before; see r300_tex_filter()
+     * for the rest.
+     */
+    bool filt;
+    bool need_lod;          /* the result depends on the pixel footprint */
+    unsigned mag, min, mip; /* 1 point, 2 linear; min 3 anisotropic */
+    unsigned aniso_l2;      /* log2 of the MAX_ANISO ratio */
+    unsigned first, last;   /* MAX_MIP_LEVEL and NUM_LEVELS */
+    int bias;               /* LOD_BIAS in 1/256 levels */
+    unsigned wl2, hl2;      /* floor(log2) of the level-0 size */
+    uint32_t border;        /* TX_BORDER_COLOR as a texel of this format */
+    uint32_t loff[R300_TEX_LEVELS];     /* card address of each level */
+    uint32_t lpitch[R300_TEX_LEVELS];   /* bytes per row of each level */
+    int lw[R300_TEX_LEVELS], lh[R300_TEX_LEVELS];
+    unsigned nlev;          /* levels the GL backend is handed: 0..nlev-1 */
+    uint32_t chain;         /* bytes from `off` to the end of that chain */
+    size_t ltexels;         /* texels in those levels */
 } R300TexUnit;
 
 typedef struct R300DrawState {
@@ -136,6 +158,7 @@ typedef struct R300DrawState {
     uint32_t res_off;       /* the buffer being resolved FROM */
     uint32_t res_pitch;
     bool textured;
+    bool lod_any;           /* a bound unit wants coordinate derivatives */
     bool blend;
     bool blend_read;                   /* READ_ENABLE: may we read dst? */
     unsigned discard;                  /* DISCARD_SRC_PIXELS selector */
@@ -457,37 +480,13 @@ static inline uint32_t r300_lane_xor32(uint32_t v, unsigned x)
     }
 }
 
-static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
-                                unsigned unit, int tx, int ty)
+/* the texel at card address `addr`, in the unit's format */
+static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
+                            unsigned unit, uint32_t addr)
 {
     const R300TexUnit *u = &d->tex[unit];
-    uint32_t addr, off;
+    uint32_t off;
 
-    /*
-     * TX_FILTER0 clamp modes: 0 is wrap/repeat -- OS X paints its
-     * title-bar gradient by drawing a 16x20 tile as a window-wide
-     * quad and letting the sampler repeat it; clamping instead
-     * smeared whatever sat next to the tile in VRAM. Treat mirror
-     * modes as repeat, everything else clamps to the edge.
-     */
-    if (u->clamp_s <= 1 && u->w > 0) {
-        tx %= u->w;
-        if (tx < 0) {
-            tx += u->w;
-        }
-    } else {
-        tx = MIN(MAX(tx, 0), u->w - 1);
-    }
-    if (u->clamp_t <= 1 && u->h > 0) {
-        ty %= u->h;
-        if (ty < 0) {
-            ty += u->h;
-        }
-    } else {
-        ty = MIN(MAX(ty, 0), u->h - 1);
-    }
-    addr = u->off + (uint32_t)ty * u->pitch +
-           (uint32_t)tx * (u->bpp / 8);
     if (u->bpp == 8) {
         /* single-component format: the byte is component X */
         uint8_t a;
@@ -563,6 +562,287 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
     }
     /* texture staged in GART/system memory */
     return r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes);
+}
+
+static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
+                                unsigned unit, int tx, int ty)
+{
+    const R300TexUnit *u = &d->tex[unit];
+
+    /*
+     * TX_FILTER0 clamp modes: 0 is wrap/repeat -- OS X paints its
+     * title-bar gradient by drawing a 16x20 tile as a window-wide
+     * quad and letting the sampler repeat it; clamping instead
+     * smeared whatever sat next to the tile in VRAM. Treat mirror
+     * modes as repeat, everything else clamps to the edge.
+     */
+    if (u->clamp_s <= 1 && u->w > 0) {
+        tx %= u->w;
+        if (tx < 0) {
+            tx += u->w;
+        }
+    } else {
+        tx = MIN(MAX(tx, 0), u->w - 1);
+    }
+    if (u->clamp_t <= 1 && u->h > 0) {
+        ty %= u->h;
+        if (ty < 0) {
+            ty += u->h;
+        }
+    } else {
+        ty = MIN(MAX(ty, 0), u->h - 1);
+    }
+    return r300_tex_at(s, d, unit, u->off + (uint32_t)ty * u->pitch +
+                                   (uint32_t)tx * (u->bpp / 8));
+}
+
+/*
+ * FILTERED SAMPLING, for a unit with `filt` set.
+ *
+ * Coordinates arrive in level-0 texels, with their screen derivatives
+ * (ds/dx, dt/dx, ds/dy, dt/dy) in the same units. Every step after the
+ * derivatives is integer or exact in floating point, so the GL backend's
+ * shader (ati_r350_gl.c, tex_filter) reproduces it bit for bit given the
+ * same derivatives:
+ *
+ *   LOD      log2 in 1/256 levels, read off the float's exponent and the
+ *            top eight mantissa bits, halved for the square root; plus
+ *            LOD_BIAS. LOD <= 0 magnifies at level MAX_MIP_LEVEL.
+ *   levels   the LOD clamped to [MAX_MIP_LEVEL, NUM_LEVELS]; MIP_FILTER
+ *            point rounds it, linear blends two levels by its 8-bit
+ *            fraction.
+ *   texels   point: floor; linear: 2x2 texels around s - 1/2, weights
+ *            quantised to 1/256. A weight of 0 or 256 fetches one column
+ *            or row, so a 1:1 draw at texel centres reads exactly the
+ *            texel nearest sampling would.
+ *   aniso    MIN_FILTER anisotropic with MAX_ANISO > 1:1: the footprint's
+ *            axis ratio rounded up to a power of two, capped by MAX_ANISO,
+ *            is the number of probes spaced along the major axis; the
+ *            LOD is taken from the major axis divided by that count.
+ *   clamps   0 wrap, 1 mirror, 2 edge, 3 mirror once to edge, 4/5 (mirror
+ *            once) half way to the border colour, 6/7 (mirror once) to
+ *            the border colour, per the R3xx register reference.
+ *
+ * Results are the format's packed components, one byte each, like
+ * r300_sample_tex()'s: filtering acts on those bytes, before the
+ * component select.
+ */
+static inline float r300_tc_pre(float c, int n, unsigned mode)
+{
+    if (mode == 3 || mode == 5 || mode == 7) {
+        c = fabsf(c);
+    }
+    if (mode == 4 || mode == 5) {
+        c = fminf(fmaxf(c, 0.0f), (float)n);
+    }
+    return fminf(fmaxf(c, -16777216.0f), 16777216.0f);
+}
+
+/* the texel index along one axis, or -1 for the border colour */
+static inline int r300_tc_idx(int i, int n, unsigned mode, bool point)
+{
+    switch (mode) {
+    case 0:
+        i %= n;
+        return i < 0 ? i + n : i;
+    case 1: {
+        int p = 2 * n;
+
+        i %= p;
+        if (i < 0) {
+            i += p;
+        }
+        return i >= n ? p - 1 - i : i;
+    }
+    case 2:
+    case 3:
+        return MIN(MAX(i, 0), n - 1);
+    case 4:
+    case 5:
+        if (point) {
+            return MIN(MAX(i, 0), n - 1);
+        }
+        /* fall through */
+    default:
+        return i < 0 || i >= n ? -1 : i;
+    }
+}
+
+static inline uint32_t r300_tex_lvl_texel(ATIR350State *s,
+                                          const R300DrawState *d,
+                                          unsigned unit, unsigned l,
+                                          int i, int j)
+{
+    const R300TexUnit *u = &d->tex[unit];
+
+    if (i < 0 || j < 0) {
+        return u->border;
+    }
+    return r300_tex_at(s, d, unit, u->loff[l] + (uint32_t)j * u->lpitch[l] +
+                                   (uint32_t)i * (u->bpp / 8));
+}
+
+static inline uint32_t r300_lerp4(uint32_t a, uint32_t b, int f)
+{
+    uint32_t o = 0;
+    unsigned c;
+
+    for (c = 0; c < 32; c += 8) {
+        int x = (a >> c) & 0xff, y = (b >> c) & 0xff;
+
+        o |= (uint32_t)((x * (256 - f) + y * f + 128) >> 8) << c;
+    }
+    return o;
+}
+
+/* one level: `fs`, `ft` in level-0 texels */
+static uint32_t r300_tex_level(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit, unsigned l, float fs, float ft,
+                               bool lin)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    int w = u->lw[l], h = u->lh[l];
+    float ss = r300_tc_pre(ldexpf(fs, -(int)MIN(l, u->wl2)), w, u->clamp_s);
+    float tt = r300_tc_pre(ldexpf(ft, -(int)MIN(l, u->hl2)), h, u->clamp_t);
+    float fx, fy, x0, y0;
+    int wx, wy, i0, j0, i1, j1;
+    uint32_t t00, t10, t01, t11, o = 0;
+    unsigned c;
+
+    if (!lin) {
+        return r300_tex_lvl_texel(s, d, unit, l,
+                                  r300_tc_idx((int)floorf(ss), w,
+                                              u->clamp_s, true),
+                                  r300_tc_idx((int)floorf(tt), h,
+                                              u->clamp_t, true));
+    }
+    fx = ss - 0.5f;
+    fy = tt - 0.5f;
+    x0 = floorf(fx);
+    y0 = floorf(fy);
+    wx = (int)((fx - x0) * 256.0f + 0.5f);
+    wy = (int)((fy - y0) * 256.0f + 0.5f);
+    i0 = (int)x0;
+    j0 = (int)y0;
+    if (wx == 256) {
+        i0++;
+        wx = 0;
+    }
+    if (wy == 256) {
+        j0++;
+        wy = 0;
+    }
+    i1 = r300_tc_idx(i0 + 1, w, u->clamp_s, false);
+    j1 = r300_tc_idx(j0 + 1, h, u->clamp_t, false);
+    i0 = r300_tc_idx(i0, w, u->clamp_s, false);
+    j0 = r300_tc_idx(j0, h, u->clamp_t, false);
+    t00 = r300_tex_lvl_texel(s, d, unit, l, i0, j0);
+    t10 = wx ? r300_tex_lvl_texel(s, d, unit, l, i1, j0) : t00;
+    if (!wy) {
+        return wx ? r300_lerp4(t00, t10, wx) : t00;
+    }
+    t01 = r300_tex_lvl_texel(s, d, unit, l, i0, j1);
+    t11 = wx ? r300_tex_lvl_texel(s, d, unit, l, i1, j1) : t01;
+    for (c = 0; c < 32; c += 8) {
+        int a = (t00 >> c) & 0xff, b = (t10 >> c) & 0xff;
+        int e = (t01 >> c) & 0xff, f = (t11 >> c) & 0xff;
+        int top = a * (256 - wx) + b * wx;
+        int bot = e * (256 - wx) + f * wx;
+
+        o |= (uint32_t)((top * (256 - wy) + bot * wy + 32768) >> 16) << c;
+    }
+    return o;
+}
+
+/* the mip stage at `lod` (1/256 levels, > 0) */
+static uint32_t r300_tex_mip(ATIR350State *s, const R300DrawState *d,
+                             unsigned unit, int lod, float fs, float ft)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    bool lin = u->min != R300_TX_FILTER_POINT;
+    int lo = MIN(MAX(lod, (int)u->first * 256), (int)u->last * 256);
+    unsigned l;
+
+    if (u->mip == R300_TX_FILTER_POINT) {
+        return r300_tex_level(s, d, unit, MIN((unsigned)(lo + 128) >> 8,
+                                              u->last), fs, ft, lin);
+    }
+    l = lo >> 8;
+    if (u->mip != R300_TX_FILTER_LINEAR || l >= u->last || !(lo & 255)) {
+        return r300_tex_level(s, d, unit, l, fs, ft, lin);
+    }
+    return r300_lerp4(r300_tex_level(s, d, unit, l, fs, ft, lin),
+                      r300_tex_level(s, d, unit, l + 1, fs, ft, lin),
+                      lo & 255);
+}
+
+/* log2(v) in 1/256 units: the exponent and the top 8 mantissa bits */
+static inline int r300_log2_fx(float v)
+{
+    uint32_t b;
+
+    if (!(v > 0.0f)) {
+        return -65536;
+    }
+    memcpy(&b, &v, sizeof(b));
+    if (b >= 0x7f800000u) {
+        return 65536;
+    }
+    return ((int)(b >> 23) - 127) * 256 + (int)((b >> 15) & 0xff);
+}
+
+static uint32_t r300_tex_filter(ATIR350State *s, const R300DrawState *d,
+                                unsigned unit, float fs, float ft,
+                                const float der[4])
+{
+    const R300TexUnit *u = &d->tex[unit];
+    float ax = 0.0f, ay = 0.0f, px, py, m, n;
+    int lod = 0, nl = 0, k, N;
+    unsigned sum[4] = { 0, 0, 0, 0 }, c;
+    uint32_t o = 0;
+
+    if (u->need_lod) {
+        m = der[0] * der[0];
+        n = der[1] * der[1];
+        px = m + n;
+        m = der[2] * der[2];
+        n = der[3] * der[3];
+        py = m + n;
+        if (u->min == R300_TX_FILTER_ANISO) {
+            int lmaj = r300_log2_fx(px >= py ? px : py);
+            int lmin = r300_log2_fx(px >= py ? py : px);
+
+            nl = MIN(MAX(((lmaj - lmin) / 2 + 255) >> 8, 0),
+                     (int)u->aniso_l2);
+            lod = (lmaj >> 1) - nl * 256;
+            ax = px >= py ? der[0] : der[2];
+            ay = px >= py ? der[1] : der[3];
+        } else {
+            lod = r300_log2_fx(px >= py ? px : py) >> 1;
+        }
+        lod += u->bias;
+    }
+    if (lod <= 0) {
+        return r300_tex_level(s, d, unit, u->first, fs, ft,
+                              u->mag != R300_TX_FILTER_POINT);
+    }
+    if (!nl) {
+        return r300_tex_mip(s, d, unit, lod, fs, ft);
+    }
+    N = 1 << nl;
+    for (k = 0; k < N; k++) {
+        float o_k = (float)(2 * k + 1 - N) / (float)(2 * N);
+        float ds = ax * o_k, dt = ay * o_k;
+        uint32_t t = r300_tex_mip(s, d, unit, lod, fs + ds, ft + dt);
+
+        for (c = 0; c < 4; c++) {
+            sum[c] += (t >> (c * 8)) & 0xff;
+        }
+    }
+    for (c = 0; c < 4; c++) {
+        o |= ((sum[c] + (N >> 1)) >> nl) << (c * 8);
+    }
+    return o;
 }
 
 /*
@@ -1119,26 +1399,104 @@ static inline bool r300_edge_accept(float w, bool top_left)
 typedef struct R300SampleCtx {
     ATIR350State *s;
     const R300DrawState *d;
+    /*
+     * Screen derivatives of each interpolated coordinate set, in the
+     * guest's units: ds/dx, dt/dx, ds/dy, dt/dy. Filled only when a bound
+     * unit needs a level of detail.
+     */
+    float der[R300_TEXCOORDS][4];
 } R300SampleCtx;
 
+/*
+ * The footprint of a fetch is that of the coordinate set the rasterizer
+ * routed into its source register. A dependent read's coordinate is an
+ * ALU result, whose derivatives this model does not have: it takes those
+ * of the set that addresses the same unit, else of set 0.
+ */
+static const float *r300_us_der(const R300SampleCtx *c, unsigned unit,
+                                unsigned src)
+{
+    const R300DrawState *d = c->d;
+    unsigned n;
+
+    for (n = 0; n < d->ntc; n++) {
+        if (d->fs->rs.tex_reg[n] == (int)src) {
+            return c->der[n];
+        }
+    }
+    for (n = 0; n < d->ntc; n++) {
+        if (d->tc_unit[n] == unit) {
+            return c->der[n];
+        }
+    }
+    return c->der[0];
+}
+
 static void r300_us_sample(void *ctx, unsigned unit, bool proj,
-                           const float coord[4], float texel[4])
+                           unsigned src, const float coord[4],
+                           float texel[4])
 {
     R300SampleCtx *c = ctx;
     const R300DrawState *d = c->d;
+    const R300TexUnit *u;
     uint32_t t;
 
     if (unit >= R300_TEX_UNITS || !d->tex[unit].en) {
         texel[0] = texel[1] = texel[2] = texel[3] = 1.0f;
         return;
     }
-    t = r300_sample_tex(c->s, d, unit,
-                        (int)(coord[0] * (float)d->tex[unit].w),
-                        (int)(coord[1] * (float)d->tex[unit].h));
-    texel[0] = r300_texel_chan(&d->tex[unit], t, 1);
-    texel[1] = r300_texel_chan(&d->tex[unit], t, 2);
-    texel[2] = r300_texel_chan(&d->tex[unit], t, 3);
-    texel[3] = r300_texel_chan(&d->tex[unit], t, 0);
+    u = &d->tex[unit];
+    if (u->filt) {
+        float der[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        if (u->need_lod) {
+            const float *g = r300_us_der(c, unit, src);
+
+            der[0] = g[0] * (float)u->w;
+            der[1] = g[1] * (float)u->h;
+            der[2] = g[2] * (float)u->w;
+            der[3] = g[3] * (float)u->h;
+        }
+        t = r300_tex_filter(c->s, d, unit, coord[0] * (float)u->w,
+                            coord[1] * (float)u->h, der);
+    } else {
+        t = r300_sample_tex(c->s, d, unit, (int)(coord[0] * (float)u->w),
+                            (int)(coord[1] * (float)u->h));
+    }
+    texel[0] = r300_texel_chan(u, t, 1);
+    texel[1] = r300_texel_chan(u, t, 2);
+    texel[2] = r300_texel_chan(u, t, 3);
+    texel[3] = r300_texel_chan(u, t, 0);
+}
+
+/*
+ * The screen derivatives of one interpolated attribute at a pixel whose
+ * interpolated value is `v`, from the corners' values `t0..t2`, the
+ * weights' gradients ga (x) and gb (y) -- already multiplied by each
+ * corner's 1/w for a perspective triangle -- and iq, the reciprocal of
+ * the interpolated 1/w (1 when affine):
+ *
+ *   dv/dx = iq * sum(ga_i * (t_i - v))
+ *
+ * One operation per statement: the GL backend's shader evaluates the
+ * same expression and has to round exactly where this does.
+ */
+static inline void r300_tc_der(const float ga[3], const float gb[3],
+                               float t0, float t1, float t2, float v,
+                               float iq, float *dx, float *dy)
+{
+    float e0 = t0 - v, e1 = t1 - v, e2 = t2 - v;
+    float m0 = ga[0] * e0, m1 = ga[1] * e1, m2 = ga[2] * e2;
+    float r = m0 + m1;
+
+    r = r + m2;
+    *dx = r * iq;
+    m0 = gb[0] * e0;
+    m1 = gb[1] * e1;
+    m2 = gb[2] * e2;
+    r = m0 + m1;
+    r = r + m2;
+    *dy = r * iq;
 }
 
 /*
@@ -1251,6 +1609,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     float area = r300_edge(v0, v1, v2->x, v2->y);
     float inv, dx0, dy0, dx1, dy1, dx2, dy2;
     float a0, b0, c0, a1, b1, c1;
+    float ga[3] = { 0.0f, 0.0f, 0.0f }, gb[3] = { 0.0f, 0.0f, 0.0f };
     float tcinv[R300_TEXCOORDS][2] = { { 1.0f, 1.0f } };
     bool flip, tl0, tl1, tl2, back;
     bool persp = v0->w != v1->w || v1->w != v2->w;
@@ -1330,6 +1689,28 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     b1 = dx1 * inv;
     c1 = (dy1 * v2->x - dx1 * v2->y) * inv;
 
+    /*
+     * The weights' screen gradients, for the texture footprint: w0 and
+     * w1 change by a0/a1 per pixel in x and b0/b1 in y, w2 by the rest;
+     * for a perspective triangle each is scaled by its corner's 1/w.
+     */
+    if (d->lod_any) {
+        ga[0] = a0;
+        ga[1] = a1;
+        ga[2] = -(a0 + a1);
+        gb[0] = b0;
+        gb[1] = b1;
+        gb[2] = -(b0 + b1);
+        if (persp) {
+            ga[0] = ga[0] * v0->w;
+            ga[1] = ga[1] * v1->w;
+            ga[2] = ga[2] * v2->w;
+            gb[0] = gb[0] * v0->w;
+            gb[1] = gb[1] * v1->w;
+            gb[2] = gb[2] * v2->w;
+        }
+    }
+
     r300_tri_bounds(d, v0, v1, v2, &x0, &y0, &x1, &y1);
     y0 = MAX(y0, ylo);
     if (yhi < y1) {
@@ -1371,7 +1752,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             float w1 = (dx1 * ry1 - dy1 * (px - v2->x)) * inv;
             float w2e = (dx2 * ry2 - dy2 * (px - v0->x)) * inv;
             float w2 = 1.0f - w0 - w1;
-            float pw0, pw1, pw2;
+            float pw0, pw1, pw2, iq = 1.0f;
             float cr, cg, cb, ca;
             uint32_t addr;
             uint32_t out;
@@ -1449,8 +1830,8 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                  * interpolated 1/w (v->w). Z stays screen-linear.
                  */
                 float q0 = w0 * v0->w, q1 = w1 * v1->w, q2 = w2 * v2->w;
-                float iq = 1.0f / (q0 + q1 + q2);
 
+                iq = 1.0f / (q0 + q1 + q2);
                 pw0 = q0 * iq;
                 pw1 = q1 * iq;
                 pw2 = q2 * iq;
@@ -1482,8 +1863,24 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                      * further sets below are never its business.
                      */
                     if (d->tex[0].en && d->fs->tex_dst >= 0) {
-                        uint32_t texel = r300_sample_tex(s, d, 0, (int)ts,
-                                                         (int)tt);
+                        uint32_t texel;
+
+                        if (d->tex[0].filt) {
+                            float der[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+                            if (d->tex[0].need_lod) {
+                                r300_tc_der(ga, gb, v0->tc[0][0],
+                                            v1->tc[0][0], v2->tc[0][0], ts,
+                                            iq, &der[0], &der[2]);
+                                r300_tc_der(ga, gb, v0->tc[0][1],
+                                            v1->tc[0][1], v2->tc[0][1], tt,
+                                            iq, &der[1], &der[3]);
+                            }
+                            texel = r300_tex_filter(s, d, 0, ts, tt, der);
+                        } else {
+                            texel = r300_sample_tex(s, d, 0, (int)ts,
+                                                    (int)tt);
+                        }
 
                         tex[0] = r300_texel_chan(&d->tex[0], texel, 1);
                         tex[1] = r300_texel_chan(&d->tex[0], texel, 2);
@@ -1523,7 +1920,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                      */
                     r300_us_run_fast(d->fs, tex, col[0], col[1], fsout);
                 } else {
-                    R300SampleCtx sc = { s, d };
+                    R300SampleCtx sc = { .s = s, .d = d };
                     R300UsRegs f;
                     float tc[R300_TEXCOORDS][4];
                     unsigned k, c;
@@ -1547,13 +1944,34 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                     tc[0][1] = tt * tcinv[0][1];
                     tc[0][2] = 0.0f;
                     tc[0][3] = 1.0f;
-                    for (k = 1; k < d->ntc; k++) {
-                        tc[k][0] = (pw0 * v0->tc[k][0] + pw1 * v1->tc[k][0] +
-                                    pw2 * v2->tc[k][0]) * tcinv[k][0];
-                        tc[k][1] = (pw0 * v0->tc[k][1] + pw1 * v1->tc[k][1] +
-                                    pw2 * v2->tc[k][1]) * tcinv[k][1];
-                        tc[k][2] = 0.0f;
-                        tc[k][3] = 1.0f;
+                    for (k = 0; k < d->ntc; k++) {
+                        float is, it;
+
+                        if (k) {
+                            is = pw0 * v0->tc[k][0] + pw1 * v1->tc[k][0] +
+                                 pw2 * v2->tc[k][0];
+                            it = pw0 * v0->tc[k][1] + pw1 * v1->tc[k][1] +
+                                 pw2 * v2->tc[k][1];
+                            tc[k][0] = is * tcinv[k][0];
+                            tc[k][1] = it * tcinv[k][1];
+                            tc[k][2] = 0.0f;
+                            tc[k][3] = 1.0f;
+                        } else {
+                            is = ts;
+                            it = tt;
+                        }
+                        if (d->lod_any) {
+                            float *g = sc.der[k];
+
+                            r300_tc_der(ga, gb, v0->tc[k][0], v1->tc[k][0],
+                                        v2->tc[k][0], is, iq, &g[0], &g[2]);
+                            r300_tc_der(ga, gb, v0->tc[k][1], v1->tc[k][1],
+                                        v2->tc[k][1], it, iq, &g[1], &g[3]);
+                            g[0] *= tcinv[k][0];
+                            g[1] *= tcinv[k][1];
+                            g[2] *= tcinv[k][0];
+                            g[3] *= tcinv[k][1];
+                        }
                     }
                     for (; k < R300_TEXCOORDS; k++) {
                         tc[k][0] = tc[k][1] = tc[k][2] = 0.0f;
@@ -3121,6 +3539,165 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
  * the other fifteen blocks hold whatever the last guest to use them
  * left, and reporting on those would be inventing telemetry.
  */
+static unsigned r300_ilog2(unsigned v)
+{
+    unsigned n = 0;
+
+    while (v > 1) {
+        v >>= 1;
+        n++;
+    }
+    return n;
+}
+
+/*
+ * Filter state and the mip chain.
+ *
+ * The sampler finds every level from TX_OFFSET alone: level l is
+ * max(w >> l, 1) x max(h >> l, 1), padded to the unit's tile alignment,
+ * and follows the previous level with no gap. The alignment, in texels
+ * (8/16/32/64 bits per texel):
+ *
+ *   micro-tiled         8x4   8x2   4x2   2x2   (16bpp square: 4x4)
+ *   macro+micro-tiled  64x32 64x16 32x16 16x16
+ *   macro-tiled only  256x8 128x8  64x8  32x8
+ *   linear             32x1  16x1   8x1   4x1
+ *
+ * A level keeps macro tiling only while both of its dimensions exceed
+ * the macro tile (reach it, under TX_FILTER1 MACRO_SWITCH). Mac OS X 10.5
+ * uploads every mipmapped texture macro+micro-tiled, one 2D blit per
+ * level, and the blits land exactly there: 256x256 32bpp levels at +0,
+ * 0x40000, 0x50000, 0x54000, 0x55000, 0x55400, 0x55500, 0x55540, 0x55560
+ * with row pitches 1024 ... 32, 16, 16, 16 (4x4 and smaller rows padded
+ * to 4 texels, 2x2 to two rows); 16bpp 256x256 pads its 8x8 and smaller
+ * levels to 8 texels; 8bpp 256x256 its 8x8 and smaller to 8 texels.
+ * The linear and macro-only rows are from Mesa's r300 driver and
+ * unobserved here.
+ *
+ * Level 0 keeps the pitch r300_sample_tex() has always used, so a
+ * texture that is not mipmapped is addressed exactly as before.
+ */
+static void r300_tex_filter_setup(ATIR350State *s, R300TexUnit *u,
+                                  unsigned unit, uint32_t txfmt0,
+                                  uint32_t filt0)
+{
+    static const uint8_t micro_a[4][2] = { {8, 4}, {8, 2}, {4, 2}, {2, 2} };
+    static const uint16_t mm_a[4][2] = { {64, 32}, {64, 16}, {32, 16},
+                                         {16, 16} };
+    static const uint16_t macro_a[4][2] = { {256, 8}, {128, 8}, {64, 8},
+                                            {32, 8} };
+    uint32_t txo = s->regs[(R300_TX_OFFSET_0 >> 2) + unit];
+    uint32_t filt1 = s->regs[(R300_TX_FILTER1_0 >> 2) + unit];
+    uint32_t bc = s->regs[(R300_TX_BORDER_COLOR_0 >> 2) + unit];
+    unsigned bytes = u->bpp / 8;
+    unsigned bi = bytes == 1 ? 0 : bytes == 2 ? 1 : bytes == 4 ? 2 : 3;
+    unsigned micro = (txo >> R300_TXO_MICRO_TILE_SHIFT) & 3;
+    bool macro = txo & R300_TXO_MACRO_TILE;
+    bool rv350 = filt1 & R300_TX_MACRO_SWITCH;
+    unsigned l, maxmip;
+    uint32_t a = u->off;
+    int bias;
+
+    u->mag = (filt0 >> R300_TX_MAG_SHIFT) & 3;
+    u->min = (filt0 >> R300_TX_MIN_SHIFT) & 3;
+    u->mip = (filt0 >> R300_TX_MIP_SHIFT) & 3;
+    /* anisotropic magnification is bilinear; reserved codes point sample */
+    if (u->mag == R300_TX_FILTER_ANISO) {
+        u->mag = R300_TX_FILTER_LINEAR;
+    } else if (u->mag == 0) {
+        u->mag = R300_TX_FILTER_POINT;
+    }
+    if (u->min == 0) {
+        u->min = R300_TX_FILTER_POINT;
+    }
+    if (u->mip == 3) {
+        u->mip = R300_TX_FILTER_LINEAR;
+    }
+    u->aniso_l2 = MIN((filt0 >> R300_TX_ANISO_SHIFT) & 7, 4u);
+    if (u->min == R300_TX_FILTER_ANISO && !u->aniso_l2) {
+        u->min = R300_TX_FILTER_LINEAR;
+    }
+    u->last = (txfmt0 >> R300_TX_NUM_LEVELS_SHIFT) & R300_TX_NUM_LEVELS_MASK;
+    u->last = MIN(u->last, R300_TEX_LEVELS - 1u);
+    maxmip = (filt0 >> R300_TX_MAX_MIP_SHIFT) & 0xf;
+    u->first = MIN(maxmip, u->last);
+    if (!u->mip) {
+        u->last = u->first;
+    }
+    /* s4.5 */
+    bias = (filt1 >> R300_TX_LOD_BIAS_SHIFT) & R300_TX_LOD_BIAS_MASK;
+    if (bias & 0x200) {
+        bias -= 0x400;
+    }
+    u->bias = bias * 8;
+    u->wl2 = r300_ilog2(u->w);
+    u->hl2 = r300_ilog2(u->h);
+
+    u->filt = u->mag != R300_TX_FILTER_POINT ||
+              u->min != R300_TX_FILTER_POINT || u->last != 0;
+    u->need_lod = u->mag != u->min || u->last > u->first;
+
+    switch (u->bpp) {
+    case 8:
+        u->border = bc & 0xff;
+        break;
+    case 16:
+        switch (u->code) {
+        case R300_TX_FMT_1_5_5_5:
+            u->border = r300_texel_1555(bc & 0xffff);
+            break;
+        case R300_TX_FMT_5_6_5:
+            u->border = r300_texel_565(bc & 0xffff);
+            break;
+        case R300_TX_FMT_4_4_4_4:
+            u->border = r300_texel_4444(bc & 0xffff);
+            break;
+        default:
+            u->border = bc & 0xffff;
+            break;
+        }
+        break;
+    default:
+        u->border = bc;
+        break;
+    }
+
+    for (l = 0; l <= u->last; l++) {
+        int w = MAX(u->w >> l, 1), h = MAX(u->h >> l, 1);
+        unsigned aw = 1, ah = 1;
+
+        if (macro) {
+            aw = micro ? mm_a[bi][0] : macro_a[bi][0];
+            ah = micro ? mm_a[bi][1] : macro_a[bi][1];
+        }
+        if (macro && (rv350 ? (w >= (int)aw && h >= (int)ah)
+                            : (w > (int)aw && h > (int)ah))) {
+            /* aligned above */
+        } else if (micro == 2 && bytes == 2) {
+            aw = 4;
+            ah = 4;
+        } else if (micro) {
+            aw = micro_a[bi][0];
+            ah = micro_a[bi][1];
+        } else {
+            aw = 32 / bytes;
+            ah = 1;
+        }
+        u->lw[l] = w;
+        u->lh[l] = h;
+        u->loff[l] = a;
+        u->lpitch[l] = l ? ROUND_UP(w, aw) * bytes : u->pitch;
+        a += ROUND_UP(w, aw) * bytes * ROUND_UP(h, ah);
+    }
+    /* one level is addressed, and cached, exactly as before */
+    u->nlev = u->filt ? u->last + 1 : 1;
+    u->chain = u->nlev > 1 ? a - u->off : (uint32_t)u->h * u->pitch;
+    u->ltexels = 0;
+    for (l = 0; l < u->nlev; l++) {
+        u->ltexels += (size_t)u->lw[l] * u->lh[l];
+    }
+}
+
 static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
 {
     static const uint8_t endian_lanes[4] = { 0, 1, 3, 2 };
@@ -3204,6 +3781,7 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
     } else {
         u->pitch = (uint32_t)u->w * (u->bpp / 8);
     }
+    r300_tex_filter_setup(s, u, unit, txfmt0, filt0);
 }
 
 /*
@@ -3500,8 +4078,10 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->af_func = (af >> 8) & 7;
         d->af_ref = (af & 0xff) / 255.0f;
     }
+    d->lod_any = false;
     for (i = 0; i < R300_TEX_UNITS; i++) {
         r300_tex_setup(s, d, i);
+        d->lod_any |= d->tex[i].en && d->tex[i].need_lod;
     }
     /*
      * The fragment program is resolved HERE, before the vertex stage
@@ -5817,8 +6397,23 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
                                unsigned unit, uint8_t *rgba)
 {
     const R300TexUnit *u = &d->tex[unit];
+    uint8_t *p = rgba + (size_t)u->w * u->h * 4;
+    unsigned l;
     int tx, ty;
 
+    /* the levels after the first, one after another behind it */
+    for (l = 1; l < u->nlev; l++) {
+        for (ty = 0; ty < u->lh[l]; ty++) {
+            for (tx = 0; tx < u->lw[l]; tx++, p += 4) {
+                uint32_t texel = r300_tex_lvl_texel(s, d, unit, l, tx, ty);
+
+                p[0] = r300_texel_byte(u, texel, 1);
+                p[1] = r300_texel_byte(u, texel, 2);
+                p[2] = r300_texel_byte(u, texel, 3);
+                p[3] = r300_texel_byte(u, texel, 0);
+            }
+        }
+    }
     if (r300_gl_decode_tex32(s, d, unit, rgba)) {
         return;
     }
@@ -5833,6 +6428,29 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
             p[3] = (uint8_t)(r300_texel_chan(u, texel, 0) * 255.0f + 0.5f);
         }
     }
+}
+
+/* a unit's filter state in the backend's terms; see ati_r350_gl.h */
+static void r300_gl_filt(const R300TexUnit *u, R350GlReq *r, unsigned i)
+{
+    int *f = r->filt[i];
+
+    f[0] = u->filt;
+    f[1] = u->need_lod;
+    f[2] = u->mag;
+    f[3] = u->min;
+    f[4] = u->mip;
+    f[5] = u->aniso_l2;
+    f[6] = u->first;
+    f[7] = u->last;
+    f[8] = u->bias;
+    f[9] = u->wl2;
+    f[10] = u->hl2;
+    r->levels[i] = u->nlev;
+    r->border[i][0] = r300_texel_byte(u, u->border, 1);
+    r->border[i][1] = r300_texel_byte(u, u->border, 2);
+    r->border[i][2] = r300_texel_byte(u, u->border, 3);
+    r->border[i][3] = r300_texel_byte(u, u->border, 0);
 }
 
 /* everything the decode above depends on, and nothing else */
@@ -5850,7 +6468,9 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
            s->gl_tex[k].sel[0] == u->sel[0] &&
            s->gl_tex[k].sel[1] == u->sel[1] &&
            s->gl_tex[k].sel[2] == u->sel[2] &&
-           s->gl_tex[k].sel[3] == u->sel[3];
+           s->gl_tex[k].sel[3] == u->sel[3] &&
+           s->gl_tex[k].nlev == u->nlev &&
+           s->gl_tex[k].lay == u->loff[u->nlev - 1] - u->off;
 }
 
 /*
@@ -5867,12 +6487,12 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     const R300TexUnit *u = &d->tex[unit];
     uint32_t off, len;
     unsigned k, victim = 0, xr = 0;
-    size_t need = (size_t)u->w * u->h * 4;
+    size_t need = u->ltexels * 4;
 
     *slot = R350_GL_TEXSLOTS;           /* the scratch: uploaded every time */
     *fresh = 1;
 
-    len = (uint32_t)u->h * u->pitch;
+    len = u->chain;
     /*
      * Not cacheable, so decoded into the scratch: too big to keep, no
      * range to invalidate on, or -- new with the dirty guard -- a range
@@ -5940,6 +6560,8 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     for (k = 0; k < 4; k++) {
         s->gl_tex[victim].sel[k] = u->sel[k];
     }
+    s->gl_tex[victim].nlev = u->nlev;
+    s->gl_tex[victim].lay = u->loff[u->nlev - 1] - u->off;
     s->gl_tex[victim].used = ++s->gl_tex_seq;
     s->gl_tex[victim].epoch = s->gl_epoch;
     s->gl_tex[victim].npg = r300_gl_pages(s, off, len);
@@ -6276,6 +6898,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         if (!n || n > R300_GL_TEX_MAX) {
             return r300_gl_fallback(s, R350_GLF_TEXTURE, prim, nvtx);
         }
+        n = d->tex[i].ltexels;
         texels = MAX(texels, n);
     }
 
@@ -6339,6 +6962,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         req.tex_h[i] = d->tex[i].h;
         req.clamp_s[i] = d->tex[i].clamp_s;
         req.clamp_t[i] = d->tex[i].clamp_t;
+        r300_gl_filt(&d->tex[i], &req, i);
         req.textured |= d->tex[i].en ? (1u << i) : 0;
     }
     req.wmask = d->wmask;

@@ -1066,7 +1066,7 @@ void r300_us_run(const R300UsProgram *p, R300UsRegs *g,
             case R300_US_TEXOP_PROJ:
                 if (sample) {
                     sample(ctx, t->unit, t->op == R300_US_TEXOP_PROJ,
-                           g->r[t->src], g->r[t->dst]);
+                           t->src, g->r[t->src], g->r[t->dst]);
                 }
                 break;
             default:

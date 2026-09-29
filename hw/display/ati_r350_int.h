@@ -716,6 +716,8 @@ struct ATIR350State {
         unsigned bpp, code, xr;
         unsigned sel[4];
         int w, h;
+        unsigned nlev;              /* mip levels decoded, one after another */
+        uint32_t lay;               /* offset of the last of them */
         uint8_t *rgba;
         size_t sz;
         uint64_t used;
