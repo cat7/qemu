@@ -784,7 +784,7 @@ static const char *vs_src =
 "layout(location = 9) in vec2 a_t0;\n"
 "layout(location = 10) in vec2 a_t1;\n"
 "layout(location = 11) in vec2 a_t2;\n"
-"layout(location = 12) in float a_inv;\n"
+"layout(location = 12) in vec4 a_inv;\n"
 "layout(location = 13) in vec4 a_s0;\n"
 "layout(location = 14) in vec4 a_s1;\n"
 "layout(location = 15) in vec4 a_s2;\n"
@@ -798,7 +798,7 @@ static const char *vs_src =
 "flat out vec2 f_t0;\n"
 "flat out vec2 f_t1;\n"
 "flat out vec2 f_t2;\n"
-"flat out float f_inv;\n"
+"flat out vec4 f_inv;\n"
 "flat out vec4 f_s0;\n"
 "flat out vec4 f_s1;\n"
 "flat out vec4 f_s2;\n"
@@ -808,7 +808,9 @@ static const char *vs_src =
 "    float ny = (a_pos.y - u_rect.y) / u_rect.w * 2.0 - 1.0;\n"
 /*
  * w = 1 keeps GL's own interpolation affine, which is what the software
- * rasterizer's screen-space barycentric weights already are.
+ * rasterizer's screen-space barycentric weights already are; the
+ * perspective correction is applied to those weights in the fragment
+ * stage, from each corner's 1/w.
  */
 "    gl_Position = vec4(nx, ny, 0.0, 1.0);\n"
 "    f_p0 = a_p0; f_p1 = a_p1; f_p2 = a_p2;\n"
@@ -849,7 +851,7 @@ static const char *fs_src =
 "flat in vec2 f_t0;\n"
 "flat in vec2 f_t1;\n"
 "flat in vec2 f_t2;\n"
-"flat in float f_inv;\n"
+"flat in vec4 f_inv;\n"
 "flat in vec4 f_s0;\n"
 "flat in vec4 f_s1;\n"
 "flat in vec4 f_s2;\n"
@@ -908,7 +910,7 @@ static const char *fs_src =
  * r300_raster_tri()'s own weights, expression for expression, fusion
  * included -- see the file comment.
  */
-"    precise float inv = f_inv;\n"
+"    precise float inv = f_inv.x;\n"
 "    precise float px = gl_FragCoord.x + u_org.x;\n"
 "    precise float py = gl_FragCoord.y + u_org.y;\n"
 "    precise float q0 = (f_p2.y - f_p1.y) * (px - f_p1.x);\n"
@@ -918,6 +920,17 @@ static const char *fs_src =
 "    precise float w0 = d0 * inv;\n"
 "    precise float w1 = d1 * inv;\n"
 "    precise float w2 = 1.0 - w0 - w1;\n"
+/*
+ * Perspective-correct weights when the corners' 1/w differ, as
+ * r300_raster_tri() computes them.
+ */
+"    if (f_inv.y != f_inv.z || f_inv.z != f_inv.w) {\n"
+"        precise float pq0 = w0 * f_inv.y;\n"
+"        precise float pq1 = w1 * f_inv.z;\n"
+"        precise float pq2 = w2 * f_inv.w;\n"
+"        precise float iq = 1.0 / (pq0 + pq1 + pq2);\n"
+"        w0 = pq0 * iq; w1 = pq1 * iq; w2 = pq2 * iq;\n"
+"    }\n"
 "    c = fma(vec4(w2), f_c2, fma(vec4(w1), f_c1, w0 * f_c0));\n"
 /*
  * Coordinate set 0, the only one a request carries -- a translated
@@ -1290,7 +1303,7 @@ R350GlCtx *ati_r350_gl_open(const char **err)
             { 6, 4, 12 + 2 * C }, { 7, 4, 16 + 2 * C }, { 8, 4, 20 + 2 * C },
             { 9, 2 * C, 24 + 2 * C }, { 10, 2 * C, 24 + 4 * C },
             { 11, 2 * C, 24 + 6 * C },
-            { 12, 1, 24 + 8 * C },
+            { 12, 4, 37 + 8 * C },
             { 13, 4, 25 + 8 * C }, { 14, 4, 29 + 8 * C },
             { 15, 4, 33 + 8 * C },
         };

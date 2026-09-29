@@ -1253,6 +1253,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     float a0, b0, c0, a1, b1, c1;
     float tcinv[R300_TEXCOORDS][2] = { { 1.0f, 1.0f } };
     bool flip, tl0, tl1, tl2, back;
+    bool persp = v0->w != v1->w || v1->w != v2->w;
     int x0, y0, x1, y1, x, y;
     unsigned n;
 
@@ -1370,6 +1371,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             float w1 = (dx1 * ry1 - dy1 * (px - v2->x)) * inv;
             float w2e = (dx2 * ry2 - dy2 * (px - v0->x)) * inv;
             float w2 = 1.0f - w0 - w1;
+            float pw0, pw1, pw2;
             float cr, cg, cb, ca;
             uint32_t addr;
             uint32_t out;
@@ -1440,16 +1442,33 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 }
                 continue;
             }
-            cr = w0 * v0->r + w1 * v1->r + w2 * v2->r;
-            cg = w0 * v0->g + w1 * v1->g + w2 * v2->g;
-            cb = w0 * v0->b + w1 * v1->b + w2 * v2->b;
-            ca = w0 * v0->a + w1 * v1->a + w2 * v2->a;
+            if (persp) {
+                /*
+                 * Attributes interpolate perspective-correctly: linear
+                 * in screen space divided by w, renormalised by the
+                 * interpolated 1/w (v->w). Z stays screen-linear.
+                 */
+                float q0 = w0 * v0->w, q1 = w1 * v1->w, q2 = w2 * v2->w;
+                float iq = 1.0f / (q0 + q1 + q2);
+
+                pw0 = q0 * iq;
+                pw1 = q1 * iq;
+                pw2 = q2 * iq;
+            } else {
+                pw0 = w0;
+                pw1 = w1;
+                pw2 = w2;
+            }
+            cr = pw0 * v0->r + pw1 * v1->r + pw2 * v2->r;
+            cg = pw0 * v0->g + pw1 * v1->g + pw2 * v2->g;
+            cb = pw0 * v0->b + pw1 * v1->b + pw2 * v2->b;
+            ca = pw0 * v0->a + pw1 * v1->a + pw2 * v2->a;
             if (d->fs_run) {
                 float tex[4], col[2][4], fsout[4];
-                float ts = w0 * v0->tc[0][0] + w1 * v1->tc[0][0] +
-                           w2 * v2->tc[0][0];
-                float tt = w0 * v0->tc[0][1] + w1 * v1->tc[0][1] +
-                           w2 * v2->tc[0][1];
+                float ts = pw0 * v0->tc[0][0] + pw1 * v1->tc[0][0] +
+                           pw2 * v2->tc[0][0];
+                float tt = pw0 * v0->tc[0][1] + pw1 * v1->tc[0][1] +
+                           pw2 * v2->tc[0][1];
 
                 if (d->fs->fast) {
                     /*
@@ -1479,10 +1498,10 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 col[0][2] = cb;
                 col[0][3] = ca;
                 if (d->fs_col1) {
-                    col[1][0] = w0 * v0->r1 + w1 * v1->r1 + w2 * v2->r1;
-                    col[1][1] = w0 * v0->g1 + w1 * v1->g1 + w2 * v2->g1;
-                    col[1][2] = w0 * v0->b1 + w1 * v1->b1 + w2 * v2->b1;
-                    col[1][3] = w0 * v0->a1 + w1 * v1->a1 + w2 * v2->a1;
+                    col[1][0] = pw0 * v0->r1 + pw1 * v1->r1 + pw2 * v2->r1;
+                    col[1][1] = pw0 * v0->g1 + pw1 * v1->g1 + pw2 * v2->g1;
+                    col[1][2] = pw0 * v0->b1 + pw1 * v1->b1 + pw2 * v2->b1;
+                    col[1][3] = pw0 * v0->a1 + pw1 * v1->a1 + pw2 * v2->a1;
                 } else {
                     col[1][0] = col[1][1] = col[1][2] = col[1][3] = 0.0f;
                 }
@@ -1529,10 +1548,10 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                     tc[0][2] = 0.0f;
                     tc[0][3] = 1.0f;
                     for (k = 1; k < d->ntc; k++) {
-                        tc[k][0] = (w0 * v0->tc[k][0] + w1 * v1->tc[k][0] +
-                                    w2 * v2->tc[k][0]) * tcinv[k][0];
-                        tc[k][1] = (w0 * v0->tc[k][1] + w1 * v1->tc[k][1] +
-                                    w2 * v2->tc[k][1]) * tcinv[k][1];
+                        tc[k][0] = (pw0 * v0->tc[k][0] + pw1 * v1->tc[k][0] +
+                                    pw2 * v2->tc[k][0]) * tcinv[k][0];
+                        tc[k][1] = (pw0 * v0->tc[k][1] + pw1 * v1->tc[k][1] +
+                                    pw2 * v2->tc[k][1]) * tcinv[k][1];
                         tc[k][2] = 0.0f;
                         tc[k][3] = 1.0f;
                     }
@@ -1545,9 +1564,9 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                             continue;
                         }
                         for (c = 0; c < 4; c++) {
-                            tc[k][c] = w0 * v0->tcr[k][c] +
-                                       w1 * v1->tcr[k][c] +
-                                       w2 * v2->tcr[k][c];
+                            tc[k][c] = pw0 * v0->tcr[k][c] +
+                                       pw1 * v1->tcr[k][c] +
+                                       pw2 * v2->tcr[k][c];
                         }
                     }
                     r300_fs_frame(d, &f, tc, col);
@@ -1717,6 +1736,7 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
     float cx, cy, cz, cw;
 
     if (!d->xform) {
+        v->w = 1.0f;
         return;
     }
     if (clip) {
@@ -1750,6 +1770,7 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
         v->x = v->y = r300_vtx_nowhere;
         return;
     }
+    v->w = 1.0f / cw;
     /*
      * The viewport's scale and offset are enabled per component, and a
      * guest that is already handing over screen coordinates turns the
@@ -1786,6 +1807,9 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
     }
     if (!isfinite(v->x) || !isfinite(v->y)) {
         v->x = v->y = r300_vtx_nowhere;
+    }
+    if (!isfinite(v->w) || v->w <= 0.0f) {
+        v->w = 1.0f;
     }
 }
 
@@ -5966,6 +5990,8 @@ static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
     v[31 + 8 * C] = t1->b1; v[32 + 8 * C] = t1->a1;
     v[33 + 8 * C] = t2->r1; v[34 + 8 * C] = t2->g1;
     v[35 + 8 * C] = t2->b1; v[36 + 8 * C] = t2->a1;
+    v[37 + 8 * C] = inv;
+    v[38 + 8 * C] = t0->w; v[39 + 8 * C] = t1->w; v[40 + 8 * C] = t2->w;
 }
 
 /*

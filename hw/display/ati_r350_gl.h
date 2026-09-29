@@ -73,13 +73,15 @@
  *   (24+2C)..(23+8C)  triangle vertex 0/1/2 coordinates, all sets each
  *   (24+8C)           1.0f / signed area, computed on the HOST
  *   (25+8C)..(36+8C)  triangle vertex 0/1/2 SECOND colours
+ *   (37+8C)           1.0f / signed area again
+ *   (38+8C)..(40+8C)  triangle vertex 0/1/2 1/w
  *
  * The second colour is the one a fragment program can add to the
  * modulated texel -- Chess.app's specular term -- and it is carried at
  * the corners like the first so the fragment stage interpolates it with
  * the same weights.
  */
-#define R350_GL_VSTRIDE (37 + 8 * R350_GL_TEXCOORDS)
+#define R350_GL_VSTRIDE (41 + 8 * R350_GL_TEXCOORDS)
 
 /*
  * How many uploaded textures the backend keeps, plus one: slot
