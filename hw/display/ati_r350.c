@@ -2970,6 +2970,7 @@ static void ati_r350_pm4_parse(ATIR350State *s,
                 p->p3_opcode != R300_PM4_OPCODE_CLEAR_CMASK &&
                 p->p3_opcode != R300_PM4_OPCODE_LOAD_VBPNTR &&
                 p->p3_opcode != R300_PM4_OPCODE_DRAW_IMMD_2 &&
+                p->p3_opcode != R300_PM4_OPCODE_DRAW_INDX_2 &&
                 p->p3_opcode != R300_PM4_OPCODE_DRAW_VBUF_2) {
                 trace_ati_r350_pm4_unimp(p->p3_opcode, p->remaining);
                 ati_r350_note_gap(s, R350_GAP_P3_OPCODE, p->p3_opcode);
@@ -3318,6 +3319,7 @@ static void ati_r350_pm4_parse(ATIR350State *s,
             break;
         }
         case R300_PM4_OPCODE_DRAW_IMMD_2:
+        case R300_PM4_OPCODE_DRAW_INDX_2:
             if (p->p3_param_idx < ARRAY_SIZE(s->r300_immd)) {
                 s->r300_immd[p->p3_param_idx] = val;
             }
@@ -3389,6 +3391,11 @@ static void ati_r350_pm4_parse(ATIR350State *s,
         p->p3_opcode == R300_PM4_OPCODE_DRAW_IMMD_2 &&
         p->p3_total >= 1 && p->p3_total <= ARRAY_SIZE(s->r300_immd)) {
         ati_r350_r300_draw_immd(s, s->r300_immd, p->p3_total);
+    }
+    if (p->remaining == 0 && p->type == 3 &&
+        p->p3_opcode == R300_PM4_OPCODE_DRAW_INDX_2 &&
+        p->p3_total >= 1 && p->p3_total <= ARRAY_SIZE(s->r300_immd)) {
+        ati_r350_r300_draw_indx(s, s->r300_immd, p->p3_total);
     }
 }
 

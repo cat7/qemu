@@ -6614,10 +6614,11 @@ static uint32_t r300_vc_swap(uint32_t val, unsigned mode)
  * went unread, so its vertex program's coordinate input read the
  * (0,0,0,1) default and the board sampled one texel for every pixel.
  */
-void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
+static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
 {
     unsigned prim = vf & 0xf;
     unsigned nvtx = (vf >> 16) & 0xffff;
+    unsigned nfetch = nvtx;
     unsigned narr = s->regs[R300_VAP_VTX_AOS_CNT >> 2] &
                     R300_VAP_VTX_NUM_ARRAYS_MASK;
     uint32_t addr[R300_AOS_MAX];
@@ -6656,6 +6657,12 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                                narr > 1 ? addr[1] : 0);
 
     /* NUM_VERTICES is 16 bits; the vertices are fetched to the heap */
+    if (idx) {
+        nfetch = 0;
+        for (i = 0; i < nvtx; i++) {
+            nfetch = MAX(nfetch, idx[i] + 1u);
+        }
+    }
     if (!nvtx || !vsize || vsize > 16) {
         trace_ati_r350_3d_skip(vf, vsize, nvtx);
         return;
@@ -6700,7 +6707,8 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
         for (a = 0; a < narr; a++) {
             uint32_t off;
 
-            span[a] = size[a] ? (size_t)(nvtx - 1) * stride[a] + size[a] : 0;
+            span[a] = size[a] ? (size_t)(nfetch - 1) * stride[a] + size[a]
+                              : 0;
             if (span[a] && !ati_r350_mc_to_vram(s, addr[a], &off)) {
                 total += span[a];
             } else {
@@ -6722,13 +6730,14 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
         r300_texcoord_src(&d, vsize, size[0], ts);
         for (i = 0; i < nvtx; i++) {
             unsigned n = 0;
+            unsigned vi = idx ? idx[i] : i;
 
             for (a = 0; a < narr; a++) {
                 unsigned base = n;
 
                 for (c = 0; c < size[a] && n < 16; c++) {
-                    uint32_t card = addr[a] + (i * stride[a] + c) * 4;
-                    uint32_t val = arr[a] ? arr[a][i * stride[a] + c]
+                    uint32_t card = addr[a] + (vi * stride[a] + c) * 4;
+                    uint32_t val = arr[a] ? arr[a][vi * stride[a] + c]
                                           : ati_r350_mc_read32(s, card);
                     uint32_t off;
 
@@ -6784,4 +6793,46 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
                                    (int32_t)(r300_f32(dw[5]) * 1000) : 0);
         r300_run_prims(s, &d, vb, nvtx, prim);
     }
+}
+
+void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
+{
+    r300_draw_aos(s, vf, NULL);
+}
+
+/*
+ * 3D_DRAW_INDX_2: VAP_VF_CNTL (PRIM_WALK=1, NUM_VERTICES = the index
+ * count) followed by the indices into the arrays bound for DRAW_VBUF_2,
+ * two 16-bit indices per dword, low half first, or one per dword with
+ * VAP_VF_CNTL.INDEX_SIZE set.
+ */
+void ati_r350_r300_draw_indx(ATIR350State *s, const uint32_t *dw, unsigned n)
+{
+    uint32_t vf = dw[0];
+    unsigned nidx = (vf >> 16) & 0xffff;
+    unsigned walk = (vf >> 4) & 3;
+    bool idx32 = vf & R300_VF_CNTL_INDEX_SIZE_32;
+    g_autofree uint16_t *idx = NULL;
+    unsigned i;
+
+    if (walk != 1 || !nidx) {
+        if (nidx) {
+            ati_r350_note_gap(s, R350_GAP_VTX_WALK, walk);
+        }
+        trace_ati_r350_3d_skip(vf, 0, n);
+        return;
+    }
+    if ((idx32 ? nidx : (nidx + 1) / 2) > n - 1) {
+        trace_ati_r350_3d_skip(vf, 0, n);
+        return;
+    }
+    idx = g_new(uint16_t, nidx);
+    for (i = 0; i < nidx; i++) {
+        uint32_t w = idx32 ? dw[1 + i] : dw[1 + i / 2];
+
+        idx[i] = idx32 ? MIN(w, 0xffffu) : (i & 1) ? w >> 16 : w & 0xffff;
+    }
+    trace_ati_r350_3d_indx(vf, nidx, idx[0], nidx > 1 ? idx[1] : 0,
+                           nidx > 2 ? idx[2] : 0, nidx > 3 ? idx[3] : 0);
+    r300_draw_aos(s, vf, idx);
 }

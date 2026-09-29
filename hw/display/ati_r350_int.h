@@ -905,10 +905,10 @@ struct ATIR350State {
     float us_konst_flat[R300_US_CONSTS * 4];
 
     /*
-     * Staging buffer for an in-flight R300 3D_DRAW_IMMD_2 payload
-     * (VAP_VF_CNTL + inline vertices). Scratch state only: a packet
-     * split across a migration is lost, like the 2D host-data
-     * accumulator above.
+     * Staging buffer for an in-flight R300 3D_DRAW_IMMD_2 or
+     * 3D_DRAW_INDX_2 payload (VAP_VF_CNTL + inline vertices or
+     * indices). Scratch state only: a packet split across a migration
+     * is lost, like the 2D host-data accumulator above.
      */
     uint32_t r300_immd[16384];
 };
@@ -1030,6 +1030,7 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
 void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
 void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                                uint32_t val);
+void ati_r350_r300_draw_indx(ATIR350State *s, const uint32_t *dw, unsigned n);
 void ati_r350_raster_init(ATIR350State *s);
 void ati_r350_raster_fini(ATIR350State *s);
 
