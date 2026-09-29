@@ -138,24 +138,37 @@ static void us_decode_alu(R300UsAlu *a, uint32_t rgb_addr, uint32_t rgb_inst,
  * emits R300_TEXCOORDS coordinate sets and two colours, so COL_PTR 0
  * and 1 are the two colour outputs and anything above them is refused.
  *
- * TEX_PTR is a pointer into that packet in FLOATS and a coordinate set
- * occupies four of them, so the set an instruction routes is TEX_PTR/4.
- * Mac OS X 10.5's compositor writes the whole eight-entry identity table
- * -- TEX_PTR 0, 4, 8, 12, 16, 20, 24, 28 -- and RS_INST_COUNT says how
- * many of the instructions above it are live; a multi-tap filter really
- * does read six or seven of them. All of that used to be refused as
- * `rasterizer attribute routing 0x1`.
+ * TEX_PTR is a pointer into that packet in FLOATS, and the sets are
+ * packed there with the component counts VAP_OUTPUT_VTX_FMT_1 declares:
+ * Mac OS X 10.5's compositor declares eight four-component sets and
+ * writes the identity table TEX_PTR 0, 4, 8, ... 28; a GLSL program
+ * with a vec4 coordinate and two vec3 varyings declares 4, 3, 3 and
+ * routes TEX_PTR 0, 4, 7. RS_INST_COUNT says how many of the
+ * instructions are live; a multi-tap filter reads six or seven.
  *
- * A TEX_PTR that is not a multiple of four would be a partial or
+ * A TEX_PTR that does not start a declared set would be a partial or
  * misaligned route into the packet, which this model does not build, so
  * it stays a gap rather than being rounded to a set.
  */
 static void us_decode_rs(R300UsRs *rs, R300UsGaps *gaps,
                          uint32_t rs_inst_count, const uint32_t *rs_inst,
-                         const uint32_t *rs_ip)
+                         const uint32_t *rs_ip, uint32_t vtx_fmt1)
 {
     unsigned n, ninst = (rs_inst_count & R300_RS_INST_COUNT_MASK) + 1;
     unsigned ncol = 0;
+    unsigned set_ptr[R300_TEXCOORDS], ptr_sum = 0;
+
+    /*
+     * Where each set starts in the packet: the sets are packed with the
+     * component counts VAP_OUTPUT_VTX_FMT_1 declares. A zero register
+     * declares nothing, and each set is then taken as four floats.
+     */
+    for (n = 0; n < R300_TEXCOORDS; n++) {
+        unsigned cnt = (vtx_fmt1 >> (n * 3)) & 7;
+
+        set_ptr[n] = cnt ? ptr_sum : ~0u;
+        ptr_sum += cnt;
+    }
 
     for (n = 0; n < R300_TEXCOORDS; n++) {
         rs->tex_reg[n] = -1;
@@ -181,8 +194,16 @@ static void us_decode_rs(R300UsRs *rs, R300UsGaps *gaps,
                 continue;
             }
             ptr = rs_ip[id] & R300_RS_IP_TEX_PTR_MASK;
-            set = ptr / 4;
-            if (ptr % 4 || set >= R300_TEXCOORDS) {
+            if (vtx_fmt1) {
+                for (set = 0; set < R300_TEXCOORDS; set++) {
+                    if (set_ptr[set] == ptr) {
+                        break;
+                    }
+                }
+            } else {
+                set = ptr % 4 ? R300_TEXCOORDS : ptr / 4;
+            }
+            if (set >= R300_TEXCOORDS) {
                 /* a coordinate set past the ones the vertex stage emits */
                 us_gap_rs(gaps, 1);
             } else if (rs->tex_reg[set] >= 0) {
@@ -411,7 +432,7 @@ void r300_us_analyse(R300UsProgram *p,
                      const uint32_t *a_addr, const uint32_t *a_inst,
                      const float (*konst)[4],
                      uint32_t rs_inst_count, const uint32_t *rs_inst,
-                     const uint32_t *rs_ip)
+                     const uint32_t *rs_ip, uint32_t vtx_fmt1)
 {
     unsigned nlevel = us_config & R300_US_CFG_NLEVEL_MASK;
     unsigned aoff = us_code_offset & R300_US_CO_ALU_OFFSET_MASK;
@@ -565,7 +586,8 @@ void r300_us_analyse(R300UsProgram *p,
             }
         }
     }
-    us_decode_rs(&p->rs, &p->gaps, rs_inst_count, rs_inst, rs_ip);
+    us_decode_rs(&p->rs, &p->gaps, rs_inst_count, rs_inst, rs_ip,
+                 vtx_fmt1);
     if (p->gaps.has_rs_route) {
         p->expressible = false;
     }

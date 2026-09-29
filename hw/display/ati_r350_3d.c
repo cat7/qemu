@@ -2833,9 +2833,11 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
           ((uint64_t)(regs[R300_US_CODE_OFFSET >> 2] & 0xffffff) << 25);
     if (sig != s->us_sig ||
         regs[R300_US_OUT_FMT_0 >> 2] != s->us_out_fmt ||
+        regs[R300_VAP_OUTPUT_VTX_FMT_1 >> 2] != s->us_vtx_fmt1 ||
         p->nregs != (regs[R300_US_PIXSIZE >> 2] & 0x1f) + 1) {
         s->us_sig = sig;
         s->us_out_fmt = regs[R300_US_OUT_FMT_0 >> 2];
+        s->us_vtx_fmt1 = regs[R300_VAP_OUTPUT_VTX_FMT_1 >> 2];
         for (i = 0; i < R300_US_CONSTS; i++) {
             unsigned k = (R300_PFS_PARAM_0_X >> 2) + i * 4;
 
@@ -2857,7 +2859,8 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
                         konst,
                         regs[R300_RS_INST_COUNT >> 2],
                         &regs[R300_RS_INST_0 >> 2],
-                        &regs[R300_RS_IP_0 >> 2]);
+                        &regs[R300_RS_IP_0 >> 2],
+                        regs[R300_VAP_OUTPUT_VTX_FMT_1 >> 2]);
         if (!p->expressible) {
             const R300UsGaps *g = &p->gaps;
 

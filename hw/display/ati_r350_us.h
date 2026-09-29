@@ -405,7 +405,9 @@ typedef struct R300UsRegs {
  * Decode the program the control words name. `alu_rgb_addr` and friends
  * are the four 64-entry ALU banks and the 32-entry texture bank as the
  * guest uploaded them; `konst` is US_ALU_CONST as 32 vectors of four
- * floats; `rs_inst`/`rs_ip` are the rasterizer routing tables.
+ * floats; `rs_inst`/`rs_ip` are the rasterizer routing tables and
+ * `vtx_fmt1` is VAP_OUTPUT_VTX_FMT_1, the component count of each
+ * coordinate set in the rasterizer's input packet.
  *
  * Leaves `p->expressible` false, and names the reason in `p->gaps`, for
  * anything the interpreter would not compute correctly -- a caller must
@@ -420,7 +422,7 @@ void r300_us_analyse(R300UsProgram *p,
                      const uint32_t *a_addr, const uint32_t *a_inst,
                      const float (*konst)[4],
                      uint32_t rs_inst_count, const uint32_t *rs_inst,
-                     const uint32_t *rs_ip);
+                     const uint32_t *rs_ip, uint32_t vtx_fmt1);
 
 /*
  * Run the program. The caller has placed the interpolated colours, and
