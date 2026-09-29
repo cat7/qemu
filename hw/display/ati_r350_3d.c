@@ -6663,7 +6663,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
             nfetch = MAX(nfetch, idx[i] + 1u);
         }
     }
-    if (!nvtx || !vsize || vsize > 16) {
+    if (!nvtx || !vsize || vsize > R300_VTX_DWORDS_MAX) {
         trace_ati_r350_3d_skip(vf, vsize, nvtx);
         return;
     }
@@ -6698,7 +6698,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
         uint32_t *arr[R300_AOS_MAX] = { NULL };
         size_t span[R300_AOS_MAX], total = 0;
         R300TexSrc ts[R300_TEXCOORDS];
-        uint32_t dw[16];
+        uint32_t dw[R300_VTX_DWORDS_MAX];
 
         /*
          * Each array outside VRAM is fetched whole before the walk; VRAM
@@ -6735,7 +6735,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
             for (a = 0; a < narr; a++) {
                 unsigned base = n;
 
-                for (c = 0; c < size[a] && n < 16; c++) {
+                for (c = 0; c < size[a] && n < R300_VTX_DWORDS_MAX; c++) {
                     uint32_t card = addr[a] + (vi * stride[a] + c) * 4;
                     uint32_t val = arr[a] ? arr[a][vi * stride[a] + c]
                                           : ati_r350_mc_read32(s, card);

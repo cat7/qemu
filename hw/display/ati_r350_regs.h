@@ -1169,11 +1169,12 @@
 #define R300_VAP_AOS_STRIDE_MASK      0x7f    /* dwords to the next vertex */
 #define R300_VAP_AOS_ODD_SHIFT        16      /* the pair's second array */
 /*
- * How many of them this model fetches. The hardware allows sixteen;
- * four covers every layout seen in a capture and keeps one vertex
- * program input register per array, which is what the inputs are.
+ * How many of them this model fetches: all sixteen the hardware allows,
+ * one vertex program input register per array.
  */
-#define R300_AOS_MAX                  4
+#define R300_AOS_MAX                  16
+/* dwords of one fetched vertex: sixteen elements of up to four */
+#define R300_VTX_DWORDS_MAX           64
 #define R300_VAP_PVS_UPLOAD_ADDRESS   0x2200
 /*
  * UPLOAD_ADDRESS is a vector index into the vertex shader's storage:
