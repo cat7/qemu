@@ -478,6 +478,10 @@ typedef struct R350GlPlat {
     HGLRC ctx;
 } R350GlPlat;
 
+/* the context current on this thread, and whether it keeps it; see below */
+static __thread R350GlPlat *r350_gl_cur;
+static __thread bool r350_gl_keep;
+
 static void r350_gl_plat_close(R350GlPlat *pl)
 {
     if (pl->ctx) {
@@ -641,9 +645,6 @@ fail:
  * (ati_r350_gl_unbind()), which is the only point at which another
  * thread can become the backend's user.
  */
-static __thread R350GlPlat *r350_gl_cur;
-static __thread bool r350_gl_keep;
-
 static inline void r350_gl_makecurrent(R350GlPlat *pl)
 {
     if (r350_gl_cur != pl) {
