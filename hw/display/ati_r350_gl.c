@@ -93,12 +93,15 @@
  *   r350_gl_plat_close(pl)            destroy it
  *   r350_gl_makecurrent(pl)           take it for this thread
  *   r350_gl_done(pl)                  give it back
- *   r350_gl_plat_has_barrier()        GL_NV_texture_barrier is offered
- *   r350_gl_barrier()                 glTextureBarrierNV
+ *   r350_gl_plat_has_barrier()        a texture barrier is offered
+ *   r350_gl_barrier()                 issue it
+ *   r350_gl_plat_hold(hold)           this thread keeps the context
+ *                                     between entry points
+ *   r350_gl_plat_unbind(pl)           ... until it gives it back here
  *
- * r350_gl_done() is the only member of that list that is not obvious,
- * and it exists because WGL needs it: see the threading comment in the
- * win32 leg. On darwin it is nothing at all.
+ * r350_gl_done() and the last two are the members that are not obvious,
+ * and they exist because WGL needs them: see the threading comment in the
+ * win32 leg. On darwin they are nothing at all.
  */
 
 #ifdef CONFIG_DARWIN
@@ -183,6 +186,14 @@ static inline void r350_gl_barrier(void)
     glTextureBarrierNV();
 }
 
+static inline void r350_gl_plat_hold(bool hold)
+{
+}
+
+static inline void r350_gl_plat_unbind(R350GlPlat *pl)
+{
+}
+
 #else /* _WIN32 */
 
 /*
@@ -241,6 +252,7 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_FLOAT                        0x1406
 #define GL_RGBA                         0x1908
 #define GL_VERSION                      0x1F02
+#define GL_EXTENSIONS                   0x1F03
 #define GL_NEAREST                      0x2600
 #define GL_TEXTURE_MAG_FILTER           0x2800
 #define GL_TEXTURE_MIN_FILTER           0x2801
@@ -264,6 +276,7 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_FRAMEBUFFER                  0x8D40
 #define GL_RGBA8UI                      0x8D7C
 #define GL_RGBA_INTEGER                 0x8D99
+#define GL_NUM_EXTENSIONS               0x821D
 
 /* GL 1.1: opengl32.dll's own exports */
 static void (APIENTRY *glBindTexture)(GLenum, GLuint);
@@ -278,6 +291,7 @@ static void (APIENTRY *glDrawArrays)(GLenum, GLint, GLsizei);
 static void (APIENTRY *glEnable)(GLenum);
 static void (APIENTRY *glGenTextures)(GLsizei, GLuint *);
 static GLenum (APIENTRY *glGetError)(void);
+static void (APIENTRY *glGetIntegerv)(GLenum, GLint *);
 static const GLubyte *(APIENTRY *glGetString)(GLenum);
 static void (APIENTRY *glPixelStorei)(GLenum, GLint);
 static void (APIENTRY *glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum,
@@ -316,6 +330,7 @@ static void (APIENTRY *glGenFramebuffers)(GLsizei, GLuint *);
 static void (APIENTRY *glGenVertexArrays)(GLsizei, GLuint *);
 static void (APIENTRY *glGetProgramiv)(GLuint, GLenum, GLint *);
 static void (APIENTRY *glGetShaderiv)(GLuint, GLenum, GLint *);
+static const GLubyte *(APIENTRY *glGetStringi)(GLenum, GLuint);
 static GLint (APIENTRY *glGetUniformLocation)(GLuint, const GLchar *);
 static void (APIENTRY *glLinkProgram)(GLuint);
 static void (APIENTRY *glShaderSource)(GLuint, GLsizei,
@@ -353,6 +368,7 @@ static const struct {
     R350_GL_PROC(glEnable),
     R350_GL_PROC(glGenTextures),
     R350_GL_PROC(glGetError),
+    R350_GL_PROC(glGetIntegerv),
     R350_GL_PROC(glGetString),
     R350_GL_PROC(glPixelStorei),
     R350_GL_PROC(glReadPixels),
@@ -384,6 +400,7 @@ static const struct {
     R350_GL_PROC(glGenVertexArrays),
     R350_GL_PROC(glGetProgramiv),
     R350_GL_PROC(glGetShaderiv),
+    R350_GL_PROC(glGetStringi),
     R350_GL_PROC(glGetUniformLocation),
     R350_GL_PROC(glLinkProgram),
     R350_GL_PROC(glShaderSource),
@@ -465,6 +482,7 @@ static void r350_gl_plat_close(R350GlPlat *pl)
 {
     if (pl->ctx) {
         wglMakeCurrent(NULL, NULL);
+        r350_gl_cur = NULL;
         wglDeleteContext(pl->ctx);
         pl->ctx = NULL;
     }
@@ -605,35 +623,93 @@ fail:
 /*
  * The context moves between HOST THREADS, and this is the one place the
  * two legs genuinely differ. ati_r350_gl_open() runs on QEMU's main
- * thread (device realize); every draw runs on whichever vCPU thread
- * reached the command processor; and ati_r350_gl_fetch() runs on the
- * main thread again whenever ati_r350_update_display() releases the
- * target for scanout (ati_r350.c). The BQL keeps two of them from being
- * inside the backend at once, which is all CGL asks for -- but WGL asks
- * for more: wglMakeCurrent FAILS while the context is current to a
- * DIFFERENT thread, and no thread can release another thread's context.
- * So here the context is taken for the duration of one entry point and
- * given straight back, and r350_gl_done() is that give-back.
+ * thread (device realize); draws run on the command processor's thread,
+ * or on a vCPU thread when it has none; and ati_r350_gl_fetch() runs on
+ * the main thread whenever ati_r350_update_display() releases the target
+ * for scanout (ati_r350.c). Only one of them may use the backend at a
+ * time: the command processor's thread while it is busy, any other only
+ * while it is idle and with the BQL held (ati_r350_gl_mine()). That is
+ * all CGL asks for -- but WGL asks for more: wglMakeCurrent FAILS while
+ * the context is current to a DIFFERENT thread, and no thread can release
+ * another thread's context.
+ *
+ * So a thread gives the context back when it leaves the backend, with one
+ * exception. Taking and giving back costs two driver calls and, on most
+ * drivers, a flush of the context, and the command processor's thread
+ * makes a draw call thousands of times a second. It holds the context
+ * (r350_gl_plat_hold()) and gives it back once, before it goes idle
+ * (ati_r350_gl_unbind()), which is the only point at which another
+ * thread can become the backend's user.
  */
+static __thread R350GlPlat *r350_gl_cur;
+static __thread bool r350_gl_keep;
+
 static inline void r350_gl_makecurrent(R350GlPlat *pl)
 {
-    wglMakeCurrent(pl->dc, pl->ctx);
+    if (r350_gl_cur != pl) {
+        wglMakeCurrent(pl->dc, pl->ctx);
+        r350_gl_cur = pl;
+    }
 }
 
 static inline void r350_gl_done(R350GlPlat *pl)
 {
-    (void)pl;
-    wglMakeCurrent(NULL, NULL);
+    if (!r350_gl_keep) {
+        wglMakeCurrent(NULL, NULL);
+        r350_gl_cur = NULL;
+    }
 }
 
-/* the destination is copied instead */
+static inline void r350_gl_plat_hold(bool hold)
+{
+    r350_gl_keep = hold;
+}
+
+static inline void r350_gl_plat_unbind(R350GlPlat *pl)
+{
+    if (r350_gl_cur == pl) {
+        wglMakeCurrent(NULL, NULL);
+        r350_gl_cur = NULL;
+    }
+}
+
+/*
+ * GL_ARB_texture_barrier (core in 4.5) or GL_NV_texture_barrier, which
+ * it was promoted from unchanged. Either lets the draw queue order
+ * overlapping passes on the GPU; without one every draw is submitted on
+ * its own and a blend that reads its destination copies it first.
+ */
+static void (APIENTRY *r350_gl_texbar)(void);
+
 static bool r350_gl_plat_has_barrier(void)
 {
+    static const char *const ext[][2] = {
+        { "GL_ARB_texture_barrier", "glTextureBarrier" },
+        { "GL_NV_texture_barrier", "glTextureBarrierNV" },
+    };
+    HMODULE gl32 = GetModuleHandleA("opengl32.dll");
+    GLint n = 0, i;
+    unsigned k;
+
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (k = 0; k < ARRAY_SIZE(ext); k++) {
+        for (i = 0; i < n; i++) {
+            const char *e = (const char *)glGetStringi(GL_EXTENSIONS, i);
+
+            if (e && !strcmp(e, ext[k][0])) {
+                r350_gl_texbar = r350_gl_getproc(gl32, ext[k][1]);
+                if (r350_gl_texbar) {
+                    return true;
+                }
+            }
+        }
+    }
     return false;
 }
 
 static inline void r350_gl_barrier(void)
 {
+    r350_gl_texbar();
 }
 
 #endif /* CONFIG_DARWIN */
@@ -1593,6 +1669,18 @@ void ati_r350_gl_queue_stats(R350GlCtx *g, uint64_t *units, uint64_t *flushes,
     *waves = g ? g->q_waves : 0;
 }
 
+void ati_r350_gl_hold(bool hold)
+{
+    r350_gl_plat_hold(hold);
+}
+
+void ati_r350_gl_unbind(R350GlCtx *g)
+{
+    if (g) {
+        r350_gl_plat_unbind(&g->plat);
+    }
+}
+
 /*
  * Emulated VRAM stores a pixel with its bytes permuted by the aperture
  * swapper's xor: byte (2^xr) is red, (1^xr) green, (0^xr) blue and
@@ -2120,11 +2208,11 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     }
     /*
      * Made current per draw rather than once: the device may reach this
-     * from whichever thread runs the vCPU, and the big QEMU lock is what
-     * keeps two of them from being here at the same time. On darwin the
-     * call is a no-op when the context is already current and the paired
-     * r350_gl_done() is nothing; on Windows both are real, and why is in
-     * the win32 leg's threading comment.
+     * from more than one thread, one at a time. On darwin the call is a
+     * no-op when the context is already current and the paired
+     * r350_gl_done() is nothing; on Windows both are real unless this
+     * thread holds the context, and why is in the win32 leg's threading
+     * comment.
      */
     r350_gl_makecurrent(&g->plat);
     if (g->barrier && !r->add_blend && !r->out) {
@@ -2390,6 +2478,14 @@ void ati_r350_gl_queue_stats(R350GlCtx *g, uint64_t *units, uint64_t *flushes,
                              uint64_t *waves)
 {
     *units = *flushes = *waves = 0;
+}
+
+void ati_r350_gl_hold(bool hold)
+{
+}
+
+void ati_r350_gl_unbind(R350GlCtx *g)
+{
 }
 
 #endif /* CONFIG_DARWIN || _WIN32 */

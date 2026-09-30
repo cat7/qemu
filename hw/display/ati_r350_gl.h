@@ -280,4 +280,13 @@ uint64_t ati_r350_gl_barriers(R350GlCtx *g);
 void ati_r350_gl_queue_stats(R350GlCtx *g, uint64_t *units, uint64_t *flushes,
                              uint64_t *waves);
 
+/*
+ * The calling thread keeps the context between entry points (hold), and
+ * gives it back (unbind) before another thread may use the backend.
+ * Only a host that cannot share a current context across threads does
+ * anything here.
+ */
+void ati_r350_gl_hold(bool hold);
+void ati_r350_gl_unbind(R350GlCtx *g);
+
 #endif /* ATI_R350_GL_H */

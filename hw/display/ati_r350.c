@@ -3603,6 +3603,7 @@ static void *ati_r350_engine_thread(void *opaque)
     rcu_register_thread();
     ati_r350_engine_ctx = true;
     ati_r350_swap_memo_bind(&s->eswap);
+    ati_r350_gl_hold(true);
     qemu_mutex_lock(&s->engine_lock);
     for (;;) {
         while (!s->engine_kick && !s->engine_quit) {
@@ -3618,6 +3619,8 @@ static void *ati_r350_engine_thread(void *opaque)
 
         qemu_mutex_lock(&s->engine_lock);
         if (!s->engine_kick) {
+            /* the GL context is free before another thread may take it */
+            ati_r350_gl_unbind(s->gl_ctx);
             qatomic_store_release(&s->engine_busy, false);
             qemu_event_set(&s->engine_idle);
         }
