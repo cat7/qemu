@@ -132,6 +132,7 @@ struct USBHostRequest {
     unsigned char                    *cbuf;
     unsigned int                     clen;
     bool                             usb3ep0quirk;
+    bool                             fsbulkquirk;
     QTAILQ_ENTRY(USBHostRequest)     next;
 };
 
@@ -418,6 +419,24 @@ static USBHostRequest *usb_host_req_find(USBHostDevice *s, USBPacket *p)
     return NULL;
 }
 
+/*
+ * A high-speed device on a full-speed port: bulk endpoints of the
+ * configuration descriptor are limited to 64 bytes at full speed.
+ */
+static void usb_host_clamp_fs_bulk(uint8_t *d, int len)
+{
+    int i;
+
+    for (i = 0; i + 2 <= len && d[i] >= 2; i += d[i]) {
+        if (d[i + 1] == USB_DT_ENDPOINT && d[i] >= 7 && i + 6 <= len &&
+            (d[i + 3] & 3) == USB_ENDPOINT_XFER_BULK &&
+            (d[i + 4] | (d[i + 5] << 8)) > 64) {
+            d[i + 4] = 64;
+            d[i + 5] = 0;
+        }
+    }
+}
+
 static void LIBUSB_CALL usb_host_req_complete_ctrl(struct libusb_transfer *xfer)
 {
     USBHostRequest *r = xfer->user_data;
@@ -440,6 +459,9 @@ static void LIBUSB_CALL usb_host_req_complete_ctrl(struct libusb_transfer *xfer)
         if (r->usb3ep0quirk && xfer->actual_length >= 18 &&
             r->cbuf[7] == 9) {
             r->cbuf[7] = 64;
+        }
+        if (r->fsbulkquirk) {
+            usb_host_clamp_fs_bulk(r->cbuf, xfer->actual_length);
         }
         /*
          *If this is GET_DESCRIPTOR request for configuration descriptor,
@@ -1516,6 +1538,11 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
         !(udev->port->speedmask & USB_SPEED_MASK_SUPER) &&
         request == 0x8006 && value == 0x100 && index == 0) {
         r->usb3ep0quirk = true;
+    }
+    if ((udev->speedmask & USB_SPEED_MASK_HIGH) &&
+        udev->speed == USB_SPEED_FULL &&
+        request == 0x8006 && (value >> 8) == USB_DT_CONFIG) {
+        r->fsbulkquirk = true;
     }
 
     libusb_fill_control_transfer(r->xfer, s->dh, r->buffer,
