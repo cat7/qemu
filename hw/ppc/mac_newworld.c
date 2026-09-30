@@ -632,6 +632,11 @@ static void ppc_core99_init(MachineState *machine)
         if (machine_arch == ARCH_MAC99_U3) {
             usb1 = pci_create_simple(macio_bus, PCI_DEVFN(9, 0), "pci-ohci");
             pci_config_set_device_id(usb1->config, PCI_DEVICE_ID_APPLE_K2_USB);
+
+            /* USB 2.0 in the NEC controller's slot behind the second bridge */
+            pci_create_simple(pci_bridge_get_sec_bus(
+                              U3_HT_HOST_BRIDGE(ht_dev)->k2[1]),
+                              PCI_DEVFN(11, 0), "usb-ehci");
         }
     }
 

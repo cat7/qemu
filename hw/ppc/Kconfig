@@ -141,6 +141,7 @@ config MAC_NEWWORLD
     imply SUNGEM
     imply TEST_DEVICES
     imply USB_OHCI_PCI
+    imply USB_EHCI_PCI
     select ADB
     select MACIO
     select MACIO_GPIO
