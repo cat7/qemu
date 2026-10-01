@@ -156,6 +156,7 @@ struct USBHostIsoRing {
     QTAILQ_HEAD(, USBHostIsoXfer)    unused;
     QTAILQ_HEAD(, USBHostIsoXfer)    inflight;
     QTAILQ_HEAD(, USBHostIsoXfer)    copy;
+    uint32_t                         nxfers;
     QTAILQ_ENTRY(USBHostIsoRing)     next;
 };
 
@@ -632,7 +633,7 @@ static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
     USBHostIsoXfer *xfer;
     /* FIXME: check interval (for now assume one xfer per frame) */
     int packets = s->iso_urb_frames;
-    int i;
+    uint32_t i;
 
     ring->host = s;
     ring->ep = ep;
@@ -640,8 +641,20 @@ static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
     QTAILQ_INIT(&ring->inflight);
     QTAILQ_INIT(&ring->copy);
     QTAILQ_INSERT_TAIL(&s->isorings, ring, next);
+    ring->nxfers = s->iso_urb_count;
 
-    for (i = 0; i < s->iso_urb_count; i++) {
+#ifdef CONFIG_WIN32
+    /*
+     * WinUSB packetizes an iso OUT buffer in MaximumBytesPerInterval
+     * chunks: packets of varying length need one transfer each.
+     */
+    if (ep->pid == USB_TOKEN_OUT) {
+        ring->nxfers = s->iso_urb_count * s->iso_urb_frames;
+        packets = 1;
+    }
+#endif
+
+    for (i = 0; i < ring->nxfers; i++) {
         xfer = g_new0(USBHostIsoXfer, 1);
         xfer->ring = ring;
         xfer->xfer = libusb_alloc_transfer(packets);
@@ -726,6 +739,44 @@ static void usb_host_iso_free_all(USBHostDevice *s)
     }
 }
 
+#ifdef CONFIG_WIN32
+/*
+ * WinUSB fails SetCurrentAlternateSetting while I/O is pending on the
+ * interface, so cancel the iso transfers of @iface and reap them.
+ * libusb resubmits a cancelled ContinueStream transfer once; cancel
+ * again until the completion reaches us.
+ */
+static void usb_host_iso_free_iface(USBHostDevice *s, int iface)
+{
+    USBHostIsoRing *ring, *rtmp;
+    USBHostIsoXfer *xfer;
+    int limit = 100;
+    bool busy;
+
+    do {
+        busy = false;
+        QTAILQ_FOREACH(ring, &s->isorings, next) {
+            if (ring->ep->ifnum != iface) {
+                continue;
+            }
+            QTAILQ_FOREACH(xfer, &ring->inflight, next) {
+                libusb_cancel_transfer(xfer->xfer);
+                busy = true;
+            }
+        }
+        if (busy) {
+            usb_host_events_wait(2500);
+        }
+    } while (busy && --limit);
+
+    QTAILQ_FOREACH_SAFE(ring, &s->isorings, next, rtmp) {
+        if (ring->ep->ifnum == iface) {
+            usb_host_iso_free(ring);
+        }
+    }
+}
+#endif
+
 static bool usb_host_iso_data_copy(USBHostIsoXfer *xfer, USBPacket *p)
 {
     unsigned int psize;
@@ -804,6 +855,13 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
     bool disconnect = false;
     int rc, filled = 0;
 
+#ifdef CONFIG_WIN32
+    /* WinUSB rejects a zero-length iso write */
+    if (p->iov.size == 0) {
+        return;
+    }
+#endif
+
     ring = usb_host_iso_find(s, p->ep);
     if (ring == NULL) {
         ring = usb_host_iso_alloc(s, p->ep);
@@ -830,7 +888,7 @@ static void usb_host_iso_data_out(USBHostDevice *s, USBPacket *p)
     if (QTAILQ_EMPTY(&ring->inflight)) {
         /* wait until half of our buffers are filled
            before kicking the iso out stream */
-        if (filled*2 < s->iso_urb_count) {
+        if (filled * 2 < ring->nxfers) {
             return;
         }
     }
@@ -1525,7 +1583,11 @@ static void usb_host_set_interface(USBHostDevice *s, int iface, int alt,
 
     trace_usb_host_set_interface(s->bus_num, s->addr, iface, alt);
 
+#ifdef CONFIG_WIN32
+    usb_host_iso_free_iface(s, iface);
+#else
     usb_host_iso_free_all(s);
+#endif
 
     if (iface >= USB_MAX_INTERFACES) {
         p->status = USB_RET_STALL;
