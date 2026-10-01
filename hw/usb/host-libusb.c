@@ -52,6 +52,8 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/queue.h"
+#include "qemu/thread.h"
 #include "system/runstate.h"
 #include "system/system.h"
 #include "trace.h"
@@ -259,34 +261,79 @@ static void usb_host_del_fd(int fd, void *user_data)
     qemu_set_fd_handler(fd, NULL, NULL, NULL);
 }
 
+#define USB_HOST_CB(fn) fn
+
 #else
 
-static QEMUTimer *poll_timer;
-static uint32_t request_count;
+/*
+ * No pollable fds on Windows: a thread handles libusb events and
+ * queues completions; a bottom half runs them under the BQL.
+ */
+typedef struct USBHostDone {
+    libusb_transfer_cb_fn            fn;
+    struct libusb_transfer           *xfer;
+    QSIMPLEQ_ENTRY(USBHostDone)      next;
+} USBHostDone;
 
-static void usb_host_timer_kick(void)
+static QemuThread event_thread;
+static QemuMutex done_lock;
+static QSIMPLEQ_HEAD(, USBHostDone) done_list =
+    QSIMPLEQ_HEAD_INITIALIZER(done_list);
+static QEMUBH *done_bh;
+
+static void usb_host_done_queue(libusb_transfer_cb_fn fn,
+                                struct libusb_transfer *xfer)
 {
-    int64_t delay_ns;
+    USBHostDone *d = g_new(USBHostDone, 1);
 
-    delay_ns = request_count
-        ? (NANOSECONDS_PER_SECOND / 100)  /* 10 ms interval with active req */
-        : (NANOSECONDS_PER_SECOND);       /* 1 sec interval otherwise */
-    timer_mod(poll_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+    d->fn = fn;
+    d->xfer = xfer;
+    qemu_mutex_lock(&done_lock);
+    QSIMPLEQ_INSERT_TAIL(&done_list, d, next);
+    qemu_mutex_unlock(&done_lock);
+    qemu_bh_schedule(done_bh);
 }
 
-static void usb_host_timer(void *opaque)
+static void usb_host_done_run(void *opaque)
 {
-    struct timeval tv = { 0, 0 };
+    USBHostDone *d;
 
-    libusb_handle_events_timeout(ctx, &tv);
-    usb_host_timer_kick();
+    for (;;) {
+        qemu_mutex_lock(&done_lock);
+        d = QSIMPLEQ_FIRST(&done_list);
+        if (d) {
+            QSIMPLEQ_REMOVE_HEAD(&done_list, next);
+        }
+        qemu_mutex_unlock(&done_lock);
+        if (!d) {
+            break;
+        }
+        d->fn(d->xfer);
+        g_free(d);
+    }
+}
+
+static void *usb_host_event_thread(void *opaque)
+{
+    for (;;) {
+        struct timeval tv = { 1, 0 };
+
+        libusb_handle_events_timeout_completed(ctx, &tv, NULL);
+    }
+    return NULL;
 }
 
 static void usb_host_events_wait(long usec)
 {
-    struct timeval tv = { 0, usec };
+    g_usleep(usec);
+    usb_host_done_run(NULL);
+}
 
-    libusb_handle_events_timeout(ctx, &tv);
+#define USB_HOST_CB(fn) fn##_deferred
+#define USB_HOST_DEFER(fn)                                              \
+static void LIBUSB_CALL fn##_deferred(struct libusb_transfer *xfer)     \
+{                                                                       \
+    usb_host_done_queue(fn, xfer);                                      \
 }
 
 #endif /* !CONFIG_WIN32 */
@@ -311,8 +358,10 @@ static int usb_host_init(void)
     libusb_set_debug(ctx, loglevel);
 #endif
 #ifdef CONFIG_WIN32
-    poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_host_timer, NULL);
-    usb_host_timer_kick();
+    qemu_mutex_init(&done_lock);
+    done_bh = qemu_bh_new(usb_host_done_run, NULL);
+    qemu_thread_create(&event_thread, "usb-host-events",
+                       usb_host_event_thread, NULL, QEMU_THREAD_DETACHED);
 #else
     libusb_set_pollfd_notifiers(ctx, usb_host_add_fd,
                                 usb_host_del_fd,
@@ -400,18 +449,11 @@ static USBHostRequest *usb_host_req_alloc(USBHostDevice *s, USBPacket *p,
         r->buffer = g_malloc(bufsize);
     }
     QTAILQ_INSERT_TAIL(&s->requests, r, next);
-#ifdef CONFIG_WIN32
-    request_count++;
-    usb_host_timer_kick();
-#endif
     return r;
 }
 
 static void usb_host_req_free(USBHostRequest *r)
 {
-#ifdef CONFIG_WIN32
-    request_count--;
-#endif
     QTAILQ_REMOVE(&r->host->requests, r, next);
     libusb_free_transfer(r->xfer);
     g_free(r->buffer);
@@ -577,6 +619,12 @@ usb_host_req_complete_iso(struct libusb_transfer *transfer)
     }
 }
 
+#ifdef CONFIG_WIN32
+USB_HOST_DEFER(usb_host_req_complete_ctrl)
+USB_HOST_DEFER(usb_host_req_complete_data)
+USB_HOST_DEFER(usb_host_req_complete_iso)
+#endif
+
 static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
 {
     USBHostIsoRing *ring = g_new0(USBHostIsoRing, 1);
@@ -615,7 +663,7 @@ static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
         if (ring->ep->pid == USB_TOKEN_IN) {
             xfer->xfer->endpoint |= USB_DIR_IN;
         }
-        xfer->xfer->callback = usb_host_req_complete_iso;
+        xfer->xfer->callback = USB_HOST_CB(usb_host_req_complete_iso);
         xfer->xfer->user_data = xfer;
 
         xfer->xfer->num_iso_packets = packets;
@@ -1169,10 +1217,14 @@ static void usb_host_abort_xfers(USBHostDevice *s)
     }
 
     while (QTAILQ_FIRST(&s->requests) != NULL) {
+#ifdef CONFIG_WIN32
+        usb_host_events_wait(2500);
+#else
         struct timeval tv;
         memset(&tv, 0, sizeof(tv));
         tv.tv_usec = 2500;
         libusb_handle_events_timeout(ctx, &tv);
+#endif
         if (--limit == 0) {
             /*
              * Don't wait forever for libusb calling the complete
@@ -1618,7 +1670,7 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
     }
 
     libusb_fill_control_transfer(r->xfer, s->dh, r->buffer,
-                                 usb_host_req_complete_ctrl, r,
+                                 USB_HOST_CB(usb_host_req_complete_ctrl), r,
                                  CONTROL_TIMEOUT);
     rc = libusb_submit_transfer(r->xfer);
     if (rc != 0) {
@@ -1672,9 +1724,8 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         if (p->stream) {
 #ifdef HAVE_STREAMS
             libusb_fill_bulk_stream_transfer(r->xfer, s->dh, ep, p->stream,
-                                             r->buffer, size,
-                                             usb_host_req_complete_data, r,
-                                             BULK_TIMEOUT);
+                r->buffer, size, USB_HOST_CB(usb_host_req_complete_data), r,
+                BULK_TIMEOUT);
 #else
             usb_host_req_free(r);
             p->status = USB_RET_STALL;
@@ -1683,8 +1734,8 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         } else {
             libusb_fill_bulk_transfer(r->xfer, s->dh, ep,
                                       r->buffer, size,
-                                      usb_host_req_complete_data, r,
-                                      BULK_TIMEOUT);
+                                      USB_HOST_CB(usb_host_req_complete_data),
+                                      r, BULK_TIMEOUT);
         }
         break;
     case USB_ENDPOINT_XFER_INT:
@@ -1695,8 +1746,8 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
         ep = p->ep->nr | (r->in ? USB_DIR_IN : 0);
         libusb_fill_interrupt_transfer(r->xfer, s->dh, ep,
                                        r->buffer, p->iov.size,
-                                       usb_host_req_complete_data, r,
-                                       INTR_TIMEOUT);
+                                       USB_HOST_CB(usb_host_req_complete_data),
+                                       r, INTR_TIMEOUT);
         break;
     case USB_ENDPOINT_XFER_ISOC:
         if (p->pid == USB_TOKEN_IN) {
