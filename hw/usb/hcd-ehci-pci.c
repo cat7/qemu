@@ -28,6 +28,7 @@ typedef struct EHCIPCIInfo {
     uint16_t device_id;
     uint8_t  revision;
     bool companion;
+    uint8_t portnr;
 } EHCIPCIInfo;
 
 static void usb_ehci_pci_realize(PCIDevice *dev, Error **errp)
@@ -83,7 +84,7 @@ static void usb_ehci_pci_init(Object *obj)
     s->capsbase = 0x00;
     s->opregbase = 0x20;
     s->portscbase = 0x44;
-    s->portnr = EHCI_PORTS;
+    s->portnr = PCI_EHCI_GET_CLASS(obj)->portnr;
 
     if (!dc->hotpluggable) {
         s->companion_enable = true;
@@ -154,7 +155,9 @@ static void ehci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    EHCIPCIClass *ec = PCI_EHCI_CLASS(klass);
 
+    ec->portnr = EHCI_PORTS;
     k->realize = usb_ehci_pci_realize;
     k->exit = usb_ehci_pci_exit;
     k->class_id = PCI_CLASS_SERIAL_USB;
@@ -168,6 +171,7 @@ static const TypeInfo ehci_pci_type_info = {
     .name = TYPE_PCI_EHCI,
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(EHCIPCIState),
+    .class_size = sizeof(EHCIPCIClass),
     .instance_init = usb_ehci_pci_init,
     .instance_finalize = usb_ehci_pci_finalize,
     .abstract = true,
@@ -182,6 +186,7 @@ static void ehci_data_class_init(ObjectClass *klass, const void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
+    EHCIPCIClass *ec = PCI_EHCI_CLASS(klass);
     const EHCIPCIInfo *i = data;
 
     k->vendor_id = i->vendor_id;
@@ -190,6 +195,9 @@ static void ehci_data_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
     if (i->companion) {
         dc->hotpluggable = false;
+    }
+    if (i->portnr) {
+        ec->portnr = i->portnr;
     }
 }
 
@@ -211,6 +219,13 @@ static struct EHCIPCIInfo ehci_pci_info[] = {
         .device_id = PCI_DEVICE_ID_INTEL_82801I_EHCI2,
         .revision  = 0x03,
         .companion = true,
+    },{
+        .name      = "nec-usb-ehci", /* uPD720101 */
+        .vendor_id = PCI_VENDOR_ID_NEC,
+        .device_id = PCI_DEVICE_ID_NEC_UPD720101_EHCI,
+        .revision  = 0x04,
+        .companion = true,
+        .portnr    = 5,
     }
 };
 
