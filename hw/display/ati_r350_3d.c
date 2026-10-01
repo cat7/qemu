@@ -3903,6 +3903,39 @@ static bool r300_cb_gart(ATIR350State *s, R300DrawState *d,
     return true;
 }
 
+/*
+ * With the vertex program bypassed, the stream control's destination
+ * locations are the rasterizer's own input slots (R5xx acceleration
+ * guide, 7.3): position at 0, the colours from 2, texture coordinate
+ * set k at 6 + k -- the layout Mesa's r300 driver programs for TCL
+ * bypass (r300_state_derived.c, stream_loc_notcl). The input register
+ * that carries set `k`, or -1.
+ */
+static int r300_bypass_tc_loc(ATIR350State *s, unsigned k)
+{
+    unsigned i, half;
+
+    if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS)) {
+        return -1;
+    }
+    for (i = 0; i < 8; i++) {
+        uint32_t v = s->regs[(R300_VAP_PROG_STREAM_CNTL_0 >> 2) + i];
+
+        for (half = 0; half < 2; half++) {
+            uint32_t w = (v >> (half * 16)) & 0xffff;
+
+            if (((w >> R300_PSC_DST_VEC_LOC_SHIFT) &
+                 R300_PSC_DST_VEC_LOC_MASK) == 6 + k) {
+                return 6 + k;
+            }
+            if (w & R300_PSC_LAST_VEC) {
+                return -1;
+            }
+        }
+    }
+    return -1;
+}
+
 static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                             unsigned vsize)
 {
@@ -4092,7 +4125,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * no evidence they should.
      */
     d->textured = (s->regs[R300_TX_ENABLE >> 2] & 1) &&
-                  (vsize >= 8 || r300_pvs_computes(&d->vs, first_tex));
+                  (vsize >= 8 || r300_pvs_computes(&d->vs, first_tex) ||
+                   r300_bypass_tc_loc(s, 0) >= 0);
     /*
      * RB3D_BLENDCNTL (R5xx accel guide): bit 0 is ALPHA_BLEND_ENABLE,
      * SRCBLEND lives in [21:16] and DESTBLEND in [29:24] as 6-bit
@@ -4359,6 +4393,11 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
             d->vs_color2 = d->vs_run && !d->vs.plain_matrix && ncolor >= 2 &&
                            d->vs_color2_out < R300_PVS_OUT_REGS &&
                            (d->vs.out_mask & (1u << d->vs_color2_out));
+        }
+    }
+    if (!vs_live && d->textured) {
+        for (i = 0; i < d->ntc; i++) {
+            d->tex_attr[i] = r300_bypass_tc_loc(s, i);
         }
     }
     /*
