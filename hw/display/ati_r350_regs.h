@@ -1007,12 +1007,18 @@
 #define R300_TX_FMT_1_5_5_5           0x0b    /* X[4:0] Y[9:5] Z[14:10] W[15] */
 #define R300_TX_FMT_8_8_8_8           0x0c    /* four, X the low byte */
 #define R300_TX_FMT_16_16_16_16       0x0e    /* four 16-bit, X the low half */
+#define R300_TX_FMT_VYUY422           0x14    /* U Y0 V Y1, U the low byte */
+#define R300_TX_FMT_YVYU422           0x15    /* Y0 U Y1 V, Y0 the low byte */
 #define R300_TX_FORMAT1_SEL_SHIFT     9       /* A, then R, G, B */
 #define R300_TX_FORMAT1_SEL_MASK      0x7
 #define R300_TX_SEL_X                 0
 #define R300_TX_SEL_W                 3
 #define R300_TX_SEL_ZERO              4
 #define R300_TX_SEL_ONE               5
+/* TX_FORMAT1 YUV_TO_RGB: 0 off, 1 with clamp, 2 without; SWAP_YUV */
+#define R300_TX_FORMAT1_YUV_SHIFT     22
+#define R300_TX_FORMAT1_YUV_MASK      0x3
+#define R300_TX_FORMAT1_SWAP_YUV      (1u << 24)
 #define R300_TX_OFFSET_0              0x4540
 #define R300_TXO_ENDIAN_MASK          0x3     /* ENDIAN_SWAP [1:0] */
 #define R300_TXO_MACRO_TILE           (1u << 2)

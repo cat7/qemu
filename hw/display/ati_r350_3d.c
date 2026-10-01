@@ -88,6 +88,7 @@ typedef struct R300TexUnit {
     unsigned sel[4];        /* TX_FORMAT1 component select, A R G B */
     unsigned clamp_s, clamp_t;  /* TX_FILTER0 clamp modes (0 = repeat) */
     unsigned lanes;         /* TX_OFFSET ENDIAN_SWAP as a byte-lane xor */
+    unsigned yuv;           /* 4:2:2 only: YUV_TO_RGB, SWAP_YUV in bit 2 */
     /*
      * Filtering. A unit with `filt` clear samples one texel of level 0
      * through r300_sample_tex() exactly as before; see r300_tex_filter()
@@ -460,6 +461,59 @@ static inline uint32_t r300_texel_16x4(uint32_t lo, uint32_t hi)
     return r300_pack_xyzw(lo >> 8, lo >> 24, hi >> 8, hi >> 24);
 }
 
+static inline bool r300_tex_yuv422(unsigned code)
+{
+    return code == R300_TX_FMT_VYUY422 || code == R300_TX_FMT_YVYU422;
+}
+
+/*
+ * A 4:2:2 texel as (X,Y,Z,W) = (U,Y,V,A) with YUV_TO_RGB off, or
+ * (B,G,R,A) with it on; TX_FORMAT1's component select is ignored for
+ * YUV formats (R3xx register reference). The conversion is BT.601
+ * with Y in 16-235 and chroma in 16-240. Components are eight bits
+ * here, so the unclamped mode clamps too. SWAP_YUV inverts the top bit
+ * of U and V.
+ */
+static inline uint32_t r300_texel_yuv(unsigned mode, int y, int cb, int cr,
+                                      uint32_t a)
+{
+    int c, d, e;
+
+    if (mode & 4) {
+        cb ^= 0x80;
+        cr ^= 0x80;
+    }
+    if (!(mode & 3)) {
+        return r300_pack_xyzw(cb, y, cr, a);
+    }
+    c = 298 * (y - 16) + 128;
+    d = cb - 128;
+    e = cr - 128;
+    return r300_pack_xyzw(MIN(MAX((c + 516 * d) >> 8, 0), 255),
+                          MIN(MAX((c - 100 * d - 208 * e) >> 8, 0), 255),
+                          MIN(MAX((c + 409 * e) >> 8, 0), 255), a);
+}
+
+/*
+ * One texel of a 4:2:2 pair, from the pair's dword with the lowest
+ * address in the low byte: each texel is a 16-bit unit, VYUY with Y in
+ * its high byte and YVYU with Y in its low byte, U in the first unit
+ * and V in the second. Mac OS X uploads GL_UNSIGNED_SHORT_8_8_APPLE
+ * (chroma in the high byte) through the 16-bit host swap and samples
+ * it as YVYU, and the _REV type as VYUY. Both texels of a pair take its
+ * U and V. Filtering blends texels after the conversion, so chroma is
+ * interpolated between pairs.
+ */
+static inline uint32_t r300_texel_422(const R300TexUnit *u, uint32_t p,
+                                      bool odd)
+{
+    unsigned sh = u->code == R300_TX_FMT_VYUY422 ? 8 : 0;
+
+    return r300_texel_yuv(u->yuv, (p >> (sh + (odd ? 16 : 0))) & 0xff,
+                          (p >> (8 - sh)) & 0xff, (p >> (24 - sh)) & 0xff,
+                          0xff);
+}
+
 /*
  * TX_OFFSET's ENDIAN_SWAP applies to a texture fetched over the bus,
  * as COLORENDIAN does to a colour buffer in GART; in VRAM the surface
@@ -516,6 +570,16 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
         unsigned xr;
         uint32_t v;
 
+        if (r300_tex_yuv422(u->code)) {
+            /* the pair's dword, through the same swapper */
+            if (!ati_r350_mc_to_vram(s, addr & ~3u, &off)) {
+                v = r300_lane_xor32(r300_tex_bus32(s, unit, addr & ~3u),
+                                    u->lanes);
+            } else {
+                v = ati_r350_vram_ld32(s, off);
+            }
+            return r300_texel_422(u, v, addr & 2);
+        }
         if (!ati_r350_mc_to_vram(s, addr, &off)) {
             v = (r300_lane_xor32(r300_tex_bus32(s, unit, addr & ~3u),
                                  u->lanes) >> ((addr & 2) * 8)) & 0xffff;
@@ -3652,6 +3716,12 @@ static void r300_tex_filter_setup(ATIR350State *s, R300TexUnit *u,
         case R300_TX_FMT_4_4_4_4:
             u->border = r300_texel_4444(bc & 0xffff);
             break;
+        case R300_TX_FMT_VYUY422:
+        case R300_TX_FMT_YVYU422:
+            /* AVYU */
+            u->border = r300_texel_yuv(u->yuv, (bc >> 8) & 0xff, bc & 0xff,
+                                       (bc >> 16) & 0xff, bc >> 24);
+            break;
         default:
             u->border = bc & 0xffff;
             break;
@@ -3724,14 +3794,17 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
      * 0xb is TX_FMT_1_5_5_5, which Abstract.saver asks for; 0xc is
      * TX_FMT_8_8_8_8, what the compositor and most
      * apps use; 0xe is TX_FMT_16_16_16_16, which RSS Visualizer.saver
-     * asks for. r300_sample_tex() hands all of them to the component
-     * select as four bytes, so one selector implementation serves
-     * every format. TXPITCH counts texels, so the byte pitch scales
-     * with the texel size -- reading an 8_8 texture as four bytes per
-     * texel doubled both the pitch and the stride and made one dword
-     * span two texels.
+     * asks for; 0x14 and 0x15 are the packed 4:2:2 TX_FMT_VYUY422 and
+     * TX_FMT_YVYU422, two bytes per texel with each pair of texels
+     * sharing one U and one V. r300_sample_tex() hands all of them to
+     * the component select as four bytes, so one selector
+     * implementation serves every format. TXPITCH counts texels, so
+     * the byte pitch scales with the texel size -- reading an 8_8
+     * texture as four bytes per texel doubled both the pitch and the
+     * stride and made one dword span two texels.
      */
     u->code = txcode;
+    u->yuv = 0;
     switch (txcode) {
     case R300_TX_FMT_8:
         u->bpp = 8;
@@ -3741,6 +3814,13 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
     case R300_TX_FMT_4_4_4_4:
     case R300_TX_FMT_1_5_5_5:
         u->bpp = 16;
+        break;
+    case R300_TX_FMT_VYUY422:
+    case R300_TX_FMT_YVYU422:
+        u->bpp = 16;
+        u->yuv = ((txfmt1 >> R300_TX_FORMAT1_YUV_SHIFT) &
+                  R300_TX_FORMAT1_YUV_MASK) |
+                 (txfmt1 & R300_TX_FORMAT1_SWAP_YUV ? 4 : 0);
         break;
     case R300_TX_FMT_16_16_16_16:
         u->bpp = 64;
@@ -3764,6 +3844,11 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
      * the other way round.
      */
     for (ch = 0; ch < 4; ch++) {
+        if (r300_tex_yuv422(txcode)) {
+            /* fixed (W,Z,Y,X) */
+            u->sel[ch] = R300_TX_SEL_W - ch;
+            continue;
+        }
         u->sel[ch] = (txfmt1 >> (R300_TX_FORMAT1_SEL_SHIFT + ch * 3)) &
                      R300_TX_FORMAT1_SEL_MASK;
         if (u->en && u->sel[ch] > R300_TX_SEL_ONE) {
@@ -6463,6 +6548,7 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
            s->gl_tex[k].pitch == u->pitch &&
            s->gl_tex[k].bpp == u->bpp &&
            s->gl_tex[k].code == u->code &&
+           s->gl_tex[k].yuv == u->yuv &&
            s->gl_tex[k].w == u->w && s->gl_tex[k].h == u->h &&
            s->gl_tex[k].xr == xr &&
            s->gl_tex[k].sel[0] == u->sel[0] &&
@@ -6554,6 +6640,7 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     s->gl_tex[victim].pitch = u->pitch;
     s->gl_tex[victim].bpp = u->bpp;
     s->gl_tex[victim].code = u->code;
+    s->gl_tex[victim].yuv = u->yuv;
     s->gl_tex[victim].w = u->w;
     s->gl_tex[victim].h = u->h;
     s->gl_tex[victim].xr = xr;
