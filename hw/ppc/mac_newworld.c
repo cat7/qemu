@@ -205,7 +205,9 @@ static void ppc_core99_init(MachineState *machine)
     DeviceState *dart;
     SysBusDevice *unin_dev;
     PCIBus *macio_bus;
-    PCIDevice *usb0, *usb1;
+    PCIDevice *usb0, *usb1, *ehci, *ohci;
+    PCIBus *nec_bus;
+    BusState *ehci_bus;
     int macio_devfn;
     hwaddr nvram_addr = 0xFFF04000;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
@@ -633,10 +635,25 @@ static void ppc_core99_init(MachineState *machine)
             usb1 = pci_create_simple(macio_bus, PCI_DEVFN(9, 0), "pci-ohci");
             pci_config_set_device_id(usb1->config, PCI_DEVICE_ID_APPLE_K2_USB);
 
-            /* USB 2.0 in the NEC controller's slot behind the second bridge */
-            pci_create_simple(pci_bridge_get_sec_bus(
-                              U3_HT_HOST_BRIDGE(ht_dev)->k2[1]),
-                              PCI_DEVFN(11, 0), "usb-ehci");
+            /*
+             * NEC uPD720101 in slot 11 behind the second bridge: EHCI at
+             * function 2, OHCI companions for ports 1-3 and 4-5 at 0 and 1
+             */
+            nec_bus = pci_bridge_get_sec_bus(U3_HT_HOST_BRIDGE(ht_dev)->k2[1]);
+            ehci = pci_new_multifunction(PCI_DEVFN(11, 2), "nec-usb-ehci");
+            pci_realize_and_unref(ehci, nec_bus, &error_fatal);
+            ehci_bus = QLIST_FIRST(&DEVICE(ehci)->child_bus);
+            for (i = 0; i < 2; i++) {
+                ohci = pci_new_multifunction(PCI_DEVFN(11, i), "pci-ohci");
+                qdev_prop_set_string(DEVICE(ohci), "masterbus", ehci_bus->name);
+                qdev_prop_set_uint32(DEVICE(ohci), "firstport", i * 3);
+                qdev_prop_set_uint32(DEVICE(ohci), "num-ports", 3 - i);
+                pci_realize_and_unref(ohci, nec_bus, &error_fatal);
+                pci_config_set_vendor_id(ohci->config, PCI_VENDOR_ID_NEC);
+                pci_config_set_device_id(ohci->config,
+                                         PCI_DEVICE_ID_NEC_UPD720101_OHCI);
+                pci_config_set_revision(ohci->config, 0x43);
+            }
         }
     }
 

@@ -751,6 +751,8 @@ static void ehci_attach(USBPort *port)
     if (*portsc & PORTSC_POWNER) {
         USBPort *companion = s->companion_ports[port->index];
         companion->dev = port->dev;
+        /* The companion runs the device at full or low speed */
+        usb_pick_speed(companion);
         companion->ops->attach(companion);
         return;
     }
