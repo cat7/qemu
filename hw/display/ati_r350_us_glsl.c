@@ -274,12 +274,16 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
         us_emit(&b, "        precise float aC = %s;\n", aC);
         /*
          * The shared dot product: the RGB side's DP4 adds the alpha
-         * arguments' product to it and the alpha side's DP is it. Left
-         * to right with the first product rounded and the rest fused,
-         * which is what `A[0]*B[0] + A[1]*B[1] + A[2]*B[2]` compiles to.
+         * arguments' product to it and the alpha side's DP is the
+         * result, four terms or three. Left to right with the first
+         * product rounded and the rest fused, which is what
+         * `A[0]*B[0] + A[1]*B[1] + A[2]*B[2]` compiles to.
          */
         us_emit(&b, "        precise float DOT = "
                     "fma(A.z, B.z, fma(A.y, B.y, A.x * B.x));\n");
+        if (a->rgb_op == R300_US_RGB_DP4) {
+            us_emit(&b, "        DOT = fma(aA, aB, DOT);\n");
+        }
         us_emit(&b, "        precise vec3 res;\n"
                     "        precise float ares;\n");
 
@@ -288,7 +292,7 @@ bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
             us_emit(&b, "        res = vec3(DOT);\n");
             break;
         case R300_US_RGB_DP4:
-            us_emit(&b, "        res = vec3(fma(aA, aB, DOT));\n");
+            us_emit(&b, "        res = vec3(DOT);\n");
             break;
         case R300_US_RGB_D2A:
             us_emit(&b, "        res = vec3(fma(A.y, B.y, A.x * B.x)"
