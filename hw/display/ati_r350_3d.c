@@ -496,18 +496,15 @@ static inline uint32_t r300_texel_yuv(unsigned mode, int y, int cb, int cr,
 
 /*
  * One texel of a 4:2:2 pair, from the pair's dword with the lowest
- * address in the low byte: each texel is a 16-bit unit, VYUY with Y in
- * its high byte and YVYU with Y in its low byte, U in the first unit
- * and V in the second. Mac OS X uploads GL_UNSIGNED_SHORT_8_8_APPLE
- * (chroma in the high byte) through the 16-bit host swap and samples
- * it as YVYU, and the _REV type as VYUY. Both texels of a pair take its
- * U and V. Filtering blends texels after the conversion, so chroma is
- * interpolated between pairs.
+ * address in the low byte. VYUY is Y0 U Y1 V and YVYU is U Y0 V Y1 from
+ * the low byte up (R5xx acceleration guide, C_VYUY / C_YVYU). Both
+ * texels of a pair take its U and V. Filtering blends texels after the
+ * conversion, so chroma is interpolated between pairs.
  */
 static inline uint32_t r300_texel_422(const R300TexUnit *u, uint32_t p,
                                       bool odd)
 {
-    unsigned sh = u->code == R300_TX_FMT_VYUY422 ? 8 : 0;
+    unsigned sh = u->code == R300_TX_FMT_VYUY422 ? 0 : 8;
 
     return r300_texel_yuv(u->yuv, (p >> (sh + (odd ? 16 : 0))) & 0xff,
                           (p >> (8 - sh)) & 0xff, (p >> (24 - sh)) & 0xff,
