@@ -347,7 +347,7 @@ void usb_ehci_unrealize(EHCIState *s, DeviceState *dev);
 void ehci_reset(void *opaque);
 
 #define TYPE_PCI_EHCI "pci-ehci-usb"
-OBJECT_DECLARE_SIMPLE_TYPE(EHCIPCIState, PCI_EHCI)
+OBJECT_DECLARE_TYPE(EHCIPCIState, EHCIPCIClass, PCI_EHCI)
 
 struct EHCIPCIState {
     /*< private >*/
@@ -355,6 +355,14 @@ struct EHCIPCIState {
     /*< public >*/
 
     EHCIState ehci;
+};
+
+struct EHCIPCIClass {
+    /*< private >*/
+    PCIDeviceClass parent_class;
+    /*< public >*/
+
+    uint16_t portnr;
 };
 
 
