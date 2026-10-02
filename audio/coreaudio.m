@@ -44,6 +44,7 @@ struct AudioCoreaudio {
 typedef struct coreaudioVoiceOut {
     HWVoiceOut hw;
     pthread_mutex_t buf_mutex;
+    const char *dev;
     AudioDeviceID device_id;
     int frame_size_setting;
     uint32_t buffer_count;
@@ -64,6 +65,7 @@ typedef struct coreaudioVoiceOut {
 typedef struct coreaudioVoiceIn {
     HWVoiceIn hw;
     pthread_mutex_t buf_mutex;
+    const char *dev;
     AudioDeviceID device_id;
     int frame_size_setting;
     uint32_t buffer_count;
@@ -84,10 +86,92 @@ static const AudioObjectPropertyAddress voice_in_addr = {
     kAudioObjectPropertyElementMain
 };
 
-static OSStatus coreaudio_get_voice_out(AudioDeviceID *id)
+static bool coreaudio_device_string(AudioDeviceID id,
+                                    AudioObjectPropertySelector sel,
+                                    char *buf, size_t len)
+{
+    AudioObjectPropertyAddress addr = {
+        sel,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    CFStringRef str = NULL;
+    UInt32 size = sizeof(str);
+    bool ok;
+
+    if (AudioObjectGetPropertyData(id, &addr, 0, NULL, &size, &str) !=
+        kAudioHardwareNoError || !str) {
+        return false;
+    }
+    ok = CFStringGetCString(str, buf, len, kCFStringEncodingUTF8);
+    CFRelease(str);
+    return ok;
+}
+
+/* the device with streams in @scope whose unique ID, else name, is @dev */
+static OSStatus coreaudio_find_device(const char *dev,
+                                      AudioObjectPropertyScope scope,
+                                      AudioDeviceID *id)
+{
+    static const AudioObjectPropertySelector keys[] = {
+        kAudioDevicePropertyDeviceUID, kAudioObjectPropertyName
+    };
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    g_autofree AudioDeviceID *ids = NULL;
+    OSStatus status;
+    UInt32 size;
+    char buf[256];
+
+    *id = kAudioDeviceUnknown;
+    status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr,
+                                            0, NULL, &size);
+    if (status != kAudioHardwareNoError) {
+        return status;
+    }
+    ids = g_malloc(size);
+    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr,
+                                        0, NULL, &size, ids);
+    if (status != kAudioHardwareNoError) {
+        return status;
+    }
+
+    for (int k = 0; k < ARRAY_SIZE(keys); k++) {
+        for (UInt32 i = 0; i < size / sizeof(*ids); i++) {
+            AudioObjectPropertyAddress streams = {
+                kAudioDevicePropertyStreams,
+                scope,
+                kAudioObjectPropertyElementMain
+            };
+            UInt32 ssize = 0;
+
+            if (AudioObjectGetPropertyDataSize(ids[i], &streams, 0, NULL,
+                                               &ssize) !=
+                kAudioHardwareNoError || !ssize) {
+                continue;
+            }
+            if (coreaudio_device_string(ids[i], keys[k], buf, sizeof(buf)) &&
+                !strcmp(buf, dev)) {
+                *id = ids[i];
+                return kAudioHardwareNoError;
+            }
+        }
+    }
+    return kAudioHardwareNoError;
+}
+
+static OSStatus coreaudio_get_voice_out(CoreaudioVoiceOut *core,
+                                        AudioDeviceID *id)
 {
     UInt32 size = sizeof(*id);
 
+    if (core->dev) {
+        return coreaudio_find_device(core->dev, kAudioObjectPropertyScopeOutput,
+                                     id);
+    }
     return AudioObjectGetPropertyData(kAudioObjectSystemObject,
                                       &voice_out_addr,
                                       0,
@@ -183,10 +267,15 @@ static OSStatus coreaudio_get_out_isrunning(AudioDeviceID id, UInt32 *result)
                                       result);
 }
 
-static OSStatus coreaudio_get_voice_in(AudioDeviceID *id)
+static OSStatus coreaudio_get_voice_in(CoreaudioVoiceIn *core,
+                                       AudioDeviceID *id)
 {
     UInt32 size = sizeof(*id);
 
+    if (core->dev) {
+        return coreaudio_find_device(core->dev, kAudioObjectPropertyScopeInput,
+                                     id);
+    }
     return AudioObjectGetPropertyData(kAudioObjectSystemObject,
                                       &voice_in_addr,
                                       0,
@@ -507,7 +596,7 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
         .mSampleRate = core->hw.info.freq
     };
 
-    status = coreaudio_get_voice_out(&device_id);
+    status = coreaudio_get_voice_out(core, &device_id);
     if (status != kAudioHardwareNoError) {
         coreaudio_playback_logerr(status,
                                   "Could not get default output device");
@@ -515,7 +604,8 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
     }
     if (device_id == kAudioDeviceUnknown) {
         error_report("coreaudio: Could not initialize playback: "
-                     "Unknown audio device");
+                     "Unknown audio device%s%s", core->dev ? " " : "",
+                     core->dev ?: "");
         return status;
     }
 
@@ -725,6 +815,7 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
         qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
 
     core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+    core->dev = cpdo->dev;
 
     status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
                                             &voice_out_addr,
@@ -925,7 +1016,7 @@ static OSStatus init_in_device(CoreaudioVoiceIn *core)
         .mSampleRate = core->hw.info.freq
     };
 
-    status = coreaudio_get_voice_in(&device_id);
+    status = coreaudio_get_voice_in(core, &device_id);
     if (status != kAudioHardwareNoError) {
         coreaudio_capture_logerr(status,
                                  "Could not get default input device");
@@ -933,7 +1024,8 @@ static OSStatus init_in_device(CoreaudioVoiceIn *core)
     }
     if (device_id == kAudioDeviceUnknown) {
         error_report("coreaudio: Could not initialize capture: "
-                     "Unknown audio input device");
+                     "Unknown audio input device%s%s", core->dev ? " " : "",
+                     core->dev ?: "");
         return -1;
     }
 
@@ -1127,6 +1219,7 @@ static int coreaudio_init_in(HWVoiceIn *hw, struct audsettings *as)
         qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
 
     core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+    core->dev = cpdo->dev;
 
     status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
                                             &voice_in_addr,
