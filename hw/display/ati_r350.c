@@ -3209,31 +3209,45 @@ static void ati_r350_pm4_parse(ATIR350State *s,
 
         case R350_PM4_OPCODE_BITBLT:
             /*
-             * Four dwords: context, SRC_X_Y, DST_X_Y,
-             * DST_WIDTH_HEIGHT -- and, like the registers of those
-             * names (and unlike PAINT's corners), X and WIDTH sit in
-             * the HIGH half with Y and HEIGHT in the low one.
-             * Established from a live capture of Mac OS dragging a
-             * window between screens, where each move issues three
-             * blits that must tile the window exactly; only this
-             * reading makes them do so. Reading three dwords from
-             * index 0 took the CONTEXT dword for the source point, so
-             * every window copy fetched its pixels from a nonsense
-             * position -- corruption that then travelled with the
-             * window, since this is the path that moves its bits.
+             * Context, then the pitch/offset dwords the context
+             * announces (SRC_PITCH_OFFSET_CNTL, DST_PITCH_OFFSET_CNTL,
+             * in that order), then SRC_X_Y, DST_X_Y, DST_WIDTH_HEIGHT
+             * -- and, like the registers of those names (and unlike
+             * PAINT's corners), X and WIDTH sit in the HIGH half with Y
+             * and HEIGHT in the low one. The packet length says how many
+             * dwords precede the rectangle; Mac OS X 10.5 scrolls a view
+             * in place with a five-dword packet carrying the source
+             * pitch/offset.
              */
-            if (p->p3_param_idx < 4) {
-                p->p3_params[p->p3_param_idx++] = val;
-                if (p->p3_param_idx == 4) {
-                    ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL,
-                                            p->p3_params[0]);
-                    s->src_y = p->p3_params[1] & 0x3fff;
-                    s->src_x = (p->p3_params[1] >> 16) & 0x3fff;
-                    s->dst_y = p->p3_params[2] & 0x3fff;
-                    s->dst_x = (p->p3_params[2] >> 16) & 0x3fff;
-                    s->dst_height = p->p3_params[3] & 0x3fff;
-                    s->dst_width = (p->p3_params[3] >> 16) & 0x3fff;
-                    ati_r350_2d_blt(s);
+            {
+                uint32_t nopt = p->p3_total > 4 ? p->p3_total - 4 : 0;
+                uint32_t idx = p->p3_param_idx++;
+
+                if (idx == 0) {
+                    p->p3_params[0] = val;
+                    ati_r350_reg_write32(s, R350_DP_GUI_MASTER_CNTL, val);
+                } else if (idx <= nopt) {
+                    bool src = p->p3_params[0] &
+                               R350_GMC_SRC_PITCH_OFFSET_CNTL;
+                    bool dst = p->p3_params[0] &
+                               R350_GMC_DST_PITCH_OFFSET_CNTL;
+
+                    if (idx == 1 && src) {
+                        ati_r350_reg_write32(s, R350_SRC_PITCH_OFFSET, val);
+                    } else if (idx == 1 + src && dst) {
+                        ati_r350_reg_write32(s, R350_DST_PITCH_OFFSET, val);
+                    }
+                } else if (idx <= nopt + 3) {
+                    p->p3_params[idx - nopt] = val;
+                    if (idx == nopt + 3) {
+                        s->src_y = p->p3_params[1] & 0x3fff;
+                        s->src_x = (p->p3_params[1] >> 16) & 0x3fff;
+                        s->dst_y = p->p3_params[2] & 0x3fff;
+                        s->dst_x = (p->p3_params[2] >> 16) & 0x3fff;
+                        s->dst_height = p->p3_params[3] & 0x3fff;
+                        s->dst_width = (p->p3_params[3] >> 16) & 0x3fff;
+                        ati_r350_2d_blt(s);
+                    }
                 }
             }
             break;
