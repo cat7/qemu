@@ -3342,7 +3342,7 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
     const uint32_t *regs = s->regs;
     float konst[R300_US_CONSTS][4];
     uint64_t sig;
-    unsigned i, tc_named = 0;
+    unsigned i;
 
     /*
      * One decode per program, not per draw: the signature is US_CONFIG
@@ -3532,45 +3532,10 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
      * is passed over. Every draw that predates multitexturing lands on
      * ntc 1 and unit 0, which is the arithmetic it always had.
      */
-    d->ntc = 1;
-    d->tc_raw = 0;
+    d->ntc = p->ntc;
+    d->tc_raw = p->tc_raw;
     for (i = 0; i < R300_TEXCOORDS; i++) {
-        d->tc_unit[i] = 0;
-        if (p->rs.tex_reg[i] >= 0) {
-            d->ntc = i + 1;
-            d->tc_raw |= 1u << i;
-        }
-    }
-    for (i = 0; d->fs_run && i < p->ntex; i++) {
-        const R300UsTex *t = &p->tex[i];
-        unsigned k;
-
-        if (t->op == R300_US_TEXOP_NOP || t->op == R300_US_TEXOP_TEXKILL) {
-            continue;
-        }
-        for (k = 0; k < d->ntc; k++) {
-            if (p->rs.tex_reg[k] == t->src) {
-                d->tc_raw &= ~(1u << k);
-            }
-        }
-    }
-    if (!d->fs_run) {
-        d->tc_raw = 0;
-    }
-    for (i = 0; d->fs_run && i < p->ntex; i++) {
-        const R300UsTex *t = &p->tex[i];
-        unsigned k;
-
-        if ((t->op != R300_US_TEXOP_LD && t->op != R300_US_TEXOP_PROJ) ||
-            t->unit >= R300_TEX_UNITS) {
-            continue;
-        }
-        for (k = 0; k < d->ntc; k++) {
-            if (p->rs.tex_reg[k] == t->src && !(tc_named & (1u << k))) {
-                d->tc_unit[k] = t->unit;
-                tc_named |= 1u << k;
-            }
-        }
+        d->tc_unit[i] = p->tc_unit[i];
     }
     s->us_draws++;
     if (p->valid && !p->expressible) {
@@ -6709,9 +6674,9 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
 
 /*
  * One vertex of the expanded triangle list, in the backend's layout.
- * Only R350_GL_TEXCOORDS sets are carried, which is one: the caller
- * offloads a draw only when the translator could express its program,
- * and that shape reads coordinate set 0 and nothing else.
+ * Only R350_GL_TEXCOORDS sets are carried, which is one: set 0, all a
+ * simple-form program reads. A general-form program's sets travel in
+ * the coordinate block (r300_gl_tcx()).
  */
 static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
                         const R300Vtx *t1, const R300Vtx *t2, float inv)
@@ -6755,6 +6720,31 @@ static void r300_gl_vtx(float *v, const R300Vtx *me, const R300Vtx *t0,
     v[35 + 8 * C] = t2->b1; v[36 + 8 * C] = t2->a1;
     v[37 + 8 * C] = inv;
     v[38 + 8 * C] = t0->w; v[39 + 8 * C] = t1->w; v[40 + 8 * C] = t2->w;
+}
+
+/*
+ * One triangle's coordinate block for a general-form request, in
+ * R350GlReq.tcx's layout: per set, per corner, (s, t) in the carrying
+ * unit's texels and then the four raw components.
+ */
+static void r300_gl_tcx(float *o, unsigned ntc, const R300Vtx *t0,
+                        const R300Vtx *t1, const R300Vtx *t2)
+{
+    const R300Vtx *t[3] = { t0, t1, t2 };
+    unsigned k, c;
+
+    for (k = 0; k < ntc; k++) {
+        for (c = 0; c < 3; c++, o += 8) {
+            o[0] = t[c]->tc[k][0];
+            o[1] = t[c]->tc[k][1];
+            o[2] = 0.0f;
+            o[3] = 0.0f;
+            o[4] = t[c]->tcr[k][0];
+            o[5] = t[c]->tcr[k][1];
+            o[6] = t[c]->tcr[k][2];
+            o[7] = t[c]->tcr[k][3];
+        }
+    }
 }
 
 /*
@@ -6864,7 +6854,8 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     unsigned ntri = 0, npass = 1, i, xr = 0;
     int x0, y0, x1, y1, w, h;
     size_t rect_sz, texels = 0;
-    bool sc_empty = false;
+    bool sc_empty = false, gen;
+    unsigned tcs = 0;
 
     for (i = 0; i < R300_TEX_UNITS; i++) {
         texslot[i] = R350_GL_TEXSLOTS;
@@ -6880,6 +6871,17 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * something else would be the one thing worse than either.
      */
     if (!d->fs_run || !s->us_glsl_ok) {
+        return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
+    }
+    /*
+     * The general form interpolates every coordinate set from the
+     * triangle's corners. The point and rectangle expansions below
+     * synthesise set 0 or extrapolate (s, t) only, so a program reading
+     * more than that stays on the path whose expansion it was written
+     * against.
+     */
+    gen = !d->fs->gl_simple;
+    if (gen && (prim == 1 || prim == 8)) {
         return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
     }
     /* the GL target has no depth or stencil buffer: the Z buffer is ours */
@@ -7041,6 +7043,13 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         s->gl_verts_sz = (size_t)ntri * 3 * R350_GL_VSTRIDE * sizeof(float);
         s->gl_verts = g_realloc(s->gl_verts, s->gl_verts_sz);
     }
+    if (gen) {
+        tcs = d->ntc * 6;
+        if ((size_t)ntri * tcs * 4 * sizeof(float) > s->gl_tcx_sz) {
+            s->gl_tcx_sz = (size_t)ntri * tcs * 4 * sizeof(float);
+            s->gl_tcx = g_realloc(s->gl_tcx, s->gl_tcx_sz);
+        }
+    }
 
     for (i = 0; i < ntri; i++) {
         /* pass order when there is one, submission order otherwise */
@@ -7054,6 +7063,9 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         for (k = 0; k < 3; k++) {
             r300_gl_vtx(s->gl_verts + (size_t)(i * 3 + k) * R350_GL_VSTRIDE,
                         &gvb[idx[src + k]], t0, t1, t2, inv);
+        }
+        if (gen) {
+            r300_gl_tcx(s->gl_tcx + (size_t)i * tcs * 4, d->ntc, t0, t1, t2);
         }
     }
     for (i = 0; i < R300_TEX_UNITS; i++) {
@@ -7108,11 +7120,30 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.us_glsl = s->us_glsl;
     req.us_key = s->us_glsl_key;
     req.us_konst = s->us_konst_flat;
+    if (gen) {
+        req.tcx = s->gl_tcx;
+        req.tc_stride = tcs;
+        req.tc_raw = d->tc_raw;
+        req.lod_any = d->lod_any;
+        /* r300_raster_tri()'s reciprocals of each set's carrying unit */
+        for (i = 0; i < R350_GL_TCSETS; i++) {
+            const R300TexUnit *u = &d->tex[i < d->ntc ? d->tc_unit[i] : 0];
+
+            req.tcinv[i][0] = i < d->ntc && u->w ? 1.0f / (float)u->w : 1.0f;
+            req.tcinv[i][1] = i < d->ntc && u->h ? 1.0f / (float)u->h : 1.0f;
+        }
+    }
 
     if (s->gl_mode == R350_GL_VERIFY) {
         r300_gl_rd_rect(d, xr, x0, y0, w, h, s->gl_before);
     }
     if (!ati_r350_gl_draw(s->gl_ctx, &req)) {
+        /* what the backend refused may not be what its slots now hold */
+        for (i = 0; i < R300_TEX_UNITS; i++) {
+            if (d->tex[i].en && texslot[i] < R300_GL_TEXCACHE) {
+                s->gl_tex[texslot[i]].up = false;
+            }
+        }
         ati_r350_gl_release(s, R350_GLR_BACKEND);
         return r300_gl_fallback(s, R350_GLF_BACKEND, prim, nvtx);
     }

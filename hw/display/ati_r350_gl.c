@@ -277,6 +277,9 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_RGBA8UI                      0x8D7C
 #define GL_RGBA_INTEGER                 0x8D99
 #define GL_NUM_EXTENSIONS               0x821D
+#define GL_RGBA32F                      0x8814
+#define GL_TEXTURE_BUFFER               0x8C2A
+#define GL_MAX_TEXTURE_BUFFER_SIZE      0x8C2B
 
 /* GL 1.1: opengl32.dll's own exports */
 static void (APIENTRY *glBindTexture)(GLenum, GLuint);
@@ -340,11 +343,17 @@ static void (APIENTRY *glUniform1fv)(GLint, GLsizei, const GLfloat *);
 static void (APIENTRY *glUniform1i)(GLint, GLint);
 static void (APIENTRY *glUniform1iv)(GLint, GLsizei, const GLint *);
 static void (APIENTRY *glUniform2f)(GLint, GLfloat, GLfloat);
+typedef void APIENTRY R350GlUniform2fv(GLint, GLsizei, const GLfloat *);
+static R350GlUniform2fv *glUniform2fv;
 static void (APIENTRY *glUniform2i)(GLint, GLint, GLint);
+typedef void APIENTRY R350GlUniform2iv(GLint, GLsizei, const GLint *);
+static R350GlUniform2iv *glUniform2iv;
 static void (APIENTRY *glUniform3i)(GLint, GLint, GLint, GLint);
 static void (APIENTRY *glUniform4f)(GLint, GLfloat, GLfloat, GLfloat,
                                     GLfloat);
 static void (APIENTRY *glUniform4fv)(GLint, GLsizei, const GLfloat *);
+typedef void APIENTRY R350GlTexBuffer(GLenum, GLenum, GLuint);
+static R350GlTexBuffer *glTexBuffer;
 static void (APIENTRY *glUseProgram)(GLuint);
 static void (APIENTRY *glVertexAttribPointer)(GLuint, GLint, GLenum,
                                               GLboolean, GLsizei,
@@ -409,10 +418,13 @@ static const struct {
     R350_GL_PROC(glUniform1i),
     R350_GL_PROC(glUniform1iv),
     R350_GL_PROC(glUniform2f),
+    R350_GL_PROC(glUniform2fv),
     R350_GL_PROC(glUniform2i),
+    R350_GL_PROC(glUniform2iv),
     R350_GL_PROC(glUniform3i),
     R350_GL_PROC(glUniform4f),
     R350_GL_PROC(glUniform4fv),
+    R350_GL_PROC(glTexBuffer),
     R350_GL_PROC(glUseProgram),
     R350_GL_PROC(glVertexAttribPointer),
 };
@@ -734,7 +746,23 @@ typedef struct R350GlProg {
     GLint u_blend, u_blendread, u_cfac, u_afac, u_konst;
     GLint u_usk;
     GLint u_tf;
+    /* the general form's; -1 in a program of the simple form */
+    GLint u_txsize, u_txclamp, u_txtf, u_txen;
+    GLint u_tcbase, u_tcstride, u_tcinv, u_tcraw, u_lodany;
 } R350GlProg;
+
+/*
+ * Where each guest texture unit is bound in the general form: unit 0
+ * where the simple form binds its one texture, the others above the
+ * destination copy (1) and the add-blend twin (2). The coordinate block
+ * is a buffer texture after them.
+ */
+static inline unsigned gl_txunit(unsigned un)
+{
+    return un ? 2 + un : 0;
+}
+
+#define R350_GL_TCUNIT 10
 
 /*
  * One guest fragment program, linked. There is no single draw shader any
@@ -792,6 +820,11 @@ struct R350GlCtx {
     size_t nqv, qv_cap;
     bool q_prebarrier;
     uint64_t q_units, q_flushes, q_waves;
+    /* the general form's coordinate block, per queue and on the GPU */
+    GLuint tcbo, tctex;
+    float *qt;
+    size_t nqt, qt_cap;
+    size_t tc_max;                      /* texels a buffer texture holds */
     char desc[128];
 };
 
@@ -1150,6 +1183,175 @@ static const char *fs_src =
 "    dy = ry;\n"
 "}\n"
 "\n"
+/*
+ * The general form's fetch: r300_us_sample() for any unit, with the same
+ * filter as above reading that unit's own state. A sampler array is
+ * indexed by literals only, which GLSL 3.30 allows without qualification.
+ */
+"#ifdef R350_USGEN\n"
+"uniform usampler2D u_txs[8];\n"
+"uniform ivec2 u_txsize[8];\n"
+"uniform ivec2 u_txclamp[8];\n"
+"uniform int u_txtf[128];\n"
+"uniform int u_txen;\n"
+"uniform samplerBuffer u_tcbuf;\n"
+"uniform int u_tcbase;\n"
+"uniform int u_tcstride;\n"
+"uniform vec2 u_tcinv[8];\n"
+"uniform int u_tcraw;\n"
+"uniform int u_lodany;\n"
+"vec4 us_der[8];\n"
+"\n"
+"uvec4 gtexel(int un, int l, ivec2 ij)\n"
+"{\n"
+"    if (un == 0) return texelFetch(u_txs[0], ij, l);\n"
+"    if (un == 1) return texelFetch(u_txs[1], ij, l);\n"
+"    if (un == 2) return texelFetch(u_txs[2], ij, l);\n"
+"    if (un == 3) return texelFetch(u_txs[3], ij, l);\n"
+"    if (un == 4) return texelFetch(u_txs[4], ij, l);\n"
+"    if (un == 5) return texelFetch(u_txs[5], ij, l);\n"
+"    if (un == 6) return texelFetch(u_txs[6], ij, l);\n"
+"    return texelFetch(u_txs[7], ij, l);\n"
+"}\n"
+"\n"
+"uvec4 gfetch(int un, int l, int i, int j)\n"
+"{\n"
+"    if (i < 0 || j < 0)\n"
+"        return uvec4(u_txtf[un * 16 + 11], u_txtf[un * 16 + 12],\n"
+"                     u_txtf[un * 16 + 13], u_txtf[un * 16 + 14]);\n"
+"    return gtexel(un, l, ivec2(i, j));\n"
+"}\n"
+"\n"
+"uvec4 glevel(int un, int l, float fs, float ft, bool lin)\n"
+"{\n"
+"    ivec2 cl = u_txclamp[un];\n"
+"    int w = max(u_txsize[un].x >> l, 1), h = max(u_txsize[un].y >> l, 1);\n"
+"    precise float ss = tc_pre(ldexp(fs, -min(l, u_txtf[un * 16 + 9])), w,\n"
+"                              cl.x);\n"
+"    precise float tt = tc_pre(ldexp(ft, -min(l, u_txtf[un * 16 + 10])), h,\n"
+"                              cl.y);\n"
+"    if (!lin)\n"
+"        return gfetch(un, l, tc_idx(int(floor(ss)), w, cl.x, true),\n"
+"                      tc_idx(int(floor(tt)), h, cl.y, true));\n"
+"    precise float fx = ss - 0.5;\n"
+"    precise float fy = tt - 0.5;\n"
+"    precise float x0 = floor(fx);\n"
+"    precise float y0 = floor(fy);\n"
+"    precise float qx = fx - x0;\n"
+"    precise float qy = fy - y0;\n"
+"    int wx = int(qx * 256.0 + 0.5);\n"
+"    int wy = int(qy * 256.0 + 0.5);\n"
+"    int i0 = int(x0), j0 = int(y0);\n"
+"    if (wx == 256) { i0++; wx = 0; }\n"
+"    if (wy == 256) { j0++; wy = 0; }\n"
+"    int i1 = tc_idx(i0 + 1, w, cl.x, false);\n"
+"    int j1 = tc_idx(j0 + 1, h, cl.y, false);\n"
+"    i0 = tc_idx(i0, w, cl.x, false);\n"
+"    j0 = tc_idx(j0, h, cl.y, false);\n"
+"    uvec4 t00 = gfetch(un, l, i0, j0);\n"
+"    uvec4 t10 = wx != 0 ? gfetch(un, l, i1, j0) : t00;\n"
+"    if (wy == 0) return wx != 0 ? tlerp(t00, t10, wx) : t00;\n"
+"    uvec4 t01 = gfetch(un, l, i0, j1);\n"
+"    uvec4 t11 = wx != 0 ? gfetch(un, l, i1, j1) : t01;\n"
+"    ivec4 top = ivec4(t00) * (256 - wx) + ivec4(t10) * wx;\n"
+"    ivec4 bot = ivec4(t01) * (256 - wx) + ivec4(t11) * wx;\n"
+"    return uvec4((top * (256 - wy) + bot * wy + 32768) >> 16);\n"
+"}\n"
+"\n"
+"uvec4 gmip(int un, int lod, float fs, float ft)\n"
+"{\n"
+"    int b = un * 16;\n"
+"    bool lin = u_txtf[b + 3] != 1;\n"
+"    int lo = min(max(lod, u_txtf[b + 6] * 256), u_txtf[b + 7] * 256);\n"
+"    if (u_txtf[b + 4] == 1)\n"
+"        return glevel(un, min((lo + 128) >> 8, u_txtf[b + 7]), fs, ft,\n"
+"                      lin);\n"
+"    int l = lo >> 8;\n"
+"    if (u_txtf[b + 4] != 2 || l >= u_txtf[b + 7] || (lo & 255) == 0)\n"
+"        return glevel(un, l, fs, ft, lin);\n"
+"    return tlerp(glevel(un, l, fs, ft, lin),\n"
+"                 glevel(un, l + 1, fs, ft, lin), lo & 255);\n"
+"}\n"
+"\n"
+"uvec4 gfilter(int un, float fs, float ft, vec4 der)\n"
+"{\n"
+"    int b = un * 16;\n"
+"    int lod = 0, nl = 0;\n"
+"    precise float ax = 0.0, ay = 0.0;\n"
+"    if (u_txtf[b + 1] != 0) {\n"
+"        precise float m = der.x * der.x;\n"
+"        precise float n = der.y * der.y;\n"
+"        precise float px = m + n;\n"
+"        m = der.z * der.z;\n"
+"        n = der.w * der.w;\n"
+"        precise float py = m + n;\n"
+"        if (u_txtf[b + 3] == 3) {\n"
+"            int lmaj = tlog2(px >= py ? px : py);\n"
+"            int lmin = tlog2(px >= py ? py : px);\n"
+"            nl = min(max(((lmaj - lmin) / 2 + 255) >> 8, 0), u_txtf[b + 5]);\n"
+"            lod = (lmaj >> 1) - nl * 256;\n"
+"            ax = px >= py ? der.x : der.z;\n"
+"            ay = px >= py ? der.y : der.w;\n"
+"        } else {\n"
+"            lod = tlog2(px >= py ? px : py) >> 1;\n"
+"        }\n"
+"        lod += u_txtf[b + 8];\n"
+"    }\n"
+"    if (lod <= 0) return glevel(un, u_txtf[b + 6], fs, ft, u_txtf[b + 2] != 1);\n"
+"    if (nl == 0) return gmip(un, lod, fs, ft);\n"
+"    int N = 1 << nl;\n"
+"    uvec4 sum = uvec4(0u);\n"
+"    for (int k = 0; k < N; k++) {\n"
+"        precise float ok = float(2 * k + 1 - N) / float(2 * N);\n"
+"        precise float ds = ax * ok;\n"
+"        precise float dt = ay * ok;\n"
+"        precise float s1 = fs + ds;\n"
+"        precise float t1 = ft + dt;\n"
+"        sum += gmip(un, lod, s1, t1);\n"
+"    }\n"
+"    return (sum + uint(N >> 1)) >> uint(nl);\n"
+"}\n"
+"\n"
+"vec4 us_fetch(int un, vec4 coord, int dset)\n"
+"{\n"
+"    if (((u_txen >> un) & 1) == 0) return vec4(1.0);\n"
+"    int w = u_txsize[un].x, h = u_txsize[un].y;\n"
+"    precise float fs = coord.x * float(w);\n"
+"    precise float ft = coord.y * float(h);\n"
+"    uvec4 tu;\n"
+"    if (u_txtf[un * 16] != 0) {\n"
+"        vec4 der = vec4(0.0);\n"
+"        if (u_txtf[un * 16 + 1] != 0) {\n"
+"            vec4 g = us_der[dset];\n"
+"            precise float d0 = g.x * float(w);\n"
+"            precise float d1 = g.y * float(h);\n"
+"            precise float d2 = g.z * float(w);\n"
+"            precise float d3 = g.w * float(h);\n"
+"            der = vec4(d0, d1, d2, d3);\n"
+"        }\n"
+"        tu = gfilter(un, fs, ft, der);\n"
+"    } else {\n"
+"        int tx = int(fs);\n"
+"        int ty = int(ft);\n"
+"        if (u_txclamp[un].x <= 1 && w > 0) {\n"
+"            tx = tx % w;\n"
+"            if (tx < 0) tx += w;\n"
+"        } else {\n"
+"            tx = clamp(tx, 0, w - 1);\n"
+"        }\n"
+"        if (u_txclamp[un].y <= 1 && h > 0) {\n"
+"            ty = ty % h;\n"
+"            if (ty < 0) ty += h;\n"
+"        } else {\n"
+"            ty = clamp(ty, 0, h - 1);\n"
+"        }\n"
+"        tu = gtexel(un, 0, ivec2(tx, ty));\n"
+"    }\n"
+"    return vec4(u_n255[int(tu.r)], u_n255[int(tu.g)],\n"
+"                u_n255[int(tu.b)], u_n255[int(tu.a)]);\n"
+"}\n"
+"#endif\n"
+"\n"
 "void main()\n"
 "{\n"
 "    precise vec4 c;\n"
@@ -1183,8 +1385,8 @@ static const char *fs_src =
 "    }\n"
 "    c = fma(vec4(w2), f_c2, fma(vec4(w1), f_c1, w0 * f_c0));\n"
 /*
- * Coordinate set 0, the only one a request carries -- a translated
- * program reads no other. See the coordinate-set note in ati_r350_gl.h.
+ * Coordinate set 0 from the vertex array, all a simple-form program
+ * reads. See the coordinate-set note in ati_r350_gl.h.
  */
 "    precise vec2 st = fma(vec2(w2), f_t2,\n"
 "                          fma(vec2(w1), f_t1, w0 * f_t0));\n"
@@ -1197,6 +1399,66 @@ static const char *fs_src =
  * program, translated; nothing here decides what it computes.
  */
 "    precise vec4 c1 = fma(vec4(w2), f_s2, fma(vec4(w1), f_s1, w0 * f_s0));\n"
+"#ifdef R350_USGEN\n"
+/*
+ * Every coordinate set r300_raster_tri() interpolates, with its weights,
+ * in the guest's units, and their derivatives where a unit filters with
+ * a footprint; then the program, which fetches as it goes.
+ */
+"    {\n"
+"        int tb = u_tcbase + gl_PrimitiveID * u_tcstride;\n"
+"        precise vec3 ga = vec3(0.0);\n"
+"        precise vec3 gb = vec3(0.0);\n"
+"        if (u_lodany != 0) {\n"
+"            precise float a0 = -(f_p2.y - f_p1.y) * f_inv.x;\n"
+"            precise float b0 = (f_p2.x - f_p1.x) * f_inv.x;\n"
+"            precise float a1 = -(f_p0.y - f_p2.y) * f_inv.x;\n"
+"            precise float b1 = (f_p0.x - f_p2.x) * f_inv.x;\n"
+"            ga = vec3(a0, a1, -(a0 + a1));\n"
+"            gb = vec3(b0, b1, -(b0 + b1));\n"
+"            if (persp) {\n"
+"                ga = ga * f_inv.yzw;\n"
+"                gb = gb * f_inv.yzw;\n"
+"            }\n"
+"        }\n"
+"        for (int k = 0; k < 8; k++) {\n"
+"            us_tc[k] = vec4(0.0, 0.0, 0.0, 1.0);\n"
+"            us_der[k] = vec4(0.0);\n"
+"        }\n"
+"        for (int k = 0; k < US_NTC; k++) {\n"
+"            vec4 s0 = texelFetch(u_tcbuf, tb + k * 6);\n"
+"            vec4 s1 = texelFetch(u_tcbuf, tb + k * 6 + 2);\n"
+"            vec4 s2 = texelFetch(u_tcbuf, tb + k * 6 + 4);\n"
+"            precise float is = fma(w2, s2.x, fma(w1, s1.x, w0 * s0.x));\n"
+"            precise float it = fma(w2, s2.y, fma(w1, s1.y, w0 * s0.y));\n"
+"            precise float ns = is * u_tcinv[k].x;\n"
+"            precise float nt = it * u_tcinv[k].y;\n"
+"            precise vec4 tc = vec4(ns, nt, 0.0, 1.0);\n"
+"            if (u_lodany != 0) {\n"
+"                float dx, dy, ex, ey;\n"
+"                tc_der(ga, gb, s0.x, s1.x, s2.x, is, iq, dx, dy);\n"
+"                tc_der(ga, gb, s0.y, s1.y, s2.y, it, iq, ex, ey);\n"
+"                precise float g0 = dx * u_tcinv[k].x;\n"
+"                precise float g1 = ex * u_tcinv[k].y;\n"
+"                precise float g2 = dy * u_tcinv[k].x;\n"
+"                precise float g3 = ey * u_tcinv[k].y;\n"
+"                us_der[k] = vec4(g0, g1, g2, g3);\n"
+"            }\n"
+"            if (((u_tcraw >> k) & 1) != 0) {\n"
+"                vec4 r0 = texelFetch(u_tcbuf, tb + k * 6 + 1);\n"
+"                vec4 r1 = texelFetch(u_tcbuf, tb + k * 6 + 3);\n"
+"                vec4 r2 = texelFetch(u_tcbuf, tb + k * 6 + 5);\n"
+"                tc = fma(vec4(w2), r2, fma(vec4(w1), r1, w0 * r0));\n"
+"            }\n"
+"            us_tc[k] = tc;\n"
+"        }\n"
+"        vec4 shaded;\n"
+"        bool kill;\n"
+"        us_main(c, c1, shaded, kill);\n"
+"        if (kill) discard;\n"
+"        c = shaded;\n"
+"    }\n"
+"#else\n"
 "    vec4 texel = vec4(1.0);\n"
 "    if (u_textured != 0 && u_tf[0] != 0) {\n"
 "        vec4 der = vec4(0.0);\n"
@@ -1245,6 +1507,7 @@ static const char *fs_src =
 "        us_main(texel, c, c1, shaded);\n"
 "        c = shaded;\n"
 "    }\n"
+"#endif\n"
 /*
  * GL core profile has no alpha test; DISCARD_SRC_PIXELS has no GL
  * equivalent at all. Both become a `discard`.
@@ -1432,6 +1695,16 @@ static void gl_prog_locs(R350GlProg *p)
         n255[k] = k / 255.0f;
     }
     glUniform1fv(glGetUniformLocation(p->prog, "u_n255"), 256, n255);
+    {
+        GLint su[R350_GL_TEXUNITS];
+
+        for (k = 0; k < R350_GL_TEXUNITS; k++) {
+            su[k] = gl_txunit(k);
+        }
+        glUniform1iv(glGetUniformLocation(p->prog, "u_txs"),
+                     R350_GL_TEXUNITS, su);
+        glUniform1i(glGetUniformLocation(p->prog, "u_tcbuf"), R350_GL_TCUNIT);
+    }
 
     p->u_rect = glGetUniformLocation(p->prog, "u_rect");
     p->u_org = glGetUniformLocation(p->prog, "u_org");
@@ -1449,6 +1722,15 @@ static void gl_prog_locs(R350GlProg *p)
     p->u_konst = glGetUniformLocation(p->prog, "u_konst");
     p->u_usk = glGetUniformLocation(p->prog, "USK");
     p->u_tf = glGetUniformLocation(p->prog, "u_tf");
+    p->u_txsize = glGetUniformLocation(p->prog, "u_txsize");
+    p->u_txclamp = glGetUniformLocation(p->prog, "u_txclamp");
+    p->u_txtf = glGetUniformLocation(p->prog, "u_txtf");
+    p->u_txen = glGetUniformLocation(p->prog, "u_txen");
+    p->u_tcbase = glGetUniformLocation(p->prog, "u_tcbase");
+    p->u_tcstride = glGetUniformLocation(p->prog, "u_tcstride");
+    p->u_tcinv = glGetUniformLocation(p->prog, "u_tcinv");
+    p->u_tcraw = glGetUniformLocation(p->prog, "u_tcraw");
+    p->u_lodany = glGetUniformLocation(p->prog, "u_lodany");
 }
 
 /*
@@ -1591,6 +1873,21 @@ R350GlCtx *ati_r350_gl_open(const char **err)
         }
     }
 
+    {
+        GLint mx = 0;
+
+        glGenBuffers(1, &g->tcbo);
+        glGenTextures(1, &g->tctex);
+        glBindBuffer(GL_TEXTURE_BUFFER, g->tcbo);
+        glBufferData(GL_TEXTURE_BUFFER, 16, NULL, GL_STREAM_DRAW);
+        glActiveTexture(GL_TEXTURE0 + R350_GL_TCUNIT);
+        glBindTexture(GL_TEXTURE_BUFFER, g->tctex);
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, g->tcbo);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &mx);
+        g->tc_max = mx > 0 ? (size_t)mx : 0;
+    }
+
     g->barrier = r350_gl_plat_has_barrier();
     snprintf(g->desc, sizeof(g->desc), R350_GL_BACKEND_NAME ", %s / GLSL %s%s",
              (const char *)glGetString(GL_VERSION),
@@ -1622,6 +1919,8 @@ void ati_r350_gl_close(R350GlCtx *g)
         glDeleteTextures(1, &g->cbuf);
         glDeleteFramebuffers(1, &g->fbo);
         glDeleteBuffers(1, &g->vbo);
+        glDeleteBuffers(1, &g->tcbo);
+        glDeleteTextures(1, &g->tctex);
         glDeleteVertexArrays(1, &g->vao);
         glDeleteVertexArrays(1, &g->vao_blit);
         for (k = 0; k < R350_GL_PROGSLOTS; k++) {
@@ -1636,6 +1935,7 @@ void ati_r350_gl_close(R350GlCtx *g)
     g_free(g->stage);
     g_free(g->q);
     g_free(g->qv);
+    g_free(g->qt);
     g_free(g);
 }
 
@@ -1872,6 +2172,16 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
 #define R350_GL_QUEUE 1024
 #define R350_GL_QUEUE_VERTS (256 * 1024)
 
+/* a request's general-form state, flattened the way the uniforms take it */
+typedef struct R350GlGen {
+    uint32_t textured;
+    unsigned slot[R350_GL_TEXUNITS];
+    GLint size[R350_GL_TEXUNITS * 2], clamp[R350_GL_TEXUNITS * 2];
+    GLint tf[R350_GL_TEXUNITS * R350_GL_TF];
+    float tcinv[R350_GL_TCSETS * 2];
+    int tcstride, tcraw, lodany;
+} R350GlGen;
+
 typedef struct R350GlUnit {
     const R350GlProg *p;
     unsigned first, count;
@@ -1892,25 +2202,39 @@ typedef struct R350GlUnit {
     float k_r, k_g, k_b, k_a;
     bool usk;
     float usk_v[R350_GL_USK * 4];
+    /* a general-form program's units and coordinate block */
+    bool gen;
+    int tcbase;
+    R350GlGen ge;
 } R350GlUnit;
 
-/* the unit-0 filter uniform: `filt`, then the border colour */
-static void gl_tf(const R350GlReq *r, GLint *tf)
+/* one unit's filter uniform: `filt`, then the border colour */
+static void gl_tf_unit(const R350GlReq *r, unsigned un, GLint *tf)
 {
     unsigned k;
 
     for (k = 0; k < 11; k++) {
-        tf[k] = r->filt[0][k];
+        tf[k] = r->filt[un][k];
     }
     for (k = 0; k < 4; k++) {
-        tf[11 + k] = r->border[0][k];
+        tf[11 + k] = r->border[un][k];
     }
     tf[15] = 0;
 }
 
+static void gl_tf(const R350GlReq *r, GLint *tf)
+{
+    gl_tf_unit(r, 0, tf);
+}
+
+static int gl_levels_unit(const R350GlReq *r, unsigned un)
+{
+    return r->filt[un][0] ? MAX(r->levels[un], 1) : 1;
+}
+
 static int gl_levels(const R350GlReq *r)
 {
-    return r->filt[0][0] ? MAX(r->levels[0], 1) : 1;
+    return gl_levels_unit(r, 0);
 }
 
 /*
@@ -1918,12 +2242,13 @@ static int gl_levels(const R350GlReq *r)
  * carries, each max(w >> l, 1) x max(h >> l, 1). The shader reads them
  * with texelFetch, which needs the chain complete, not filterable.
  */
-static void gl_upload_tex(R350GlCtx *g, unsigned slot, const R350GlReq *r)
+static void gl_upload_tex_unit(R350GlCtx *g, unsigned slot,
+                               const R350GlReq *r, unsigned un)
 {
-    int nl = gl_levels(r), l;
-    bool same = g->tex_w[slot] == r->tex_w[0] &&
-                g->tex_h[slot] == r->tex_h[0] && g->tex_nl[slot] == nl;
-    const uint8_t *p = r->tex[0];
+    int nl = gl_levels_unit(r, un), l;
+    bool same = g->tex_w[slot] == r->tex_w[un] &&
+                g->tex_h[slot] == r->tex_h[un] && g->tex_nl[slot] == nl;
+    const uint8_t *p = r->tex[un];
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
                     nl > 1 ? GL_NEAREST_MIPMAP_NEAREST : GL_NEAREST);
@@ -1931,7 +2256,7 @@ static void gl_upload_tex(R350GlCtx *g, unsigned slot, const R350GlReq *r)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, nl - 1);
     for (l = 0; l < nl; l++) {
-        int w = MAX(r->tex_w[0] >> l, 1), h = MAX(r->tex_h[0] >> l, 1);
+        int w = MAX(r->tex_w[un] >> l, 1), h = MAX(r->tex_h[un] >> l, 1);
 
         if (same) {
             glTexSubImage2D(GL_TEXTURE_2D, l, 0, 0, w, h, GL_RGBA_INTEGER,
@@ -1942,9 +2267,14 @@ static void gl_upload_tex(R350GlCtx *g, unsigned slot, const R350GlReq *r)
         }
         p += (size_t)w * h * 4;
     }
-    g->tex_w[slot] = r->tex_w[0];
-    g->tex_h[slot] = r->tex_h[0];
+    g->tex_w[slot] = r->tex_w[un];
+    g->tex_h[slot] = r->tex_h[un];
     g->tex_nl[slot] = nl;
+}
+
+static void gl_upload_tex(R350GlCtx *g, unsigned slot, const R350GlReq *r)
+{
+    gl_upload_tex_unit(g, slot, r, 0);
 }
 
 static bool gl_rect_meet(int ax0, int ay0, int ax1, int ay1,
@@ -1958,12 +2288,129 @@ static bool gl_queue_uses_slot(R350GlCtx *g, unsigned slot)
     unsigned k;
 
     for (k = 0; k < g->nq; k++) {
-        if (g->q[k].tex_slot == slot) {
+        const R350GlUnit *u = &g->q[k];
+        unsigned un;
+
+        if (u->tex_slot == slot) {
             return true;
+        }
+        for (un = 0; u->gen && un < R350_GL_TEXUNITS; un++) {
+            if ((u->ge.textured & (1u << un)) && u->ge.slot[un] == slot) {
+                return true;
+            }
         }
     }
     return false;
 }
+
+/*
+ * The general form's textures: every unit the request samples, each
+ * into the slot the caller named, uploaded once when several units share
+ * one. False when the request cannot be bound -- two units wanting the
+ * scratch, or a slot the caller called current that is not.
+ * `queue` empties the queue before a slot a queued draw reads is
+ * overwritten.
+ */
+static bool gl_bind_units(R350GlCtx *g, const R350GlReq *r, bool queue)
+{
+    uint32_t done = 0;
+    unsigned un, k;
+
+    for (un = 0; un < R350_GL_TEXUNITS; un++) {
+        unsigned sl = r->tex_slot[un];
+
+        if (!(r->textured & (1u << un))) {
+            continue;
+        }
+        if (sl > R350_GL_TEXSLOTS) {
+            return false;
+        }
+        for (k = 0; k < un; k++) {
+            if ((r->textured & (1u << k)) && r->tex_slot[k] == sl &&
+                (sl == R350_GL_TEXSLOTS || r->tex[k] != r->tex[un])) {
+                /* one scratch, or one slot named for two textures */
+                return false;
+            }
+        }
+        if (r->tex_fresh[un] && r->tex[un]) {
+            if (done & (1u << un)) {
+                continue;
+            }
+            for (k = un + 1; k < R350_GL_TEXUNITS; k++) {
+                if ((r->textured & (1u << k)) && r->tex_slot[k] == sl) {
+                    done |= 1u << k;
+                }
+            }
+            if (queue && gl_queue_uses_slot(g, sl)) {
+                gl_flush_queue(g);
+            }
+            glActiveTexture(GL_TEXTURE0 + gl_txunit(un));
+            glBindTexture(GL_TEXTURE_2D, g->tex[sl]);
+            gl_upload_tex_unit(g, sl, r, un);
+        } else if (g->tex_w[sl] != r->tex_w[un] ||
+                   g->tex_h[sl] != r->tex_h[un] ||
+                   g->tex_nl[sl] != gl_levels_unit(r, un)) {
+            return false;
+        }
+    }
+    glActiveTexture(GL_TEXTURE0);
+    return true;
+}
+
+/* bind every guest unit's texture, white where the request samples none */
+static void gl_bind_txunits(R350GlCtx *g, uint32_t textured,
+                            const unsigned *slots)
+{
+    unsigned un;
+
+    for (un = 0; un < R350_GL_TEXUNITS; un++) {
+        glActiveTexture(GL_TEXTURE0 + gl_txunit(un));
+        glBindTexture(GL_TEXTURE_2D, (textured & (1u << un)) &&
+                      slots[un] <= R350_GL_TEXSLOTS
+                      ? g->tex[slots[un]] : g->white);
+    }
+    glActiveTexture(GL_TEXTURE0);
+}
+
+/* the general form's uniforms that do not change within a request */
+static void gl_gen_uniforms(const R350GlProg *p, uint32_t textured,
+                            const GLint *size, const GLint *clamp,
+                            const GLint *tf, const float *tcinv,
+                            int tcbase, int tcstride, int tcraw, int lodany)
+{
+    glUniform2iv(p->u_txsize, R350_GL_TEXUNITS, size);
+    glUniform2iv(p->u_txclamp, R350_GL_TEXUNITS, clamp);
+    glUniform1iv(p->u_txtf, R350_GL_TEXUNITS * R350_GL_TF, tf);
+    glUniform1i(p->u_txen, (GLint)textured);
+    glUniform2fv(p->u_tcinv, R350_GL_TCSETS, tcinv);
+    glUniform1i(p->u_tcbase, tcbase);
+    glUniform1i(p->u_tcstride, tcstride);
+    glUniform1i(p->u_tcraw, tcraw);
+    glUniform1i(p->u_lodany, lodany);
+}
+
+static void gl_gen_from(R350GlGen *e, const R350GlReq *r)
+{
+    unsigned un;
+
+    e->textured = r->textured;
+    for (un = 0; un < R350_GL_TEXUNITS; un++) {
+        e->slot[un] = r->tex_slot[un];
+        e->size[un * 2] = r->tex_w[un];
+        e->size[un * 2 + 1] = r->tex_h[un];
+        e->clamp[un * 2] = r->clamp_s[un];
+        e->clamp[un * 2 + 1] = r->clamp_t[un];
+        gl_tf_unit(r, un, &e->tf[un * R350_GL_TF]);
+    }
+    for (un = 0; un < R350_GL_TCSETS; un++) {
+        e->tcinv[un * 2] = r->tcinv[un][0];
+        e->tcinv[un * 2 + 1] = r->tcinv[un][1];
+    }
+    e->tcstride = (int)r->tc_stride;
+    e->tcraw = (int)r->tc_raw;
+    e->lodany = r->lod_any;
+}
+
 
 static void gl_emit(R350GlCtx *g, const R350GlUnit *u, const R350GlUnit *prev)
 {
@@ -1978,7 +2425,12 @@ static void gl_emit(R350GlCtx *g, const R350GlUnit *u, const R350GlUnit *prev)
     if (!prev || prev->surf_w != u->surf_w || prev->surf_h != u->surf_h) {
         glViewport(0, 0, u->surf_w, u->surf_h);
     }
-    if (!prev || prev->tex_slot != u->tex_slot) {
+    if (u->gen) {
+        gl_bind_txunits(g, u->ge.textured, u->ge.slot);
+        gl_gen_uniforms(p, u->ge.textured, u->ge.size, u->ge.clamp,
+                        u->ge.tf, u->ge.tcinv, u->tcbase, u->ge.tcstride,
+                        u->ge.tcraw, u->ge.lodany);
+    } else if (!prev || prev->gen || prev->tex_slot != u->tex_slot) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, u->tex_slot <= R350_GL_TEXSLOTS
                       ? g->tex[u->tex_slot] : g->white);
@@ -2022,6 +2474,13 @@ static void gl_flush_queue(R350GlCtx *g)
     glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(float) * g->nqv),
                  g->qv, GL_STREAM_DRAW);
+    if (g->nqt) {
+        glBindBuffer(GL_TEXTURE_BUFFER, g->tcbo);
+        glBufferData(GL_TEXTURE_BUFFER, (GLsizeiptr)(sizeof(float) * g->nqt),
+                     g->qt, GL_STREAM_DRAW);
+        glActiveTexture(GL_TEXTURE0 + R350_GL_TCUNIT);
+        glBindTexture(GL_TEXTURE_BUFFER, g->tctex);
+    }
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, g->cbuf);
     glEnable(GL_SCISSOR_TEST);
@@ -2049,6 +2508,7 @@ static void gl_flush_queue(R350GlCtx *g)
     g->q_waves += maxw + 1;
     g->nq = 0;
     g->nqv = 0;
+    g->nqt = 0;
     g->q_prebarrier = false;
 }
 
@@ -2060,14 +2520,20 @@ static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
     R350GlUnit *u;
     float fx0 = FLT_MAX, fy0 = FLT_MAX, fx1 = -FLT_MAX, fy1 = -FLT_MAX;
     size_t need = (size_t)nv * R350_GL_VSTRIDE;
+    size_t tneed = r->tcx ? (size_t)nv / 3 * r->tc_stride * 4 : 0;
     unsigned k;
 
-    if (g->nq == R350_GL_QUEUE || g->nqv + need > g->qv_cap) {
+    if (g->nq == R350_GL_QUEUE || g->nqv + need > g->qv_cap ||
+        (g->nqt + tneed) / 4 > g->tc_max) {
         gl_flush_queue(g);
         if (need > g->qv_cap) {
             g->qv_cap = MAX(need, (size_t)R350_GL_QUEUE_VERTS);
             g->qv = g_renew(float, g->qv, g->qv_cap);
         }
+    }
+    if (g->nqt + tneed > g->qt_cap) {
+        g->qt_cap = MAX(g->nqt + tneed, 2 * g->qt_cap);
+        g->qt = g_renew(float, g->qt, g->qt_cap);
     }
     if (!g->q) {
         g->q = g_new(R350GlUnit, R350_GL_QUEUE);
@@ -2084,6 +2550,14 @@ static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
     u->p = p;
     u->first = g->nqv / R350_GL_VSTRIDE;
     u->count = nv;
+    u->gen = r->tcx != NULL;
+    if (u->gen) {
+        memcpy(g->qt + g->nqt, r->tcx + (size_t)v0 / 3 * r->tc_stride * 4,
+               tneed * sizeof(float));
+        u->tcbase = (int)(g->nqt / 4);
+        g->nqt += tneed;
+        gl_gen_from(&u->ge, r);
+    }
     u->sx0 = MAX(r->sx0, r->x0);
     u->sy0 = MAX(r->sy0, r->y0);
     u->sx1 = MIN(r->sx1, r->x0 + r->w);
@@ -2104,7 +2578,7 @@ static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
     u->reads = r->blend && r->blend_read;
     u->surf_w = r->surf_w;
     u->surf_h = r->surf_h;
-    u->tex_slot = slot;
+    u->tex_slot = u->gen ? R350_GL_TEXSLOTS + 1 : slot;
     u->tex_w = r->tex_w[0];
     u->tex_h = r->tex_h[0];
     u->clamp_s = r->clamp_s[0];
@@ -2171,7 +2645,12 @@ static bool gl_enqueue(R350GlCtx *g, const R350GlReq *r)
     if (!p) {
         return false;
     }
-    if ((r->textured & 1) && r->tex_slot[0] <= R350_GL_TEXSLOTS) {
+    if (r->tcx) {
+        if ((size_t)r->nvert / 3 * r->tc_stride > g->tc_max ||
+            !gl_bind_units(g, r, true)) {
+            return false;
+        }
+    } else if ((r->textured & 1) && r->tex_slot[0] <= R350_GL_TEXSLOTS) {
         slot = r->tex_slot[0];
         if (r->tex_fresh[0] && r->tex[0]) {
             if (gl_queue_uses_slot(g, slot)) {
@@ -2272,7 +2751,27 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     }
 
     glActiveTexture(GL_TEXTURE0);
-    if ((r->textured & 1) && r->tex_slot[0] <= R350_GL_TEXSLOTS) {
+    if (r->tcx) {
+        R350GlGen ge;
+
+        if ((size_t)r->nvert / 3 * r->tc_stride > g->tc_max ||
+            !gl_bind_units(g, r, false)) {
+            r350_gl_done(&g->plat);
+            return false;
+        }
+        gl_gen_from(&ge, r);
+        gl_bind_txunits(g, ge.textured, ge.slot);
+        gl_gen_uniforms(p, ge.textured, ge.size, ge.clamp, ge.tf, ge.tcinv,
+                        0, ge.tcstride, ge.tcraw, ge.lodany);
+        glBindBuffer(GL_TEXTURE_BUFFER, g->tcbo);
+        glBufferData(GL_TEXTURE_BUFFER,
+                     (GLsizeiptr)(sizeof(float) * 4 * r->tc_stride *
+                                  (r->nvert / 3)),
+                     r->tcx, GL_STREAM_DRAW);
+        glActiveTexture(GL_TEXTURE0 + R350_GL_TCUNIT);
+        glBindTexture(GL_TEXTURE_BUFFER, g->tctex);
+        glActiveTexture(GL_TEXTURE0);
+    } else if ((r->textured & 1) && r->tex_slot[0] <= R350_GL_TEXSLOTS) {
         unsigned sl = r->tex_slot[0];
 
         glBindTexture(GL_TEXTURE_2D, g->tex[sl]);

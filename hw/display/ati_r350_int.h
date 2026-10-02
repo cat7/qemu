@@ -668,6 +668,8 @@ struct ATIR350State {
     size_t gl_rect_sz, gl_texbuf_sz;
     float *gl_verts;
     size_t gl_verts_sz;
+    float *gl_tcx;              /* the general form's coordinate block */
+    size_t gl_tcx_sz;
     /*
      * The self-overlap partition's working set, sized once rather than
      * allocated per draw: which pass each triangle landed in, the
@@ -902,7 +904,7 @@ struct ATIR350State {
      * The constants are flattened per draw because they change without
      * the program changing.
      */
-    char us_glsl[16 * 1024];
+    char us_glsl[64 * 1024];
     bool us_glsl_ok;
     uint64_t us_glsl_key;
     uint64_t us_glsl_ok_n, us_glsl_refused_n;
