@@ -40,6 +40,10 @@
 #include <poll.h>
 #endif
 
+#ifdef CONFIG_DARWIN
+#include <sys/event.h>
+#endif
+
 #ifdef CONFIG_PRCTL_PR_SET_TIMERSLACK
 #include <sys/prctl.h>
 #endif
@@ -321,11 +325,67 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 }
 
 
+#ifdef CONFIG_DARWIN
+/*
+ * Without ppoll() every deadline is rounded up to the next millisecond.
+ * A one-shot nanosecond kqueue timer, polled with the caller's
+ * descriptors, ends the wait on time instead.
+ */
+static __thread int poll_kq = -1;
+
+static int qemu_poll_ns_kqueue(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    g_autofree GPollFD *all = NULL;
+    struct kevent kev;
+    int ret;
+
+    if (poll_kq == -1) {
+        poll_kq = kqueue();
+        if (poll_kq < 0) {
+            poll_kq = -2;
+        } else {
+            qemu_set_cloexec(poll_kq);
+        }
+    }
+    if (poll_kq < 0) {
+        return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+    }
+
+    EV_SET(&kev, 0, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+           NOTE_NSECONDS | NOTE_CRITICAL, timeout, NULL);
+    if (kevent(poll_kq, &kev, 1, NULL, 0, NULL) < 0) {
+        return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+    }
+
+    all = g_new(GPollFD, nfds + 1);
+    memcpy(all, fds, nfds * sizeof(GPollFD));
+    all[nfds] = (GPollFD) { .fd = poll_kq, .events = G_IO_IN };
+
+    ret = g_poll(all, nfds + 1, qemu_timeout_ns_to_ms(timeout));
+    if (ret > 0 && all[nfds].revents) {
+        ret--;
+    }
+    for (guint i = 0; i < nfds; i++) {
+        fds[i].revents = all[i].revents;
+    }
+
+    /* drop the timer, and its event if it fired */
+    EV_SET(&kev, 0, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+    kevent(poll_kq, &kev, 1, NULL, 0, NULL);
+    return ret;
+}
+#endif
+
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
 int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 {
+#ifdef CONFIG_DARWIN
+    if (timeout > 0) {
+        return qemu_poll_ns_kqueue(fds, nfds, timeout);
+    }
+#endif
 #ifdef CONFIG_PPOLL
     if (timeout < 0) {
         return ppoll((struct pollfd *)fds, nfds, NULL, NULL);
