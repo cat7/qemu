@@ -18,12 +18,13 @@
  * `false` back falls back to the software path for that draw instead of
  * rendering it wrong.
  *
- * Two limits are shared with the interpreter deliberately, so that the
- * two agree by construction rather than by accident: relative addressing
- * (PVS_SRC_ADDR_MODE / PVS_DST_ADDR_MODE) is ignored in both, and the
- * math engine's transcendentals are the host's and the GPU's respective
- * best efforts at the same function, which cannot agree in the last bit.
- * The offline harness measures how far apart they land.
+ * Relative addressing (PVS_SRC_ADDR_MODE / PVS_DST_ADDR_MODE 1) indexes
+ * the file by the offset plus an address-register component, with the
+ * interpreter's answer for a register outside the file: zero on a read,
+ * no write on a store. The loop-index mode is refused in both. The math
+ * engine's transcendentals are the host's and the GPU's respective best
+ * efforts at the same function, which cannot agree in the last bit; the
+ * offline harness measures how far apart they land.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -90,18 +91,40 @@ static const char *pvs_repl_swz(unsigned we, char out[5])
  * The order matters -- an absolute value applied after a negate would
  * discard it -- and it is the interpreter's order.
  */
-static void pvs_src(PvsBuf *b, const R300PvsProgram *p, uint32_t dw,
-                    R300PvsGlsl *info)
+/* PVSK[] entries a program can reach: PVS_MAX_CONST_ADDR and the file */
+static unsigned pvs_const_reach(const R300PvsProgram *p)
 {
-    unsigned type = dw & R300_PVS_SRC_REG_TYPE_MASK;
-    unsigned off = (dw >> R300_PVS_SRC_OFFSET_SHIFT) &
-                   R300_PVS_SRC_OFFSET_MASK;
-    char reg[32];
-    unsigned c;
+    unsigned n = p->cbase < p->const_slots ? p->const_slots - p->cbase : 0;
 
+    if (p->bounded && p->cmax + 1 < n) {
+        n = p->cmax + 1;
+    }
+    return n;
+}
+
+/*
+ * A register of `file` (`n` entries) at the offset plus an address-register
+ * component; outside the file it reads zero, as in the interpreter.
+ */
+static void pvs_rel_reg(char *reg, size_t len, const char *file,
+                        unsigned off, unsigned sel, unsigned n)
+{
+    if (!n) {
+        snprintf(reg, len, "vec4(0.0)");
+        return;
+    }
+    snprintf(reg, len, "(uint(%u + A0.%c) < %uu ? %s[clamp(%u + A0.%c, 0, %u)]"
+             " : vec4(0.0))", off, "xyzw"[sel], n, file, off, "xyzw"[sel],
+             n - 1);
+}
+
+/* the register an absolutely addressed operand names */
+static void pvs_abs_reg(char *reg, size_t len, const R300PvsProgram *p,
+                        unsigned type, unsigned off, R300PvsGlsl *info)
+{
     switch (type) {
     case R300_PVS_SRC_REG_INPUT:
-        snprintf(reg, sizeof(reg), "PVSA[%u]", off % R300_PVS_IN_REGS);
+        snprintf(reg, len, "PVSA[%u]", off % R300_PVS_IN_REGS);
         info->in_mask |= 1u << (off % R300_PVS_IN_REGS);
         break;
     case R300_PVS_SRC_REG_CONSTANT:
@@ -114,20 +137,72 @@ static void pvs_src(PvsBuf *b, const R300PvsProgram *p, uint32_t dw,
          */
         if ((p->bounded && off > p->cmax) ||
             (p->cbase + off + 1) * 4 > p->const_slots * 4) {
-            snprintf(reg, sizeof(reg), "vec4(0.0)");
+            snprintf(reg, len, "vec4(0.0)");
         } else {
-            snprintf(reg, sizeof(reg), "PVSK[%u]", off);
+            snprintf(reg, len, "PVSK[%u]", off);
             if (off + 1 > info->nconst) {
                 info->nconst = off + 1;
             }
         }
         break;
     case R300_PVS_SRC_REG_ALT_TEMP:
-        snprintf(reg, sizeof(reg), "AT[%u]", off % R300_PVS_ATMP_REGS);
+        snprintf(reg, len, "AT[%u]", off % R300_PVS_ATMP_REGS);
         break;
     default:
-        snprintf(reg, sizeof(reg), "T[%u]", off % R300_PVS_TMP_REGS);
+        snprintf(reg, len, "T[%u]", off % R300_PVS_TMP_REGS);
         break;
+    }
+}
+
+/* ... and one addressed relative to A0.<asel> */
+static void pvs_rel_src(char *reg, size_t len, const R300PvsProgram *p,
+                        unsigned type, unsigned off, unsigned asel,
+                        R300PvsGlsl *info)
+{
+    unsigned n;
+
+    switch (type) {
+    case R300_PVS_SRC_REG_INPUT:
+        pvs_rel_reg(reg, len, "PVSA", off, asel, R300_PVS_IN_REGS);
+        info->in_mask |= (1u << R300_PVS_IN_REGS) - 1;
+        break;
+    case R300_PVS_SRC_REG_CONSTANT:
+        n = pvs_const_reach(p);
+        pvs_rel_reg(reg, len, "PVSK", off, asel, n);
+        if (n > info->nconst) {
+            info->nconst = n;
+        }
+        break;
+    case R300_PVS_SRC_REG_ALT_TEMP:
+        pvs_rel_reg(reg, len, "AT", off, asel, R300_PVS_ATMP_REGS);
+        break;
+    default:
+        pvs_rel_reg(reg, len, "T", off, asel, R300_PVS_TMP_REGS);
+        break;
+    }
+}
+
+static bool pvs_src(PvsBuf *b, const R300PvsProgram *p, uint32_t dw,
+                    R300PvsGlsl *info)
+{
+    unsigned type = dw & R300_PVS_SRC_REG_TYPE_MASK;
+    unsigned off = (dw >> R300_PVS_SRC_OFFSET_SHIFT) &
+                   R300_PVS_SRC_OFFSET_MASK;
+    unsigned mode = ((dw & R300_PVS_SRC_ADDR_MODE_1) ? 2 : 0) |
+                    ((dw & R300_PVS_SRC_ADDR_MODE_0) ? 1 : 0);
+    unsigned asel = (dw >> R300_PVS_SRC_ADDR_SEL_SHIFT) &
+                    R300_PVS_SRC_ADDR_SEL_MASK;
+    char reg[128];
+    unsigned c;
+
+    if (mode == R300_PVS_ADDR_RELATIVE_A0) {
+        pvs_rel_src(reg, sizeof(reg), p, type, off, asel, info);
+    } else if (mode == R300_PVS_ADDR_ABSOLUTE) {
+        pvs_abs_reg(reg, sizeof(reg), p, type, off, info);
+    } else {
+        info->gaps.has_addr_mode = true;
+        info->gaps.addr_mode = mode;
+        return false;
     }
 
     pvs_emit(b, "vec4(");
@@ -135,7 +210,7 @@ static void pvs_src(PvsBuf *b, const R300PvsProgram *p, uint32_t dw,
         unsigned sel = (dw >> (R300_PVS_SRC_SWIZZLE_SHIFT + 3 * c)) &
                        R300_PVS_SRC_SWIZZLE_MASK;
         bool neg = (dw >> (R300_PVS_SRC_MODIFIER_SHIFT + c)) & 1;
-        char body[64];
+        char body[160];
 
         if (sel < 4) {
             snprintf(body, sizeof(body), "%s.%c", reg, "xyzw"[sel]);
@@ -148,6 +223,7 @@ static void pvs_src(PvsBuf *b, const R300PvsProgram *p, uint32_t dw,
                  (dw & R300_PVS_SRC_ABS_XYZW) ? ")" : "");
     }
     pvs_emit(b, ")");
+    return true;
 }
 
 /*
@@ -214,6 +290,12 @@ static bool pvs_vector(PvsBuf *b, unsigned opcode)
         pvs_emit(b, "    r = vec4(cc.w < a.w * bb.w ? cc.w :\n"
                     "             cc.x >= a.x * bb.x ? cc.x :"
                     " a.x * bb.x);\n");
+        return true;
+    case R300_VE_FLT2FIX_DX:
+        pvs_emit(b, "    r = floor(a);\n");
+        return true;
+    case R300_VE_FLT2FIX_DX_RND:
+        pvs_emit(b, "    r = floor(a + vec4(0.5));\n");
         return true;
     default:
         return false;
@@ -318,7 +400,9 @@ static bool pvs_dual_math(PvsBuf *b, const R300PvsProgram *p, uint32_t dw,
     }
     pvs_emit(b, "    {\n"
                 "    precise vec4 s = ");
-    pvs_src(b, p, dw & ~(0x3fu << 19), info);
+    if (!pvs_src(b, p, dw & ~(0x3fu << 19), info)) {
+        return false;
+    }
     pvs_emit(b, ";\n"
                 "    precise vec4 a = vec4(s.x), bb = vec4(s.y),"
                 " cc = bb, r;\n");
@@ -368,6 +452,7 @@ bool r300_pvs_glsl(const R300PvsProgram *p, char *buf, size_t cap,
 
     pvs_emit(&b, "void pvs_main()\n{\n"
                  "    vec4 T[%u], AT[%u];\n"
+                 "    ivec4 A0 = ivec4(0);\n"
                  "    for (int i = 0; i < %u; i++) { T[i] = vec4(0.0); }\n"
                  "    for (int i = 0; i < %u; i++) { AT[i] = vec4(0.0); }\n",
              R300_PVS_TMP_REGS, R300_PVS_ATMP_REGS,
@@ -384,19 +469,28 @@ bool r300_pvs_glsl(const R300PvsProgram *p, char *buf, size_t cap,
         unsigned doff = (op >> R300_PVS_DST_OFFSET_SHIFT) &
                         R300_PVS_DST_OFFSET_MASK;
         unsigned we = (op >> R300_PVS_DST_WE_SHIFT) & R300_PVS_DST_WE_MASK;
+        unsigned dmode = ((op & R300_PVS_DST_ADDR_MODE_1) ? 2 : 0) |
+                         ((op & R300_PVS_DST_ADDR_MODE_0) ? 1 : 0);
+        unsigned dsel = (op >> R300_PVS_DST_ADDR_SEL_SHIFT) &
+                        R300_PVS_DST_ADDR_SEL_MASK;
         char dstsw[5], srcsw[5];
         const char *file;
+        unsigned n, k;
 
         pvs_emit(&b, "    /* %u */\n    {\n"
                      "    precise vec4 a = ", i);
-        pvs_src(&b, p, w[1], info);
+        if (!pvs_src(&b, p, w[1], info)) {
+            return false;
+        }
         pvs_emit(&b, ";\n    precise vec4 bb = ");
-        pvs_src(&b, p, w[2], info);
+        if (!pvs_src(&b, p, w[2], info)) {
+            return false;
+        }
         pvs_emit(&b, ";\n    precise vec4 cc = ");
         if (dual) {
             pvs_emit(&b, "vec4(0.0)");
-        } else {
-            pvs_src(&b, p, w[3], info);
+        } else if (!pvs_src(&b, p, w[3], info)) {
+            return false;
         }
         pvs_emit(&b, ";\n    precise vec4 r = vec4(0.0);\n");
 
@@ -408,6 +502,9 @@ bool r300_pvs_glsl(const R300PvsProgram *p, char *buf, size_t cap,
          * cannot see the value the vector half writes.
          */
         if (dual && !pvs_dual_math(&b, p, w[3], info)) {
+            if (info->gaps.has_addr_mode) {
+                return false;
+            }
             info->gaps.has_math_op = true;
             info->gaps.math_op = ((w[3] >> R300_PVS_DUAL_OPCODE_SHIFT) &
                                   R300_PVS_DUAL_OPCODE_MASK) |
@@ -445,27 +542,51 @@ bool r300_pvs_glsl(const R300PvsProgram *p, char *buf, size_t cap,
             pvs_emit(&b, "    r = clamp(r, 0.0, 1.0);\n");
         }
 
+        if (dtype == R300_PVS_DST_REG_A0 && !math &&
+            !(op & R300_PVS_DST_MACRO_INST) &&
+            (opcode == R300_VE_FLT2FIX_DX ||
+             opcode == R300_VE_FLT2FIX_DX_RND)) {
+            /* the integral result, clamped to -256..255, as the interpreter */
+            for (k = 0; k < 4; k++) {
+                if (we & (1u << k)) {
+                    pvs_emit(&b, "    A0.%c = int(r.%c > %d.0 ? (r.%c < %d.0 ?"
+                                 " r.%c : %d.0) : %d.0);\n",
+                             "xyzw"[k], "xyzw"[k], R300_PVS_ADDR_MIN,
+                             "xyzw"[k], R300_PVS_ADDR_MAX, "xyzw"[k],
+                             R300_PVS_ADDR_MAX, R300_PVS_ADDR_MIN);
+                }
+            }
+            pvs_emit(&b, "    }\n");
+            continue;
+        }
+        if (dmode != R300_PVS_ADDR_ABSOLUTE &&
+            dmode != R300_PVS_ADDR_RELATIVE_A0) {
+            info->gaps.has_addr_mode = true;
+            info->gaps.addr_mode = dmode;
+            return false;
+        }
+
         switch (dtype) {
         case R300_PVS_DST_REG_OUT:
         case R300_PVS_DST_REG_OUT_REPL_X:
             file = "PVSo";
-            doff %= R300_PVS_OUT_REGS;
-            info->out_mask |= 1u << doff;
+            n = R300_PVS_OUT_REGS;
+            info->out_mask |= dmode ? (1u << n) - 1 : 1u << (doff % n);
             break;
         case R300_PVS_DST_REG_TEMPORARY:
             file = "T";
-            doff %= R300_PVS_TMP_REGS;
+            n = R300_PVS_TMP_REGS;
             break;
         case R300_PVS_DST_REG_ALT_TEMP:
             file = "AT";
-            doff %= R300_PVS_ATMP_REGS;
+            n = R300_PVS_ATMP_REGS;
             break;
         default:
             /*
-             * The address register and a write back into the input file
-             * are the two the interpreter refuses; refusing them here as
-             * well is what keeps the translated program and the
-             * interpreted one the same program.
+             * A write back into the input file, and A0 from anything but
+             * a float-to-fixed load, are what the interpreter refuses;
+             * refusing them here as well is what keeps the translated
+             * program and the interpreted one the same program.
              */
             info->gaps.has_dst_file = true;
             info->gaps.dst_file = dtype;
@@ -478,7 +599,16 @@ bool r300_pvs_glsl(const R300PvsProgram *p, char *buf, size_t cap,
             } else {
                 pvs_mask_swz(we, srcsw);
             }
-            pvs_emit(&b, "    %s[%u].%s = r.%s;\n", file, doff, dstsw, srcsw);
+            if (dmode) {
+                /* outside the file, the store is dropped */
+                pvs_emit(&b, "    if (uint(%u + A0.%c) < %uu) {\n"
+                             "        %s[%u + A0.%c].%s = r.%s;\n    }\n",
+                         doff, "xyzw"[dsel], n, file, doff, "xyzw"[dsel],
+                         dstsw, srcsw);
+            } else {
+                pvs_emit(&b, "    %s[%u].%s = r.%s;\n", file, doff % n,
+                         dstsw, srcsw);
+            }
         }
         pvs_emit(&b, "    }\n");
     }
