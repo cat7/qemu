@@ -928,17 +928,21 @@ static void us_run_alu(const R300UsProgram *p, R300UsRegs *g,
     /*
      * The dot products are shared between the banks: the RGB side's
      * DP4 takes its fourth term from the alpha arguments, and the
-     * alpha side's DP reads the result the RGB side computed. Both
-     * are evaluated here so either bank can name it.
+     * alpha side's DP is the dot product the RGB side computed -- the
+     * four-term one when that is a DP4 (R3xx register reference,
+     * US_ALU_ALPHA_INST OP_DP and US_ALU_RGB_INST OP_DP4).
      */
     dot = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
+    if (a->rgb_op == R300_US_RGB_DP4) {
+        dot = dot + aA * aB;
+    }
 
     switch (a->rgb_op) {
     case R300_US_RGB_DP3:
         res[0] = res[1] = res[2] = dot;
         break;
     case R300_US_RGB_DP4:
-        res[0] = res[1] = res[2] = dot + aA * aB;
+        res[0] = res[1] = res[2] = dot;
         break;
     case R300_US_RGB_D2A:
         res[0] = res[1] = res[2] = A[0] * B[0] + A[1] * B[1] + C[2];
