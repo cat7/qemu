@@ -415,13 +415,79 @@ static bool ati_r350_2d_brush(ATIR350State *s, int x, int y, int bpp,
     return true;
 }
 
+/* a monochrome brush whose clear bits leave the destination alone */
+static bool ati_r350_2d_brush_masks(ATIR350State *s)
+{
+    switch ((s->dp_datatype & R350_DP_BRUSH_DATATYPE) >>
+            R350_DP_BRUSH_DATATYPE_SHIFT) {
+    case R350_BRUSH_8X8_MONO_FG_LA:
+    case R350_BRUSH_1X8_MONO_FG_LA:
+    case R350_BRUSH_32X1_MONO_FG_LA:
+    case R350_BRUSH_32X32_MONO_FG_LA:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * One row of a 32bpp SRCCOPY from bus-mastered staging into VRAM -- the
+ * surface page-in -- with the source read a page at a time instead of
+ * one translation per pixel. The pixels written, their swaps and the
+ * dirty ranges are the per-pixel loop's; false, having written nothing,
+ * for a row any part of which that loop would treat otherwise.
+ */
+static bool ati_r350_2d_page_in_row(ATIR350State *s, uint32_t src_stride,
+                                    uint32_t dst_stride, int sx0, int sy,
+                                    int dx0, int dy, int n)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint64_t src, dst;
+    unsigned sxr = ati_r350_host_swap_xor(s);
+    uint32_t buf[256];
+    int i, k;
+
+    if (n <= 0 || sx0 < 0 || sy < 0 || dx0 < 0 || dy < 0) {
+        return false;
+    }
+    src = (uint32_t)(s->src_offset + (uint32_t)sy * src_stride +
+                     (uint32_t)sx0 * 4);
+    dst = (uint32_t)(s->dst_offset + (uint32_t)dy * dst_stride +
+                     (uint32_t)dx0 * 4);
+    if ((src & 3) || src + 4 <= ATI_R350_VRAM_SIZE ||
+        src + (uint64_t)n * 4 > 0x100000000ull ||
+        dst + (uint64_t)n * 4 > ATI_R350_VRAM_SIZE ||
+        (dst < 0xe000 && dst + (uint64_t)n * 4 > 0xd000)) {
+        return false;
+    }
+    for (i = 0; i < n; i += 256) {
+        int m = MIN(n - i, 256);
+
+        ati_r350_mc_read_block(s, (uint32_t)src + i * 4, buf, m);
+        for (k = 0; k < m; k++) {
+            uint32_t dw = buf[k];
+            uint32_t a = (uint32_t)dst + (i + k) * 4;
+            unsigned xr = ati_r350_vram_xor(s, a);
+
+            vram[a ^ xr] = (dw >> ((0 ^ sxr) * 8)) & 0xff;
+            vram[(a + 1) ^ xr] = (dw >> ((1 ^ sxr) * 8)) & 0xff;
+            vram[(a + 2) ^ xr] = (dw >> ((2 ^ sxr) * 8)) & 0xff;
+            vram[(a + 3) ^ xr] = (dw >> ((3 ^ sxr) * 8)) & 0xff;
+        }
+    }
+    memory_region_set_dirty(&s->vram, dst & ~7ull,
+                            ((dst + (uint64_t)n * 4 - 4) & ~7ull) + 8 -
+                            (dst & ~7ull));
+    return true;
+}
+
 static void ati_r350_2d_do_blt(ATIR350State *s)
 {
     int bpp = ati_r350_bpp_from_dp_datatype(s);
     uint8_t rop = (s->dp_mix >> 16) & 0xff;
     bool left_to_right = s->dp_cntl & R350_DST_X_LEFT_TO_RIGHT;
     bool top_to_bottom = s->dp_cntl & R350_DST_Y_TOP_TO_BOTTOM;
-    bool overlaps;
+    bool overlaps, page_in;
     bool rop_dst = rop != 0xcc && rop != 0x33 && rop != 0xf0 &&
                    rop != 0x00 && rop != 0xff;
     int width = s->dst_width;
@@ -486,6 +552,7 @@ static void ati_r350_2d_do_blt(ATIR350State *s)
         left_to_right = s->dst_x <= s->src_x;
         top_to_bottom = s->dst_y <= s->src_y;
     }
+    page_in = rop == 0xcc && bpp == 32 && !ati_r350_2d_brush_masks(s);
 
     for (y = 0; y < height; y++) {
         int dy = top_to_bottom ? (int)s->dst_y + y
@@ -495,6 +562,23 @@ static void ati_r350_2d_do_blt(ATIR350State *s)
 
         if (dy < sc_top || dy > sc_bottom) {
             continue;
+        }
+        if (page_in) {
+            /*
+             * The pixels the loop below writes, as the run of x it
+             * leaves inside the scissor; the source does not alias the
+             * destination, so the direction does not matter.
+             */
+            int x0 = MAX(0, sc_left - (int)s->dst_x);
+            int x1 = MIN(width - 1, sc_right - (int)s->dst_x);
+
+            if (x1 < x0 ||
+                ati_r350_2d_page_in_row(s, src_stride, dst_stride,
+                                        (int)s->src_x + x0, sy,
+                                        (int)s->dst_x + x0, dy,
+                                        x1 - x0 + 1)) {
+                continue;
+            }
         }
         for (x = 0; x < width; x++) {
             int dx = left_to_right ? (int)s->dst_x + x
