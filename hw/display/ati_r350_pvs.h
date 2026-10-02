@@ -25,6 +25,10 @@
 #define R300_PVS_TMP_REGS             32
 #define R300_PVS_ATMP_REGS            4
 
+/* the address register: four signed integers, clamped to -256..255 */
+#define R300_PVS_ADDR_MIN             (-256)
+#define R300_PVS_ADDR_MAX             255
+
 /* word 0: opcode and destination operand */
 #define R300_PVS_DST_OPCODE_MASK      0x3f
 #define R300_PVS_DST_MATH_INST        (1u << 6)
@@ -40,6 +44,8 @@
 #define R300_PVS_DST_ME_SAT           (1u << 25)
 #define R300_PVS_DST_PRED_ENABLE      (1u << 26)
 #define R300_PVS_DST_DUAL_MATH_OP     (1u << 28)
+#define R300_PVS_DST_ADDR_SEL_SHIFT   29
+#define R300_PVS_DST_ADDR_SEL_MASK    0x3
 #define R300_PVS_DST_ADDR_MODE_0      (1u << 31)
 
 /* words 1-3: source operands */
@@ -51,7 +57,17 @@
 #define R300_PVS_SRC_SWIZZLE_SHIFT    13      /* four 3-bit selectors */
 #define R300_PVS_SRC_SWIZZLE_MASK     0x7
 #define R300_PVS_SRC_MODIFIER_SHIFT   25      /* four per-channel negates */
+#define R300_PVS_SRC_ADDR_SEL_SHIFT   29
+#define R300_PVS_SRC_ADDR_SEL_MASK    0x3
 #define R300_PVS_SRC_ADDR_MODE_1      (1u << 31)
+
+/*
+ * ADDR_MODE, from MODE_1 (msb) and MODE_0 (lsb) of an operand: absolute,
+ * relative to the address-register component ADDR_SEL names, or relative
+ * to the loop index (R5xx flow control, not modelled).
+ */
+#define R300_PVS_ADDR_ABSOLUTE        0
+#define R300_PVS_ADDR_RELATIVE_A0     1
 
 /*
  * Word 3 when R300_PVS_DST_DUAL_MATH_OP is set: it stops being a third
@@ -99,6 +115,8 @@
 #define R300_VE_SET_LESS_THAN         10
 #define R300_VE_MULTIPLYX2_ADD        11
 #define R300_VE_MULTIPLY_CLAMP        12
+#define R300_VE_FLT2FIX_DX            13
+#define R300_VE_FLT2FIX_DX_RND        14
 
 /* math-engine opcodes (one scalar per source, always its w channel) */
 #define R300_ME_NO_OP                 0
@@ -161,8 +179,8 @@ typedef struct R300PvsTexMat {
 
 /* opcodes met that this interpreter does not implement */
 typedef struct R300PvsGaps {
-    uint8_t vec_op, math_op, dst_file;
-    bool has_vec_op, has_math_op, has_dst_file;
+    uint8_t vec_op, math_op, dst_file, addr_mode;
+    bool has_vec_op, has_math_op, has_dst_file, has_addr_mode;
 } R300PvsGaps;
 
 typedef struct R300PvsRegs {
@@ -170,6 +188,7 @@ typedef struct R300PvsRegs {
     float out[R300_PVS_OUT_REGS][4];
     float tmp[R300_PVS_TMP_REGS][4];
     float atmp[R300_PVS_ATMP_REGS][4];
+    int32_t a0[4];              /* the address register, A0.xyzw */
     uint32_t out_written;       /* bit per output register actually written */
 } R300PvsRegs;
 
@@ -243,6 +262,8 @@ typedef struct R300PvsGlsl {
  * PVS_MAX_CONST_ADDR already applied, so PVSK[k] is what
  * r300_pvs_const(p, k, ...) returns), and writing `vec4 PVSo[16]`. The
  * caller declares all three and calls pvs_main() from its own main().
+ * A program that addresses the constant file relative to the address
+ * register makes `n` every constant it can legally reach.
  *
  * Returns false, without writing a usable shader, for any construct the
  * interpreter would report as a gap -- so a program the translator cannot

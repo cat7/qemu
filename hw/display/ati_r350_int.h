@@ -112,6 +112,7 @@ typedef enum ATIR350GapKind {
     R350_GAP_FS_OUT_FMT,     /* US_OUT_FMT_0 pixel format not modelled */
     R350_GAP_ZB_FORMAT,      /* ZB_FORMAT depth format not modelled */
     R350_GAP_CB_FORMAT,      /* COLORFORMAT the rasteriser cannot store */
+    R350_GAP_VS_ADDR_MODE,   /* PVS operand addressing mode not modelled */
     R350_GAP_MAX
 } ATIR350GapKind;
 
@@ -877,7 +878,7 @@ struct ATIR350State {
     bool pvs_glsl;
     uint64_t pvs_tr_sig;
     uint64_t pvs_tr_ok, pvs_tr_refused;
-    uint64_t pvs_tr_by_reason[3];       /* vector op, math op, dst file */
+    uint64_t pvs_tr_by_reason[4];   /* vector op, math op, dst file, addr */
     uint32_t pvs_tr_last_bytes, pvs_tr_last_nconst;
     uint32_t pvs_tr_last_in, pvs_tr_last_out;
 
