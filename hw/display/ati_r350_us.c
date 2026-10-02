@@ -435,6 +435,78 @@ static void us_try_fast(R300UsProgram *p)
     p->fast = true;
 }
 
+/*
+ * Which coordinate sets a draw carries and in whose units, and the set a
+ * filtered fetch takes its footprint from. Programs that are not run
+ * carry set 0 in unit 0's texels, as raw as the routing leaves it.
+ */
+static void us_tc_layout(R300UsProgram *p)
+{
+    bool run = p->valid && p->expressible;
+    uint32_t named = 0;
+    unsigned i, k;
+
+    p->ntc = 1;
+    p->tc_raw = 0;
+    for (i = 0; i < R300_TEXCOORDS; i++) {
+        p->tc_unit[i] = 0;
+        if (p->rs.tex_reg[i] >= 0) {
+            p->ntc = i + 1;
+            p->tc_raw |= 1u << i;
+        }
+    }
+    if (!run) {
+        p->tc_raw = 0;
+        return;
+    }
+    for (i = 0; i < p->ntex; i++) {
+        const R300UsTex *t = &p->tex[i];
+
+        if (t->op == R300_US_TEXOP_NOP || t->op == R300_US_TEXOP_TEXKILL) {
+            continue;
+        }
+        for (k = 0; k < p->ntc; k++) {
+            if (p->rs.tex_reg[k] == t->src) {
+                p->tc_raw &= ~(1u << k);
+            }
+        }
+    }
+    for (i = 0; i < p->ntex; i++) {
+        const R300UsTex *t = &p->tex[i];
+
+        if ((t->op != R300_US_TEXOP_LD && t->op != R300_US_TEXOP_PROJ) ||
+            t->unit >= R300_TEX_UNITS) {
+            continue;
+        }
+        for (k = 0; k < p->ntc; k++) {
+            if (p->rs.tex_reg[k] == t->src && !(named & (1u << k))) {
+                p->tc_unit[k] = t->unit;
+                named |= 1u << k;
+            }
+        }
+    }
+    for (i = 0; i < p->ntex; i++) {
+        R300UsTex *t = &p->tex[i];
+
+        t->dset = 0;
+        for (k = 0; k < p->ntc; k++) {
+            if (p->rs.tex_reg[k] == t->src) {
+                t->dset = k;
+                break;
+            }
+        }
+        if (k < p->ntc) {
+            continue;
+        }
+        for (k = 0; k < p->ntc; k++) {
+            if (p->tc_unit[k] == t->unit) {
+                t->dset = k;
+                break;
+            }
+        }
+    }
+}
+
 void r300_us_analyse(R300UsProgram *p,
                      uint32_t us_config, uint32_t us_code_offset,
                      const uint32_t *us_code_addr,
@@ -455,6 +527,7 @@ void r300_us_analyse(R300UsProgram *p,
 
     memset(p, 0, sizeof(*p));
     p->tex_dst = -1;
+    p->ntc = 1;
     for (i = 0; i < R300_TEXCOORDS; i++) {
         p->rs.tex_reg[i] = -1;
     }
@@ -713,6 +786,7 @@ void r300_us_analyse(R300UsProgram *p,
                           p->out_perm[2] != 2 || p->out_perm[3] != 3;
     }
 
+    us_tc_layout(p);
     us_try_fast(p);
 }
 

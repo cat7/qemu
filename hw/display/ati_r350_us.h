@@ -211,6 +211,12 @@ typedef struct R300UsAlu {
 typedef struct R300UsTex {
     uint8_t op;                 /* R300_US_TEXOP_* */
     uint8_t src, dst, unit;
+    /*
+     * The coordinate set whose screen derivatives a filtered fetch takes:
+     * the set routed into `src`, else the first set carried in `unit`'s
+     * texels, else set 0 (see r300_us_der() in ati_r350_3d.c).
+     */
+    uint8_t dset;
 } R300UsTex;
 
 /*
@@ -338,13 +344,23 @@ typedef struct R300UsProgram {
     uint8_t nlevels;
     bool has_kill;              /* the program contains a TEXKILL */
     /*
-     * The shape the GL backend's shader can express: ONE level, at most
-     * one fetch, from unit 0, and no TEXKILL. That backend samples the
-     * texture itself and hands `us_main()` a finished texel, so anything
-     * needing a fetch mid-program is refused by the translator and falls
-     * back to the software rasterizer -- which renders it correctly.
+     * ONE level, at most one fetch, from unit 0 addressed by coordinate
+     * set 0, and no TEXKILL: the shape whose fetch the GL backend and
+     * the specialised executor perform in front of the program. Any
+     * other program is translated with its fetches inside it.
      */
     bool gl_simple;
+    /*
+     * The interpolated coordinate sets a draw of this program carries.
+     * `ntc` is one past the highest set the routing names; `tc_unit[k]`
+     * is the unit whose texels set k is carried in, the unit of the first
+     * fetch addressed directly by it; `tc_raw` has bit k set for a routed
+     * set no fetch reads directly, which the rasterizer interpolates in
+     * all four components as the vertex stage emitted them.
+     */
+    unsigned ntc;
+    uint8_t tc_unit[R300_TEXCOORDS];
+    uint32_t tc_raw;
     /*
      * The one texture fetch, resolved: which frame register receives the
      * texel, and -1 when the program fetches nothing. A program with more
@@ -521,13 +537,22 @@ static inline void r300_us_run_fast(const R300UsProgram *p,
 
 
 /*
- * Translate the program to a GLSL 3.30 function
+ * Translate the program to GLSL 3.30 whose arithmetic is the
+ * interpreter's, expression for expression, including the host
+ * compiler's fusion (see ati_r350_us_glsl.c). A `gl_simple` program
+ * becomes
  *
  *     void us_main(vec4 tex0, vec4 col0, vec4 col1, out vec4 outc);
  *
- * whose arithmetic is the interpreter's, expression for expression,
- * including the host compiler's fusion (see ati_r350_us_glsl.c). Returns
- * false, without writing a usable shader, for anything
+ * and any other defines R350_USGEN and US_NTC, declares `us_tc[8]` and
+ *
+ *     vec4 us_fetch(int unit, vec4 coord, int dset);
+ *
+ * for the caller to supply, and becomes
+ *
+ *     void us_main(vec4 col0, vec4 col1, out vec4 outc, out bool kill);
+ *
+ * Returns false, without writing a usable shader, for anything
  * `p->expressible` refuses.
  */
 bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap);

@@ -38,24 +38,21 @@
  * Interpolated texture coordinate SETS a request carries, and texture
  * UNITS it can bind.
  *
- * ONE coordinate set, and that is a consequence rather than a limit.
- * The caller only offloads a draw whose fragment program the translator
- * could express, and that shape is a single fetch from unit 0 addressed
- * by coordinate SET 0 -- anything else needs a fetch inside the program,
- * which this contract's `us_main()` cannot perform. So a request can
- * never carry a second set, and the vertex layout below does not spend
- * a GL attribute on one; the sixteen GL 3.3 core guarantees are exactly
- * filled as it stands. The device's own R300_TEXCOORDS is eight,
- * because its software rasterizer really does interpolate that many for
- * Mac OS X 10.5.
+ * ONE coordinate set in the vertex array. A program in the simple form
+ * -- a single fetch from unit 0 addressed by coordinate SET 0 -- reads
+ * nothing else, and the sixteen GL 3.3 core attributes are exactly
+ * filled by that layout. A program in the general form carries every
+ * set it routes in a buffer texture instead (R350GlReq.tcx), up to the
+ * device's eight.
  *
- * The unit count is the device's, and asserted equal to it: a request
- * names a texture per unit even though today's translated programs read
- * only unit 0, so that a backend growing multi-unit sampling does not
- * need the contract changed underneath it.
+ * The unit count is the device's: a request names a texture per unit,
+ * and a general-form program samples any of them.
  */
 #define R350_GL_TEXCOORDS 1
 #define R350_GL_TEXUNITS  8
+
+/* coordinate sets a general-form request carries; see R350GlReq.tcx */
+#define R350_GL_TCSETS    8
 
 /*
  * Floats per vertex in a request's vertex array. Each vertex carries
@@ -229,6 +226,26 @@ typedef struct R350GlReq {
     const char *us_glsl;
     uint64_t us_key;
     const float *us_konst;      /* 32 * 4 floats */
+
+    /*
+     * A program translated in the GENERAL form, the one whose fetches
+     * run inside it: `tcx` is then every interpolated coordinate set of
+     * every triangle, in the order of the triangles in `verts`, as
+     * `tc_stride` RGBA32F texels per triangle -- for set k and corner c,
+     * texel 6k + 2c is (s, t) in the carrying unit's texels and texel
+     * 6k + 2c + 1 the four components the vertex stage emitted. The
+     * fragment stage interpolates them with the same weights as
+     * everything else. `tcinv[k]` is what undoes the carrying unit's
+     * size, `tc_raw` has bit k set for a set read raw, and `lod_any`
+     * asks for the coordinates' screen derivatives. Every unit in
+     * `textured` is bound and sampled as its own filter says. NULL for
+     * a program in the simple form, which reads none of this.
+     */
+    const float *tcx;
+    unsigned tc_stride;
+    float tcinv[R350_GL_TCSETS][2];
+    uint32_t tc_raw;
+    int lod_any;
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;
