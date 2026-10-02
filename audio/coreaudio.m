@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include <CoreAudio/CoreAudio.h>
+#include <IOKit/IOKitLib.h>
 #include <pthread.h>            /* pthread_X */
 
 #include "qemu/main-loop.h"
@@ -44,6 +45,7 @@ struct AudioCoreaudio {
 typedef struct coreaudioVoiceOut {
     HWVoiceOut hw;
     pthread_mutex_t buf_mutex;
+    const char *dev;
     AudioDeviceID device_id;
     int frame_size_setting;
     uint32_t buffer_count;
@@ -56,6 +58,8 @@ typedef struct coreaudioVoiceOut {
 typedef struct coreaudioVoiceIn {
     HWVoiceIn hw;
     pthread_mutex_t buf_mutex;
+    const char *dev;
+    AudioDeviceID reported;
     AudioDeviceID device_id;
     int frame_size_setting;
     uint32_t buffer_count;
@@ -144,10 +148,211 @@ static const AudioObjectPropertyAddress voice_in_addr = {
     kAudioObjectPropertyElementMain
 };
 
-static OSStatus coreaudio_get_voice_out(AudioDeviceID *id)
+static bool coreaudio_device_string(AudioDeviceID id,
+                                    AudioObjectPropertySelector sel,
+                                    char *buf, size_t len)
+{
+    AudioObjectPropertyAddress addr = {
+        sel,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    CFStringRef str = NULL;
+    UInt32 size = sizeof(str);
+    bool ok;
+
+    if (AudioObjectGetPropertyData(id, &addr, 0, NULL, &size, &str) !=
+        kAudioHardwareNoError || !str) {
+        return false;
+    }
+    ok = CFStringGetCString(str, buf, len, kCFStringEncodingUTF8);
+    CFRelease(str);
+    return ok;
+}
+
+/* the device with streams in @scope whose unique ID, else name, is @dev */
+static OSStatus coreaudio_find_device(const char *dev,
+                                      AudioObjectPropertyScope scope,
+                                      AudioDeviceID *id)
+{
+    static const AudioObjectPropertySelector keys[] = {
+        kAudioDevicePropertyDeviceUID, kAudioObjectPropertyName
+    };
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    g_autofree AudioDeviceID *ids = NULL;
+    OSStatus status;
+    UInt32 size;
+    char buf[256];
+
+    *id = kAudioDeviceUnknown;
+    status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr,
+                                            0, NULL, &size);
+    if (status != kAudioHardwareNoError) {
+        return status;
+    }
+    ids = g_malloc(size);
+    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr,
+                                        0, NULL, &size, ids);
+    if (status != kAudioHardwareNoError) {
+        return status;
+    }
+
+    for (int k = 0; k < ARRAY_SIZE(keys); k++) {
+        for (UInt32 i = 0; i < size / sizeof(*ids); i++) {
+            AudioObjectPropertyAddress streams = {
+                kAudioDevicePropertyStreams,
+                scope,
+                kAudioObjectPropertyElementMain
+            };
+            UInt32 ssize = 0;
+
+            if (AudioObjectGetPropertyDataSize(ids[i], &streams, 0, NULL,
+                                               &ssize) !=
+                kAudioHardwareNoError || !ssize) {
+                continue;
+            }
+            if (coreaudio_device_string(ids[i], keys[k], buf, sizeof(buf)) &&
+                !strcmp(buf, dev)) {
+                *id = ids[i];
+                return kAudioHardwareNoError;
+            }
+        }
+    }
+    return kAudioHardwareNoError;
+}
+
+/*
+ * True for a USB audio device with an interface claimed by this process,
+ * i.e. one passed through with usb-host.  macOS keeps listing such a
+ * device, and keeps it the default input; starting it fails.
+ */
+static bool coreaudio_device_passed_through(AudioDeviceID id)
+{
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyTransportType,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 transport = 0, size = sizeof(transport);
+    char model[256], uid[256], creator[32], *p, *serial = NULL;
+    unsigned vid, pid;
+    CFMutableDictionaryRef match;
+    CFNumberRef num;
+    io_iterator_t devs;
+    io_service_t usbdev;
+    bool held = false;
+
+    if (AudioObjectGetPropertyData(id, &addr, 0, NULL, &size, &transport) !=
+        kAudioHardwareNoError || transport != kAudioDeviceTransportTypeUSB ||
+        !coreaudio_device_string(id, kAudioDevicePropertyModelUID,
+                                 model, sizeof(model))) {
+        return false;
+    }
+    /* model UID "<name>:<vendor>:<product>", hex */
+    p = strrchr(model, ':');
+    if (!p || p == model) {
+        return false;
+    }
+    *p = '\0';
+    pid = strtoul(p + 1, NULL, 16);
+    p = strrchr(model, ':');
+    if (!p) {
+        return false;
+    }
+    vid = strtoul(p + 1, NULL, 16);
+
+    /* unique ID "AppleUSBAudioEngine:<vendor>:<name>:<serial>:<n>" */
+    if (coreaudio_device_string(id, kAudioDevicePropertyDeviceUID,
+                                uid, sizeof(uid)) &&
+        (p = strrchr(uid, ':')) && p != uid) {
+        *p = '\0';
+        serial = strrchr(uid, ':');
+        serial = serial ? serial + 1 : NULL;
+    }
+
+    match = IOServiceMatching("IOUSBHostDevice");
+    if (!match) {
+        return false;
+    }
+    num = CFNumberCreate(NULL, kCFNumberIntType, &vid);
+    CFDictionarySetValue(match, CFSTR("idVendor"), num);
+    CFRelease(num);
+    num = CFNumberCreate(NULL, kCFNumberIntType, &pid);
+    CFDictionarySetValue(match, CFSTR("idProduct"), num);
+    CFRelease(num);
+    if (IOServiceGetMatchingServices(MACH_PORT_NULL, match, &devs) !=
+        KERN_SUCCESS) {
+        return false;
+    }
+
+    snprintf(creator, sizeof(creator), "pid %d,", getpid());
+    while (!held && (usbdev = IOIteratorNext(devs))) {
+        io_iterator_t children;
+        io_registry_entry_t child;
+        CFTypeRef sn = NULL;
+        bool same = true;
+
+        if (serial && *serial) {
+            char buf[256];
+
+            sn = IORegistryEntryCreateCFProperty(usbdev,
+                                                 CFSTR("USB Serial Number"),
+                                                 NULL, 0);
+            same = sn && CFGetTypeID(sn) == CFStringGetTypeID() &&
+                   CFStringGetCString(sn, buf, sizeof(buf),
+                                      kCFStringEncodingUTF8) &&
+                   !strcmp(buf, serial);
+            if (sn) {
+                CFRelease(sn);
+            }
+        }
+        if (same &&
+            IORegistryEntryCreateIterator(usbdev, kIOServicePlane,
+                                          kIORegistryIterateRecursively,
+                                          &children) == KERN_SUCCESS) {
+            while (!held && (child = IOIteratorNext(children))) {
+                CFTypeRef c = IORegistryEntryCreateCFProperty(
+                    child, CFSTR("IOUserClientCreator"), NULL, 0);
+                io_registry_entry_t parent;
+                char buf[64];
+
+                /* an interface claimed by this process */
+                held = c && CFGetTypeID(c) == CFStringGetTypeID() &&
+                       CFStringGetCString(c, buf, sizeof(buf),
+                                          kCFStringEncodingUTF8) &&
+                       g_str_has_prefix(buf, creator) &&
+                       IORegistryEntryGetParentEntry(child, kIOServicePlane,
+                                                     &parent) == KERN_SUCCESS;
+                if (held) {
+                    held = IOObjectConformsTo(parent, "IOUSBHostInterface");
+                    IOObjectRelease(parent);
+                }
+                if (c) {
+                    CFRelease(c);
+                }
+                IOObjectRelease(child);
+            }
+            IOObjectRelease(children);
+        }
+        IOObjectRelease(usbdev);
+    }
+    IOObjectRelease(devs);
+    return held;
+}
+
+static OSStatus coreaudio_get_voice_out(CoreaudioVoiceOut *core,
+                                        AudioDeviceID *id)
 {
     UInt32 size = sizeof(*id);
 
+    if (core->dev) {
+        return coreaudio_find_device(core->dev, kAudioObjectPropertyScopeOutput,
+                                     id);
+    }
     return AudioObjectGetPropertyData(kAudioObjectSystemObject,
                                       &voice_out_addr,
                                       0,
@@ -239,16 +444,160 @@ static OSStatus coreaudio_get_out_streamformat(AudioDeviceID id,
     return AudioObjectGetPropertyData(id, &addr, 0, NULL, &size, d);
 }
 
-static OSStatus coreaudio_get_voice_in(AudioDeviceID *id)
+static OSStatus coreaudio_get_voice_in(CoreaudioVoiceIn *core,
+                                       AudioDeviceID *id)
 {
     UInt32 size = sizeof(*id);
 
+    if (core->dev) {
+        return coreaudio_find_device(core->dev, kAudioObjectPropertyScopeInput,
+                                     id);
+    }
     return AudioObjectGetPropertyData(kAudioObjectSystemObject,
                                       &voice_in_addr,
                                       0,
                                       NULL,
                                       &size,
                                       id);
+}
+
+/* an alive mono or stereo input that is not passed through */
+static bool coreaudio_input_usable(AudioDeviceID id)
+{
+    AudioObjectPropertyAddress alive_addr = {
+        kAudioDevicePropertyDeviceIsAlive,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectPropertyAddress fmt_addr = {
+        kAudioDevicePropertyStreamFormat,
+        kAudioObjectPropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+    AudioStreamBasicDescription d;
+    UInt32 alive = 0, size = sizeof(alive);
+
+    if (id == kAudioDeviceUnknown ||
+        AudioObjectGetPropertyData(id, &alive_addr, 0, NULL, &size, &alive) !=
+        kAudioHardwareNoError || !alive) {
+        return false;
+    }
+    size = sizeof(d);
+    if (AudioObjectGetPropertyData(id, &fmt_addr, 0, NULL, &size, &d) !=
+        kAudioHardwareNoError ||
+        d.mChannelsPerFrame < 1 || d.mChannelsPerFrame > 2) {
+        return false;
+    }
+    return !coreaudio_device_passed_through(id);
+}
+
+/* built-in first, then USB, then the rest; virtual devices last */
+static int coreaudio_input_rank(AudioDeviceID id)
+{
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyTransportType,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 transport = 0, size = sizeof(transport);
+
+    AudioObjectGetPropertyData(id, &addr, 0, NULL, &size, &transport);
+    switch (transport) {
+    case kAudioDeviceTransportTypeBuiltIn:
+        return 0;
+    case kAudioDeviceTransportTypeUSB:
+        return 1;
+    case kAudioDeviceTransportTypeVirtual:
+    case kAudioDeviceTransportTypeAggregate:
+    case kAudioDeviceTransportTypeAutoAggregate:
+        return 3;
+    default:
+        return 2;
+    }
+}
+
+/*
+ * The input to capture from: in.dev, else the default input; when that
+ * one is gone or passed through to the guest, the default input, else the
+ * best ranked usable input.
+ */
+static OSStatus coreaudio_pick_voice_in(CoreaudioVoiceIn *core,
+                                        AudioDeviceID *id)
+{
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    g_autofree AudioDeviceID *ids = NULL;
+    AudioDeviceID want, def = kAudioDeviceUnknown, best = kAudioDeviceUnknown;
+    char name[256] = "", why[300];
+    UInt32 size = sizeof(def);
+    OSStatus status;
+    int best_rank = INT_MAX;
+
+    status = coreaudio_get_voice_in(core, &want);
+    if (status != kAudioHardwareNoError) {
+        return status;
+    }
+    if (coreaudio_input_usable(want)) {
+        *id = want;
+        return kAudioHardwareNoError;
+    }
+
+    if (want == kAudioDeviceUnknown) {
+        snprintf(why, sizeof(why), "%s%s%s", core->dev ? "\"" : "",
+                 core->dev ?: "no default input",
+                 core->dev ? "\" not found" : "");
+    } else {
+        coreaudio_device_string(want, kAudioObjectPropertyName,
+                                name, sizeof(name));
+        snprintf(why, sizeof(why), "\"%s\" %s", name,
+                 coreaudio_device_passed_through(want) ?
+                 "is passed through to the guest" : "is not usable");
+    }
+
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &voice_in_addr,
+                               0, NULL, &size, &def);
+    if (core->dev && def != want && coreaudio_input_usable(def)) {
+        best = def;
+    } else if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr,
+                                              0, NULL, &size) ==
+               kAudioHardwareNoError) {
+        ids = g_malloc(size);
+        if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr,
+                                       0, NULL, &size, ids) !=
+            kAudioHardwareNoError) {
+            size = 0;
+        }
+        for (UInt32 i = 0; i < size / sizeof(*ids); i++) {
+            int rank;
+
+            if (ids[i] == want || !coreaudio_input_usable(ids[i])) {
+                continue;
+            }
+            rank = coreaudio_input_rank(ids[i]);
+            if (rank < best_rank) {
+                best = ids[i];
+                best_rank = rank;
+            }
+        }
+    }
+
+    *id = best;
+    if (best != core->reported) {
+        name[0] = '\0';
+        coreaudio_device_string(best, kAudioObjectPropertyName,
+                                name, sizeof(name));
+        if (best == kAudioDeviceUnknown) {
+            info_report("coreaudio: %s, and no other input to capture from",
+                        why);
+        } else {
+            info_report("coreaudio: capturing from \"%s\": %s", name, why);
+        }
+        core->reported = best;
+    }
+    return kAudioHardwareNoError;
 }
 
 static OSStatus coreaudio_get_in_framesizerange(AudioDeviceID id,
@@ -544,7 +893,7 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
         .mSampleRate = core->hw.info.freq
     };
 
-    status = coreaudio_get_voice_out(&device_id);
+    status = coreaudio_get_voice_out(core, &device_id);
     if (status != kAudioHardwareNoError) {
         coreaudio_playback_logerr(status,
                                   "Could not get default output device");
@@ -552,7 +901,8 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
     }
     if (device_id == kAudioDeviceUnknown) {
         error_report("coreaudio: Could not initialize playback: "
-                     "Unknown audio device");
+                     "Unknown audio device%s%s", core->dev ? " " : "",
+                     core->dev ?: "");
         return status;
     }
 
@@ -781,6 +1131,7 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
         qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
 
     core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+    core->dev = cpdo->dev;
 
     status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
                                             &voice_out_addr,
@@ -984,7 +1335,7 @@ static OSStatus init_in_device(CoreaudioVoiceIn *core)
         .mSampleRate = core->hw.info.freq
     };
 
-    status = coreaudio_get_voice_in(&device_id);
+    status = coreaudio_pick_voice_in(core, &device_id);
     if (status != kAudioHardwareNoError) {
         coreaudio_capture_logerr(status,
                                  "Could not get default input device");
@@ -992,7 +1343,8 @@ static OSStatus init_in_device(CoreaudioVoiceIn *core)
     }
     if (device_id == kAudioDeviceUnknown) {
         error_report("coreaudio: Could not initialize capture: "
-                     "Unknown audio input device");
+                     "Unknown audio input device%s%s", core->dev ? " " : "",
+                     core->dev ?: "");
         return -1;
     }
 
@@ -1137,6 +1489,14 @@ static void update_in_device_capture_state(CoreaudioVoiceIn *core)
 {
     OSStatus status;
 
+    if (core->enabled && !core->running &&
+        (core->device_id == kAudioDeviceUnknown ||
+         coreaudio_device_passed_through(core->device_id))) {
+        /* passed through since the voice was set up: choose again */
+        fini_in_device(core);
+        init_in_device(core);
+    }
+
     if (core->device_id == kAudioDeviceUnknown) {
         return;
     }
@@ -1208,6 +1568,7 @@ static int coreaudio_init_in(HWVoiceIn *hw, struct audsettings *as)
         qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
 
     core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+    core->dev = cpdo->dev;
 
     status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
                                             &voice_in_addr,
