@@ -66,29 +66,90 @@ void r300_pvs_const(const R300PvsProgram *p, unsigned off, float v[4])
     }
 }
 
-/* an ordinary source operand: register file, swizzle, negate, abs */
-static void r300_pvs_src(const R300PvsProgram *p, const R300PvsRegs *r,
-                         uint32_t dw, float out[4])
+/* an operand's ADDR_MODE, MODE_1 the msb and MODE_0 the lsb */
+static unsigned r300_pvs_addr_mode(bool mode1, bool mode0)
+{
+    return (mode1 ? 2 : 0) | (mode0 ? 1 : 0);
+}
+
+static void r300_pvs_addr_gap(R300PvsGaps *gaps, unsigned mode)
+{
+    if (gaps && !gaps->has_addr_mode) {
+        gaps->has_addr_mode = true;
+        gaps->addr_mode = mode;
+    }
+}
+
+/*
+ * A register read relative to the address register. The constant file
+ * returns (0,0,0,0) for an address outside 0..PVS_MAX_CONST_ADDR (R5xx
+ * guide 7.5); the other files are given the same answer for an address
+ * outside the file.
+ */
+static void r300_pvs_read_rel(const R300PvsProgram *p, const R300PvsRegs *r,
+                              unsigned type, int idx, float v[4])
+{
+    switch (type) {
+    case R300_PVS_SRC_REG_INPUT:
+        if (idx >= 0 && idx < R300_PVS_IN_REGS) {
+            memcpy(v, r->in[idx], 4 * sizeof(float));
+        }
+        break;
+    case R300_PVS_SRC_REG_CONSTANT:
+        if (idx >= 0) {
+            r300_pvs_const(p, idx, v);
+        }
+        break;
+    case R300_PVS_SRC_REG_ALT_TEMP:
+        if (idx >= 0 && idx < R300_PVS_ATMP_REGS) {
+            memcpy(v, r->atmp[idx], 4 * sizeof(float));
+        }
+        break;
+    default:
+        if (idx >= 0 && idx < R300_PVS_TMP_REGS) {
+            memcpy(v, r->tmp[idx], 4 * sizeof(float));
+        }
+        break;
+    }
+}
+
+/*
+ * An ordinary source operand: register file, swizzle, negate, abs.
+ * False, with the gap recorded, for an addressing mode not modelled.
+ */
+static bool r300_pvs_src(const R300PvsProgram *p, const R300PvsRegs *r,
+                         uint32_t dw, float out[4], R300PvsGaps *gaps)
 {
     unsigned type = dw & R300_PVS_SRC_REG_TYPE_MASK;
     unsigned off = (dw >> R300_PVS_SRC_OFFSET_SHIFT) &
                    R300_PVS_SRC_OFFSET_MASK;
+    unsigned mode = r300_pvs_addr_mode(dw & R300_PVS_SRC_ADDR_MODE_1,
+                                       dw & R300_PVS_SRC_ADDR_MODE_0);
+    unsigned asel = (dw >> R300_PVS_SRC_ADDR_SEL_SHIFT) &
+                    R300_PVS_SRC_ADDR_SEL_MASK;
     float v[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     unsigned c;
 
-    switch (type) {
-    case R300_PVS_SRC_REG_INPUT:
-        memcpy(v, r->in[off % R300_PVS_IN_REGS], sizeof(v));
-        break;
-    case R300_PVS_SRC_REG_CONSTANT:
-        r300_pvs_const(p, off, v);
-        break;
-    case R300_PVS_SRC_REG_ALT_TEMP:
-        memcpy(v, r->atmp[off % R300_PVS_ATMP_REGS], sizeof(v));
-        break;
-    default:
-        memcpy(v, r->tmp[off % R300_PVS_TMP_REGS], sizeof(v));
-        break;
+    if (mode == R300_PVS_ADDR_RELATIVE_A0) {
+        r300_pvs_read_rel(p, r, type, (int)off + r->a0[asel], v);
+    } else if (mode != R300_PVS_ADDR_ABSOLUTE) {
+        r300_pvs_addr_gap(gaps, mode);
+        return false;
+    } else {
+        switch (type) {
+        case R300_PVS_SRC_REG_INPUT:
+            memcpy(v, r->in[off % R300_PVS_IN_REGS], sizeof(v));
+            break;
+        case R300_PVS_SRC_REG_CONSTANT:
+            r300_pvs_const(p, off, v);
+            break;
+        case R300_PVS_SRC_REG_ALT_TEMP:
+            memcpy(v, r->atmp[off % R300_PVS_ATMP_REGS], sizeof(v));
+            break;
+        default:
+            memcpy(v, r->tmp[off % R300_PVS_TMP_REGS], sizeof(v));
+            break;
+        }
     }
 
     for (c = 0; c < 4; c++) {
@@ -109,6 +170,7 @@ static void r300_pvs_src(const R300PvsProgram *p, const R300PvsRegs *r,
         }
         out[c] = f;
     }
+    return true;
 }
 
 /*
@@ -267,6 +329,18 @@ static bool r300_pvs_vector(unsigned opcode, const float a[4],
         }
         res[1] = res[2] = res[3] = res[0];
         return true;
+    case R300_VE_FLT2FIX_DX:
+        /* the address-register load: floor() of each component */
+        for (i = 0; i < 4; i++) {
+            res[i] = floorf(a[i]);
+        }
+        return true;
+    case R300_VE_FLT2FIX_DX_RND:
+        /* ... and its rounding form, floor(x + 0.5) */
+        for (i = 0; i < 4; i++) {
+            res[i] = floorf(a[i] + 0.5f);
+        }
+        return true;
     default:
         return false;
     }
@@ -303,7 +377,9 @@ static void r300_pvs_dual_math(const R300PvsProgram *p, R300PvsRegs *r,
      * channels that do exist and nothing else, then present each as a w
      * channel, which is all the math engine ever reads.
      */
-    r300_pvs_src(p, r, dw & ~(0x3fu << 19), src);
+    if (!r300_pvs_src(p, r, dw & ~(0x3fu << 19), src, gaps)) {
+        return;
+    }
     a[3] = src[0];
     b[3] = src[1];
     if (!r300_pvs_math(opcode, a, b, b, res)) {
@@ -315,6 +391,23 @@ static void r300_pvs_dual_math(const R300PvsProgram *p, R300PvsRegs *r,
     }
     c = we;
     r->atmp[doff][c] = res[c];
+}
+
+/*
+ * The register a destination writes in a file of `n`: the offset itself,
+ * or relative to the address register, where a register outside the file
+ * is not written at all. -1 for that.
+ */
+static int r300_pvs_dst_slot(unsigned mode, unsigned doff, int32_t a0,
+                             unsigned n)
+{
+    int idx;
+
+    if (mode == R300_PVS_ADDR_ABSOLUTE) {
+        return doff % n;
+    }
+    idx = (int)doff + a0;
+    return idx >= 0 && idx < (int)n ? idx : -1;
 }
 
 void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
@@ -337,15 +430,22 @@ void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
         unsigned we = (op >> R300_PVS_DST_WE_SHIFT) & R300_PVS_DST_WE_MASK;
         float a[4], b[4], c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         float res[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        unsigned dmode = r300_pvs_addr_mode(op & R300_PVS_DST_ADDR_MODE_1,
+                                            op & R300_PVS_DST_ADDR_MODE_0);
+        unsigned dsel = (op >> R300_PVS_DST_ADDR_SEL_SHIFT) &
+                        R300_PVS_DST_ADDR_SEL_MASK;
         float *dst;
+        int idx;
         unsigned k;
 
-        r300_pvs_src(p, r, w[1], a);
-        r300_pvs_src(p, r, w[2], b);
+        if (!r300_pvs_src(p, r, w[1], a, gaps) ||
+            !r300_pvs_src(p, r, w[2], b, gaps)) {
+            continue;
+        }
         if (dual) {
             r300_pvs_dual_math(p, r, w[3], gaps);
-        } else {
-            r300_pvs_src(p, r, w[3], c);
+        } else if (!r300_pvs_src(p, r, w[3], c, gaps)) {
+            continue;
         }
 
         if (op & R300_PVS_DST_MACRO_INST) {
@@ -388,24 +488,68 @@ void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
             }
         }
 
+        if (dtype == R300_PVS_DST_REG_A0 && !math &&
+            !(op & R300_PVS_DST_MACRO_INST) &&
+            (opcode == R300_VE_FLT2FIX_DX ||
+             opcode == R300_VE_FLT2FIX_DX_RND)) {
+            /*
+             * The only writers of A0 (R5xx guide 7.5.9): the integral
+             * result, clamped to -256..255. The register is a single
+             * vector, so the destination offset and addressing mode are
+             * meaningless here.
+             */
+            for (k = 0; k < 4; k++) {
+                if (we & (1u << k)) {
+                    float f = res[k] > R300_PVS_ADDR_MIN ?
+                              (res[k] < R300_PVS_ADDR_MAX ?
+                               res[k] : R300_PVS_ADDR_MAX) :
+                              R300_PVS_ADDR_MIN;
+
+                    r->a0[k] = (int32_t)f;
+                }
+            }
+            continue;
+        }
+
+        if (dmode != R300_PVS_ADDR_ABSOLUTE &&
+            dmode != R300_PVS_ADDR_RELATIVE_A0) {
+            r300_pvs_addr_gap(gaps, dmode);
+            continue;
+        }
+
         switch (dtype) {
         case R300_PVS_DST_REG_OUT:
         case R300_PVS_DST_REG_OUT_REPL_X:
-            dst = r->out[doff % R300_PVS_OUT_REGS];
-            r->out_written |= 1u << (doff % R300_PVS_OUT_REGS);
+            idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
+                                    R300_PVS_OUT_REGS);
+            if (idx < 0) {
+                continue;
+            }
+            dst = r->out[idx];
+            r->out_written |= 1u << idx;
             break;
         case R300_PVS_DST_REG_TEMPORARY:
-            dst = r->tmp[doff % R300_PVS_TMP_REGS];
+            idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
+                                    R300_PVS_TMP_REGS);
+            if (idx < 0) {
+                continue;
+            }
+            dst = r->tmp[idx];
             break;
         case R300_PVS_DST_REG_ALT_TEMP:
-            dst = r->atmp[doff % R300_PVS_ATMP_REGS];
+            idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
+                                    R300_PVS_ATMP_REGS);
+            if (idx < 0) {
+                continue;
+            }
+            dst = r->atmp[idx];
             break;
         default:
             /*
-             * The address register drives the relative addressing this
-             * interpreter does not model, and writing the input file back
-             * is a shader-model-3 trick; either would give a wrong answer
-             * silently rather than an approximate one.
+             * Writing the input file back is a shader-model-3 trick, and
+             * A0 is written only by the float-to-fixed loads above;
+             * either would give a wrong answer silently rather than an
+             * approximate one.
              */
             if (gaps && !gaps->has_dst_file) {
                 gaps->has_dst_file = true;
@@ -587,7 +731,11 @@ void r300_pvs_analyse(R300PvsProgram *p, const uint32_t *code,
         bool is_out = dtype == R300_PVS_DST_REG_OUT ||
                       dtype == R300_PVS_DST_REG_OUT_REPL_X;
 
-        if (is_out && doff < R300_PVS_OUT_REGS) {
+        if (is_out && (op & (R300_PVS_DST_ADDR_MODE_0 |
+                             R300_PVS_DST_ADDR_MODE_1))) {
+            /* a relative destination may land on any output */
+            p->out_mask |= (1u << R300_PVS_OUT_REGS) - 1;
+        } else if (is_out && doff < R300_PVS_OUT_REGS) {
             p->out_mask |= 1u << doff;
             /* out[n] = in[k] * (1,1,1,1): an attribute forwarded intact */
             if (opcode == R300_VE_MULTIPLY && we == 0xf &&

@@ -3235,6 +3235,9 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
     if (g.has_dst_file) {
         ati_r350_note_gap(s, R350_GAP_VS_DST_FILE, g.dst_file);
     }
+    if (g.has_addr_mode) {
+        ati_r350_note_gap(s, R350_GAP_VS_ADDR_MODE, g.addr_mode);
+    }
 
     if ((r.out_written & (1u << d->vs_color_out)) && r300_vs_has_color(d)) {
         r300_vs_color(v, r.out[d->vs_color_out]);
@@ -3313,6 +3316,10 @@ static void r300_pvs_translate(ATIR350State *s, const R300PvsProgram *p)
         if (info.gaps.has_dst_file) {
             s->pvs_tr_by_reason[2]++;
             ati_r350_note_gap(s, R350_GAP_VS_DST_FILE, info.gaps.dst_file);
+        }
+        if (info.gaps.has_addr_mode) {
+            s->pvs_tr_by_reason[3]++;
+            ati_r350_note_gap(s, R350_GAP_VS_ADDR_MODE, info.gaps.addr_mode);
         }
     }
     trace_ati_r350_pvs_glsl(p->first, p->last, p->cbase, p->cmax, ok,

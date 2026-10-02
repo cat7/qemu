@@ -4688,6 +4688,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_FS_OUT_FMT]   = "fragment output format",
     [R350_GAP_ZB_FORMAT]    = "depth buffer format",
     [R350_GAP_CB_FORMAT]    = "colour buffer format",
+    [R350_GAP_VS_ADDR_MODE] = "vertex operand address mode",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
@@ -4816,10 +4817,11 @@ static char *ati_r350_get_pvs(Object *obj, Error **errp)
     }
     g_string_append_printf(out, "programs %" PRIu64 " translated, %" PRIu64
                            " refused (vector op %" PRIu64 ", math op %"
-                           PRIu64 ", dst file %" PRIu64 ")",
+                           PRIu64 ", dst file %" PRIu64 ", address mode %"
+                           PRIu64 ")",
                            s->pvs_tr_ok, s->pvs_tr_refused,
                            s->pvs_tr_by_reason[0], s->pvs_tr_by_reason[1],
-                           s->pvs_tr_by_reason[2]);
+                           s->pvs_tr_by_reason[2], s->pvs_tr_by_reason[3]);
     g_string_append_printf(out, "\nlast: %u bytes of GLSL, %u constants,"
                            " in 0x%x, out 0x%x", s->pvs_tr_last_bytes,
                            s->pvs_tr_last_nconst, s->pvs_tr_last_in,
