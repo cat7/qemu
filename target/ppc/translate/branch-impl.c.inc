@@ -177,7 +177,7 @@ static bool bcond_helper(DisasContext *ctx, int type, uint32_t bo, int bi,
         } else {
             tcg_gen_andi_tl(cpu_nip, target, ~3);
         }
-        gen_lookup_and_goto_ptr(ctx);
+        gen_branch_lookup_and_goto_ptr(ctx);
     }
     if ((bo & 0x14) != 0x14) {
         /* fallthrough case */
