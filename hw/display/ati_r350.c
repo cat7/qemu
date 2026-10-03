@@ -1673,6 +1673,7 @@ static uint32_t ati_r350_reg_read32(ATIR350State *s, uint32_t base)
 static void ati_r350_bm_gui_run(ATIR350State *s, uint32_t table);
 static void ati_r350_pm4_run(ATIR350State *s);
 static void ati_r350_pm4_run_ring(ATIR350State *s);
+static void ati_r350_cp_rptr_load(ATIR350State *s);
 static void ati_r350_scratch_writeback(ATIR350State *s, unsigned n);
 static void ati_r350_pm4_fifo_push(ATIR350State *s, uint32_t val);
 static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
@@ -1977,11 +1978,20 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         break;
     }
     case R350_CP_RB_RPTR:
+        /* read-only */
+        trace_ati_r350_cp_rptr_ignored("CP_RB_RPTR", val,
+                                       s->regs[R350_CP_RB_CNTL >> 2]);
+        break;
     case R350_CP_RB_RPTR_WR:
-        s->pm4_rptr = s->pm4_ring_dwords ?
-                      val & (s->pm4_ring_dwords - 1) : val;
+        /* moved into CP_RB_RPTR by a CP_RB_WPTR write, if RB_RPTR_WR_ENA */
+        s->regs[base >> 2] = val & 0x7fffff;
+        if (!(s->regs[R350_CP_RB_CNTL >> 2] & R350_RB_RPTR_WR_ENA)) {
+            trace_ati_r350_cp_rptr_ignored("CP_RB_RPTR_WR", val,
+                                           s->regs[R350_CP_RB_CNTL >> 2]);
+        }
         break;
     case R350_CP_RB_WPTR:
+        ati_r350_cp_rptr_load(s);
         s->pm4_wptr = s->pm4_ring_dwords ?
                       val & (s->pm4_ring_dwords - 1) : val;
         s->regs[base >> 2] = val;
@@ -2860,6 +2870,26 @@ static void ati_r350_cp_rptr_writeback(ATIR350State *s)
         }
         ati_r350_mc_write32(s, addr, val);
     }
+}
+
+/*
+ * With CP_RB_CNTL.RB_RPTR_WR_ENA set, a CP_RB_WPTR write first moves
+ * CP_RB_RPTR_WR into the read pointer: the ring reset sequence.
+ */
+static void ati_r350_cp_rptr_load(ATIR350State *s)
+{
+    uint32_t old = s->pm4_rptr;
+    uint32_t val = s->regs[R350_CP_RB_RPTR_WR >> 2];
+
+    if (!(s->regs[R350_CP_RB_CNTL >> 2] & R350_RB_RPTR_WR_ENA)) {
+        return;
+    }
+    qatomic_set(&s->pm4_rptr, s->pm4_ring_dwords ?
+                val & (s->pm4_ring_dwords - 1) : val);
+    /* a packet split across the old position is not continued */
+    s->pm4_ring.remaining = 0;
+    trace_ati_r350_cp_rptr_load(old, s->pm4_rptr);
+    ati_r350_cp_rptr_writeback(s);
 }
 
 static void ati_r350_scratch_writeback(ATIR350State *s, unsigned n)
@@ -3741,6 +3771,10 @@ static void ati_r350_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     }
     if (s->engine_on) {
         if (base == R350_CP_RB_WPTR && size == 4 && !(addr & 3)) {
+            if (s->regs[R350_CP_RB_CNTL >> 2] & R350_RB_RPTR_WR_ENA) {
+                ati_r350_engine_wait(s);
+                ati_r350_cp_rptr_load(s);
+            }
             s->regs[base >> 2] = val;
             qatomic_store_release(&s->pm4_wptr, s->pm4_ring_dwords ?
                                   val & (s->pm4_ring_dwords - 1) : val);

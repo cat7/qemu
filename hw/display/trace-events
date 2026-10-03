@@ -292,6 +292,8 @@ ati_r350_monidb(int64_t ns, uint32_t raw, uint32_t y) "t=%"PRId64" GPIO_MONIDB p
 ati_r350_monidb_wr(int64_t ns, uint32_t val) "t=%"PRId64" GPIO_MONIDB write val=0x%08x"
 ati_r350_cp_rb_cntl(uint32_t val, uint32_t dwords, int noupdate, uint32_t swap) "CP_RB_CNTL 0x%08x ring %u dwords no_update=%d buf_swap=%u"
 ati_r350_cp_reg(const char *name, uint32_t val) "%s = 0x%08x"
+ati_r350_cp_rptr_load(uint32_t old, uint32_t rptr) "CP_RB_RPTR %u -> %u (CP_RB_RPTR_WR)"
+ati_r350_cp_rptr_ignored(const char *name, uint32_t val, uint32_t cntl) "%s = 0x%08x ignored, CP_RB_CNTL 0x%08x"
 ati_r350_mc_ind(uint32_t idx, uint32_t val) "MC_IND[0x%02x] = 0x%08x"
 ati_r350_surface(const char *name, uint32_t val) "%s = 0x%08x"
 ati_r350_ddc_pad(uint32_t reg, uint32_t val, int scl, int sda, int sda_in) "pad 0x%x = 0x%08x scl=%d sda=%d -> sda_in=%d"
