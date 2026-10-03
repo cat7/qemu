@@ -2899,10 +2899,13 @@ static uint32_t ati_r350_pm4_read_ring(ATIR350State *s)
  */
 static void ati_r350_pm4_run(ATIR350State *s)
 {
-    if (!s->pm4_ring_dwords) {
+    /* a CP_RB_WPTR write from the command stream extends the running loop */
+    if (!s->pm4_ring_dwords || s->pm4_in_ring) {
         return;
     }
+    s->pm4_in_ring = true;
     ati_r350_pm4_run_ring(s);
+    s->pm4_in_ring = false;
     /*
      * A whole ring is drained inside the guest store that kicked it, so
      * this is the first moment the guest CPU could look at VRAM again --
@@ -3957,6 +3960,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     s->pm4_wptr = 0;
     s->pm4_buffer_addr = 0;
     s->pm4_in_ib = false;
+    s->pm4_in_ring = false;
     s->vga_ddc_sda = 1;
     s->dvi_ddc_sda = 1;
 }
