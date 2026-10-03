@@ -5054,14 +5054,10 @@ floatx80 normalizeRoundAndPackFloatx80(FloatX80RoundPrec roundingPrecision,
 | `a'. The operation is performed according to the IEC/IEEE Standard for
 | Binary Floating-Point Arithmetic.
 |
-| Uses the following identities:
+| The argument is split as x = n + f, n = round(x), |f| <= 1/2.  n goes into
+| the exponent; 2^f = e^(f*ln(2)) is summed from the series below, which
+| converges quickly on that interval.  The result is rounded once.
 |
-| 1. -------------------------------------------------------------------------
-|      x    x*ln(2)
-|     2  = e
-|
-| 2. -------------------------------------------------------------------------
-|                      2     3     4     5           n
 |      x        x     x     x     x     x           x
 |     e  = 1 + --- + --- + --- + --- + --- + ... + --- + ...
 |               1!    2!    3!    4!    5!          n!
@@ -5086,10 +5082,19 @@ static const float64 float32_exp2_coefficients[15] =
     const_float64( 0x3d6ae7f3e733b81fll ), /* 15 */
 };
 
+/* ln(2) to 64 bits */
+static const FloatParts64 float32_exp2_ln2 = {
+    .cls = float_class_normal,
+    .exp = -1,
+    .frac = 0xb17217f7d1cf79acull,
+};
+
 float32 float32_exp2(float32 a, float_status *status)
 {
     FloatParts64 xnp, tp, rp;
     FloatParts64 xp = float32_unpack_canonical(a, status);
+    int64_t fx;
+    int n;
 
     if (unlikely(xp.cls != float_class_normal)) {
         switch (xp.cls) {
@@ -5108,19 +5113,44 @@ float32 float32_exp2(float32 a, float_status *status)
         }
     }
 
+    rp = float64_unpack_canonical(float64_one, status);
+
+    if (xp.exp >= 8) {
+        /* |x| >= 256: overflows or underflows */
+        n = xp.sign ? -512 : 512;
+        float_raise(float_flag_inexact, status);
+        goto pack;
+    }
+    if (xp.exp >= -1) {
+        /* x * 2^32 is exact: at most 24 significant bits below 2^40 */
+        fx = xp.frac >> (31 - xp.exp);
+        if (xp.sign) {
+            fx = -fx;
+        }
+        n = (fx + (INT64_C(1) << 31)) >> 32;
+        fx -= (int64_t)n * (INT64_C(1) << 32);
+        if (fx == 0) {
+            goto pack;
+        }
+        parts64_sint_to_float(&xp, fx, -32, status);
+    } else {
+        n = 0;
+    }
+
     float_raise(float_flag_inexact, status);
 
-    tp = float64_unpack_canonical(float64_ln2, status);
+    tp = float32_exp2_ln2;
     xp = parts64_mul(&xp, &tp, status);
     xnp = xp;
 
-    rp = float64_unpack_canonical(float64_one, status);
     for (int i = 0; i < 15; i++) {
         tp = float64_unpack_canonical(float32_exp2_coefficients[i], status);
         rp = parts64_muladd(&tp, &xnp, &rp, 0, status);
         xnp = parts64_mul(&xnp, &xp, status);
     }
 
+ pack:
+    rp.exp += n;
     return float32_round_pack_canonical(&rp, status);
 }
 
