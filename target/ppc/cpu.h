@@ -872,6 +872,7 @@ enum {
     HFLAGS_PMC_OTHER = 18, /* PMC other than PMC5-6 is enabled */
     HFLAGS_INSN_CNT = 19, /* PMU instruction count enabled */
     HFLAGS_BHRB_ENABLE = 20, /* Summary flag for enabling BHRB */
+    HFLAGS_FP_FAST = 21, /* inline host FP: FPSCR enables, NI and RN zero */
     HFLAGS_VSX = 23, /* MSR_VSX if cpu has VSX */
     HFLAGS_VR = 25,  /* MSR_VR if cpu has VRE */
 
