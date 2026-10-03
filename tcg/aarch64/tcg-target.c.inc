@@ -2913,6 +2913,291 @@ static const TCGOutOpStore outop_st = {
     .out_r = tcg_out_st,
 };
 
+/*
+ * fparith_vec.  Scratch registers V23-V30 are reserved for it, and it
+ * also uses TCG_VEC_TMP0 and the integer temporaries.
+ */
+#define FPA_T(n)        (TCG_REG_V23 + (n))
+
+enum {
+    FPA_FMUL    = 0x1e200800,   /* | ftype << 22 */
+    FPA_FDIV    = 0x1e201800,
+    FPA_FADD    = 0x1e202800,
+    FPA_FSUB    = 0x1e203800,
+    FPA_FMADD   = 0x1f000000,   /* d = a + n * m */
+    FPA_FMSUB   = 0x1f008000,   /* d = a - n * m */
+    FPA_FNMSUB  = 0x1f208000,   /* d = n * m - a */
+    FPA_FMOV    = 0x1e204000,
+    FPA_FNEG    = 0x1e214000,
+    FPA_FCVT_SD = 0x1e624000,   /* single from double */
+    FPA_FCVT_DS = 0x1e22c000,   /* double from single */
+    FPA_FCMEQ   = 0x5e20e400,   /* | sz << 22 */
+    FPA_FCMEQ0  = 0x5ea0d800,
+    FPA_AND8B   = 0x0e201c00,
+    FPA_UMOV_WS = 0x1e260000,   /* fmov wd, sn */
+    FPA_UMOV_XD = 0x9e660000,   /* fmov xd, dn */
+    FPA_FMOV_DX = 0x9e670000,   /* fmov dd, xn */
+};
+
+static void fpa_out3(TCGContext *s, uint32_t insn, bool dbl,
+                     TCGReg d, TCGReg n, TCGReg m)
+{
+    tcg_out32(s, insn | dbl << 22 | (m & 31) << 16 | (n & 31) << 5 | (d & 31));
+}
+
+static void fpa_out4(TCGContext *s, uint32_t insn, bool dbl,
+                     TCGReg d, TCGReg n, TCGReg m, TCGReg a)
+{
+    tcg_out32(s, insn | dbl << 22 | (m & 31) << 16 | (a & 31) << 10
+              | (n & 31) << 5 | (d & 31));
+}
+
+/*
+ * The biased exponent of v outside [lo, hi]: the first check leaves v's
+ * bits in TMP0 and sets TMP1; later ones use TMP2 and OR into TMP1.
+ */
+static void fpa_range(TCGContext *s, TCGReg v, bool dbl,
+                      unsigned lo, unsigned hi, bool first)
+{
+    TCGReg bits = first ? TCG_REG_TMP0 : TCG_REG_TMP2;
+    TCGReg exp = first ? TCG_REG_TMP1 : TCG_REG_TMP2;
+
+    tcg_out32(s, (dbl ? FPA_UMOV_XD : FPA_UMOV_WS) | (v & 31) << 5 | bits);
+    tcg_out_ubfm(s, TCG_TYPE_I64, exp, bits, dbl ? 52 : 23, dbl ? 62 : 30);
+    tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, exp, exp, lo);
+    tgen_cmpi(s, TCG_TYPE_I64, TCG_COND_GTU, exp, hi - lo);
+    if (first) {
+        tgen_cset(s, TCG_COND_GTU, TCG_REG_TMP1);
+    } else {
+        tcg_out_insn(s, csel, CSINC, TCG_TYPE_I64, TCG_REG_TMP1,
+                     TCG_REG_TMP1, TCG_REG_XZR, TCG_COND_LEU);
+    }
+}
+
+static void fpa_and(TCGContext *s, TCGReg d, TCGReg n, TCGReg m)
+{
+    tcg_out32(s, FPA_AND8B | (m & 31) << 16 | (n & 31) << 5 | (d & 31));
+}
+
+static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
+                            TCGReg a, TCGReg c, TCGReg b, unsigned desc)
+{
+    unsigned op = desc & FPARITH_OP_MASK;
+    bool ix = desc & FPARITH_INEXACT;
+    bool rsp = op == FPARITH_RSP;
+    bool sgl = (desc & FPARITH_SINGLE) && !rsp;
+    bool dbl = !sgl;
+    bool fma = op >= FPARITH_MADD && op <= FPARITH_NMSUB;
+    unsigned emax = dbl ? 0x7fe : 0xfe;
+    /* smallest exponent at which a rounding error is representable */
+    unsigned eprod = dbl ? 56 : 26;
+    TCGReg p = a, q = fma ? c : b, z = b;
+    TCGReg r = FPA_T(0), mask = FPA_T(1), tmp = TCG_VEC_TMP0;
+    unsigned rlo = 2;
+    tcg_insn_unit *tbnz, *bdone;
+    TCGReg save[TCG_TARGET_NB_REGS];
+    int nsave = 0, frame;
+
+    if (rsp) {
+        tcg_out32(s, FPA_FCVT_SD | (a & 31) << 5 | (r & 31));
+        tcg_out32(s, FPA_FCVT_DS | (r & 31) << 5 | (FPA_T(2) & 31));
+        if (ix) {
+            fpa_out3(s, FPA_FCMEQ, true, mask, FPA_T(2), a);
+        }
+        /* not tiny before rounding, finite after */
+        fpa_range(s, a, true, 1023 - 126, 0x7fe, true);
+        fpa_range(s, r, false, 1, 0xfe, false);
+        tcg_out32(s, FPA_UMOV_WS | (r & 31) << 5 | TCG_REG_TMP0);
+        goto status;
+    }
+
+    if (sgl) {
+        /* operands to single; st = all ones if each was a single */
+        TCGReg in[3] = { p, q, z };
+
+        for (int i = 0; i < (fma ? 3 : 2); i++) {
+            TCGReg cv = FPA_T(5 + i);
+
+            tcg_out32(s, FPA_FCVT_SD | (in[i] & 31) << 5 | (cv & 31));
+            tcg_out32(s, FPA_FCVT_DS | (cv & 31) << 5 | (FPA_T(4) & 31));
+            fpa_out3(s, FPA_FCMEQ, true, i ? FPA_T(4) : tmp,
+                     FPA_T(4), in[i]);
+            if (i) {
+                fpa_and(s, tmp, tmp, FPA_T(4));
+            }
+        }
+        tcg_out32(s, FPA_UMOV_WS | (tmp & 31) << 5 | st);
+        p = FPA_T(5);
+        q = FPA_T(6);
+        z = FPA_T(7);
+    }
+
+    switch (op) {
+    case FPARITH_ADD:
+        fpa_out3(s, FPA_FADD, dbl, r, p, q);
+        if (ix) {
+            /* exact iff r - p == q and r - q == p */
+            fpa_out3(s, FPA_FSUB, dbl, FPA_T(2), r, p);
+            fpa_out3(s, FPA_FSUB, dbl, FPA_T(3), r, q);
+            fpa_out3(s, FPA_FCMEQ, dbl, FPA_T(2), FPA_T(2), q);
+            fpa_out3(s, FPA_FCMEQ, dbl, FPA_T(3), FPA_T(3), p);
+            fpa_and(s, mask, FPA_T(2), FPA_T(3));
+        }
+        break;
+    case FPARITH_SUB:
+        fpa_out3(s, FPA_FSUB, dbl, r, p, q);
+        if (ix) {
+            /* exact iff p - r == q and r + q == p */
+            fpa_out3(s, FPA_FSUB, dbl, FPA_T(2), p, r);
+            fpa_out3(s, FPA_FADD, dbl, FPA_T(3), r, q);
+            fpa_out3(s, FPA_FCMEQ, dbl, FPA_T(2), FPA_T(2), q);
+            fpa_out3(s, FPA_FCMEQ, dbl, FPA_T(3), FPA_T(3), p);
+            fpa_and(s, mask, FPA_T(2), FPA_T(3));
+        }
+        break;
+    case FPARITH_MUL:
+        fpa_out3(s, FPA_FMUL, dbl, r, p, q);
+        if (ix) {
+            /* exact iff p * q - r == 0 */
+            fpa_out4(s, FPA_FNMSUB, dbl, FPA_T(2), p, q, r);
+            tcg_out32(s, FPA_FCMEQ0 | dbl << 22 | (FPA_T(2) & 31) << 5
+                      | (mask & 31));
+            rlo = eprod;
+        }
+        break;
+    case FPARITH_DIV:
+        fpa_out3(s, FPA_FDIV, dbl, r, p, q);
+        if (ix) {
+            /* exact iff p - r * q == 0 */
+            fpa_out4(s, FPA_FMSUB, dbl, FPA_T(2), r, q, p);
+            tcg_out32(s, FPA_FCMEQ0 | dbl << 22 | (FPA_T(2) & 31) << 5
+                      | (mask & 31));
+        }
+        break;
+    case FPARITH_MADD:
+    case FPARITH_NMADD:
+    case FPARITH_MSUB:
+    case FPARITH_NMSUB:
+        {
+            bool sub = op == FPARITH_MSUB || op == FPARITH_NMSUB;
+            TCGReg u1 = FPA_T(2), u2 = FPA_T(3), sm = FPA_T(4), e = mask;
+
+            fpa_out4(s, sub ? FPA_FNMSUB : FPA_FMADD, dbl, r, p, q, z);
+            if (!ix) {
+                break;
+            }
+            /*
+             * exact iff (sm, e) = TwoSum(r, -+z) equals
+             * (u1, u2) = TwoProduct(p, q)
+             */
+            fpa_out3(s, FPA_FMUL, dbl, u1, p, q);
+            fpa_out4(s, FPA_FNMSUB, dbl, u2, p, q, u1);
+            fpa_out3(s, sub ? FPA_FADD : FPA_FSUB, dbl, sm, r, z);
+            fpa_out3(s, FPA_FSUB, dbl, e, sm, r);           /* bp */
+            fpa_out3(s, FPA_FSUB, dbl, tmp, sm, e);         /* ap */
+            fpa_out3(s, FPA_FSUB, dbl, tmp, r, tmp);        /* da */
+            if (sub) {
+                fpa_out3(s, FPA_FSUB, dbl, e, z, e);        /* db */
+                fpa_out3(s, FPA_FADD, dbl, e, tmp, e);
+            } else {
+                fpa_out3(s, FPA_FADD, dbl, e, z, e);        /* -db */
+                fpa_out3(s, FPA_FSUB, dbl, e, tmp, e);
+            }
+            fpa_out3(s, FPA_FCMEQ, dbl, sm, sm, u1);
+            fpa_out3(s, FPA_FCMEQ, dbl, e, e, u2);
+            fpa_and(s, mask, sm, e);
+        }
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (op == FPARITH_NMADD || op == FPARITH_NMSUB) {
+        tcg_out32(s, FPA_FNEG | dbl << 22 | (r & 31) << 5 | (r & 31));
+    }
+
+    fpa_range(s, r, dbl, rlo, emax, true);
+    if (ix && op == FPARITH_DIV) {
+        fpa_range(s, p, dbl, eprod, emax, false);
+    }
+    if (ix && fma) {
+        fpa_range(s, FPA_T(2), dbl, eprod, emax, false);
+    }
+    if (sgl) {
+        /* cmn wst, #1; csinc tmp1, tmp1, xzr, eq */
+        tcg_out_insn(s, addsub_imm, ADDSI, TCG_TYPE_I32, TCG_REG_XZR, st, 1);
+        tcg_out_insn(s, csel, CSINC, TCG_TYPE_I64, TCG_REG_TMP1,
+                     TCG_REG_TMP1, TCG_REG_XZR, TCG_COND_EQ);
+    }
+
+ status:
+    /* st = inexact | sign << 1 | off << 5; TMP0 holds r's bits */
+    if (ix) {
+        tcg_out32(s, FPA_UMOV_WS | (mask & 31) << 5 | st);
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I32, st, st, 1);
+    } else {
+        tcg_out_movi(s, TCG_TYPE_I64, st, 0);
+    }
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_TMP0,
+                 dbl && !rsp ? 63 : 31, dbl && !rsp ? 63 : 31);
+    /* orr st, st, tmp0, lsl #1; orr st, st, tmp1, lsl #5 */
+    tcg_out32(s, 0xaa000000 | TCG_REG_TMP0 << 16 | 1 << 10 | st << 5 | st);
+    tcg_out32(s, 0xaa000000 | TCG_REG_TMP1 << 16 | 5 << 10 | st << 5 | st);
+
+    /* tbnz st, #5, ref */
+    tbnz = s->code_ptr;
+    tcg_out_insn(s, tbz, TBNZ, st, 5, 0);
+    if (rsp) {
+        tcg_out_mov(s, TCG_TYPE_V64, rd, FPA_T(2));
+    } else if (sgl) {
+        tcg_out32(s, FPA_FCVT_DS | (r & 31) << 5 | (rd & 31));
+    } else {
+        tcg_out_mov(s, TCG_TYPE_V64, rd, r);
+    }
+    bdone = s->code_ptr;
+    tcg_out_insn(s, branch, B, 0);
+
+    /*
+     * Otherwise call tcg_fparith_ref(env, a, c, b, desc), saving the
+     * call-clobbered registers that hold live values.
+     */
+    reloc_pc14(tbnz, tcg_splitwx_to_rx(s->code_ptr));
+    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
+        if (s->reg_to_temp[i] && i != rd && i != st &&
+            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+            save[nsave++] = i;
+        }
+    }
+    frame = ROUND_UP(nsave * 16, 16);
+    if (frame) {
+        tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_SP,
+                     TCG_REG_SP, frame);
+    }
+    for (int i = 0; i < nsave; i++) {
+        tcg_out_st(s, save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
+                   save[i], TCG_REG_SP, i * 16);
+    }
+    tcg_out32(s, FPA_UMOV_XD | (a & 31) << 5 | TCG_REG_X1);
+    tcg_out32(s, FPA_UMOV_XD | (c & 31) << 5 | TCG_REG_X2);
+    tcg_out32(s, FPA_UMOV_XD | (b & 31) << 5 | TCG_REG_X3);
+    tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_X0, TCG_AREG0);
+    tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_X4, desc);
+    tcg_out_call_int(s, (const tcg_insn_unit *)tcg_fparith_ref);
+    tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_X0);
+    tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_X1);
+    for (int i = 0; i < nsave; i++) {
+        tcg_out_ld(s, save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
+                   save[i], TCG_REG_SP, i * 16);
+    }
+    if (frame) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP,
+                     TCG_REG_SP, frame);
+    }
+    tcg_out32(s, FPA_FMOV_DX | TCG_REG_TMP0 << 5 | (rd & 31));
+    tcg_out_mov(s, TCG_TYPE_I64, st, TCG_REG_TMP1);
+    reloc_pc26(bdone, tcg_splitwx_to_rx(s->code_ptr));
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -3223,6 +3508,10 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         }
         break;
 
+    case INDEX_op_fparith_vec:
+        tcg_out_fparith(s, a0, a1, a2, args[3], args[4], args[5]);
+        break;
+
     case INDEX_op_bitsel_vec:
         a3 = args[3];
         if (a0 == a3) {
@@ -3402,6 +3691,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I2(w, w, wZ);
     case INDEX_op_bitsel_vec:
         return C_O1_I3(w, w, w, w);
+    case INDEX_op_fparith_vec:
+        return C_O2_I3(w, r, w, w, w);
     case INDEX_op_aa64_sli_vec:
         return C_O1_I2(w, 0, w);
 
@@ -3446,6 +3737,9 @@ static void tcg_target_init(TCGContext *s)
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP1);
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP2);
     tcg_regset_set_reg(s->reserved_regs, TCG_VEC_TMP0);
+    for (int i = 0; i < 8; i++) {
+        tcg_regset_set_reg(s->reserved_regs, FPA_T(i));
+    }
 }
 
 /* Saving pairs: (X19, X20) .. (X27, X28), (X29(fp), X30(lr)).  */

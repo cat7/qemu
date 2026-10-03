@@ -486,6 +486,58 @@ void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d);
 
+/*
+ * Scalar IEEE binary floating point on the host, round to nearest even,
+ * on the low 64 bits of V64 temps holding doubles.  desc is an
+ * FPARITH_* operation, optionally ORed with FPARITH_SINGLE (operate in
+ * single precision; the result is widened to double) and
+ * FPARITH_INEXACT.  Two-operand operations take a and b; c is ignored.
+ *
+ * status holds FPARITH_ST_INEXACT (with FPARITH_INEXACT: the result was
+ * rounded), FPARITH_ST_NEG (the result is negative) and the result's
+ * FPARITH_CLASS_* at FPARITH_ST_CLASS.  Results the host operation and
+ * its inexact test cannot vouch for (non-normal and near-underflow
+ * results, operands too small for the error terms, single operations on
+ * non-single inputs) come from the function set with tcg_set_fparith_ref(),
+ * which the generated code calls with the env pointer.  It returns
+ * FPARITH_ST_OFF when the caller must use its own implementation; r is
+ * undefined then.
+ */
+enum {
+    FPARITH_ADD,        /* a + b */
+    FPARITH_SUB,        /* a - b */
+    FPARITH_MUL,        /* a * b */
+    FPARITH_DIV,        /* a / b */
+    FPARITH_MADD,       /* a * c + b */
+    FPARITH_MSUB,       /* a * c - b */
+    FPARITH_NMADD,      /* -(a * c + b) */
+    FPARITH_NMSUB,      /* -(a * c - b) */
+    FPARITH_RSP,        /* a rounded to single */
+    FPARITH_OP_MASK = 0xf,
+    FPARITH_SINGLE = 0x10,
+    FPARITH_INEXACT = 0x20,
+};
+
+enum {
+    FPARITH_ST_INEXACT = 1,
+    FPARITH_ST_NEG = 2,
+    FPARITH_ST_CLASS = 2,       /* shift of the 3-bit class */
+    FPARITH_ST_OFF = 0x20,
+};
+
+enum {
+    FPARITH_CLASS_NORMAL,
+    FPARITH_CLASS_ZERO,
+    FPARITH_CLASS_SUBNORMAL,
+    FPARITH_CLASS_INF,
+    FPARITH_CLASS_QNAN,
+};
+
+void tcg_set_fparith_ref(FParithRef fn);
+bool tcg_can_emit_fparith(void);
+void tcg_gen_fparith_vec(unsigned desc, TCGv_vec r, TCGv_i64 status,
+                         TCGv_vec a, TCGv_vec c, TCGv_vec b);
+
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);
