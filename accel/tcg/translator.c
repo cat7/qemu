@@ -121,6 +121,21 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
     return translator_is_same_page(db, dest);
 }
 
+/* QEMU_TB_INLINE=0 leaves every lookup to helper_lookup_tb_ptr. */
+static bool tb_inline_lookup_enabled(void)
+{
+    static int enabled = -1;
+    int e = qatomic_read(&enabled);
+
+    if (e < 0) {
+        const char *s = getenv("QEMU_TB_INLINE");
+
+        e = !(s && s[0] == '0');
+        qatomic_set(&enabled, e);
+    }
+    return e;
+}
+
 /*
  * The jump cache probe of helper_lookup_tb_ptr, inline: hash @pc, and if
  * the entry holds a live TB for it with this TB's cs_base, flags and
@@ -147,7 +162,8 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
                CF_SINGLE_STEP | CF_MEMI_ONLY | CF_USE_ICOUNT | CF_NOIRQ |
                CF_PCREL | CF_BP_PAGE)) ||
         db->plugin_enabled ||
-        qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+        qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC) ||
+        !tb_inline_lookup_enabled()) {
         tcg_gen_lookup_and_goto_ptr();
         return;
     }
