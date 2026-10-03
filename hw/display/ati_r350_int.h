@@ -483,6 +483,7 @@ struct ATIR350State {
     uint32_t pm4_buffer_addr;
     uint32_t pm4_buffer_cntl;
     uint32_t pm4_ring_dwords;  /* ring size decoded from CNTL, 0 = no ring */
+    bool pm4_in_ib;            /* fetching from the indirect buffer */
 
     /*
      * CCE microcode store (PM4_MICROCODE_ADDR/RADDR/DATAH/DATAL):

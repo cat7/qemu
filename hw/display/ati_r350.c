@@ -1992,8 +1992,19 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         break;
     case R350_CP_IB_BUFSZ:
         s->regs[base >> 2] = val;
+        if (s->pm4_in_ib) {
+            /* the indirect stream cannot restart itself */
+            trace_ati_r350_pm4_ib_nested(s->regs[R350_CP_IB_BASE >> 2],
+                                         val & 0x7fffff);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ati-r350: CP_IB_BUFSZ written from an indirect "
+                          "buffer, ignored\n");
+            break;
+        }
+        s->pm4_in_ib = true;
         ati_r350_pm4_indirect(s, s->regs[R350_CP_IB_BASE >> 2] & ~3u,
                               val & 0x7fffff);
+        s->pm4_in_ib = false;
         break;
     case R350_PM4_MICROCODE_ADDR:
         s->pm4_ucode_waddr = val & (R350_PM4_MICROCODE_WORDS - 1);
@@ -3945,6 +3956,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     s->pm4_rptr = 0;
     s->pm4_wptr = 0;
     s->pm4_buffer_addr = 0;
+    s->pm4_in_ib = false;
     s->vga_ddc_sda = 1;
     s->dvi_ddc_sda = 1;
 }
