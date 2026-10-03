@@ -3746,6 +3746,23 @@ static void gen_lookup_and_goto_ptr(DisasContext *ctx)
     }
 }
 
+/*
+ * A branch to cpu_nip that changes nothing else: the next TB has this
+ * TB's hflags and cs_base, so the jump cache can be probed inline.
+ */
+static void gen_branch_lookup_and_goto_ptr(DisasContext *ctx)
+{
+    if (unlikely(ctx->singlestep_flags) ||
+        (tb_cflags(ctx->base.tb) & CF_NO_GOTO_PTR)) {
+        gen_lookup_and_goto_ptr(ctx);
+    } else {
+        TCGv_i64 pc = tcg_temp_new_i64();
+
+        tcg_gen_extu_tl_i64(pc, cpu_nip);
+        translator_lookup_and_goto_ptr(&ctx->base, pc);
+    }
+}
+
 /***                                Branch                                 ***/
 static void gen_goto_tb(DisasContext *ctx, unsigned tb_slot_idx,
                         target_ulong dest)
@@ -3760,7 +3777,7 @@ static void gen_goto_tb(DisasContext *ctx, unsigned tb_slot_idx,
         tcg_gen_exit_tb(ctx->base.tb, tb_slot_idx);
     } else {
         tcg_gen_movi_tl(cpu_nip, dest & ~3);
-        gen_lookup_and_goto_ptr(ctx);
+        gen_branch_lookup_and_goto_ptr(ctx);
     }
 }
 
@@ -3909,7 +3926,7 @@ static void gen_bcond(DisasContext *ctx, int type)
         } else {
             tcg_gen_andi_tl(cpu_nip, target, ~3);
         }
-        gen_lookup_and_goto_ptr(ctx);
+        gen_branch_lookup_and_goto_ptr(ctx);
     }
     if ((bo & 0x14) != 0x14) {
         /* fallthrough case */
