@@ -30,6 +30,220 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 #endif
 
 /***                       Floating-Point arithmetic                       ***/
+
+/*
+ * Inline host FP (fparith_vec) for the A-form arithmetic, in TBs with
+ * HFLAGS_FP_FAST.  The result, FPRF, FI, XX and FX
+ * are those of the helper sequence; everything else branches to that
+ * sequence, emitted after the TB's exit, which then leaves the TB.
+ * PPC_NATIVE_FP=0 turns it off, PPC_NATIVE_FP_RELAXED=1 leaves FI, XX
+ * and FX alone.
+ */
+enum { NFP_AB, NFP_ACB };
+
+static bool native_env(const char *name, bool dflt)
+{
+    const char *v = getenv(name);
+
+    return v && *v ? *v != '0' : dflt;
+}
+
+static void native_fp_init(void)
+{
+#ifndef CONFIG_USER_ONLY
+    if (!tcg_can_emit_fparith() || !native_env("PPC_NATIVE_FP", true) ||
+        native_env("PPC_STRICT_FP", false)) {
+        return;
+    }
+    ppc_native_fp = native_env("PPC_NATIVE_FP_RELAXED", false)
+                    ? PPC_NATIVE_FP_RELAXED : PPC_NATIVE_FP_EXACT;
+    tcg_set_fparith_ref(ppc_fparith_ref);
+#endif
+}
+
+static bool native_fp(DisasContext *ctx)
+{
+    return ctx->fp_fast && ctx->n_nfp < ARRAY_SIZE(ctx->nfp)
+           && !ctx->singlestep_flags && !ctx->pmu_insn_cnt
+           && !(tb_cflags(ctx->base.tb) & CF_USE_ICOUNT);
+}
+
+/* mtfs* changing FPSCR[0:7] may change HFLAGS_FP_FAST */
+static void native_fp_end_tb(DisasContext *ctx, uint32_t nibbles)
+{
+    if (ppc_native_fp && (nibbles & 3) && ctx->base.is_jmp == DISAS_NEXT) {
+        ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
+    }
+}
+
+static TCGLabel *native_fp_slow(DisasContext *ctx, int kind, void *helper,
+                                int frt, int x, int y, int z)
+{
+    NativeFPSlow *sp = &ctx->nfp[ctx->n_nfp++];
+
+    *sp = (NativeFPSlow) {
+        .label = gen_new_label(), .next = ctx->base.pc_next,
+        .helper = helper, .kind = kind,
+        .frt = frt, .x = x, .y = y, .z = z,
+    };
+    return sp->label;
+}
+
+static TCGv_vec native_fpr(int regno)
+{
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V64);
+
+    tcg_gen_ld_vec(v, tcg_env, fpr_offset(regno));
+    return v;
+}
+
+/* FPRF by class and sign: 5 bits per entry, sign + 2 * class */
+#define NATIVE_FPRF(cls, neg, fprf) \
+    ((uint64_t)(fprf) << (FPSCR_FPRF + 5 * ((cls) * 2 + (neg))))
+static const uint64_t native_fprf =
+    NATIVE_FPRF(FPARITH_CLASS_NORMAL, 0, 0x04) |
+    NATIVE_FPRF(FPARITH_CLASS_NORMAL, 1, 0x08) |
+    NATIVE_FPRF(FPARITH_CLASS_ZERO, 0, 0x02) |
+    NATIVE_FPRF(FPARITH_CLASS_ZERO, 1, 0x12) |
+    NATIVE_FPRF(FPARITH_CLASS_SUBNORMAL, 0, 0x14) |
+    NATIVE_FPRF(FPARITH_CLASS_SUBNORMAL, 1, 0x18) |
+    NATIVE_FPRF(FPARITH_CLASS_INF, 0, 0x05) |
+    NATIVE_FPRF(FPARITH_CLASS_INF, 1, 0x09) |
+    NATIVE_FPRF(FPARITH_CLASS_QNAN, 0, 0x11) |
+    NATIVE_FPRF(FPARITH_CLASS_QNAN, 1, 0x11);
+
+/* FPSCR from the status: FPRF; FI, XX and FX unless relaxed */
+static void native_fp_fpscr(TCGv_i64 st, bool relaxed)
+{
+    TCGv_i64 f = tcg_temp_new_i64();
+    TCGv_i64 sh = tcg_temp_new_i64();
+    TCGv t = tcg_temp_new();
+    target_ulong mask = FP_FPRF;
+
+    QEMU_BUILD_BUG_ON(FPARITH_ST_NEG != 2 || FPARITH_ST_CLASS != 2);
+    tcg_gen_extract_i64(sh, st, 1, 4);
+    tcg_gen_shli_i64(f, sh, 2);
+    tcg_gen_add_i64(sh, sh, f);
+    tcg_gen_shr_i64(f, tcg_constant_i64(native_fprf), sh);
+    tcg_gen_andi_i64(f, f, FP_FPRF);
+    if (!relaxed) {
+        TCGv_i64 ix = tcg_temp_new_i64();
+
+        tcg_gen_andi_i64(ix, st, FPARITH_ST_INEXACT);
+        tcg_gen_neg_i64(ix, ix);
+        tcg_gen_andi_i64(ix, ix, FP_FI | FP_XX | FP_FX);
+        tcg_gen_or_i64(f, f, ix);
+        mask |= FP_FI;
+    }
+    tcg_gen_trunc_i64_tl(t, f);
+    tcg_gen_andi_tl(cpu_fpscr, cpu_fpscr, ~mask);
+    tcg_gen_or_tl(cpu_fpscr, cpu_fpscr, t);
+}
+
+/* frt = op(x, y[, z]) for an FPARITH_* desc; x, y, z as the helper's */
+static void native_fp_op(DisasContext *ctx, unsigned desc, int kind,
+                         void *helper, int frt, int x, int y, int z)
+{
+    bool relaxed = ppc_native_fp == PPC_NATIVE_FP_RELAXED;
+    TCGLabel *slow = native_fp_slow(ctx, kind, helper, frt, x, y, z);
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V64);
+    TCGv_i64 st = tcg_temp_new_i64();
+    TCGv_vec vx = native_fpr(x);
+    TCGv_vec vy = y >= 0 ? native_fpr(y) : vx;
+    TCGv_vec vz = z >= 0 ? native_fpr(z) : vx;
+
+    if (!relaxed) {
+        desc |= FPARITH_INEXACT;
+    }
+    if (kind == NFP_ACB) {
+        tcg_gen_fparith_vec(desc, r, st, vx, vy, vz);
+    } else {
+        tcg_gen_fparith_vec(desc, r, st, vx, vx, vy);
+    }
+    tcg_gen_brcondi_i64(TCG_COND_TSTNE, st, FPARITH_ST_OFF, slow);
+    tcg_gen_st_vec(r, tcg_env, fpr_offset(frt));
+    tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
+    native_fp_fpscr(st, relaxed);
+}
+
+static int native_fp_desc(void *helper)
+{
+    static const struct { void *h; int desc; } map[] = {
+        { gen_helper_FADD, FPARITH_ADD },
+        { gen_helper_FADDS, FPARITH_ADD | FPARITH_SINGLE },
+        { gen_helper_FSUB, FPARITH_SUB },
+        { gen_helper_FSUBS, FPARITH_SUB | FPARITH_SINGLE },
+        { gen_helper_FMUL, FPARITH_MUL },
+        { gen_helper_FMULS, FPARITH_MUL | FPARITH_SINGLE },
+        { gen_helper_FDIV, FPARITH_DIV },
+        { gen_helper_FDIVS, FPARITH_DIV | FPARITH_SINGLE },
+        { gen_helper_FMADD, FPARITH_MADD },
+        { gen_helper_FMADDS, FPARITH_MADD | FPARITH_SINGLE },
+        { gen_helper_FMSUB, FPARITH_MSUB },
+        { gen_helper_FMSUBS, FPARITH_MSUB | FPARITH_SINGLE },
+        { gen_helper_FNMADD, FPARITH_NMADD },
+        { gen_helper_FNMADDS, FPARITH_NMADD | FPARITH_SINGLE },
+        { gen_helper_FNMSUB, FPARITH_NMSUB },
+        { gen_helper_FNMSUBS, FPARITH_NMSUB | FPARITH_SINGLE },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(map); i++) {
+        if (map[i].h == helper) {
+            return map[i].desc;
+        }
+    }
+    return -1;
+}
+
+static bool native_fp_try(DisasContext *ctx, void *helper, bool rc, int kind,
+                          int frt, int x, int y, int z)
+{
+    int desc;
+
+    if (rc || !native_fp(ctx)) {
+        return false;
+    }
+    desc = native_fp_desc(helper);
+    if (desc < 0) {
+        return false;
+    }
+    native_fp_op(ctx, desc, kind, helper, frt, x, y, z);
+    return true;
+}
+
+/* The helper sequences of the inline ops, then on to the next insn */
+static void native_fp_emit_slow_paths(DisasContext *ctx)
+{
+    for (int i = 0; i < ctx->n_nfp; i++) {
+        NativeFPSlow *sp = &ctx->nfp[i];
+        TCGv_i64 t0 = tcg_temp_new_i64();
+        TCGv_i64 t1 = tcg_temp_new_i64();
+        TCGv_i64 t2 = tcg_temp_new_i64();
+        TCGv_i64 t3 = tcg_temp_new_i64();
+
+        gen_set_label(sp->label);
+        gen_reset_fpstatus();
+        get_fpr(t0, sp->x);
+        switch (sp->kind) {
+        case NFP_AB:
+            get_fpr(t1, sp->y);
+            ((void (*)(TCGv_i64, TCGv_ptr, TCGv_i64, TCGv_i64))sp->helper)
+                (t3, tcg_env, t0, t1);
+            break;
+        case NFP_ACB:
+            get_fpr(t1, sp->y);
+            get_fpr(t2, sp->z);
+            ((void (*)(TCGv_i64, TCGv_ptr, TCGv_i64, TCGv_i64, TCGv_i64))
+                sp->helper)(t3, tcg_env, t0, t1, t2);
+            break;
+        }
+        set_fpr(sp->frt, t3);
+        gen_compute_fprf_float64(t3);
+        gen_update_nip(ctx, sp->next);
+        tcg_gen_lookup_and_goto_ptr();
+    }
+    ctx->n_nfp = 0;
+}
 static bool do_helper_acb(DisasContext *ctx, arg_A *a,
                           void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
                                          TCGv_i64, TCGv_i64))
@@ -37,6 +251,10 @@ static bool do_helper_acb(DisasContext *ctx, arg_A *a,
     TCGv_i64 t0, t1, t2, t3;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
+    if (native_fp_try(ctx, helper, a->rc, NFP_ACB,
+                      a->frt, a->fra, a->frc, a->frb)) {
+        return true;
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
@@ -61,6 +279,10 @@ static bool do_helper_ab(DisasContext *ctx, arg_A_tab *a,
     TCGv_i64 t0, t1, t2;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
+    if (native_fp_try(ctx, helper, a->rc, NFP_AB,
+                      a->frt, a->fra, a->frb, -1)) {
+        return true;
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
@@ -83,6 +305,10 @@ static bool do_helper_ac(DisasContext *ctx, arg_A_tac *a,
     TCGv_i64 t0, t1, t2;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
+    if (native_fp_try(ctx, helper, a->rc, NFP_AB,
+                      a->frt, a->fra, a->frc, -1)) {
+        return true;
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
@@ -462,6 +688,7 @@ static bool trans_MFFSCE(DisasContext *ctx, arg_X_t *a)
     gen_reset_fpstatus();
     fpscr = place_from_fpscr(a->rt, UINT64_MAX);
     store_fpscr_masked(fpscr, FP_ENABLES, tcg_constant_i64(0), 0x0003);
+    native_fp_end_tb(ctx, 0x0003);
     return true;
 }
 
@@ -478,6 +705,7 @@ static bool trans_MFFSCRN(DisasContext *ctx, arg_X_tb *a)
     gen_reset_fpstatus();
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_RN, t1, 0x0001);
+    native_fp_end_tb(ctx, 0x0001);
     return true;
 }
 
@@ -509,6 +737,7 @@ static bool trans_MFFSCRNI(DisasContext *ctx, arg_X_imm2 *a)
     gen_reset_fpstatus();
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_RN, t1, 0x0001);
+    native_fp_end_tb(ctx, 0x0001);
     return true;
 }
 
@@ -554,6 +783,7 @@ static void gen_mtfsb0(DisasContext *ctx)
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
         tcg_gen_shri_i32(cpu_crf[1], cpu_crf[1], FPSCR_OX);
     }
+    native_fp_end_tb(ctx, 1 << (crb / 4));
 }
 
 /* mtfsb1 */
@@ -576,6 +806,7 @@ static void gen_mtfsb1(DisasContext *ctx)
     }
     /* We can raise a deferred exception */
     gen_helper_fpscr_check_status(tcg_env);
+    native_fp_end_tb(ctx, 1 << (crb / 4));
 }
 
 /* mtfsf */
@@ -584,6 +815,7 @@ static void gen_mtfsf(DisasContext *ctx)
     TCGv_i32 t0;
     TCGv_i64 t1;
     int flm, l, w;
+    uint32_t nibbles;
 
     if (unlikely(!ctx->fpu_enabled)) {
         gen_exception(ctx, POWERPC_EXCP_FPU);
@@ -597,12 +829,13 @@ static void gen_mtfsf(DisasContext *ctx)
         return;
     }
     if (!l) {
-        t0 = tcg_constant_i32(flm << (w * 8));
+        nibbles = flm << (w * 8);
     } else if (ctx->insns_flags2 & PPC2_ISA205) {
-        t0 = tcg_constant_i32(0xffff);
+        nibbles = 0xffff;
     } else {
-        t0 = tcg_constant_i32(0xff);
+        nibbles = 0xff;
     }
+    t0 = tcg_constant_i32(nibbles);
     t1 = tcg_temp_new_i64();
     get_fpr(t1, rB(ctx->opcode));
     gen_helper_store_fpscr(tcg_env, t1, t0);
@@ -612,6 +845,7 @@ static void gen_mtfsf(DisasContext *ctx)
     }
     /* We can raise a deferred exception */
     gen_helper_fpscr_check_status(tcg_env);
+    native_fp_end_tb(ctx, nibbles);
 }
 
 /* mtfsfi */
@@ -641,6 +875,7 @@ static void gen_mtfsfi(DisasContext *ctx)
     }
     /* We can raise a deferred exception */
     gen_helper_fpscr_check_status(tcg_env);
+    native_fp_end_tb(ctx, 1 << sh);
 }
 
 static void gen_qemu_ld32fs(DisasContext *ctx, TCGv_i64 dest, TCGv addr)

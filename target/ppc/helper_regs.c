@@ -129,6 +129,8 @@ static uint32_t hreg_compute_pmu_hflags_mask(CPUPPCState *env)
     return hflags_mask;
 }
 
+int ppc_native_fp;
+
 static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
 {
     target_ulong msr = env->msr;
@@ -185,6 +187,9 @@ static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
     }
     if (env->spr[SPR_LPCR] & LPCR_HR) {
         hflags |= 1 << HFLAGS_HR;
+    }
+    if (ppc_native_fp && !(env->fpscr & (FP_ENABLES | FP_NI | FP_RN))) {
+        hflags |= 1 << HFLAGS_FP_FAST;
     }
     if (unlikely(ppc_flags & POWERPC_FLAG_PPE42)) {
         /* PPE42 has a single address space and no problem state */
