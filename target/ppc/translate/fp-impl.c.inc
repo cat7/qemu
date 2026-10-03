@@ -32,17 +32,17 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 /***                       Floating-Point arithmetic                       ***/
 
 /*
- * Inline host FP (fparith_vec) for the A-form arithmetic and fcmpu, in
- * TBs with HFLAGS_FP_FAST.  The result, FPRF, FI, XX and FX
+ * Inline host FP (fparith_vec) for the A-form arithmetic, frsp and
+ * fcmpu, in TBs with HFLAGS_FP_FAST.  The result, FPRF, FI, XX and FX
  * are those of the helper sequence; everything else branches to that
  * sequence, emitted after the TB's exit, which then leaves the TB.
  * PPC_NATIVE_FP=0 turns it off, PPC_NATIVE_FP_RELAXED=1 leaves FI, XX
- * and FX alone in the arithmetic, PPC_NATIVE_FCMP=0 keeps the helpers
- * for fcmpu.
+ * and FX alone in the arithmetic, PPC_NATIVE_FCMP=0 and
+ * PPC_NATIVE_FRSP=0 keep the helpers for fcmpu and frsp.
  */
-enum { NFP_AB, NFP_ACB, NFP_CMPU };
+enum { NFP_AB, NFP_ACB, NFP_RSP, NFP_CMPU };
 
-static bool native_fcmp_on;
+static bool native_fcmp_on, native_frsp_on;
 
 static bool native_env(const char *name, bool dflt)
 {
@@ -62,6 +62,7 @@ static void native_fp_init(void)
                     ? PPC_NATIVE_FP_RELAXED : PPC_NATIVE_FP_EXACT;
     tcg_set_fparith_ref(ppc_fparith_ref);
     native_fcmp_on = native_env("PPC_NATIVE_FCMP", true);
+    native_frsp_on = native_env("PPC_NATIVE_FRSP", true);
 #endif
 }
 
@@ -148,7 +149,8 @@ static void native_fp_fpscr(TCGv_i64 st, bool relaxed)
 static void native_fp_op(DisasContext *ctx, unsigned desc, int kind,
                          void *helper, int frt, int x, int y, int z)
 {
-    bool relaxed = ppc_native_fp == PPC_NATIVE_FP_RELAXED;
+    bool relaxed = ppc_native_fp == PPC_NATIVE_FP_RELAXED &&
+                   (desc & FPARITH_OP_MASK) != FPARITH_RSP;
     TCGLabel *slow = native_fp_slow(ctx, kind, helper, frt, x, y, z);
     TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V64);
     TCGv_i64 st = tcg_temp_new_i64();
@@ -189,6 +191,7 @@ static int native_fp_desc(void *helper)
         { gen_helper_FNMADDS, FPARITH_NMADD | FPARITH_SINGLE },
         { gen_helper_FNMSUB, FPARITH_NMSUB },
         { gen_helper_FNMSUBS, FPARITH_NMSUB | FPARITH_SINGLE },
+        { gen_helper_FRSP, FPARITH_RSP },
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(map); i++) {
@@ -208,7 +211,7 @@ static bool native_fp_try(DisasContext *ctx, void *helper, bool rc, int kind,
         return false;
     }
     desc = native_fp_desc(helper);
-    if (desc < 0) {
+    if (desc < 0 || (desc == FPARITH_RSP && !native_frsp_on)) {
         return false;
     }
     native_fp_op(ctx, desc, kind, helper, frt, x, y, z);
@@ -283,6 +286,10 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
             get_fpr(t2, sp->z);
             ((void (*)(TCGv_i64, TCGv_ptr, TCGv_i64, TCGv_i64, TCGv_i64))
                 sp->helper)(t3, tcg_env, t0, t1, t2);
+            break;
+        case NFP_RSP:
+            ((void (*)(TCGv_i64, TCGv_ptr, TCGv_i64))sp->helper)
+                (t3, tcg_env, t0);
             break;
         case NFP_CMPU:
             get_fpr(t1, sp->y);
@@ -386,6 +393,9 @@ static bool do_round_convert(DisasContext *ctx, arg_X_tb_rc *a,
 {
     TCGv_i64 t0, t1;
     REQUIRE_FPU(ctx);
+    if (native_fp_try(ctx, helper, a->rc, NFP_RSP, a->rt, a->rb, -1, -1)) {
+        return true;
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     gen_reset_fpstatus();
