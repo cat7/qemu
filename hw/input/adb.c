@@ -238,6 +238,8 @@ static void adb_bus_reset_hold(Object *obj, ResetType type)
     adb_bus->autopoll_enabled = false;
     adb_bus->autopoll_mask = 0xffff;
     adb_bus->autopoll_rate_ms = 20;
+    adb_bus->autopoll_blocked = false;
+    timer_del(adb_bus->autopoll_timer);
 }
 
 static void adb_bus_realize(BusState *qbus, Error **errp)
