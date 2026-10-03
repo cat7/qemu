@@ -324,4 +324,8 @@ static inline int ger_pack_masks(int pmsk, int ymsk, int xmsk)
 TCGTBCPUState ppc_get_tb_cpu_state(CPUState *cs);
 #endif
 
+typedef struct FParithResult FParithResult;
+FParithResult ppc_fparith_ref(void *env, uint64_t a, uint64_t c,
+                              uint64_t b, uint32_t desc);
+
 #endif /* PPC_INTERNAL_H */
