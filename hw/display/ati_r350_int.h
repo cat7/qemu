@@ -323,11 +323,21 @@ struct ATIR350State {
     uint64_t engine_kicks, engine_waits, engine_wait_us, engine_bql_writes;
     uint64_t engine_ibs, engine_scratch;
     unsigned engine_rptr_wb;
-    /*
-     * The decoded-texture cache, the scan-block bookkeeping and the VGA
-     * dirty bits it claims are shared by the draw path and the display.
-     */
+    /* the decoded-texture cache, held by the draw path */
     QemuRecMutex gl_tex_lock;
+    /*
+     * What the display's refresh hands the draw path: the pages its
+     * dirty-bitmap clear found written, not yet applied to the texture
+     * cache, and the framebuffer range it shows (offset << 32 | length).
+     * scan_lock covers only the hand-over, so the refresh never waits
+     * for a draw; scan_seq is odd while a clear is under way.
+     */
+    QemuMutex scan_lock;
+    unsigned long *scan_dirty;
+    unsigned long *scan_work;
+    bool scan_pending;          /* atomic */
+    unsigned scan_seq;          /* atomic */
+    uint64_t scan_fb;           /* atomic */
     /* R300 memory-controller indirect register file (MC_IND_INDEX/DATA) */
     uint32_t mc_ind[256];
     /*
@@ -982,11 +992,14 @@ const char *ati_r350_gl_2d_path_name(ATIR350Gl2dPath path);
 /*
  * The display refresh has just snapshotted and CLEARED the VGA dirty
  * bitmap, which is the one thing the decoded-texture cache reads to
- * know whether the guest CPU wrote over a texture. Hand the snapshot
- * over before it is discarded: entries whose range it marks are killed,
- * and the rest are carried into the new generation.
+ * know whether the guest CPU wrote over a texture. Hand the pages it
+ * marks over before the snapshot is discarded (with scan_lock held,
+ * the same hold as the clear); ati_r350_gl_epoch_apply() then kills
+ * the entries over them and carries the rest into the new generation,
+ * on the draw path, with gl_tex_lock held.
  */
 void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap);
+void ati_r350_gl_epoch_apply(ATIR350State *s);
 
 /*
  * Take responsibility for the VGA dirty bits over a VRAM range the
