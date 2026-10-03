@@ -32,14 +32,17 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 /***                       Floating-Point arithmetic                       ***/
 
 /*
- * Inline host FP (fparith_vec) for the A-form arithmetic, in TBs with
- * HFLAGS_FP_FAST.  The result, FPRF, FI, XX and FX
+ * Inline host FP (fparith_vec) for the A-form arithmetic and fcmpu, in
+ * TBs with HFLAGS_FP_FAST.  The result, FPRF, FI, XX and FX
  * are those of the helper sequence; everything else branches to that
  * sequence, emitted after the TB's exit, which then leaves the TB.
  * PPC_NATIVE_FP=0 turns it off, PPC_NATIVE_FP_RELAXED=1 leaves FI, XX
- * and FX alone.
+ * and FX alone in the arithmetic, PPC_NATIVE_FCMP=0 keeps the helpers
+ * for fcmpu.
  */
-enum { NFP_AB, NFP_ACB };
+enum { NFP_AB, NFP_ACB, NFP_CMPU };
+
+static bool native_fcmp_on;
 
 static bool native_env(const char *name, bool dflt)
 {
@@ -58,6 +61,7 @@ static void native_fp_init(void)
     ppc_native_fp = native_env("PPC_NATIVE_FP_RELAXED", false)
                     ? PPC_NATIVE_FP_RELAXED : PPC_NATIVE_FP_EXACT;
     tcg_set_fparith_ref(ppc_fparith_ref);
+    native_fcmp_on = native_env("PPC_NATIVE_FCMP", true);
 #endif
 }
 
@@ -211,6 +215,50 @@ static bool native_fp_try(DisasContext *ctx, void *helper, bool rc, int kind,
     return true;
 }
 
+/*
+ * fcmpu without NaNs: CR field and FPCC 8, 4 or 2, FI cleared.  The
+ * doubles' bits become signed keys ordered like the doubles, -0 == +0.
+ */
+static bool native_fcmpu(DisasContext *ctx, arg_X_bf *a)
+{
+    TCGLabel *slow;
+    TCGv_i64 k[2], m = tcg_temp_new_i64(), c = tcg_temp_new_i64();
+    TCGv t = tcg_temp_new();
+
+    if (!native_fcmp_on || !native_fp(ctx)) {
+        return false;
+    }
+    slow = native_fp_slow(ctx, NFP_CMPU, gen_helper_FCMPU, a->bf,
+                          a->ra, a->rb, -1);
+    for (int i = 0; i < 2; i++) {
+        TCGv_i64 v = tcg_temp_new_i64(), s = tcg_temp_new_i64();
+
+        get_fpr(v, i ? a->rb : a->ra);
+        tcg_gen_shli_i64(s, v, 1);
+        if (i) {
+            tcg_gen_umax_i64(m, m, s);
+        } else {
+            tcg_gen_mov_i64(m, s);
+        }
+        tcg_gen_sari_i64(s, v, 63);
+        tcg_gen_andi_i64(v, v, INT64_MAX);
+        tcg_gen_xor_i64(v, v, s);
+        tcg_gen_sub_i64(v, v, s);
+        k[i] = v;
+    }
+    tcg_gen_brcondi_i64(TCG_COND_GTU, m, 0xffe0000000000000ull, slow);
+    tcg_gen_movcond_i64(TCG_COND_GT, c, k[0], k[1],
+                        tcg_constant_i64(4), tcg_constant_i64(2));
+    tcg_gen_movcond_i64(TCG_COND_LT, c, k[0], k[1],
+                        tcg_constant_i64(8), c);
+    tcg_gen_extrl_i64_i32(cpu_crf[a->bf], c);
+    tcg_gen_shli_i64(c, c, FPSCR_FPCC);
+    tcg_gen_trunc_i64_tl(t, c);
+    tcg_gen_andi_tl(cpu_fpscr, cpu_fpscr, ~(target_ulong)(FP_FPCC | FP_FI));
+    tcg_gen_or_tl(cpu_fpscr, cpu_fpscr, t);
+    return true;
+}
+
 /* The helper sequences of the inline ops, then on to the next insn */
 static void native_fp_emit_slow_paths(DisasContext *ctx)
 {
@@ -236,9 +284,17 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
             ((void (*)(TCGv_i64, TCGv_ptr, TCGv_i64, TCGv_i64, TCGv_i64))
                 sp->helper)(t3, tcg_env, t0, t1, t2);
             break;
+        case NFP_CMPU:
+            get_fpr(t1, sp->y);
+            ((void (*)(TCGv_ptr, TCGv_i64, TCGv_i64, TCGv_i32))sp->helper)
+                (tcg_env, t0, t1, tcg_constant_i32(sp->frt));
+            gen_helper_float_check_status(tcg_env);
+            break;
         }
-        set_fpr(sp->frt, t3);
-        gen_compute_fprf_float64(t3);
+        if (sp->kind != NFP_CMPU) {
+            set_fpr(sp->frt, t3);
+            gen_compute_fprf_float64(t3);
+        }
         gen_update_nip(ctx, sp->next);
         tcg_gen_lookup_and_goto_ptr();
     }
@@ -491,6 +547,9 @@ static bool do_helper_cmp(DisasContext *ctx, arg_X_bf *a,
     TCGv_i64 t0, t1;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
+    if ((void *)helper == (void *)gen_helper_FCMPU && native_fcmpu(ctx, a)) {
+        return true;
+    }
     t0 = tcg_temp_new_i64();
     t1 = tcg_temp_new_i64();
     gen_reset_fpstatus();
