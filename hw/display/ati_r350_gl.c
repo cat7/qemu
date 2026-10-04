@@ -1512,7 +1512,16 @@ static const char *fs_src =
 "        precise float pq0 = w0 * f_inv.y;\n"
 "        precise float pq1 = w1 * f_inv.z;\n"
 "        precise float pq2 = w2 * f_inv.w;\n"
-"        iq = 1.0 / (pq0 + pq1 + pq2);\n"
+"        precise float qs = pq0 + pq1 + pq2;\n"
+/*
+ * GLSL division is not correctly rounded, and here it decides a texel.
+ * One Newton step on the fma residual gives the rounded reciprocal; an
+ * infinite one is kept as it is.
+ */
+"        iq = 1.0 / qs;\n"
+"        precise float qe = fma(-qs, iq, 1.0);\n"
+"        precise float qr = fma(iq, qe, iq);\n"
+"        if (!isnan(qr)) iq = qr;\n"
 "        w0 = pq0 * iq; w1 = pq1 * iq; w2 = pq2 * iq;\n"
 "    }\n"
 /*
