@@ -725,6 +725,12 @@ static void qemu_timer_cb(void *opaque)
 static void openpic_tmr_set_tmr(OpenPICTimer *tmr, uint32_t val, bool enabled)
 {
     uint64_t ns = ticks_to_ns(val & ~TCCR_TOG);
+
+    /* Only the Freescale models create the timers; the others map the regs */
+    if (!tmr->qemu_timer) {
+        tmr->qemu_timer_active = false;
+        return;
+    }
     /*
      * A count of zero causes a timer to be set to expire immediately.  This
      * effectively stops the simulation since the timer is constantly expiring
