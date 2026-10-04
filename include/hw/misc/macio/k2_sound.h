@@ -63,6 +63,8 @@ typedef struct K2SoundState {
     uint32_t fifo_count;
     bool prebuffering;
     int64_t last_push_ns;
+    int backend_size;
+    bool legacy_prebuffer;
 } K2SoundState;
 
 void k2_sound_init(K2SoundState *s, DeviceState *owner, MemoryRegion *bar);

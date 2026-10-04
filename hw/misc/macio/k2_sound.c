@@ -240,27 +240,67 @@ static void k2_i2s_write_silence(K2SoundState *s, int avail)
     }
 }
 
+/*
+ * The prebuffer target counts what the backend already holds, so the
+ * lead is K2_I2S_PREBUF_NS in all. A stream restarts after the FIFO and
+ * the backend have both run low. Silence is written only while no stream
+ * is running, to keep a shared mixer moving.
+ */
+static bool k2_i2s_prebuffer(K2SoundState *s, int avail, uint32_t want,
+                             bool pushing)
+{
+    uint32_t held = s->backend_size > avail ? s->backend_size - avail : 0;
+
+    if (s->fifo_count == 0) {
+        if (!pushing) {
+            s->prebuffering = true;
+            k2_i2s_write_silence(s, avail);
+        } else if (held < want / 4) {
+            s->prebuffering = true;
+        }
+        return true;
+    }
+    if (s->prebuffering) {
+        if ((uint64_t)s->fifo_count + held < want && pushing) {
+            return true;
+        }
+        s->prebuffering = false;
+    }
+    return false;
+}
+
+/* FIFO depth alone is the lead; the backend is kept full of silence */
+static bool k2_i2s_prebuffer_legacy(K2SoundState *s, int avail,
+                                    uint32_t want, bool pushing)
+{
+    if (s->fifo_count == 0) {
+        s->prebuffering = true;
+        k2_i2s_write_silence(s, avail);
+        return true;
+    }
+    if (s->prebuffering) {
+        if (s->fifo_count < want && pushing) {
+            k2_i2s_write_silence(s, avail);
+            return true;
+        }
+        s->prebuffering = false;
+    }
+    return false;
+}
+
 static void k2_i2s_audio_cb(void *opaque, int avail)
 {
     K2SoundState *s = opaque;
     int fb = s->voice_frame_bytes;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t want = (uint64_t)s->voice_rate * fb * K2_I2S_PREBUF_NS /
+                    NANOSECONDS_PER_SECOND;
+    bool pushing = now - s->last_push_ns < K2_I2S_PREBUF_GIVEUP_NS;
 
-    if (s->fifo_count == 0) {
-        s->prebuffering = true;
-        k2_i2s_write_silence(s, avail);
+    if (s->legacy_prebuffer ?
+        k2_i2s_prebuffer_legacy(s, avail, want, pushing) :
+        k2_i2s_prebuffer(s, avail, want, pushing)) {
         return;
-    }
-    if (s->prebuffering) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        uint32_t want = (uint64_t)s->voice_rate * fb * K2_I2S_PREBUF_NS /
-                        NANOSECONDS_PER_SECOND;
-
-        if (s->fifo_count < want &&
-            now - s->last_push_ns < K2_I2S_PREBUF_GIVEUP_NS) {
-            k2_i2s_write_silence(s, avail);
-            return;
-        }
-        s->prebuffering = false;
     }
 
     avail -= avail % fb;
@@ -312,6 +352,7 @@ static void k2_i2s_tap_out(K2SoundState *s, DBDMA_io *io, int rate)
         s->fifo_rptr = s->fifo_wptr = s->fifo_count = 0;
         s->voice = audio_be_open_out(s->audio_be, s->voice, "tas3004.out",
                                      s, k2_i2s_audio_cb, &as);
+        s->backend_size = audio_be_get_buffer_size_out(s->audio_be, s->voice);
         audio_be_set_active_out(s->audio_be, s->voice, true);
         s->prebuffering = true;
     }

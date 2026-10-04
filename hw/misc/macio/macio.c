@@ -458,6 +458,8 @@ static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
     DEFINE_PROP_BOOL("k2", NewWorldMacIOState, k2, false),
+    DEFINE_PROP_BOOL("k2-legacy-prebuffer", NewWorldMacIOState,
+                     sound.legacy_prebuffer, false),
     DEFINE_AUDIO_PROPERTIES(NewWorldMacIOState, audio_be),
 };
 

@@ -51,6 +51,7 @@ typedef struct coreaudioVoiceOut {
     uint32_t buffer_count;
     UInt32 device_frame_size;
     AudioDeviceIOProcID ioprocid;
+    bool whole_periods;
     bool enabled;
     bool running;
 } CoreaudioVoiceOut;
@@ -823,7 +824,7 @@ static OSStatus out_device_ioproc(
     void *out;
     HWVoiceOut *hw = hwptr;
     CoreaudioVoiceOut *core = hwptr;
-    size_t len;
+    size_t len, pad;
 
     if (!outOutputData || outOutputData->mNumberBuffers < 1) {
         return 0;
@@ -846,14 +847,16 @@ static OSStatus out_device_ioproc(
     trace_coreaudio_out_ioproc(core, inDevice, (uint32_t)len, frame_size,
                                pending_frames);
 
-    /* if there are not enough samples, set signal and return */
-    if (pending_frames < frame_size) {
+    /* a short period plays what there is, padded with silence */
+    if (pending_frames == 0 ||
+        (pending_frames < frame_size && core->whole_periods)) {
         inInputTime = 0;
         coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(empty)");
         return 0;
     }
 
-    len = frame_size * hw->info.bytes_per_frame;
+    len = MIN(pending_frames, frame_size) * hw->info.bytes_per_frame;
+    pad = frame_size * hw->info.bytes_per_frame - len;
     while (len) {
         size_t write_len, start;
 
@@ -868,6 +871,7 @@ static OSStatus out_device_ioproc(
         len -= write_len;
         out += write_len;
     }
+    memset(out, 0, pad);
 
     coreaudio_voice_out_buf_unlock(core, "out_device_ioproc");
     return 0;
@@ -1132,6 +1136,8 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
 
     core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
     core->dev = cpdo->dev;
+    core->whole_periods = dev->u.coreaudio.has_whole_periods &&
+                          dev->u.coreaudio.whole_periods;
 
     status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
                                             &voice_out_addr,
