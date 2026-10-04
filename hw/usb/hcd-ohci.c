@@ -1290,6 +1290,29 @@ static void ohci_process_lists(OHCIState *ohci)
     }
 }
 
+/*
+ * Frames missed while the emulator was held up are run back to back.
+ * Meanwhile the guest may sample HccaFrameNumber against its own clock, as
+ * Mac OS X does to time isochronous streams: it is shown the frame due
+ * now, not the one being caught up, but not past a FrameNumberOverflow
+ * that has not been raised yet.
+ */
+static uint16_t ohci_due_frame(OHCIState *ohci)
+{
+    int64_t lag = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - ohci->sof_time) /
+                  usb_frame_time - 1;
+    uint16_t due;
+
+    if ((ohci->ctl & OHCI_CTL_HCFS) != OHCI_USB_OPERATIONAL || lag <= 0) {
+        return ohci->frame_number;
+    }
+    due = ohci->frame_number + MIN(lag, 0x7fff);
+    if ((due ^ ohci->frame_number) & 0x8000) {
+        due = ohci->frame_number | 0x7fff;
+    }
+    return due;
+}
+
 /* Do frame processing on frame boundary */
 static void ohci_frame_boundary(void *opaque)
 {
@@ -1327,7 +1350,7 @@ static void ohci_frame_boundary(void *opaque)
 
     /* Increment frame number and take care of endianness. */
     ohci->frame_number = (ohci->frame_number + 1) & 0xffff;
-    hcca.frame = cpu_to_le16(ohci->frame_number);
+    hcca.frame = cpu_to_le16(ohci_due_frame(ohci));
     /* When the HC updates frame number, set pad to 0. Ref OHCI Spec 4.4.1*/
     hcca.pad = 0;
     /* FrameNumberOverflow happens when bit 15 of frame number changes */
@@ -1668,7 +1691,7 @@ static uint64_t ohci_mem_read(void *opaque,
             break;
 
         case 15: /* HcFmNumber */
-            retval = ohci->frame_number;
+            retval = ohci_due_frame(ohci);
             break;
 
         case 16: /* HcPeriodicStart */
