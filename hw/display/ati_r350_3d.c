@@ -5822,9 +5822,11 @@ static void r300_gl_discard(ATIR350State *s)
  *                            next exit; the deferral starts after it.
  *   the 2D engine, MM_DATA,  ati_r350_gl_sync() writes the copy back
  *   CP fetches, sampling     and keeps it; ati_r350_gl_wrote() drops it
- *   the software rasterizer  r300_gl_zsoft(): written back when the test
- *                            is on, dropped when the draw writes Z or
- *                            its colour lands in the copy's bytes
+ *   the software rasterizer  r300_gl_zsoft(): the draw's rectangle is
+ *                            written back when the test is on and seeded
+ *                            again after it writes Z; the copy is
+ *                            dropped when the draw's colour lands in
+ *                            its bytes
  *   a draw rendering colour  r300_gl_bind()
  *   into the copy's bytes
  *   3D_CLEAR_ZMASK           cleared on the GPU; VRAM inside the seeded
@@ -5968,6 +5970,47 @@ static void r300_gl_zflush(ATIR350State *s)
         s->gl_zres = false;
     }
     s->gl_zdx0 = s->gl_zdx1 = s->gl_zdy0 = s->gl_zdy1 = 0;
+}
+
+/*
+ * The GPU's newer words inside [x0,x1) x [y0,y1) back into VRAM. The
+ * drawn rectangle stays as it is: outside this one the GPU is still
+ * newer, and inside it the two now agree.
+ */
+static bool r300_gl_zflush_rect(ATIR350State *s, int x0, int y0,
+                                int x1, int y1)
+{
+    uint8_t *vram;
+    uint32_t *st;
+    int x, y, w, h;
+
+    x0 = MAX(x0, s->gl_zdx0);
+    y0 = MAX(y0, s->gl_zdy0);
+    x1 = MIN(x1, s->gl_zdx1);
+    y1 = MIN(y1, s->gl_zdy1);
+    if (!s->gl_zres || x1 <= x0 || y1 <= y0) {
+        return true;
+    }
+    w = x1 - x0;
+    h = y1 - y0;
+    st = r300_gl_zbuf(&s->gl_zstage, &s->gl_zstage_n, (size_t)w * h);
+    if (!ati_r350_gl_zfetch(s->gl_ctx, x0, y0, w, h, st,
+                            s->gl_z_z16 ? 2 : 1)) {
+        return false;
+    }
+    vram = memory_region_get_ram_ptr(&s->vram);
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint32_t old, v = st[(size_t)y * w + x];
+
+            if (r300_gl_zload(s, vram, x0 + x, y0 + y, &old) && old != v) {
+                r300_gl_zstore(s, vram, x0 + x, y0 + y, v);
+            }
+        }
+    }
+    s->gl_zflushes++;
+    s->gl_zflush_px += (uint64_t)w * h;
+    return true;
 }
 
 /* forget the GPU's copy, WITHOUT writing it back */
@@ -6152,15 +6195,43 @@ static void r300_gl_zrelease(ATIR350State *s, ATIR350GlRel why)
  * are writers too.
  */
 static bool r300_gl_zwrites(const ATIR350State *s);
+static bool r300_gl_zseed(ATIR350State *s, int x0, int y0, int x1, int y1);
 
 static void r300_gl_zsoft(ATIR350State *s, const R300DrawState *d,
-                          const R300Vtx *vb, unsigned nvtx, unsigned prim)
+                          const R300Vtx *vb, unsigned nvtx, unsigned prim,
+                          int *zr)
 {
     uint32_t lo, hi;
     int x0, y0, x1, y1;
     bool empty;
 
+    zr[0] = zr[1] = zr[2] = zr[3] = 0;
     if (!s->gl_zres) {
+        return;
+    }
+    if (s->zb.z_en && s->gl_zlazy && r300_gl_zsame(s) && nvtx &&
+        s->gl_mode != R350_GL_VERIFY &&
+        prim != 2 && prim != 3 &&
+        r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1, &empty) &&
+        d->dst_off + (uint64_t)y1 * d->dst_pitch + (uint64_t)x1 * 4 <=
+        ATI_R350_VRAM_SIZE) {
+        /*
+         * The draw reads and writes Z only inside its rectangle (lines,
+         * whose width it does not count, and a rectangle trimmed at the
+         * end of VRAM excepted): that
+         * much goes back to VRAM first, and if the draw writes Z, is
+         * seeded again from VRAM after it (r300_gl_zsoft_after()).
+         */
+        if (!r300_gl_zflush_rect(s, x0, y0, x1, y1)) {
+            r300_gl_zback(s, R350_GLZD_SOFT);
+            return;
+        }
+        if (r300_gl_zwrites(s)) {
+            zr[0] = MAX(x0, s->gl_zvx0);
+            zr[1] = MAX(y0, s->gl_zvy0);
+            zr[2] = MIN(x1, s->gl_zvx1);
+            zr[3] = MIN(y1, s->gl_zvy1);
+        }
         return;
     }
     if (s->zb.z_en) {
@@ -6183,6 +6254,17 @@ static void r300_gl_zsoft(ATIR350State *s, const R300DrawState *d,
     if (y1 > y0 && d->dst_off + (uint64_t)y0 * d->dst_pitch < hi &&
         d->dst_off + (uint64_t)y1 * d->dst_pitch > lo) {
         r300_gl_zback(s, R350_GLZD_SOFT);
+    }
+}
+
+/* after the software path wrote Z inside `zr`: the copy takes it again */
+static void r300_gl_zsoft_after(ATIR350State *s, const int *zr)
+{
+    if (!s->gl_zres || zr[2] <= zr[0] || zr[3] <= zr[1]) {
+        return;
+    }
+    if (!r300_gl_zseed(s, zr[0], zr[1], zr[2], zr[3])) {
+        r300_gl_zdrop(s, R350_GLZD_SOFT);
     }
 }
 
@@ -9054,6 +9136,8 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
                                   const R300Vtx *vb, unsigned nvtx,
                                   unsigned prim)
 {
+    int zr[4];
+
     if (nvtx && trace_event_get_state_backends(TRACE_ATI_R350_3D_RECT)) {
         r300_trace_rect(s, d, vb, nvtx, prim);
     }
@@ -9082,8 +9166,9 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
     }
     if (s->cap_fp && s->cap_arm && nvtx) {
         ati_r350_gl_release(s, R350_GLR_FALLBACK);
-        r300_gl_zsoft(s, d, vb, nvtx, prim);
+        r300_gl_zsoft(s, d, vb, nvtx, prim, zr);
         r300_cap_draw(s, d, vb, nvtx, prim);
+        r300_gl_zsoft_after(s, zr);
         return;
     }
     if (s->gl_ctx && nvtx &&
@@ -9119,12 +9204,13 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
     /* the software rasterizer writes VRAM the GPU copy shadows */
     ati_r350_gl_release(s, R350_GLR_FALLBACK);
     /* ... and reads or writes the depth buffer a kept one does */
-    r300_gl_zsoft(s, d, vb, nvtx, prim);
+    r300_gl_zsoft(s, d, vb, nvtx, prim, zr);
     if (d->cb_host) {
         r300_raster_gart(s, d, vb, nvtx, prim);
-        return;
+    } else {
+        r300_raster_prims(s, d, vb, nvtx, prim);
     }
-    r300_raster_prims(s, d, vb, nvtx, prim);
+    r300_gl_zsoft_after(s, zr);
 }
 
 /*
