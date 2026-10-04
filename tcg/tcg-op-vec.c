@@ -754,6 +754,37 @@ void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
     }
 }
 
+FParithRef tcg_fparith_ref;
+
+void tcg_set_fparith_ref(FParithRef fn)
+{
+    tcg_fparith_ref = fn;
+}
+
+bool tcg_can_emit_fparith(void)
+{
+    return tcg_op_supported(INDEX_op_fparith_vec, TCG_TYPE_V64, 0);
+}
+
+void tcg_gen_fparith_vec(unsigned desc, TCGv_vec r, TCGv_i64 status,
+                         TCGv_vec a, TCGv_vec c, TCGv_vec b)
+{
+    TCGOp *op;
+
+    tcg_debug_assert(tcgv_vec_temp(r)->base_type == TCG_TYPE_V64);
+    tcg_debug_assert((desc & FPARITH_OP_MASK) <= FPARITH_RSP);
+    tcg_debug_assert(tcg_fparith_ref);
+    op = tcg_emit_op(INDEX_op_fparith_vec, 6);
+    TCGOP_TYPE(op) = TCG_TYPE_V64;
+    TCGOP_VECE(op) = MO_64;
+    op->args[0] = tcgv_vec_arg(r);
+    op->args[1] = tcgv_i64_arg(status);
+    op->args[2] = tcgv_vec_arg(a);
+    op->args[3] = tcgv_vec_arg(c);
+    op->args[4] = tcgv_vec_arg(b);
+    op->args[5] = desc;
+}
+
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d)
 {

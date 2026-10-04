@@ -786,13 +786,11 @@ static void cpu_ppc_tb_stop (CPUPPCState *env)
         tb = cpu_ppc_get_tb(tb_env, vmclk, tb_env->tb_offset);
         /* Get the alternate time base */
         atb = cpu_ppc_get_tb(tb_env, vmclk, tb_env->atb_offset);
-        /* Store the time base value (ie compute the current offset) */
-        cpu_ppc_store_tb(tb_env, vmclk, &tb_env->tb_offset, tb);
-        /* Store the alternate time base value (compute the current offset) */
-        cpu_ppc_store_tb(tb_env, vmclk, &tb_env->atb_offset, atb);
         /* Set the time base frequency to zero */
         tb_env->tb_freq = 0;
-        /* Now, the time bases are frozen to tb_offset / atb_offset value */
+        /* With no frequency the offsets hold the frozen time base values */
+        cpu_ppc_store_tb(tb_env, vmclk, &tb_env->tb_offset, tb);
+        cpu_ppc_store_tb(tb_env, vmclk, &tb_env->atb_offset, atb);
     }
 }
 

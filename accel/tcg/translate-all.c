@@ -632,7 +632,15 @@ void tcg_flush_jmp_cache(CPUState *cpu)
         return;
     }
 
-    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-        qatomic_set(&jc->array[i].tb, NULL);
+    /*
+     * Retire every entry at once.  Walk the array only when the counter
+     * wraps, so that entries from an earlier lap cannot match again.
+     */
+    if (unlikely(qatomic_inc_fetch(&jc->gen) == 0)) {
+        for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+            qatomic_set(&jc->array[i].tb, NULL);
+            jc->array[i].gen = 0;
+        }
+        qatomic_set(&jc->gen, 1);
     }
 }

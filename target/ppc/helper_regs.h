@@ -22,6 +22,14 @@
 
 #include "target/ppc/cpu.h"
 
+/* Inline host FP arithmetic: PPC_NATIVE_FP_* */
+enum {
+    PPC_NATIVE_FP_OFF,
+    PPC_NATIVE_FP_EXACT,
+    PPC_NATIVE_FP_RELAXED,  /* the arithmetic leaves FI, XX and FX */
+};
+extern int ppc_native_fp;
+
 void hreg_swap_gpr_tgpr(CPUPPCState *env);
 void hreg_compute_hflags(CPUPPCState *env);
 void hreg_update_pmu_hflags(CPUPPCState *env);

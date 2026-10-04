@@ -540,11 +540,114 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
     return PROT_READ | PROT_WRITE | PROT_EXEC;
 }
 #else
+#if defined(CONFIG_DARWIN) && defined(__aarch64__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+
+/*
+ * Apple cores mispredict every indirect branch to a target outside the
+ * branch's 4 GiB-aligned window.  Unless code_gen_buffer shares the
+ * window of QEMU's text, each helper call from translated code pays
+ * that, which halves the speed of floating-point guest code.
+ *
+ * Below the dyld shared cache the window has room for about 1.5 GiB,
+ * which libmalloc splits at a random point before main().  Reserve the
+ * largest hole there from a constructor, up to the default buffer size,
+ * and give translated code that hole, even if smaller than asked for.
+ */
+#define NEAR_TEXT_WINDOW    (4 * GiB)
+#define NEAR_TEXT_MIN_SIZE  (256 * MiB)
+#define NEAR_TEXT_FLAGS     (MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT)
+
+static void *near_text_buf;
+static size_t near_text_size;
+
+static void *mmap_near_text(size_t *size, int prot, int flags)
+{
+    mach_vm_address_t lo = (uintptr_t)mmap_near_text &
+                           -(uintptr_t)NEAR_TEXT_WINDOW;
+    mach_vm_address_t hi = lo + NEAR_TEXT_WINDOW;
+    mach_vm_address_t addr = lo, prev = lo, best = 0;
+    mach_vm_size_t len = 0;
+    void *buf;
+
+    while (prev < hi) {
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj;
+        mach_vm_size_t rsize = 0;
+
+        if (mach_vm_region(mach_task_self(), &addr, &rsize,
+                           VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                           &count, &obj) != KERN_SUCCESS) {
+            addr = hi;
+        }
+        if (MIN(addr, hi) - prev > len) {
+            best = prev;
+            len = MIN(addr, hi) - prev;
+        }
+        prev = addr = addr + rsize;
+    }
+
+    len = QEMU_ALIGN_DOWN(MIN(len, *size), 2 * MiB);
+    if (len < NEAR_TEXT_MIN_SIZE) {
+        return NULL;
+    }
+    buf = mmap((void *)best, len, prot, flags, -1, 0);
+    if (buf == MAP_FAILED) {
+        return NULL;
+    }
+    if ((uintptr_t)buf < lo || (uintptr_t)buf + len > hi) {
+        munmap(buf, len);
+        return NULL;
+    }
+    *size = len;
+    return buf;
+}
+
+static void __attribute__((constructor)) reserve_code_gen_buffer(void)
+{
+    size_t size = DEFAULT_CODE_GEN_BUFFER_SIZE;
+
+    near_text_buf = mmap_near_text(&size, PROT_NONE, NEAR_TEXT_FLAGS);
+    near_text_size = near_text_buf ? size : 0;
+}
+
+static void *alloc_code_gen_buffer_near_text(size_t *size, int prot,
+                                             int flags)
+{
+    void *buf = near_text_buf;
+
+    near_text_buf = NULL;
+    if (buf) {
+        if (prot == PROT_NONE && flags == NEAR_TEXT_FLAGS) {
+            if (*size < near_text_size) {
+                munmap(buf + *size, near_text_size - *size);
+            } else {
+                *size = near_text_size;
+            }
+            return buf;
+        }
+        munmap(buf, near_text_size);
+    }
+    return mmap_near_text(size, prot, flags);
+}
+#endif
+
 static int alloc_code_gen_buffer_anon(size_t size, int prot,
                                       int flags, Error **errp)
 {
     void *buf;
 
+#if defined(CONFIG_DARWIN) && defined(__aarch64__)
+    buf = flags & MAP_JIT ? alloc_code_gen_buffer_near_text(&size, prot, flags)
+                          : NULL;
+    if (buf) {
+        region.start_aligned = buf;
+        region.total_size = size;
+        return prot;
+    }
+#endif
     buf = mmap(NULL, size, prot, flags, -1, 0);
     if (buf == MAP_FAILED) {
         error_setg_errno(errp, errno,
@@ -759,6 +862,7 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_threads)
 
     have_prot = alloc_code_gen_buffer(tb_size, splitwx, &error_fatal);
     assert(have_prot >= 0);
+    tb_size = region.total_size;
 
     /* Request large pages for the buffer and the splitwx.  */
     qemu_madvise(region.start_aligned, region.total_size, QEMU_MADV_HUGEPAGE);

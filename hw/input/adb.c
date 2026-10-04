@@ -250,6 +250,8 @@ static void adb_bus_reset_hold(Object *obj, ResetType type)
      * hardware-accurate value.
      */
     adb_bus->autopoll_rate_ms = 11;
+    adb_bus->autopoll_blocked = false;
+    timer_del(adb_bus->autopoll_timer);
 }
 
 static void adb_bus_realize(BusState *qbus, Error **errp)

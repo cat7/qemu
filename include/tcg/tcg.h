@@ -783,6 +783,13 @@ void tcg_gen_call7(void *func, TCGHelperInfo *, TCGTemp *ret,
                    TCGTemp *, TCGTemp *, TCGTemp *, TCGTemp *,
                    TCGTemp *, TCGTemp *, TCGTemp *);
 
+/* see tcg_gen_fparith_vec() */
+typedef struct FParithResult {
+    uint64_t r, status;
+} FParithResult;
+typedef FParithResult (*FParithRef)(void *env, uint64_t a, uint64_t c,
+                                    uint64_t b, uint32_t desc);
+
 TCGOp *tcg_emit_op(TCGOpcode opc, unsigned nargs);
 void tcg_op_remove(TCGContext *s, TCGOp *op);
 

@@ -242,6 +242,8 @@ static inline void fpscr_set_rounding_mode(CPUPPCState *env)
 
 void ppc_store_fpscr(CPUPPCState *env, target_ulong val)
 {
+    target_ulong old = env->fpscr;
+
     val &= FPSCR_MTFS_MASK;
     if (val & FPSCR_IX) {
         val |= FP_VX;
@@ -254,5 +256,8 @@ void ppc_store_fpscr(CPUPPCState *env, target_ulong val)
     set_float_rebias_underflow(FP_UE & env->fpscr, &env->fp_status);
     if (tcg_enabled()) {
         fpscr_set_rounding_mode(env);
+        if (ppc_native_fp && ((old ^ val) & (FP_ENABLES | FP_NI | FP_RN))) {
+            hreg_compute_hflags(env);
+        }
     }
 }
