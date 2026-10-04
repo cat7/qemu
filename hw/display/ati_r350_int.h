@@ -178,6 +178,19 @@ typedef enum ATIR350GlRel {
     R350_GLR_MAX
 } ATIR350GlRel;
 
+/* why the GPU's copy of the depth buffer was given up */
+typedef enum ATIR350GlZDrop {
+    R350_GLZD_PARK,         /* could not be kept across a release */
+    R350_GLZD_STALE,        /* kept, then VRAM under it changed */
+    R350_GLZD_OTHER,        /* another depth buffer, or drawn into */
+    R350_GLZD_SOFT,         /* the software path wrote Z */
+    R350_GLZD_WRITER,       /* 2D engine, CP or MM_DATA wrote its range */
+    R350_GLZD_GUARD,        /* the guest CPU touched it */
+    R350_GLZD_RESET,        /* reset, backend failure, target grown */
+    R350_GLZD_VERIFY,       /* gl=verify */
+    R350_GLZD_MAX
+} ATIR350GlZDrop;
+
 /*
  * WHICH 2D path ended the residency. R350_GLR_2D above lumps three
  * unrelated operations together, and they call for opposite fixes: a
@@ -794,6 +807,21 @@ struct ATIR350State {
     size_t gl_zstage_n, gl_zv_n;
     uint64_t gl_zdrawn, gl_zflushes, gl_zflush_px, gl_zseed_px;
     uint64_t gl_zclears, gl_zkept, gl_zstale, gl_zdropped;
+    uint64_t gl_zdrop_why[R350_GLZD_MAX];
+    /*
+     * "gl-depth-resident": the copy stays on the GPU across releases and
+     * goes back to VRAM only when something reads it. The guest CPU's
+     * accesses are trapped by the DEPTH GUARD, a window over the
+     * aperture at [zg_lo, zg_hi) laid over the Z buffer's pages; zg_zlo
+     * and zg_zhi are the Z bytes inside it. Changed with the BQL and the
+     * engine both held. See "GL-OWNED DEPTH BUFFER".
+     */
+    bool gl_zlazy;
+    bool zg_ready, zg_on;
+    MemoryRegion zg_io, zg_win;
+    uint32_t zg_lo, zg_hi, zg_zlo, zg_zhi;
+    uint64_t gl_zlazy_rel, gl_zg_arms, gl_zg_traps, gl_zg_back;
+    uint64_t gl_zclr_px;        /* cleared on the GPU only */
     /* gl=verify over the depth buffer, classed as the colour is */
     uint64_t gl_vz_draws, gl_vz_px, gl_vz_diff, gl_vz_cover_px, gl_vz_cover;
     /*
@@ -1108,6 +1136,18 @@ void ati_r350_gl_epoch_apply(ATIR350State *s);
  */
 bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len);
 
+/*
+ * The depth guard (see "GL-OWNED DEPTH BUFFER" in ati_r350_3d.c).
+ * ati_r350_zguard_arm() lays it over [lo, hi), page aligned, taking the
+ * BQL if the caller does not hold it; the engine must be this thread's.
+ * ati_r350_gl_zguard() is the trap's half in the draw code: the guest
+ * CPU is about to access [off, off+len), the engine is held, and it
+ * returns true when the guard has nothing left to watch.
+ */
+bool ati_r350_zguard_arm(ATIR350State *s, uint32_t lo, uint32_t hi,
+                         uint32_t zlo, uint32_t zhi);
+bool ati_r350_gl_zguard(ATIR350State *s, uint32_t off, unsigned len);
+
 bool ati_r350_on_engine(void);
 /* ati_r350_vram_xor() on this thread uses `memo` from now on */
 void ati_r350_swap_memo_bind(ATIR350SwapMemo *memo);
@@ -1128,7 +1168,7 @@ void ati_r350_gl_leave(ATIR350State *s, bool claimed);
 static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
                                      uint32_t len)
 {
-    if (unlikely(s->gl_res)) {
+    if (unlikely(s->gl_res || s->gl_zres)) {
         ati_r350_gl_sync(s, off, len);
     }
 }

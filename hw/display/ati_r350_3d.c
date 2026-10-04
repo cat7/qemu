@@ -1320,7 +1320,7 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
  * ZB_ZMASK_PITCH pixels: a 640x480 clear is 600 dwords.
  */
 static bool r300_gl_zclear(ATIR350State *s, uint32_t first, uint32_t n,
-                           unsigned bw, uint32_t clr);
+                           unsigned bw, uint32_t clr, int *keep);
 
 void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                                uint32_t val)
@@ -1333,6 +1333,7 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
     unsigned zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
     uint32_t i, off;
     unsigned x, y, k;
+    int keep[4];
 
     if (val || !bw || !((zp >> 2) & 0xfff) ||
         (zfmt != R300_ZB_FORMAT_24_8 && zfmt != R300_ZB_FORMAT_16) ||
@@ -1347,13 +1348,20 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
     s->zb.aa = smp == 2;
     s->zb.z16 = zfmt == R300_ZB_FORMAT_16;
     n = MIN(n, 0x100000);
-    /* a GPU copy of this buffer is cleared alike; any other goes back */
-    r300_gl_zclear(s, first, n, bw, s->zb.z16 ? clr & 0xffff : clr);
+    /*
+     * A GPU copy of this buffer is cleared alike; any other goes back.
+     * Inside `keep` the copy is newer and VRAM is left to it.
+     */
+    r300_gl_zclear(s, first, n, bw, s->zb.z16 ? clr & 0xffff : clr, keep);
     for (i = first; i < first + n; i++) {
         unsigned bx = (i % bw) * 32, by = (i / bw) * 16;
 
         for (y = by; y < by + 16; y++) {
             for (x = bx; x < bx + 32; x++) {
+                if ((int)x >= keep[0] && (int)x < keep[2] &&
+                    (int)y >= keep[1] && (int)y < keep[3]) {
+                    continue;
+                }
                 if (s->zb.z16) {
                     /* the linear layout r300_zb_pixel() uses */
                     uint32_t a = off + (y * s->zb.pitch + x) * 2;
@@ -5796,6 +5804,37 @@ static void r300_gl_discard(ATIR350State *s)
  * stores do not: the depth buffer is not displayed. A copy is never
  * parked under gl=verify, where the software path owns VRAM, nor when
  * the texture cache does not use the dirty bitmap (gl-texlife).
+ *
+ * KEPT UNWRITTEN (gl-depth-resident=on, the default). Nothing outside
+ * the 3D engine reads a depth buffer except to pick, so the write-back
+ * at every release is replaced by one at the first READ, and the copy
+ * stays newer than VRAM across releases. Every reader is then a hook:
+ *
+ *   the guest CPU            the DEPTH GUARD (ati_r350.c): an MMIO
+ *                            window over the copy's pages, laid at a
+ *                            release after which the guest may run
+ *                            (r300_gl_zkeep()). An access to the Z bytes
+ *                            writes the copy back, drops it and lifts
+ *                            the guard; then the access is done on VRAM.
+ *                            The release that lays the guard still
+ *                            writes back, because each vCPU drops its
+ *                            TLB entries for those pages only at its
+ *                            next exit; the deferral starts after it.
+ *   the 2D engine, MM_DATA,  ati_r350_gl_sync() writes the copy back
+ *   CP fetches, sampling     and keeps it; ati_r350_gl_wrote() drops it
+ *   the software rasterizer  r300_gl_zsoft(): written back when the test
+ *                            is on, dropped when the draw writes Z or
+ *                            its colour lands in the copy's bytes
+ *   a draw rendering colour  r300_gl_bind()
+ *   into the copy's bytes
+ *   3D_CLEAR_ZMASK           cleared on the GPU; VRAM inside the seeded
+ *                            rectangle is left to the copy, which is
+ *                            newer there (r300_gl_zclear()'s `keep`)
+ *
+ * Behind the guard the dirty bitmap says nothing the guard does not, so
+ * r300_gl_zepoch() ignores it there. A release before the guard is laid
+ * (a target change or a fallback inside a burst) writes back and parks
+ * as above. gl=verify never keeps a copy unwritten.
  */
 static bool r300_gl_zspan(ATIR350State *s, uint32_t *lo, uint32_t *hi)
 {
@@ -5932,9 +5971,10 @@ static void r300_gl_zflush(ATIR350State *s)
 }
 
 /* forget the GPU's copy, WITHOUT writing it back */
-static void r300_gl_zdrop(ATIR350State *s)
+static void r300_gl_zdrop(ATIR350State *s, ATIR350GlZDrop why)
 {
     s->gl_zdropped += s->gl_zres;
+    s->gl_zdrop_why[why] += s->gl_zres;
     s->gl_zres = false;
     s->gl_zpark = false;
     s->gl_ztaint = false;
@@ -5943,11 +5983,11 @@ static void r300_gl_zdrop(ATIR350State *s)
 }
 
 /* back into VRAM and forgotten: before anything else works on the buffer */
-static void r300_gl_zback(ATIR350State *s)
+static void r300_gl_zback(ATIR350State *s, ATIR350GlZDrop why)
 {
     if (s->gl_zres) {
         r300_gl_zflush(s);
-        r300_gl_zdrop(s);
+        r300_gl_zdrop(s, why);
     }
 }
 
@@ -5968,17 +6008,17 @@ static void r300_gl_zpark(ATIR350State *s)
     }
     if (s->gl_mode == R350_GL_VERIFY || s->gl_ztaint ||
         s->gl_texlife != R350_TEXLIFE_DIRTY || !r300_gl_zspan(s, &lo, &hi)) {
-        r300_gl_zdrop(s);
+        r300_gl_zdrop(s, R350_GLZD_PARK);
         return;
     }
     npg = r300_gl_pages(s, lo, hi - lo);
     if (npg > R300_GL_ZPARK_PAGES || r300_gl_range_dirty(s, lo, npg)) {
-        r300_gl_zdrop(s);
+        r300_gl_zdrop(s, R350_GLZD_PARK);
         return;
     }
     smp_mb(); /* the bits before scan_seq; pairs with the refresh */
     if (qatomic_read(&s->scan_seq) & 1) {
-        r300_gl_zdrop(s);
+        r300_gl_zdrop(s, R350_GLZD_PARK);
         return;
     }
     s->gl_zpark = true;
@@ -6003,6 +6043,12 @@ static bool r300_gl_zcurrent(ATIR350State *s)
     return s->gl_zres && s->gl_zepoch == s->gl_epoch;
 }
 
+/* the depth guard traps every access to [lo, hi) */
+static bool r300_gl_zguarded(const ATIR350State *s, uint32_t lo, uint32_t hi)
+{
+    return s->zg_on && s->zg_zlo <= lo && hi <= s->zg_zhi;
+}
+
 /* the dirty pages a refresh handed over, against the copy; tex lock held */
 static void r300_gl_zepoch(ATIR350State *s, const unsigned long *pages)
 {
@@ -6012,12 +6058,17 @@ static void r300_gl_zepoch(ATIR350State *s, const unsigned long *pages)
     if (!r300_gl_zspan(s, &lo, &hi)) {
         return;
     }
+    if (r300_gl_zguarded(s, lo, hi)) {
+        /* the guard saw every CPU access to these pages */
+        s->gl_zepoch = s->gl_epoch;
+        return;
+    }
     p1 = ((uint64_t)hi + (1u << s->gl_pgbits) - 1) >> s->gl_pgbits;
     for (p = lo >> s->gl_pgbits; p < p1; p++) {
         if (test_bit(p, pages)) {
             if (s->gl_zpark) {
                 s->gl_zstale++;
-                r300_gl_zdrop(s);
+                r300_gl_zdrop(s, R350_GLZD_STALE);
             } else {
                 s->gl_ztaint = true;
             }
@@ -6032,6 +6083,130 @@ static bool r300_gl_zsame(const ATIR350State *s)
     return s->gl_z_off == s->zb.off && s->gl_z_pitch == s->zb.pitch &&
            s->gl_z_macro == s->zb.macro && s->gl_z_micro == s->zb.micro &&
            s->gl_z_aa == s->zb.aa && s->gl_z_z16 == s->zb.z16;
+}
+
+/* a release after which the guest CPU may run */
+static bool r300_gl_rel_guest(ATIR350GlRel why)
+{
+    return why == R350_GLR_SCANOUT || why == R350_GLR_RING ||
+           why == R350_GLR_IB || why == R350_GLR_FIFO ||
+           why == R350_GLR_FENCE;
+}
+
+/*
+ * gl-depth-resident: may the copy stay on the GPU, unwritten, across
+ * this release? Only behind the guard. Laying the guard down is a
+ * memory transaction whose TLB flush reaches each vCPU at its next
+ * exit, so the release that lays it writes the copy back as before and
+ * the deferral starts at the next one.
+ */
+static bool r300_gl_zkeep(ATIR350State *s, ATIR350GlRel why)
+{
+    uint64_t pg = (uint64_t)1 << s->gl_pgbits;
+    uint32_t lo, hi;
+
+    if (!s->gl_zlazy || s->gl_mode == R350_GL_VERIFY ||
+        !r300_gl_zspan(s, &lo, &hi)) {
+        return false;
+    }
+    if (r300_gl_zguarded(s, lo, hi)) {
+        s->gl_zlazy_rel++;
+        return true;
+    }
+    if (!r300_gl_rel_guest(why)) {
+        return false;
+    }
+    r300_gl_zflush(s);
+    if (!s->gl_zres ||
+        !ati_r350_zguard_arm(s, lo & ~(pg - 1), ROUND_UP((uint64_t)hi, pg),
+                             lo, hi)) {
+        return false;
+    }
+    s->gl_zg_arms++;
+    s->gl_ztaint = false;
+    return true;
+}
+
+/* the colour target is being given back: what becomes of the depth copy */
+static void r300_gl_zrelease(ATIR350State *s, ATIR350GlRel why)
+{
+    if (!s->gl_zres) {
+        return;
+    }
+    if (why == R350_GLR_RESET || why == R350_GLR_BACKEND ||
+        why == R350_GLR_2D) {
+        r300_gl_zback(s, R350_GLZD_RESET);
+        return;
+    }
+    if (r300_gl_zkeep(s, why)) {
+        return;
+    }
+    r300_gl_zflush(s);
+    r300_gl_zpark(s);
+}
+
+/*
+ * The software path is about to run a draw: it reads the Z buffer in
+ * VRAM when the test is on and writes it when the draw changes it.
+ * With the copy kept across releases, colour stores into its range
+ * are writers too.
+ */
+static bool r300_gl_zwrites(const ATIR350State *s);
+
+static void r300_gl_zsoft(ATIR350State *s, const R300DrawState *d,
+                          const R300Vtx *vb, unsigned nvtx, unsigned prim)
+{
+    uint32_t lo, hi;
+    int x0, y0, x1, y1;
+    bool empty;
+
+    if (!s->gl_zres) {
+        return;
+    }
+    if (s->zb.z_en) {
+        r300_gl_zflush(s);
+        if (r300_gl_zwrites(s)) {
+            r300_gl_zdrop(s, R350_GLZD_SOFT);
+        }
+        return;
+    }
+    if (!s->gl_zlazy || !r300_gl_zspan(s, &lo, &hi) || !nvtx) {
+        return;
+    }
+    if (!r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1, &empty)) {
+        if (empty) {
+            return;
+        }
+        y0 = MAX(d->sc_y0, 0);
+        y1 = d->sc_y1 + 1;
+    }
+    if (y1 > y0 && d->dst_off + (uint64_t)y0 * d->dst_pitch < hi &&
+        d->dst_off + (uint64_t)y1 * d->dst_pitch > lo) {
+        r300_gl_zback(s, R350_GLZD_SOFT);
+    }
+}
+
+/*
+ * The guest CPU is about to access [off, off+len) through the depth
+ * guard, with the engine held. An access to the copy's bytes writes it
+ * back and gives it up, so the access then sees exactly what the
+ * software path would have left; one to the rest of a guarded page
+ * changes nothing. True when the guard can be lifted.
+ */
+bool ati_r350_gl_zguard(ATIR350State *s, uint32_t off, unsigned len)
+{
+    uint32_t lo, hi;
+
+    if (!s->gl_zres || !r300_gl_zspan(s, &lo, &hi)) {
+        return true;
+    }
+    if (off + len <= lo || off >= hi) {
+        return false;
+    }
+    s->gl_zg_traps++;
+    s->gl_zg_back += s->gl_zdx1 > s->gl_zdx0 && s->gl_zdy1 > s->gl_zdy0;
+    r300_gl_zback(s, R350_GLZD_GUARD);
+    return true;
 }
 
 /* seed [x0,x1) x [y0,y1) of the depth buffer from VRAM */
@@ -6066,7 +6241,8 @@ static bool r300_gl_zbind(ATIR350State *s, int x0, int y0, int x1, int y1)
     unsigned k, n = 0;
 
     if (s->gl_zres && !r300_gl_zsame(s)) {
-        r300_gl_zback(s);               /* another depth buffer entirely */
+        /* another depth buffer entirely */
+        r300_gl_zback(s, R350_GLZD_OTHER);
     }
     if (s->gl_zres && s->gl_zpark) {
         if (r300_gl_zcurrent(s)) {
@@ -6074,7 +6250,7 @@ static bool r300_gl_zbind(ATIR350State *s, int x0, int y0, int x1, int y1)
             s->gl_zkept++;
         } else {
             s->gl_zstale += s->gl_zres;
-            r300_gl_zdrop(s);
+            r300_gl_zdrop(s, R350_GLZD_STALE);
         }
     }
     if (!s->gl_zres) {
@@ -6112,7 +6288,7 @@ static bool r300_gl_zbind(ATIR350State *s, int x0, int y0, int x1, int y1)
     for (k = 0; k < n; k++) {
         if (!r300_gl_zseed(s, strip[k].x0, strip[k].y0,
                            strip[k].x1, strip[k].y1)) {
-            r300_gl_zback(s);
+            r300_gl_zback(s, R350_GLZD_RESET);
             return false;
         }
     }
@@ -6127,17 +6303,25 @@ static bool r300_gl_zbind(ATIR350State *s, int x0, int y0, int x1, int y1)
  * merged into one rectangle. A copy of another buffer, or one a clear
  * fails on, goes back first so it cannot later overwrite the cleared
  * words. False when there was nothing to clear on the GPU.
+ *
+ * A copy kept behind the depth guard is newer than VRAM wherever the
+ * clear covers its seeded rectangle, so there the caller leaves VRAM
+ * alone: *keep is set to that rectangle, and the drawn one grows over
+ * the cleared tiles inside it. Otherwise *keep is empty.
  */
 static bool r300_gl_zclear(ATIR350State *s, uint32_t first, uint32_t n,
-                           unsigned bw, uint32_t clr)
+                           unsigned bw, uint32_t clr, int *keep)
 {
-    uint32_t i = first, end = first + n;
+    uint32_t i = first, end = first + n, lo, hi;
+    int cx0, cy0, cx1, cy1;
 
+    keep[0] = keep[1] = keep[2] = keep[3] = 0;
     if (!s->gl_zres || !s->gl_ctx) {
         return false;
     }
     if (!r300_gl_zsame(s) || s->gl_mode == R350_GL_VERIFY) {
-        r300_gl_zback(s);
+        r300_gl_zback(s, s->gl_mode == R350_GL_VERIFY ? R350_GLZD_VERIFY
+                                                      : R350_GLZD_OTHER);
         return false;
     }
     while (i < end) {
@@ -6157,12 +6341,45 @@ static bool r300_gl_zclear(ATIR350State *s, uint32_t first, uint32_t n,
         if (x1 > x0 && y1 > y0 &&
             !ati_r350_gl_zclear(s->gl_ctx, x0, y0, x1 - x0, y1 - y0, clr,
                                 s->gl_z_z16 ? 2 : 1)) {
-            r300_gl_zback(s);
+            r300_gl_zback(s, R350_GLZD_RESET);
             return false;
         }
         i += rows * cnt;
     }
     s->gl_zclears++;
+    if (!s->gl_zlazy || !n || !r300_gl_zspan(s, &lo, &hi) ||
+        !r300_gl_zguarded(s, lo, hi)) {
+        return true;
+    }
+    /* the cleared tiles' bounding box, inside the seeded rectangle */
+    cy0 = (first / bw) * 16;
+    cy1 = ((end - 1) / bw + 1) * 16;
+    if ((end - 1) / bw > first / bw) {
+        cx0 = 0;
+        cx1 = bw * 32;
+    } else {
+        cx0 = (first % bw) * 32;
+        cx1 = ((end - 1) % bw + 1) * 32;
+    }
+    cx0 = MAX(cx0, s->gl_zvx0);
+    cy0 = MAX(cy0, s->gl_zvy0);
+    cx1 = MIN(cx1, s->gl_zvx1);
+    cy1 = MIN(cy1, s->gl_zvy1);
+    if (cx1 <= cx0 || cy1 <= cy0) {
+        return true;
+    }
+    if (s->gl_zdx1 <= s->gl_zdx0 || s->gl_zdy1 <= s->gl_zdy0) {
+        s->gl_zdx0 = cx0; s->gl_zdy0 = cy0;
+        s->gl_zdx1 = cx1; s->gl_zdy1 = cy1;
+    } else {
+        s->gl_zdx0 = MIN(s->gl_zdx0, cx0);
+        s->gl_zdy0 = MIN(s->gl_zdy0, cy0);
+        s->gl_zdx1 = MAX(s->gl_zdx1, cx1);
+        s->gl_zdy1 = MAX(s->gl_zdy1, cy1);
+    }
+    keep[0] = s->gl_zvx0; keep[1] = s->gl_zvy0;
+    keep[2] = s->gl_zvx1; keep[3] = s->gl_zvy1;
+    s->gl_zclr_px += (uint64_t)(cx1 - cx0) * (cy1 - cy0);
     return true;
 }
 
@@ -6412,13 +6629,7 @@ void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
         r300_gl_texdrop(s);
     }
     if (s->gl_res) {
-        r300_gl_zflush(s);
-        if (why == R350_GLR_RESET || why == R350_GLR_BACKEND ||
-            why == R350_GLR_2D) {
-            r300_gl_zdrop(s);
-        } else {
-            r300_gl_zpark(s);
-        }
+        r300_gl_zrelease(s, why);
         px = s->gl_flush_px;
         r300_gl_flush(s);
         r300_gl_discard(s);
@@ -6442,7 +6653,7 @@ void ati_r350_gl_reset(ATIR350State *s)
 {
     ati_r350_gl_release(s, R350_GLR_RESET);
     r300_gl_texdrop(s);
-    r300_gl_zdrop(s);
+    r300_gl_zdrop(s, R350_GLZD_RESET);
 }
 
 /*
@@ -6462,9 +6673,13 @@ void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
         return;
     }
     if ((r300_gl_span(s, &lo, &hi) && off + len > lo && off < hi) ||
-        (s->gl_res && r300_gl_zspan(s, &lo, &hi) &&
+        (!s->gl_zlazy && s->gl_res && r300_gl_zspan(s, &lo, &hi) &&
          off + len > lo && off < hi)) {
         ati_r350_gl_release(s, R350_GLR_READ);
+    }
+    if (s->gl_zres && r300_gl_zspan(s, &lo, &hi) &&
+        off + len > lo && off < hi) {
+        r300_gl_zflush(s);              /* a kept copy stays */
     }
     ati_r350_gl_leave(s, claimed);
 }
@@ -6493,7 +6708,7 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
         /* written back by the sync above if it was newer; now stale */
         if (ati_r350_gl_enter(s, &claimed)) {
             if (r300_gl_zspan(s, &lo, &hi) && off + len > lo && off < hi) {
-                r300_gl_zback(s);
+                r300_gl_zback(s, R350_GLZD_WRITER);
             }
             ati_r350_gl_leave(s, claimed);
         }
@@ -6534,7 +6749,7 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
         s->gl_tex_w = MAX(x1, s->gl_tex_w);
         s->gl_tex_h = MAX(y1, s->gl_tex_h);
         r300_gl_discard(s);
-        r300_gl_zdrop(s);
+        r300_gl_zdrop(s, R350_GLZD_RESET);
     }
     for (i = 0; s->gl_texlife != R350_TEXLIFE_NEVER &&
                 i < s->gl_tex_n; i++) {
@@ -6546,6 +6761,16 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
             s->gl_tex_over++;
             s->gl_tex[i].live = false;
             s->gl_tex[i].up = false;
+        }
+    }
+    if (s->gl_zlazy && s->gl_zres) {
+        uint32_t zlo, zhi;
+
+        /* rendering into the bytes of the depth copy */
+        if (r300_gl_zspan(s, &zlo, &zhi) &&
+            d->dst_off + (uint64_t)y0 * d->dst_pitch < zhi &&
+            d->dst_off + (uint64_t)y1 * d->dst_pitch > zlo) {
+            r300_gl_zback(s, R350_GLZD_OTHER);
         }
     }
     s->gl_res = true;
@@ -8278,7 +8503,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         if (gpuz) {
             /* the software path wrote the Z buffer in VRAM too */
             r300_gl_zverify(s, x0, y0, w, h);
-            r300_gl_zdrop(s);
+            r300_gl_zdrop(s, R350_GLZD_VERIFY);
         }
         return R300_GL_DRAWN;
     }
@@ -8839,7 +9064,7 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
      * target back first. Chess's compositor does exactly this -- it
      * samples the resolve buffer the board was rendered into.
      */
-    if (unlikely(s->gl_res)) {
+    if (unlikely(s->gl_res || s->gl_zres)) {
         unsigned u;
 
         for (u = 0; u < R300_TEX_UNITS; u++) {
@@ -8857,6 +9082,7 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
     }
     if (s->cap_fp && s->cap_arm && nvtx) {
         ati_r350_gl_release(s, R350_GLR_FALLBACK);
+        r300_gl_zsoft(s, d, vb, nvtx, prim);
         r300_cap_draw(s, d, vb, nvtx, prim);
         return;
     }
@@ -8872,7 +9098,7 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
              * still goes through the software path, shading nothing.
              */
             if (!gpuz && s->zb.z_en && s->zb.z_wr) {
-                r300_gl_zback(s);
+                r300_gl_zback(s, R350_GLZD_SOFT);
                 d->wmask = 0;
                 r300_raster_prims(s, d, vb, nvtx, prim);
             }
@@ -8892,10 +9118,8 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
     }
     /* the software rasterizer writes VRAM the GPU copy shadows */
     ati_r350_gl_release(s, R350_GLR_FALLBACK);
-    if (s->gl_zres && r300_gl_zwrites(s)) {
-        /* ... and the depth buffer the parked one does */
-        r300_gl_zdrop(s);
-    }
+    /* ... and reads or writes the depth buffer a kept one does */
+    r300_gl_zsoft(s, d, vb, nvtx, prim);
     if (d->cb_host) {
         r300_raster_gart(s, d, vb, nvtx, prim);
         return;
