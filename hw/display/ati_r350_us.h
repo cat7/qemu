@@ -557,4 +557,86 @@ static inline void r300_us_run_fast(const R300UsProgram *p,
  */
 bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap);
 
+/*
+ * S3TC, TX_FORMAT1 TXFORMAT 0x0f/0x10/0x11 (Mesa r300_reg.h
+ * R300_TX_FORMAT_DXT1/3/5). A block is 4x4 texels, 8 bytes for DXT1 and
+ * 16 for DXT3/5, read as a byte stream in ascending address order with
+ * multi-byte fields little-endian.
+ *
+ * Output texels are packed X = blue, Y = green, Z = red, W = alpha, one
+ * byte each from the low lane: the component numbering of the 5_6_5
+ * endpoint words (X in bits 4:0).
+ */
+static inline unsigned r300_dxt_block_bytes(unsigned dxt)
+{
+    return dxt == 1 ? 8 : 16;
+}
+
+static inline void r300_dxt_565(uint32_t c, uint32_t rgb[3])
+{
+    uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+
+    rgb[0] = (r << 3) | (r >> 2);
+    rgb[1] = (g << 2) | (g >> 4);
+    rgb[2] = (b << 3) | (b >> 2);
+}
+
+static inline void r300_dxt_decode(unsigned dxt, const uint8_t *b,
+                                   uint32_t out[16])
+{
+    const uint8_t *cb = dxt == 1 ? b : b + 8;
+    uint32_t c0 = cb[0] | (cb[1] << 8), c1 = cb[2] | (cb[3] << 8);
+    uint32_t idx = cb[4] | (cb[5] << 8) | (cb[6] << 16) |
+                   ((uint32_t)cb[7] << 24);
+    uint32_t pal[4][3], pa[4] = { 255, 255, 255, 255 }, apal[8];
+    uint64_t abits = 0;
+    unsigned k, t;
+
+    r300_dxt_565(c0, pal[0]);
+    r300_dxt_565(c1, pal[1]);
+    for (k = 0; k < 3; k++) {
+        if (dxt != 1 || c0 > c1) {
+            pal[2][k] = (2 * pal[0][k] + pal[1][k]) / 3;
+            pal[3][k] = (pal[0][k] + 2 * pal[1][k]) / 3;
+        } else {
+            pal[2][k] = (pal[0][k] + pal[1][k]) / 2;
+            pal[3][k] = 0;
+        }
+    }
+    if (dxt == 1 && c0 <= c1) {
+        pa[3] = 0;
+    }
+    if (dxt == 5) {
+        uint32_t a0 = b[0], a1 = b[1];
+
+        for (k = 0; k < 6; k++) {
+            abits |= (uint64_t)b[2 + k] << (8 * k);
+        }
+        apal[0] = a0;
+        apal[1] = a1;
+        for (k = 2; k < 8; k++) {
+            if (a0 > a1) {
+                apal[k] = ((8 - k) * a0 + (k - 1) * a1) / 7;
+            } else if (k < 6) {
+                apal[k] = ((6 - k) * a0 + (k - 1) * a1) / 5;
+            } else {
+                apal[k] = k == 6 ? 0 : 255;
+            }
+        }
+    }
+    for (t = 0; t < 16; t++) {
+        uint32_t a;
+
+        k = (idx >> (2 * t)) & 3;
+        if (dxt == 1) {
+            a = pa[k];
+        } else if (dxt == 3) {
+            a = ((b[t >> 1] >> ((t & 1) * 4)) & 15) * 17;
+        } else {
+            a = apal[(abits >> (3 * t)) & 7];
+        }
+        out[t] = pal[k][2] | (pal[k][1] << 8) | (pal[k][0] << 16) | (a << 24);
+    }
+}
+
 #endif /* ATI_R350_US_H */

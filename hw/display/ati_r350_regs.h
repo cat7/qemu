@@ -1007,6 +1007,9 @@
 #define R300_TX_FMT_1_5_5_5           0x0b    /* X[4:0] Y[9:5] Z[14:10] W[15] */
 #define R300_TX_FMT_8_8_8_8           0x0c    /* four, X the low byte */
 #define R300_TX_FMT_16_16_16_16       0x0e    /* four 16-bit, X the low half */
+#define R300_TX_FMT_DXT1              0x0f    /* S3TC 4x4 blocks, 8 bytes */
+#define R300_TX_FMT_DXT3              0x10    /* 16 bytes, explicit alpha */
+#define R300_TX_FMT_DXT5              0x11    /* 16 bytes, interpolated alpha */
 #define R300_TX_FMT_VYUY422           0x14    /* Y0 U Y1 V, Y0 the low byte */
 #define R300_TX_FMT_YVYU422           0x15    /* U Y0 V Y1, U the low byte */
 #define R300_TX_FORMAT1_SEL_SHIFT     9       /* A, then R, G, B */
