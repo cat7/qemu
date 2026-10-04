@@ -2623,6 +2623,23 @@ static unsigned r300_psc_dwords(unsigned type)
     return n[type & 0xf];
 }
 
+/* elements VAP_PROG_STREAM_CNTL names up to LAST_VEC; 0 without one */
+static unsigned r300_psc_elements(ATIR350State *s)
+{
+    unsigned i, half;
+
+    for (i = 0; i < 8; i++) {
+        uint32_t v = s->regs[(R300_VAP_PROG_STREAM_CNTL_0 >> 2) + i];
+
+        for (half = 0; half < 2; half++) {
+            if ((v >> (half * 16)) & R300_PSC_LAST_VEC) {
+                return i * 2 + half + 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /*
  * WHICH INPUT REGISTER EACH VERTEX ELEMENT FEEDS.
  *
@@ -7511,8 +7528,9 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                     R300_VAP_VTX_NUM_ARRAYS_MASK;
     uint32_t addr[R300_AOS_MAX];
     unsigned size[R300_AOS_MAX], stride[R300_AOS_MAX];
-    unsigned vsize = 0;
+    unsigned vsize = 0, pos;
     unsigned swap = s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_VC_SWAP;
+    bool split;
     R300DrawState d;
     R300VtxFmt fmt = { 0 };
     unsigned i, a, c;
@@ -7572,13 +7590,24 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
         }
     }
     /*
-     * Zero, not `vsize`: these sizes are the bound arrays themselves,
-     * and element i is fetched from array i, so registers that describe
-     * a different split of the same dwords are stale and not a better
-     * answer. (The whole packed-colour family reaches the fetch through
-     * here, and reaches it with the arrays and the registers agreeing.)
+     * Zero, not `vsize`, while each array is one element: these sizes are
+     * the bound arrays themselves, so registers that describe a different
+     * split of the same dwords are stale. (The whole packed-colour family
+     * reaches the fetch through here, and reaches it with the arrays and
+     * the registers agreeing.)
+     *
+     * An array can also carry several elements interleaved. Quake III's
+     * vertex on Mac OS X 10.4 is one array of six dwords that the stream
+     * control splits as a FLOAT_3 position, a BYTE colour and a FLOAT_2
+     * coordinate. The fetcher hands the arrays' dwords on back to back,
+     * so when the registers name more elements than there are arrays,
+     * their split is taken where it covers exactly this vertex, as for
+     * an inline one. Read as one element, the colour dword was the
+     * position's w and no vertex had a place on screen.
      */
-    r300_stream_route(s, d.attr_size, &d.attr_count, 0, &fmt);
+    split = r300_psc_elements(s) > d.attr_count;
+    r300_stream_route(s, d.attr_size, &d.attr_count, split ? vsize : 0, &fmt);
+    pos = split ? d.attr_size[0] : size[0];
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
@@ -7615,7 +7644,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                 }
             }
         }
-        r300_texcoord_src(&d, vsize, size[0], ts);
+        r300_texcoord_src(&d, vsize, pos, ts);
         for (i = 0; i < nvtx; i++) {
             unsigned n = 0;
             unsigned vi = idx ? idx[i] : i;
@@ -7658,7 +7687,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                         n > base + 3 ? dw[base + 3] : 0);
                 }
             }
-            r300_load_vtx(&d, &fmt, dw, vsize, size[0], &vb[i]);
+            r300_load_vtx(&d, &fmt, dw, vsize, pos, &vb[i]);
             r300_attr_texcoord(&d, &fmt, dw, ts, &vb[i]);
             if (i == 0 && d.textured) {
                 r300_trace_texcoord(&d, &fmt, dw, &vb[i]);
