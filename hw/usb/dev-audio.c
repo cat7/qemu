@@ -834,11 +834,12 @@ static int streambuf_put(struct streambuf *buf, USBPacket *p, uint32_t channels)
     size_t offset = buf->prod % buf->size;
     size_t first = MIN(len, buf->size - offset);
 
-    if (free < len) {
-        return 0;
-    }
     if (len > USBAUDIO_PACKET_SIZE(channels) || len % (channels * 2)) {
         return 0;
+    }
+    if (free < len) {
+        /* the oldest data gives way */
+        buf->cons += len - free;
     }
 
     usb_packet_copy(p, buf->data + offset, first);
@@ -922,6 +923,9 @@ struct USBAudioState {
         struct streambuf buf;
         uint32_t channels;
         uint32_t freq;
+        size_t backend_size;    /* bytes the backend buffers at most */
+        bool prebuffering;
+        unsigned starved;
     } out;
 
     struct {
@@ -944,10 +948,62 @@ struct USBAudioState {
 #define TYPE_USB_AUDIO "usb-audio"
 OBJECT_DECLARE_SIMPLE_TYPE(USBAudioState, USB_AUDIO)
 
+/*
+ * The host controller delivers the frames it missed while the main loop
+ * was held up in one burst afterwards, so playback keeps a lead: a stream
+ * starts, and restarts after running dry, once USBAUDIO_OUT_LEAD_MS has
+ * arrived, and what the backend holds then covers a stall of about that
+ * length. Audio queued beyond lead + slack, after a stall longer than
+ * that, is dropped oldest first, so latency does not ratchet up.
+ */
+#define USBAUDIO_OUT_LEAD_MS      40
+#define USBAUDIO_OUT_SLACK_MS     20
+#define USBAUDIO_OUT_RING_PACKETS 128
+
+static size_t usb_audio_out_bytes(USBAudioState *s, unsigned ms)
+{
+    return (size_t)s->out.freq * ms / 1000 * s->out.channels * 2;
+}
+
+static void usb_audio_out_restart(USBAudioState *s)
+{
+    s->out.backend_size = s->out.voice ?
+        audio_be_get_buffer_size_out(s->audio_be, s->out.voice) : 0;
+    s->out.prebuffering = true;
+    s->out.starved = 0;
+}
+
 static void output_callback(void *opaque, int avail)
 {
     USBAudioState *s = opaque;
+    struct streambuf *buf = &s->out.buf;
+    size_t lead = usb_audio_out_bytes(s, USBAUDIO_OUT_LEAD_MS);
+    size_t slack = usb_audio_out_bytes(s, USBAUDIO_OUT_SLACK_MS);
+    size_t held = s->out.backend_size > avail ? s->out.backend_size - avail : 0;
+    size_t fill = buf->prod - buf->cons;
     uint8_t *data;
+
+    if (s->out.prebuffering) {
+        if (fill < lead) {
+            return;
+        }
+        s->out.prebuffering = false;
+        s->out.starved = 0;
+    } else if (fill == 0 && held < lead / 4) {
+        /* one dry period can be a late frame, two are a dry stream */
+        if (++s->out.starved >= 2) {
+            s->out.prebuffering = true;
+        }
+        return;
+    } else {
+        s->out.starved = 0;
+    }
+
+    if (held + fill > lead + slack) {
+        size_t drop = MIN(held + fill - lead, fill);
+
+        buf->cons += drop - drop % (s->out.channels * 2);
+    }
 
     while (avail) {
         size_t written, len;
@@ -975,6 +1031,7 @@ static void usb_audio_set_output_freq(USBAudioState *s, uint32_t freq)
                                      s, output_callback, &s->out.as);
     audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
     streambuf_init(&s->out.buf, s->buffer, s->out.channels);
+    usb_audio_out_restart(s);
     audio_be_set_active_out(s->audio_be, s->out.voice,
                             s->out.altset != ALTSET_OFF);
 }
@@ -999,6 +1056,7 @@ static int usb_audio_set_output_altset(USBAudioState *s, int altset)
             usb_audio_set_output_freq(s, freq);
         }
         streambuf_init(&s->out.buf, s->buffer, s->out.channels);
+        usb_audio_out_restart(s);
         audio_be_set_active_out(s->audio_be, s->out.voice, true);
         break;
     default:
@@ -1066,7 +1124,8 @@ static int usb_audio_set_input_altset(USBAudioState *s, int altset)
         }
         break;
     case ALTSET_STEREO:
-        streambuf_init(&s->in.buf, s->buffer, s->in.channels);
+        streambuf_init(&s->in.buf, s->buffer_user ? s->buffer_user :
+                       32 * USBAUDIO_PACKET_SIZE(2), s->in.channels);
         if (s->in.voice) {
             audio_be_set_active_in(s->audio_be, s->in.voice, true);
         }
@@ -1489,7 +1548,8 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
 
     s->out.channels      = channels;
     if (!s->buffer_user) {
-        s->buffer = 32 * USBAUDIO_PACKET_SIZE(s->out.channels);
+        s->buffer = USBAUDIO_OUT_RING_PACKETS *
+                    USBAUDIO_PACKET_SIZE(s->out.channels);
     } else {
         s->buffer = s->buffer_user;
     }
@@ -1504,6 +1564,7 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
     s->out.voice = audio_be_open_out(s->audio_be, s->out.voice, TYPE_USB_AUDIO,
                                 s, output_callback, &s->out.as);
     audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
+    usb_audio_out_restart(s);
     audio_be_set_active_out(s->audio_be, s->out.voice, 0);
 
     /* Input is always stereo */
