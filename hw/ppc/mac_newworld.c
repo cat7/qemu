@@ -170,6 +170,7 @@ static void ppc_core99_reset(void *opaque)
     PowerPCCPU *cpu = opaque;
     CPUState *cs = CPU(cpu);
 
+    cpu_ppc_tb_reset(&cpu->env);
     cpu_reset(cs);
     /* 970 CPUs want to get their initial IP as part of their boot protocol */
     cpu->env.nip = PROM_BASE + 0x100;
