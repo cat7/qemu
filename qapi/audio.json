@@ -178,12 +178,17 @@
 #
 # @out: options of the playback stream
 #
+# @whole-periods: play only whole device periods; a shorter remainder
+#     is held back and silence is played instead (default false: the
+#     remainder is played, padded with silence) (since 11.2)
+#
 # Since: 4.0
 ##
 { 'struct': 'AudiodevCoreaudioOptions',
   'data': {
     '*in':  'AudiodevCoreaudioPerDirectionOptions',
-    '*out': 'AudiodevCoreaudioPerDirectionOptions' } }
+    '*out': 'AudiodevCoreaudioPerDirectionOptions',
+    '*whole-periods': 'bool' } }
 
 ##
 # @AudiodevDsoundOptions:
