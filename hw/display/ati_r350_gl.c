@@ -644,7 +644,8 @@ fail:
  * the main thread whenever ati_r350_update_display() releases the target
  * for scanout (ati_r350.c). Only one of them may use the backend at a
  * time: the command processor's thread while it is busy, any other only
- * while it is idle and with the BQL held (ati_r350_gl_mine()). That is
+ * while it is idle and with the BQL held, or, with lockless register
+ * access, while it has claimed the engine (ati_r350_gl_enter()). That is
  * all CGL asks for -- but WGL asks for more: wglMakeCurrent FAILS while
  * the context is current to a DIFFERENT thread, and no thread can release
  * another thread's context.

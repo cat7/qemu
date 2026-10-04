@@ -323,6 +323,18 @@ struct ATIR350State {
     uint64_t engine_kicks, engine_waits, engine_wait_us, engine_bql_writes;
     uint64_t engine_ibs, engine_scratch;
     unsigned engine_rptr_wb;
+    /*
+     * Register accesses without the BQL; see "LOCKLESS REGISTER ACCESS"
+     * in ati_r350.c. engine_claimed and the claim counters are under
+     * engine_lock.
+     */
+    bool lockless_mmio;         /* property */
+    bool lockless;              /* in effect: needs the engine thread */
+    bool engine_claimed;
+    QemuCond engine_claim_cond;
+    ATIR350SwapMemo cswap;      /* the claimant's ati_r350_vram_xor() memo */
+    uint64_t engine_claims, engine_claim_waits, engine_claim_wait_us;
+    uint64_t engine_claim_busy;
     /* the decoded-texture cache, held by the draw path */
     QemuRecMutex gl_tex_lock;
     /*
@@ -1019,15 +1031,14 @@ void ati_r350_engine_wait(ATIR350State *s);
 
 /*
  * May this thread use the GL target and the command processor's state
- * right now: always on the engine thread, elsewhere only while it is
- * idle. It cannot become busy under the BQL, which every other caller
- * holds.
+ * right now: always on the engine thread or the thread that claimed the
+ * engine, elsewhere only while it is idle. Without lockless register
+ * access it cannot become busy under the BQL, which every other caller
+ * holds; with it, a caller here takes the engine if it is idle, and
+ * ati_r350_gl_leave() gives it back when *claimed says so.
  */
-static inline bool ati_r350_gl_mine(ATIR350State *s)
-{
-    return !s->engine_on || ati_r350_on_engine() ||
-           !qatomic_read(&s->engine_busy);
-}
+bool ati_r350_gl_enter(ATIR350State *s, bool *claimed);
+void ati_r350_gl_leave(ATIR350State *s, bool claimed);
 
 /* something is about to READ this range of VRAM */
 static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
