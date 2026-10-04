@@ -691,32 +691,37 @@ static DirtyBitmapSnapshot *ati_r350_take_dirty(ATIR350State *s)
     int i;
 
     /*
-     * Not under gl_tex_lock: under TCG the snapshot waits for every vCPU
-     * to finish its translation block, and a vCPU may be waiting for the
-     * command processor thread, which may be waiting for that lock. The
-     * bitmap operations are atomic; a range admitted in between is at
-     * worst dropped again by gl_epoch().
+     * Not under gl_tex_lock, which a draw holds for as long as it runs:
+     * the refresh holds the BQL, and waiting for a draw there stalls
+     * every vCPU's device access and every main-loop timer with it.
+     * Nor under any lock the draw path waits for: under TCG the
+     * snapshot waits for a vCPU, which may be waiting for the command
+     * processor thread.
+     *
+     * The clear is the only thing that resets DIRTY_MEMORY_VGA, and the
+     * decoded-texture cache reads those bits to know whether the guest
+     * CPU wrote over a texture, so the pages it found are handed over --
+     * the sole record of what was set. scan_seq is odd from before the
+     * clear until they are, and a lookup that finds it odd decodes
+     * afresh.
      */
+    qatomic_inc(&s->scan_seq);
     snap = memory_region_snapshot_and_clear_dirty(&s->vram, 0,
                                                    ATI_R350_VRAM_SIZE,
                                                    DIRTY_MEMORY_VGA);
-    /* the draw path claims dirty bits for textures; see gl_tex_lock */
-    QEMU_LOCK_GUARD(&s->gl_tex_lock);
+    qemu_mutex_lock(&s->scan_lock);
+    ati_r350_gl_epoch(s, snap);
+    qatomic_set(&s->scan_pending, true);
+    qemu_mutex_unlock(&s->scan_lock);
+    qatomic_inc(&s->scan_seq);
     for (i = 0; i < nblocks; i++) {
-        if (!s->fb_block_pending[i] &&
+        if (!qatomic_read(&s->fb_block_pending[i]) &&
             memory_region_snapshot_get_dirty(&s->vram, snap,
                                              (hwaddr)i * ATI_R350_FB_SCAN_BLOCK,
                                              ATI_R350_FB_SCAN_BLOCK)) {
-            s->fb_block_pending[i] = true;
+            qatomic_set(&s->fb_block_pending[i], true);
         }
     }
-    /*
-     * The clear above is the only thing that resets DIRTY_MEMORY_VGA,
-     * and the decoded-texture cache reads those bits to know whether
-     * the guest CPU wrote over a texture. Hand the snapshot over before
-     * it is discarded -- it is the sole record of what was set.
-     */
-    ati_r350_gl_epoch(s, snap);
     return snap;
 }
 
@@ -744,7 +749,8 @@ bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len)
     uint64_t pg = qemu_target_page_size();
     uint64_t lo = off & ~(pg - 1);
     uint64_t hi = (off + len + pg - 1) & ~(pg - 1);
-    uint64_t fb_len = (uint64_t)s->mode.pitch * s->mode.height;
+    uint64_t fb = qatomic_read(&s->scan_fb);
+    uint64_t fb_off = fb >> 32, fb_len = (uint32_t)fb;
     ram_addr_t base;
     uint64_t a;
     int i;
@@ -752,8 +758,7 @@ bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len)
     if (hi > ATI_R350_VRAM_SIZE) {
         return false;
     }
-    if (fb_len && lo < (uint64_t)s->mode.fb_offset + fb_len &&
-        hi > s->mode.fb_offset) {
+    if (fb_len && lo < fb_off + fb_len && hi > fb_off) {
         return false;               /* those bits decide the redraw */
     }
     base = memory_region_get_ram_addr(&s->vram);
@@ -761,7 +766,7 @@ bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len)
         if (physical_memory_get_dirty_flag(base + a, DIRTY_MEMORY_VGA)) {
             i = a / ATI_R350_FB_SCAN_BLOCK;
             if (i < nblocks) {
-                s->fb_block_pending[i] = true;
+                qatomic_set(&s->fb_block_pending[i], true);
             }
         }
     }
@@ -954,9 +959,10 @@ static bool ati_r350_update_display(void *opaque)
         redraw = true;
     }
     g_free(snap);
-    qemu_rec_mutex_lock(&s->gl_tex_lock);
-    s->mode = mode;             /* ati_r350_gl_admit() reads it */
-    qemu_rec_mutex_unlock(&s->gl_tex_lock);
+    s->mode = mode;
+    /* ati_r350_gl_admit() reads it */
+    qatomic_set(&s->scan_fb, (uint64_t)mode.fb_offset << 32 |
+                (fb_len <= UINT32_MAX ? fb_len : UINT32_MAX));
     s->mode_dirty = false;
     if (!redraw) {
         ati_r350_cursor_update(s);
@@ -3699,6 +3705,7 @@ static void ati_r350_engine_vm_state(void *opaque, bool running,
 static void ati_r350_engine_init(ATIR350State *s)
 {
     qemu_rec_mutex_init(&s->gl_tex_lock);
+    qemu_mutex_init(&s->scan_lock);
     s->engine_on = s->engine_async == ON_OFF_AUTO_ON ||
                    (s->engine_async == ON_OFF_AUTO_AUTO && !qtest_enabled());
     if (!s->engine_on) {
@@ -3941,6 +3948,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
 
     /* scanout bookkeeping back to what a cold boot starts from */
     memset(&s->mode, 0, sizeof(s->mode));
+    qatomic_set(&s->scan_fb, 0);
     memset(&s->crtc_mode, 0, sizeof(s->crtc_mode));
     s->have_valid_mode = false;
     memset(s->fb_scan_activity, 0, sizeof(s->fb_scan_activity));
@@ -4467,6 +4475,8 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
         trace_ati_r350_gl_open(ati_r350_gl_describe(s->gl_ctx));
     }
     s->gl_pgbits = qemu_target_page_bits();
+    s->scan_dirty = bitmap_new(ATI_R350_VRAM_SIZE >> s->gl_pgbits);
+    s->scan_work = bitmap_new(ATI_R350_VRAM_SIZE >> s->gl_pgbits);
     s->gl_texlife = R350_TEXLIFE_DIRTY;
     if (s->gl_texlife_path && s->gl_texlife_path[0]) {
         if (!strcmp(s->gl_texlife_path, "burst")) {
@@ -4647,6 +4657,8 @@ static void ati_r350_exit(PCIDevice *dev)
     g_free(s->gl_out);
     g_free(s->gl_sw);
     g_free(s->gl_texbuf);
+    g_free(s->scan_dirty);
+    g_free(s->scan_work);
     g_free(s->gl_verts);
     g_free(s->gl_tcx);
     if (s->agp_as_valid) {

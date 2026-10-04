@@ -22,6 +22,7 @@
 #include <math.h>
 #include "hw/pci/pci_device.h"
 #include "system/physmem.h"
+#include "qemu/bitmap.h"
 #include "qemu/rcu.h"
 #include "qemu/thread.h"
 #include "qemu/units.h"
@@ -5570,8 +5571,9 @@ const char *ati_r350_gl_rel_name(ATIR350GlRel why)
  *   between refreshes  r300_gl_tex_current() re-reads the live flags
  *   at a refresh       ati_r350_gl_epoch() is handed the snapshot the
  *                      clear produced -- the only record of what was
- *                      set -- applies the same test to every live entry
- *                      before it is discarded, and carries the
+ *                      set -- and keeps its pages; before the next
+ *                      lookup, ati_r350_gl_epoch_apply() applies the
+ *                      same test to every live entry and carries the
  *                      survivors into the next generation
  *
  * An entry whose generation is not the current one was not carried, so
@@ -5620,37 +5622,81 @@ static bool r300_gl_range_dirty(ATIR350State *s, uint32_t off, unsigned npg)
     return false;
 }
 
+/*
+ * The live bits first, the handed-over pages second. A refresh makes
+ * scan_seq odd, clears the bits, hands their pages over and makes it
+ * even again, so a write the first test misses because it was just
+ * cleared is either among the pages or the clear is still under way --
+ * and then this entry cannot be vouched for.
+ */
 static bool r300_gl_tex_current(ATIR350State *s, unsigned k)
 {
     if (s->gl_texlife != R350_TEXLIFE_DIRTY) {
         /* burst: dropped at release instead. never: the control. */
         return true;
     }
-    return s->gl_tex[k].epoch == s->gl_epoch &&
-           !r300_gl_range_dirty(s, s->gl_tex[k].off, s->gl_tex[k].npg);
+    if (r300_gl_range_dirty(s, s->gl_tex[k].off, s->gl_tex[k].npg)) {
+        return false;
+    }
+    smp_mb(); /* the bits before scan_seq; pairs with the refresh */
+    if (qatomic_read(&s->scan_seq) & 1) {
+        return false;
+    }
+    smp_rmb(); /* scan_seq before scan_pending */
+    ati_r350_gl_epoch_apply(s);
+    return s->gl_tex[k].live && s->gl_tex[k].epoch == s->gl_epoch;
 }
 
+/* the display's half: note the snapshot's pages, scan_lock held */
 void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap)
 {
-    bool any = false;
-    unsigned k, i;
+    uint64_t pg = (uint64_t)1 << s->gl_pgbits;
+    uint64_t blk, a;
 
-    s->gl_epoch++;
     if (s->gl_texlife != R350_TEXLIFE_DIRTY) {
         return;
     }
+    for (blk = 0; blk < ATI_R350_VRAM_SIZE; blk += ATI_R350_FB_SCAN_BLOCK) {
+        if (!memory_region_snapshot_get_dirty(&s->vram, snap, blk,
+                                              ATI_R350_FB_SCAN_BLOCK)) {
+            continue;
+        }
+        for (a = blk; a < blk + ATI_R350_FB_SCAN_BLOCK; a += pg) {
+            if (memory_region_snapshot_get_dirty(&s->vram, snap, a, pg)) {
+                set_bit(a >> s->gl_pgbits, s->scan_dirty);
+            }
+        }
+    }
+}
+
+/* the draw path's half, gl_tex_lock held */
+void ati_r350_gl_epoch_apply(ATIR350State *s)
+{
+    unsigned long *pages;
+    bool any = false;
+    unsigned k, i;
+
+    if (!qatomic_read(&s->scan_pending)) {
+        return;
+    }
+    qemu_mutex_lock(&s->scan_lock);
+    pages = s->scan_dirty;
+    s->scan_dirty = s->scan_work;
+    s->scan_work = pages;
+    qatomic_set(&s->scan_pending, false);
+    qemu_mutex_unlock(&s->scan_lock);
+
+    s->gl_epoch++;
     for (k = 0; k < R300_GL_TEXCACHE; k++) {
-        uint32_t p0;
+        unsigned long p0;
         bool stale = false;
 
         if (!s->gl_tex[k].live) {
             continue;
         }
-        p0 = s->gl_tex[k].off & ~((1u << s->gl_pgbits) - 1);
+        p0 = s->gl_tex[k].off >> s->gl_pgbits;
         for (i = 0; i < s->gl_tex[k].npg && !stale; i++) {
-            stale = memory_region_snapshot_get_dirty(&s->vram, snap,
-                        p0 + ((uint64_t)i << s->gl_pgbits),
-                        (uint64_t)1 << s->gl_pgbits);
+            stale = test_bit(p0 + i, pages);
         }
         if (stale) {
             s->gl_tex[k].live = false;
@@ -5662,6 +5708,7 @@ void ati_r350_gl_epoch(ATIR350State *s, DirtyBitmapSnapshot *snap)
         }
     }
     s->gl_tex_any = any;
+    bitmap_zero(pages, ATI_R350_VRAM_SIZE >> s->gl_pgbits);
 }
 
 void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
@@ -7250,6 +7297,7 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
                            const R300Vtx *vb, unsigned nvtx, unsigned prim)
 {
     qemu_rec_mutex_lock(&s->gl_tex_lock);
+    ati_r350_gl_epoch_apply(s);
     r300_run_prims_locked(s, d, vb, nvtx, prim);
     qemu_rec_mutex_unlock(&s->gl_tex_lock);
 }
