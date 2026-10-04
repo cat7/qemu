@@ -609,16 +609,26 @@ static void audio_timer (void *opaque)
 {
     int64_t now, diff;
     AudioMixengBackend *s = opaque;
+    bool late = false;
 
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     diff = now - s->timer_last;
     if (diff > s->period_ticks * 3 / 2) {
         trace_audio_timer_delayed(diff / SCALE_MS);
+        late = true;
     }
     s->timer_last = now;
 
     audio_run(s, "timer");
     audio_reset_timer(s);
+
+    /*
+     * Device timers that fell behind with this one catch up after it in
+     * the same pass; collect what they produce without waiting a period.
+     */
+    if (late && s->timer_running) {
+        timer_mod_anticipate_ns(s->ts, now + MIN(s->period_ticks, SCALE_MS));
+    }
 }
 
 /*
