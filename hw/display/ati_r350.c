@@ -4444,6 +4444,126 @@ static const MemoryRegionOps ati_r350_fillwatch_ops = {
     },
 };
 
+/*
+ * The DEPTH GUARD: a window over aperture 0 laid over the pages of a
+ * depth buffer the host GPU holds newer than VRAM (gl-depth-resident;
+ * see "GL-OWNED DEPTH BUFFER" in ati_r350_3d.c). Every guest CPU access
+ * there comes here instead of reaching RAM. One that touches the Z
+ * bytes writes the GPU's copy back first and lifts the guard; the access
+ * itself is then done on VRAM exactly as the RAM it replaces would, so
+ * a byte lands where a store through aperture 0 puts it (see
+ * ati_r350_fillwatch_read()).
+ */
+static void ati_r350_zguard_set(ATIR350State *s, uint32_t lo, uint32_t hi,
+                                uint32_t zlo, uint32_t zhi)
+{
+    memory_region_transaction_begin();
+    if (hi > lo) {
+        memory_region_set_enabled(&s->zg_win, false);
+        memory_region_set_alias_offset(&s->zg_win, lo);
+        memory_region_set_size(&s->zg_win, hi - lo);
+        memory_region_set_address(&s->zg_win, lo);
+    }
+    memory_region_set_enabled(&s->zg_win, hi > lo);
+    memory_region_transaction_commit();
+    s->zg_on = hi > lo;
+    s->zg_lo = lo;
+    s->zg_hi = hi;
+    s->zg_zlo = zlo;
+    s->zg_zhi = zhi;
+}
+
+bool ati_r350_zguard_arm(ATIR350State *s, uint32_t lo, uint32_t hi,
+                         uint32_t zlo, uint32_t zhi)
+{
+    bool bql = !bql_locked();
+
+    if (!s->zg_ready || hi <= lo || hi > ATI_R350_VRAM_SIZE) {
+        return false;
+    }
+    if (bql) {
+        bql_lock();
+    }
+    ati_r350_zguard_set(s, lo, hi, zlo, zhi);
+    if (bql) {
+        bql_unlock();
+    }
+    return true;
+}
+
+/* the BQL is held: this is an ordinary MMIO region */
+static void ati_r350_zguard_hit(ATIR350State *s, uint32_t off, unsigned len)
+{
+    bool lift;
+
+    if (!s->zg_on || off + len <= s->zg_zlo || off >= s->zg_zhi) {
+        return;
+    }
+    if (s->lockless) {
+        ati_r350_engine_claim(s);
+    } else {
+        ati_r350_engine_wait(s);
+    }
+    lift = ati_r350_gl_zguard(s, off, len);
+    if (lift && s->zg_on) {
+        ati_r350_zguard_set(s, 0, 0, 0, 0);
+    }
+    if (s->lockless) {
+        ati_r350_engine_unclaim(s, false);
+    }
+}
+
+static uint64_t ati_r350_zguard_read(void *opaque, hwaddr addr,
+                                     unsigned size)
+{
+    ATIR350State *s = opaque;
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint64_t val = 0;
+    unsigned i;
+
+    if (addr + size > ATI_R350_VRAM_SIZE) {
+        return 0;
+    }
+    ati_r350_zguard_hit(s, addr, size);
+    for (i = 0; i < size; i++) {
+        val |= (uint64_t)vram[addr + i] << (8 * (size - 1 - i));
+    }
+    return val;
+}
+
+static void ati_r350_zguard_write(void *opaque, hwaddr addr,
+                                  uint64_t data, unsigned size)
+{
+    ATIR350State *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    unsigned i;
+
+    if (addr + size > ATI_R350_VRAM_SIZE) {
+        return;
+    }
+    ati_r350_zguard_hit(s, addr, size);
+    for (i = 0; i < size; i++) {
+        vram[addr + i] = (data >> (8 * (size - 1 - i))) & 0xff;
+    }
+    memory_region_set_dirty(&s->vram, addr, size);
+}
+
+static const MemoryRegionOps ati_r350_zguard_ops = {
+    .read = ati_r350_zguard_read,
+    .write = ati_r350_zguard_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
+
 /* ---------------------------------------------------------------- */
 
 static void ati_r350_reset_hold(Object *obj, ResetType type)
@@ -4457,6 +4577,9 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     }
     /* the surface descriptors are about to go: resolve the target first */
     ati_r350_gl_reset(s);
+    if (s->zg_on) {
+        ati_r350_zguard_set(s, 0, 0, 0, 0);
+    }
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
     ati_r350_palette_reset(s);
@@ -5019,6 +5142,29 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
             return;
         }
     }
+    if (s->gl_tex_slots > R300_GL_TEXCACHE ||
+        (s->gl_tex_slots && s->gl_tex_slots < R300_GL_TEXCACHE_OLD)) {
+        error_setg(errp, "gl-texcache-slots must be 0 or %u to %u (got %u)",
+                   R300_GL_TEXCACHE_OLD, R300_GL_TEXCACHE, s->gl_tex_slots);
+        return;
+    }
+    s->gl_tex_n = s->gl_tex_slots ? s->gl_tex_slots : R300_GL_TEXCACHE_OLD;
+    s->gl_tex_hashed = s->gl_tex_n > R300_GL_TEXCACHE_OLD;
+    memset(s->gl_tex_bucket, 0xff, sizeof(s->gl_tex_bucket));
+    for (unsigned k = 0; k < R300_GL_TEXCACHE; k++) {
+        s->gl_tex[k].hb = R300_GL_TEXNIL;
+        s->gl_tex[k].hnext = R300_GL_TEXNIL;
+    }
+
+    if (s->gl_ctx && s->gl_zlazy) {
+        memory_region_init_io(&s->zg_io, obj, &ati_r350_zguard_ops, s,
+                              "ati-r350-zguard", ATI_R350_VRAM_SIZE);
+        memory_region_init_alias(&s->zg_win, obj, "ati-r350-zguard-win",
+                                 &s->zg_io, 0, qemu_target_page_size());
+        memory_region_set_enabled(&s->zg_win, false);
+        memory_region_add_subregion_overlap(&s->aper, 0, &s->zg_win, 2);
+        s->zg_ready = true;
+    }
 
     memory_region_init_io(&s->mmio, obj, &ati_r350_mmio_ops, s,
                           "ati-r350-mmio", ATI_R350_MMIO_SIZE);
@@ -5278,11 +5424,21 @@ static const Property ati_r350_properties[] = {
      */
     DEFINE_PROP_STRING("gl-texlife", ATIR350State, gl_texlife_path),
     /*
+     * Decoded textures kept: 0 or 32 is the linear 32-entry cache, up to
+     * 256 a hashed one bounded by R300_GL_TEXCACHE_BYTES.
+     */
+    DEFINE_PROP_UINT32("gl-texcache-slots", ATIR350State, gl_tex_slots, 256),
+    /*
      * Depth- and stencil-tested draws on the host GPU, against a copy of
      * the Z buffer kept beside the colour target ("GL-OWNED DEPTH
      * BUFFER" in ati_r350_3d.c). Off sends them to the software path.
      */
     DEFINE_PROP_BOOL("gl-depth", ATIR350State, gl_depth, true),
+    /*
+     * Keep the GPU's depth buffer across releases and write it back only
+     * when something reads it; off writes it back at every release.
+     */
+    DEFINE_PROP_BOOL("gl-depth-resident", ATIR350State, gl_zlazy, true),
     /* threads a draw's rows are split across: 0 = auto, 1 = serial */
     DEFINE_PROP_UINT32("raster-threads", ATIR350State, raster_threads, 0),
     DEFINE_PROP_UINT64("x-raster-split", ATIR350State, raster_tri_split, 0),
@@ -5593,6 +5749,10 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                              ? "never (CONTROL: invalidation OFF)" : "dirty",
                            s->gl_tex_noadmit, s->gl_tex_stale,
                            s->gl_tex_wrote, s->gl_tex_over, s->gl_tex_evict);
+    g_string_append_printf(out, "\n  slots %u %s, %zu KiB held, %" PRIu64
+                           " dropped for space", s->gl_tex_n,
+                           s->gl_tex_hashed ? "hashed" : "linear",
+                           s->gl_tex_bytes >> 10, s->gl_tex_trim);
     /*
      * WHICH hook ended each residency. "the target is not staying
      * resident" is a symptom whose cure depends entirely on which rule
@@ -5650,6 +5810,31 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                s->gl_zdrawn, s->gl_zflushes, s->gl_zflush_px,
                                s->gl_zseed_px, s->gl_zclears, s->gl_zkept,
                                s->gl_zstale, s->gl_zdropped);
+        g_string_append_printf(out, "\n  resident %s: kept unwritten across "
+                               "%" PRIu64 " releases, guard laid %" PRIu64
+                               ", CPU accesses trapped %" PRIu64 " (%" PRIu64
+                               " wrote back), %" PRIu64 " px cleared on the "
+                               "GPU only",
+                               s->gl_zlazy ? "on" : "off", s->gl_zlazy_rel,
+                               s->gl_zg_arms, s->gl_zg_traps, s->gl_zg_back,
+                               s->gl_zclr_px);
+        for (k = 0; k < R350_GLZD_MAX; k++) {
+            static const char *const zd[R350_GLZD_MAX] = {
+                [R350_GLZD_PARK] = "not kept at a release",
+                [R350_GLZD_STALE] = "kept, then stale",
+                [R350_GLZD_OTHER] = "another depth buffer or drawn into",
+                [R350_GLZD_SOFT] = "software path",
+                [R350_GLZD_WRITER] = "2D, CP or MM_DATA write",
+                [R350_GLZD_GUARD] = "guest CPU access",
+                [R350_GLZD_RESET] = "reset, backend or grown target",
+                [R350_GLZD_VERIFY] = "gl=verify",
+            };
+
+            if (s->gl_zdrop_why[k]) {
+                g_string_append_printf(out, "\n  dropped by %s: %" PRIu64,
+                                       zd[k], s->gl_zdrop_why[k]);
+            }
+        }
     }
     if (s->gl_addblend) {
         /*

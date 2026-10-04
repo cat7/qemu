@@ -3003,6 +3003,23 @@ bool ati_r350_gl_zclear(R350GlCtx *g, int x0, int y0, int w, int h,
     return ok;
 }
 
+void ati_r350_gl_tex_forget(R350GlCtx *g, unsigned slot)
+{
+    if (!g || slot >= R350_GL_TEXSLOTS) {
+        return;
+    }
+    r350_gl_makecurrent(&g->plat);
+    if (gl_queue_uses_slot(g, slot)) {
+        gl_flush_queue(g);
+    }
+    glDeleteTextures(1, &g->tex[slot]);
+    glGenTextures(1, &g->tex[slot]);
+    g->tex_w[slot] = g->tex_h[slot] = 0;
+    g->tex_nl[slot] = 0;
+    g->tex_cb[slot] = 0;
+    r350_gl_done(&g->plat);
+}
+
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 {
     const R350GlProg *p;
@@ -3296,6 +3313,10 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req)
 {
     return false;
+}
+
+void ati_r350_gl_tex_forget(R350GlCtx *g, unsigned slot)
+{
 }
 
 bool ati_r350_gl_depth(R350GlCtx *g)

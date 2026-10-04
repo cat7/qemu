@@ -83,17 +83,16 @@
 #define R350_GL_VSTRIDE (45 + 8 * R350_GL_TEXCOORDS)
 
 /*
- * How many uploaded textures the backend keeps, plus one: slot
+ * How many uploaded textures the backend can keep, plus one: slot
  * R350_GL_TEXSLOTS is a scratch the caller uses for a texture it is not
  * tracking, and it is uploaded every time. See R350GlReq.tex_slot.
+ * The device uses as many of these as its gl-texcache-slots property
+ * says and bounds their total size (R300_GL_TEXCACHE_BYTES).
  *
- * MEASURED, not guessed: at 8 a live Flurry session reported 620 of its
- * 2546 decodes as entries the LRU had evicted -- the second largest
- * miss class after the ones a writer killed. The device-side cache
- * bounds each entry at R300_GL_TEXCACHE_MAX texels, so this many slots
- * is a bounded worst case rather than an open-ended allocation.
+ * At 8 a Flurry session reported 620 of its 2546 decodes as LRU
+ * evictions; at 32 a Quake III timedemo reported 133004 of 134782.
  */
-#define R350_GL_TEXSLOTS 32
+#define R350_GL_TEXSLOTS 256
 
 /* US_ALU_CONST vectors a translated fragment program may name */
 #define R350_GL_USK 32
@@ -339,6 +338,9 @@ bool ati_r350_gl_zclear(R350GlCtx *g, int x0, int y0, int w, int h,
  * the caller must fall back.
  */
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req);
+
+/* release the storage of a cached texture slot; the slot reads as empty */
+void ati_r350_gl_tex_forget(R350GlCtx *g, unsigned slot);
 
 /* a one-line description of the backend actually in use, for `qom-get gl` */
 const char *ati_r350_gl_describe(R350GlCtx *g);
