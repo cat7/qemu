@@ -17,10 +17,12 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include <math.h>
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "internal.h"
 #include "fpu/softfloat.h"
+#include "tcg/tcg-op-common.h"
 
 static inline float128 float128_snan_to_qnan(float128 x)
 {
@@ -684,6 +686,186 @@ FPU_FMADD(FMADD, MADD_FLGS)
 FPU_FMADD(FNMADD, NMADD_FLGS)
 FPU_FMADD(FMSUB, MSUB_FLGS)
 FPU_FMADD(FNMSUB, NMSUB_FLGS)
+
+/*
+ * Exact results with infinite, zero or subnormal values on the host FPU:
+ * no NaN operand or result, and an infinity only from an infinite
+ * operand, a zero or subnormal only where the operation is exact.
+ */
+static bool fparith_host(unsigned op, bool sgl, uint64_t a, uint64_t c,
+                         uint64_t b, uint64_t *rp)
+{
+    double x, y, z, r;
+    bool fused = op >= FPARITH_MADD && op <= FPARITH_NMSUB;
+    uint64_t ri;
+
+    memcpy(&x, &a, 8);
+    memcpy(&y, &b, 8);
+    memcpy(&z, &c, 8);
+    switch (op) {
+    case FPARITH_ADD:
+        r = x + y;
+        break;
+    case FPARITH_SUB:
+        r = x - y;
+        break;
+    case FPARITH_MUL:
+        r = x * y;
+        break;
+    case FPARITH_DIV:
+        r = x / y;
+        break;
+    case FPARITH_MADD:
+        r = fma(x, z, y);
+        break;
+    case FPARITH_MSUB:
+        r = fma(x, z, -y);
+        break;
+    case FPARITH_NMADD:
+        r = fma(x, z, y);
+        break;
+    case FPARITH_NMSUB:
+        r = fma(x, z, -y);
+        break;
+    default:
+        return false;
+    }
+    if (isnan(r) || isnan(x) || isnan(y) || (fused && isnan(z))) {
+        return false;
+    }
+    if (isinf(r)) {
+        if (!isinf(x) && !isinf(y) && !(fused && isinf(z))) {
+            return false;
+        }
+    } else if (fpclassify(r) == FP_ZERO || fpclassify(r) == FP_SUBNORMAL) {
+        switch (op) {
+        case FPARITH_ADD:
+        case FPARITH_SUB:
+            break;
+        case FPARITH_MUL:
+            if (x != 0 && y != 0) {
+                return false;
+            }
+            break;
+        case FPARITH_DIV:
+            if (x != 0 && !isinf(y)) {
+                return false;
+            }
+            break;
+        default:
+            if (x != 0 && z != 0) {
+                return false;
+            }
+            break;
+        }
+        if (sgl && r != 0 && (double)(float)r != r) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    memcpy(&ri, &r, 8);
+    /* the negated forms negate the rounded result, -0 for a zero sum */
+    if (op == FPARITH_NMADD || op == FPARITH_NMSUB) {
+        ri ^= INT64_MIN;
+    }
+    *rp = ri;
+    return true;
+}
+
+/*
+ * The inline FP ops' (fp-impl.c.inc) result and status for the cases
+ * they do not compute themselves: the helpers' result, FPARITH_ST_OFF if
+ * the helpers would set more than FI, XX and FX.
+ */
+FParithResult ppc_fparith_ref(void *opaque, uint64_t a, uint64_t c,
+                              uint64_t b, uint32_t desc)
+{
+    static const int mflags[] = {
+        MADD_FLGS, MSUB_FLGS, NMADD_FLGS, NMSUB_FLGS,
+    };
+    CPUPPCState *env = opaque;
+    float_status s;
+    bool sgl = desc & FPARITH_SINGLE;
+    unsigned op = desc & FPARITH_OP_MASK;
+    bool fma = op >= FPARITH_MADD && op <= FPARITH_NMSUB;
+    uint64_t in[3] = { a, b, c };
+    int nin = op == FPARITH_RSP ? 1 : fma ? 3 : 2;
+    uint64_t r, st, exp, frac;
+    int cls, flags, i;
+    bool infzero;
+
+    /* quiet NaN operands propagate: the first of a, b, c, as softfloat's */
+    for (i = 0; i < nin; i++) {
+        if (float64_is_signaling_nan(in[i], &env->fp_status)) {
+            break;
+        }
+    }
+    infzero = fma && ((float64_is_infinity(a) && float64_is_zero(c)) ||
+                      (float64_is_zero(a) && float64_is_infinity(c)));
+    if (i == nin && !infzero) {
+        for (i = 0; i < nin; i++) {
+            if (float64_is_any_nan(in[i])) {
+                r = in[i];
+                if (sgl || op == FPARITH_RSP) {
+                    r &= ~MAKE_64BIT_MASK(0, 29);
+                }
+                return (FParithResult) {
+                    r, FPARITH_CLASS_QNAN << FPARITH_ST_CLASS
+                       | (r >> 63 ? FPARITH_ST_NEG : 0)
+                };
+            }
+        }
+    }
+
+    if (fparith_host(op, sgl, a, c, b, &r)) {
+        flags = 0;
+        goto done;
+    }
+
+    s = env->fp_status;
+    set_float_exception_flags(0, &s);
+    switch (op) {
+    case FPARITH_ADD:
+        r = sgl ? float64r32_add(a, b, &s) : float64_add(a, b, &s);
+        break;
+    case FPARITH_SUB:
+        r = sgl ? float64r32_sub(a, b, &s) : float64_sub(a, b, &s);
+        break;
+    case FPARITH_MUL:
+        r = sgl ? float64r32_mul(a, b, &s) : float64_mul(a, b, &s);
+        break;
+    case FPARITH_DIV:
+        r = sgl ? float64r32_div(a, b, &s) : float64_div(a, b, &s);
+        break;
+    case FPARITH_RSP:
+        r = helper_todouble(float64_to_float32(a, &s));
+        break;
+    default:
+        r = sgl ? float64r32_muladd(a, c, b, mflags[op - FPARITH_MADD], &s)
+                : float64_muladd(a, c, b, mflags[op - FPARITH_MADD], &s);
+        break;
+    }
+    flags = get_float_exception_flags(&s);
+    if (flags & (float_flag_invalid | float_flag_divbyzero |
+                 float_flag_overflow | float_flag_underflow)) {
+        return (FParithResult) { 0, FPARITH_ST_OFF };
+    }
+
+ done:
+    exp = extract64(r, 52, 11);
+    frac = extract64(r, 0, 52);
+    if (exp == 0) {
+        cls = frac ? FPARITH_CLASS_SUBNORMAL : FPARITH_CLASS_ZERO;
+    } else if (exp == 0x7ff) {
+        cls = frac ? FPARITH_CLASS_QNAN : FPARITH_CLASS_INF;
+    } else {
+        cls = FPARITH_CLASS_NORMAL;
+    }
+    st = (flags & float_flag_inexact ? FPARITH_ST_INEXACT : 0)
+         | (r >> 63 ? FPARITH_ST_NEG : 0) | cls << FPARITH_ST_CLASS;
+    return (FParithResult) { r, st };
+}
 
 /* frsp - frsp. */
 static uint64_t do_frsp(CPUPPCState *env, uint64_t arg, uintptr_t retaddr)
