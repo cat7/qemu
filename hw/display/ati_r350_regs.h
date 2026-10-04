@@ -1156,8 +1156,20 @@
 #define R300_ZB_DEPTHPITCH            0x4f24
 #define R300_ZB_MACROTILE             (1u << 16)
 #define R300_ZB_MICROTILE_SHIFT       17
+#define R300_ZB_DEPTHENDIAN_SHIFT     19    /* none, word, dword, half */
 #define R300_ZB_DEPTHCLEARVALUE       0x4f28
 #define R300_ZB_ZMASK_PITCH           0x4f34
+/*
+ * The occlusion counter. Writing ZB_ZPASS_DATA sets the count of samples
+ * that passed the depth and stencil test; writing a dword address to
+ * ZB_ZPASS_ADDR makes each pipe SU_REG_DEST selects store its count
+ * there, in the Z buffer's DEPTHENDIAN byte order. SU_REG_DEST bit 0
+ * selects pipe 0; its reset value 0xf selects every pipe.
+ */
+#define R300_SU_REG_DEST              0x42c8
+#define R300_SU_REG_DEST_P0           (1u << 0)
+#define R300_ZB_ZPASS_DATA            0x4f58
+#define R300_ZB_ZPASS_ADDR            0x4f5c
 /* SU_CULL_MODE: cull front, cull back, front face clockwise */
 #define R300_RE_CULL_CNTL             0x42b8
 /*

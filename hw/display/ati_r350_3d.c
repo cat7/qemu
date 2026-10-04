@@ -215,6 +215,9 @@ typedef struct R300DrawState {
     uint32_t cb_card;
     unsigned cb_xr;
     bool cb_host;
+    /* count the samples passing the depth test, zq_spp to a pixel */
+    bool zq;
+    unsigned zq_spp;
 } R300DrawState;
 
 /*
@@ -1787,6 +1790,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
     bool persp = v0->w != v1->w || v1->w != v2->w;
     int x0, y0, x1, y1, x, y;
     unsigned n;
+    uint64_t zqn = 0;
 
     if (area == 0.0f) {
         return;
@@ -1960,10 +1964,11 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
             }
             if (!d->wmask) {
                 /* depth-only pass: nothing to shade */
-                if (s->zb.z_en) {
+                if (!s->zb.z_en ||
                     r300_zb_pixel(s, d, x, y,
                                   w0 * v0->z + w1 * v1->z + w2 * v2->z,
-                                  back);
+                                  back)) {
+                    zqn++;
                 }
                 continue;
             }
@@ -2203,6 +2208,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                                back)) {
                 continue;
             }
+            zqn++;
             if (d->discard) {
                 /*
                  * DISCARD_SRC_PIXELS: skip the colour write for source
@@ -2299,6 +2305,9 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
 
             memory_region_set_dirty(&s->vram, lo, hi - lo);
         }
+    }
+    if (zqn && d->zq) {
+        qatomic_add(&s->zq_draw, zqn * d->zq_spp);
     }
 }
 
@@ -6798,6 +6807,211 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
 }
 
 /*
+ * ZPASS COUNTER
+ *
+ * The hardware counts the samples that pass the depth and stencil test
+ * (R3xx_3D_Registers ZB_ZPASS_DATA, ZB_ZPASS_ADDR). Writing ZB_ZPASS_DATA
+ * sets the count; writing a dword address to ZB_ZPASS_ADDR makes each
+ * pipe SU_REG_DEST selects store its own count there. A driver resets
+ * the count before a query's draws, then selects each pipe in turn and
+ * has it store to its own dword, and adds the dwords up; the stores
+ * follow the Z buffer's DEPTHENDIAN swap (Mesa r300_emit_query_start,
+ * r300_emit_query_end_frag_pipes, r300_get_query_result).
+ *
+ * Which bit is the second pipe differs: the register guide and Mesa
+ * name bit 3, Apple's Tiger driver selects pipe i with bit i and reads
+ * 1 << 1. One count stands for every pipe here: P0 stores it and any
+ * other pipe stores zero, so the sum is right; with P0 among several
+ * selected P0's is stored. The driver presets each pipe's dword to ~0
+ * and waits for all of them, so every selected pipe must store. Draws
+ * count from the reset to the first dump (zq_on). A dump of a count that
+ * was drawn into, uncounted, since the previous dump is a gap.
+ *
+ * A software draw adds what r300_raster_tri() passes: the fragments that
+ * survive TEXKILL, the alpha test and the depth and stencil test, times
+ * the samples a pixel has. A GL draw is counted by the backend's
+ * occlusion queries over the same fragments: its program discards what
+ * r300_raster_tri() rejects before the test, and a DISCARD_SRC_PIXELS
+ * kill, which the hardware applies after the test, writes the
+ * destination back instead of discarding (dkeep). A multisampled draw
+ * stays in software while counted.
+ *
+ * A dump with no GL draw counted since the reset is stored at once. One
+ * that needs the GPU's count is queued in zq_pend with the backend's
+ * tickets at the reset and at the dump, and stored by
+ * ati_r350_zpass_settle() at the next point the guest can look: the end
+ * of a ring run or of an indirect buffer, a FIFO push, a fence. Those
+ * points have just given the render target back, so the queries have
+ * finished. Everything here runs on the thread that has the engine, as
+ * the register writes do; the backend is used under gl_tex_lock and the
+ * stores go out after it is dropped, as the scratch write-back does. No
+ * lock is added.
+ */
+static void r300_zq_store(ATIR350State *s, uint32_t addr, uint32_t val,
+                          unsigned swap)
+{
+    uint32_t v = val;
+
+    switch (swap) {
+    case 1:
+        v = ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu);
+        break;
+    case 2:
+        v = bswap32(v);
+        break;
+    case 3:
+        v = (v << 16) | (v >> 16);
+        break;
+    }
+    trace_ati_r350_zpass_store(addr, val, swap);
+    ati_r350_mc_write32(s, addr, v);
+}
+
+/* the backend's sum at a reset's ticket, remembered for its other dumps */
+static bool r300_zq_base(ATIR350State *s, uint64_t t0, uint64_t *p0)
+{
+    if (s->zq_cv && s->zq_ct == t0) {
+        *p0 = s->zq_cp;
+        return true;
+    }
+    if (!ati_r350_gl_zq_sum(s->gl_ctx, t0, true, p0)) {
+        return false;
+    }
+    s->zq_cv = true;
+    s->zq_ct = t0;
+    s->zq_cp = *p0;
+    return true;
+}
+
+static uint64_t r300_zq_mark(ATIR350State *s)
+{
+    uint64_t t;
+
+    if (!s->gl_ctx) {
+        return 0;
+    }
+    qemu_rec_mutex_lock(&s->gl_tex_lock);
+    t = ati_r350_gl_zq_mark(s->gl_ctx);
+    qemu_rec_mutex_unlock(&s->gl_tex_lock);
+    return t;
+}
+
+void ati_r350_zpass_reset(ATIR350State *s, uint32_t val)
+{
+    s->zq_resets++;
+    s->zq_base = val;
+    s->zq_sw = 0;
+    s->zq_on = true;
+    s->zq_late = false;
+    s->zq_gl = false;
+    s->zq_t0 = r300_zq_mark(s);
+    trace_ati_r350_zpass_reset(val, s->zq_t0);
+}
+
+void ati_r350_zpass_dump(ATIR350State *s, uint32_t addr)
+{
+    uint32_t dest = s->regs[R300_SU_REG_DEST >> 2];
+    unsigned swap = (s->regs[R300_ZB_DEPTHPITCH >> 2] >>
+                     R300_ZB_DEPTHENDIAN_SHIFT) & 3;
+    uint32_t part = s->zq_base + (uint32_t)s->zq_sw;
+
+    s->zq_dumps++;
+    if (!s->zq_on && s->zq_late) {
+        ati_r350_note_gap(s, R350_GAP_ZPASS, 0);
+    }
+    s->zq_on = false;
+    s->zq_late = false;
+    trace_ati_r350_zpass_dump(addr, dest, part, s->zq_gl);
+    if (!(dest & 0xf)) {
+        return;
+    }
+    if (!(dest & R300_SU_REG_DEST_P0)) {
+        r300_zq_store(s, addr, 0, swap);
+        return;
+    }
+    if (!s->zq_gl) {
+        r300_zq_store(s, addr, part, swap);
+        return;
+    }
+    if (s->zq_npend == R350_ZQ_PEND) {
+        ati_r350_zpass_settle(s);
+    }
+    s->zq_pend[s->zq_npend++] = (typeof(s->zq_pend[0])) {
+        .addr = addr, .part = part, .swap = swap,
+        .t0 = s->zq_t0, .t = r300_zq_mark(s),
+    };
+    s->zq_deferred++;
+}
+
+void ati_r350_zpass_settle(ATIR350State *s)
+{
+    uint32_t val[R350_ZQ_PEND];
+    unsigned n = s->zq_npend, i;
+    uint64_t p0, p1;
+    bool claimed;
+
+    if (!n && !(s->zq_on && s->zq_gl)) {
+        return;
+    }
+    if (!ati_r350_gl_enter(s, &claimed)) {
+        return;         /* the command processor's; it settles at its end */
+    }
+    qemu_rec_mutex_lock(&s->gl_tex_lock);
+    for (i = 0; i < n; i++) {
+        val[i] = s->zq_pend[i].part;
+        if (r300_zq_base(s, s->zq_pend[i].t0, &p0) &&
+            ati_r350_gl_zq_sum(s->gl_ctx, s->zq_pend[i].t, true, &p1)) {
+            val[i] += (uint32_t)(p1 - p0);
+        } else {
+            trace_ati_r350_zpass_lost(s->zq_pend[i].t0, s->zq_pend[i].t);
+        }
+    }
+    s->zq_npend = 0;
+    if (s->zq_on && s->zq_gl && r300_zq_base(s, s->zq_t0, &p0)) {
+        /* sum what has finished, so the queries do not pile up */
+        ati_r350_gl_zq_sum(s->gl_ctx, ati_r350_gl_zq_mark(s->gl_ctx),
+                           false, &p1);
+    }
+    qemu_rec_mutex_unlock(&s->gl_tex_lock);
+    ati_r350_gl_leave(s, claimed);
+    for (i = 0; i < n; i++) {
+        r300_zq_store(s, s->zq_pend[i].addr, val[i], s->zq_pend[i].swap);
+    }
+}
+
+uint32_t ati_r350_zpass_read(ATIR350State *s)
+{
+    uint32_t val = s->zq_base + (uint32_t)s->zq_sw;
+    uint64_t p0, p1;
+    bool claimed;
+
+    s->zq_reads++;
+    ati_r350_zpass_settle(s);
+    if (s->zq_gl && ati_r350_gl_enter(s, &claimed)) {
+        qemu_rec_mutex_lock(&s->gl_tex_lock);
+        if (r300_zq_base(s, s->zq_t0, &p0) &&
+            ati_r350_gl_zq_sum(s->gl_ctx, ati_r350_gl_zq_mark(s->gl_ctx),
+                               true, &p1)) {
+            val += (uint32_t)(p1 - p0);
+        }
+        qemu_rec_mutex_unlock(&s->gl_tex_lock);
+        ati_r350_gl_leave(s, claimed);
+    }
+    return val;
+}
+
+void ati_r350_zpass_drop(ATIR350State *s)
+{
+    s->zq_npend = 0;
+    s->zq_on = false;
+    s->zq_late = false;
+    s->zq_gl = false;
+    s->zq_cv = false;
+    s->zq_base = 0;
+    s->zq_sw = 0;
+}
+
+/*
  * Make `d`'s colour buffer the resident target and make sure the GPU
  * holds the rectangle this draw is about to blend against. Growing the
  * backend texture throws its contents away, so anything drawn goes back
@@ -8182,6 +8396,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     size_t rect_sz, texels = 0;
     bool sc_empty = false, gen;
     unsigned tcs = 0;
+    uint32_t zq_gl = 0;
     /*
      * The depth test on the GPU, against the resident depth buffer, and
      * whether the draw shades at all: a pass with every colour channel
@@ -8255,7 +8470,8 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * keeps the Z write; a GL discard drops both, so the backend writes
      * the destination back instead and the draw reads it like a blend.
      */
-    dkeep = gpuz && !zonly && d->discard && r300_gl_zwrites(s);
+    dkeep = !zonly && d->discard &&
+            ((gpuz && r300_gl_zwrites(s)) || d->zq);
     /*
      * Assemble first: a primitive this path does not know is the
      * commonest fallback and the cheapest one to detect. `vb`/`nvtx`
@@ -8537,7 +8753,13 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     }
     if (gpuz) {
         r300_gl_zreq(s, &req.z);
-        req.dkeep = dkeep;
+    }
+    req.dkeep = dkeep;
+    /* see "ZPASS COUNTER"; gl=verify reads this draw's count back */
+    if (s->gl_mode == R350_GL_VERIFY) {
+        req.zq_out = d->zq ? &zq_gl : NULL;
+    } else {
+        req.zq = d->zq;
     }
 
     if (s->gl_mode == R350_GL_VERIFY) {
@@ -8577,9 +8799,23 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
          * dropped, unwritten, the moment the rasterizer changes VRAM
          * underneath it.
          */
+        uint64_t zq0 = qatomic_read(&s->zq_draw);
+
         r300_raster_prims(s, d, vb, nvtx, prim);
         if (!zonly) {
             r300_gl_verify(s, d, prim, ntri, xr, x0, y0, w, h);
+        }
+        if (req.zq_out) {
+            uint64_t sw = qatomic_read(&s->zq_draw) - zq0;
+            uint64_t gl = (uint64_t)zq_gl * d->zq_spp;
+
+            s->zq_v_draws++;
+            s->zq_v_sw += sw;
+            s->zq_v_gl += gl;
+            if (sw != gl) {
+                s->zq_v_bad++;
+                trace_ati_r350_zpass_verify(prim, sw, gl, x0, y0, x1, y1);
+            }
         }
         r300_gl_discard(s);
         if (gpuz) {
@@ -9132,9 +9368,9 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
     qemu_rec_mutex_unlock(&s->gl_tex_lock);
 }
 
-static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
-                                  const R300Vtx *vb, unsigned nvtx,
-                                  unsigned prim)
+static void r300_run_prims_draw(ATIR350State *s, R300DrawState *d,
+                                const R300Vtx *vb, unsigned nvtx,
+                                unsigned prim)
 {
     int zr[4];
 
@@ -9174,17 +9410,30 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
     if (s->gl_ctx && nvtx &&
         (d->wmask || (s->zb.z_en && r300_gl_zok(s)))) {
         bool gpuz = s->zb.z_en && r300_gl_zok(s);
-        R300GlOutcome o = r300_gl_prims(s, d, vb, nvtx, prim);
+        R300GlOutcome o;
 
+        if (s->zq_on && (!s->gl_zpass || d->zq_spp != 1)) {
+            /* counted, and the GPU may not count it */
+            s->zq_offdraws++;
+            o = r300_gl_fallback(s, R350_GLF_ZPASS, prim, nvtx);
+        } else {
+            o = r300_gl_prims(s, d, vb, nvtx, prim);
+        }
         if (o == R300_GL_DRAWN) {
+            if (s->zq_on && s->gl_mode != R350_GL_VERIFY) {
+                s->zq_gl = true;
+                s->zq_gldraws++;
+            }
             /*
              * The backend rendered the colour. Without the GPU's depth
              * buffer the Z buffer is the CPU's to read, so the depth
-             * still goes through the software path, shading nothing.
+             * still goes through the software path, shading nothing --
+             * and counting nothing: the draw is counted already.
              */
             if (!gpuz && s->zb.z_en && s->zb.z_wr) {
                 r300_gl_zback(s, R350_GLZD_SOFT);
                 d->wmask = 0;
+                d->zq = false;
                 r300_raster_prims(s, d, vb, nvtx, prim);
             }
             return;
@@ -9211,6 +9460,39 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
         r300_raster_prims(s, d, vb, nvtx, prim);
     }
     r300_gl_zsoft_after(s, zr);
+}
+
+/* samples a pixel has under GB_AA_CONFIG: 2, 3, 4 or 6 with AA on */
+static unsigned r300_aa_samples(const ATIR350State *s)
+{
+    static const uint8_t n[4] = { 2, 3, 4, 6 };
+    uint32_t aa = s->regs[R300_GB_AA_CONFIG >> 2];
+
+    return aa & R300_AA_ENABLE ? n[(aa >> 1) & 3] : 1;
+}
+
+/* one draw, and its samples into the occlusion counter */
+static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
+                                  const R300Vtx *vb, unsigned nvtx,
+                                  unsigned prim)
+{
+    bool zq = s->zq_on;
+    uint64_t gld = s->zq_gldraws;
+
+    /* gl=verify counts every draw both ways */
+    d->zq = zq || (s->gl_ctx && s->gl_mode == R350_GL_VERIFY);
+    d->zq_spp = r300_aa_samples(s);
+    qatomic_set(&s->zq_draw, 0);
+    r300_run_prims_draw(s, d, vb, nvtx, prim);
+    if (!nvtx) {
+        return;
+    }
+    if (zq) {
+        s->zq_sw += qatomic_read(&s->zq_draw);
+        s->zq_swdraws += s->zq_gldraws == gld;
+    } else {
+        s->zq_late = true;
+    }
 }
 
 /*

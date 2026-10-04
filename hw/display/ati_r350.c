@@ -1388,6 +1388,9 @@ static uint32_t ati_r350_reg_read32(ATIR350State *s, uint32_t base)
             val |= R350_CUR_LOCK;
         }
         break;
+    case R300_ZB_ZPASS_DATA:
+        val = ati_r350_zpass_read(s);
+        break;
     case R350_MM_DATA:
         val = 0;
         if (s->regs[R350_MM_INDEX >> 2] & R350_MM_APER) {
@@ -2256,9 +2259,18 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         if (ati_r350_on_engine()) {
             /* a fence: what was drawn before it is in VRAM first */
             ati_r350_gl_release(s, R350_GLR_FENCE);
+            ati_r350_zpass_settle(s);
         }
         qatomic_store_release(&s->regs[base >> 2], val);
         ati_r350_scratch_writeback(s, (base - R350_SCRATCH_REG_BASE) >> 2);
+        break;
+    case R300_ZB_ZPASS_DATA:
+        s->regs[base >> 2] = val;
+        ati_r350_zpass_reset(s, val);
+        break;
+    case R300_ZB_ZPASS_ADDR:
+        s->regs[base >> 2] = val;
+        ati_r350_zpass_dump(s, val & ~3u);
         break;
     case R300_VAP_PVS_UPLOAD_ADDRESS:
         s->regs[base >> 2] = val;
@@ -3156,6 +3168,7 @@ static void ati_r350_pm4_run(ATIR350State *s)
      * the command processor thread, may act on the write-back at once.
      */
     ati_r350_gl_release(s, R350_GLR_RING);
+    ati_r350_zpass_settle(s);
     ati_r350_cp_rptr_writeback(s);
 }
 
@@ -3690,6 +3703,7 @@ static void ati_r350_pm4_fifo_push(ATIR350State *s, uint32_t val)
 {
     ati_r350_pm4_parse(s, &s->pm4_fifo, val);
     ati_r350_gl_release(s, R350_GLR_FIFO);
+    ati_r350_zpass_settle(s);
 }
 
 /*
@@ -3766,6 +3780,7 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
      */
     if (!ati_r350_on_engine()) {
         ati_r350_gl_release(s, R350_GLR_IB);
+        ati_r350_zpass_settle(s);
     }
 }
 
@@ -4577,6 +4592,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     }
     /* the surface descriptors are about to go: resolve the target first */
     ati_r350_gl_reset(s);
+    ati_r350_zpass_drop(s);
     if (s->zg_on) {
         ati_r350_zguard_set(s, 0, 0, 0, 0);
     }
@@ -4643,6 +4659,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     s->regs[R350_MC_AGP_LOCATION >> 2] = 0xffffffc0;
     s->regs[R350_MEM_CNTL >> 2] = R350_MEM_NUM_CHANNELS_256;
     s->regs[R350_CP_RB_CNTL >> 2] = R350_RB_NO_UPDATE;
+    s->regs[R300_SU_REG_DEST >> 2] = 0xf;
     s->pm4_buffer_cntl = R350_RB_NO_UPDATE;
     s->pm4_ring_dwords = 0;
     s->pm4_rptr = 0;
@@ -5434,6 +5451,8 @@ static const Property ati_r350_properties[] = {
      * BUFFER" in ati_r350_3d.c). Off sends them to the software path.
      */
     DEFINE_PROP_BOOL("gl-depth", ATIR350State, gl_depth, true),
+    /* occlusion-queried draws: counted on the GPU, or off = software */
+    DEFINE_PROP_BOOL("gl-zpass", ATIR350State, gl_zpass, true),
     /*
      * Keep the GPU's depth buffer across releases and write it back only
      * when something reads it; off writes it back at every release.
@@ -5470,6 +5489,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_CB_FORMAT]    = "colour buffer format",
     [R350_GAP_VS_ADDR_MODE] = "vertex operand address mode",
     [R350_GAP_UCP]          = "user clip planes",
+    [R350_GAP_ZPASS]        = "occlusion counter use",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
@@ -5570,6 +5590,7 @@ static const char *const ati_r350_gl_fb_names[R350_GLF_MAX] = {
     [R350_GLF_FSPROG]   = "fragment program refused",
     [R350_GLF_CBFMT]    = "16bpp or GART colour buffer",
     [R350_GLF_ZTEST]    = "depth or stencil test",
+    [R350_GLF_ZPASS]    = "occlusion query (gl-zpass=off)",
 };
 
 const char *ati_r350_gl_fb_name(ATIR350GlFallback why)
@@ -5685,6 +5706,26 @@ static char *ati_r350_get_engine(Object *obj, Error **errp)
                            s->engine_claim_busy);
 }
 
+/* the occlusion counter's line of `gl-stats` */
+static void ati_r350_zpass_stats(ATIR350State *s, GString *out)
+{
+    g_string_append_printf(out, "\nocclusion counter: %" PRIu64 " resets, %"
+                           PRIu64 " dumps (%" PRIu64 " waited for the GPU), %"
+                           PRIu64 " reads; counted %" PRIu64 " draws on the "
+                           "GPU, %" PRIu64 " in software (%" PRIu64
+                           " by gl-zpass=off)",
+                           s->zq_resets, s->zq_dumps, s->zq_deferred,
+                           s->zq_reads, s->zq_gldraws, s->zq_swdraws,
+                           s->zq_offdraws);
+    if (s->zq_v_draws) {
+        g_string_append_printf(out, "\nverify occlusion %" PRIu64 " draws, %"
+                               PRIu64 " counted differently; samples "
+                               "software %" PRIu64 ", GPU %" PRIu64,
+                               s->zq_v_draws, s->zq_v_bad, s->zq_v_sw,
+                               s->zq_v_gl);
+    }
+}
+
 static char *ati_r350_get_gl(Object *obj, Error **errp)
 {
     ATIR350State *s = ATI_R350(obj);
@@ -5694,6 +5735,7 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
 
     if (!s->gl_ctx) {
         g_string_append(out, "off");
+        ati_r350_zpass_stats(s, out);
         return g_string_free(out, FALSE);
     }
     for (k = 0; k < R350_GLF_MAX; k++) {
@@ -5911,6 +5953,7 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                    : 100.0,
                                s->gl_vz_cover_px, s->gl_vz_cover);
     }
+    ati_r350_zpass_stats(s, out);
     return g_string_free(out, FALSE);
 }
 

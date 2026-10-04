@@ -283,6 +283,15 @@ typedef struct R350GlReq {
      * being killed, so the draw reads its destination as a blend does.
      */
     int dkeep;
+    /*
+     * Occlusion counting. `zq` adds the samples this draw passes -- the
+     * fragments that survive the program, the alpha test and the depth
+     * and stencil test -- to the backend's running count; see
+     * ati_r350_gl_zq_mark(). `zq_out`, for gl=verify, receives this
+     * draw's own count instead, read back at once.
+     */
+    int zq;
+    uint32_t *zq_out;
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;
@@ -338,6 +347,19 @@ bool ati_r350_gl_zclear(R350GlCtx *g, int x0, int y0, int w, int h,
  * the caller must fall back.
  */
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req);
+
+/*
+ * The running occlusion count. The samples of counted draws are summed by
+ * host occlusion queries issued in submission order. mark() closes the
+ * queries over everything submitted so far and returns a TICKET, the
+ * number of queries issued. sum() gives the samples of every counted
+ * draw before `ticket`: with `wait` it waits for the GPU, without it it
+ * returns false while the GPU has not finished them. Tickets are summed
+ * in non-decreasing order; one below the last summed is refused.
+ */
+uint64_t ati_r350_gl_zq_mark(R350GlCtx *g);
+bool ati_r350_gl_zq_sum(R350GlCtx *g, uint64_t ticket, bool wait,
+                        uint64_t *sum);
 
 /* release the storage of a cached texture slot; the slot reads as empty */
 void ati_r350_gl_tex_forget(R350GlCtx *g, unsigned slot);
