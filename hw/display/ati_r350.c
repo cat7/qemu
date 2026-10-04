@@ -5194,6 +5194,9 @@ static void ati_r350_exit(PCIDevice *dev)
     g_free(s->scan_dirty);
     g_free(s->scan_work);
     g_free(s->gl_verts);
+    g_free(s->gl_zstage);
+    g_free(s->gl_zbefore);
+    g_free(s->gl_zgpu);
     g_free(s->gl_tcx);
     if (s->agp_as_valid) {
         address_space_destroy(&s->agp_as);
@@ -5274,6 +5277,12 @@ static const Property ati_r350_properties[] = {
      * cache lifetime block in ati_r350_3d.c.
      */
     DEFINE_PROP_STRING("gl-texlife", ATIR350State, gl_texlife_path),
+    /*
+     * Depth- and stencil-tested draws on the host GPU, against a copy of
+     * the Z buffer kept beside the colour target ("GL-OWNED DEPTH
+     * BUFFER" in ati_r350_3d.c). Off sends them to the software path.
+     */
+    DEFINE_PROP_BOOL("gl-depth", ATIR350State, gl_depth, true),
     /* threads a draw's rows are split across: 0 = auto, 1 = serial */
     DEFINE_PROP_UINT32("raster-threads", ATIR350State, raster_threads, 0),
     DEFINE_PROP_UINT64("x-raster-split", ATIR350State, raster_tri_split, 0),
@@ -5625,6 +5634,18 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                    qu, qf, qw);
         }
     }
+    if (ati_r350_gl_depth(s->gl_ctx)) {
+        g_string_append_printf(out, "\ndepth buffer %s: %" PRIu64
+                               " draws tested on the GPU, %" PRIu64
+                               " flushes, %" PRIu64 " px out, %" PRIu64
+                               " px in, %" PRIu64 " clears"
+                               "\n  kept across a release %" PRIu64
+                               ", stale %" PRIu64 ", dropped %" PRIu64,
+                               s->gl_depth ? "on" : "off",
+                               s->gl_zdrawn, s->gl_zflushes, s->gl_zflush_px,
+                               s->gl_zseed_px, s->gl_zclears, s->gl_zkept,
+                               s->gl_zstale, s->gl_zdropped);
+    }
     if (s->gl_addblend) {
         /*
          * Blended draws GL's own blender rendered in a single pass
@@ -5684,6 +5705,21 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                                s->gl_v_cover_px, s->gl_v_cover,
                                100.0 * s->gl_v_cover / s->gl_v_px,
                                s->gl_v_mesh);
+    }
+    if (s->gl_vz_draws) {
+        uint64_t vpx = s->gl_vz_px - s->gl_vz_cover_px;
+
+        g_string_append_printf(out,
+                               "\nverify depth %" PRIu64 " draws, %" PRIu64
+                               " px\n  VALUE %" PRIu64 " px, %" PRIu64
+                               " differing = %.6f%% exact"
+                               "\n  COVER %" PRIu64 " px, %" PRIu64
+                               " differing",
+                               s->gl_vz_draws, s->gl_vz_px, vpx,
+                               s->gl_vz_diff,
+                               vpx ? 100.0 * (vpx - s->gl_vz_diff) / vpx
+                                   : 100.0,
+                               s->gl_vz_cover_px, s->gl_vz_cover);
     }
     return g_string_free(out, FALSE);
 }

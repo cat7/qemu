@@ -766,6 +766,28 @@ struct ATIR350State {
     uint64_t gl_rel_2d[R350_GL2D_MAX];
     uint64_t gl_rel_2d_px[R350_GL2D_MAX];
     /*
+     * The GL-owned DEPTH buffer. The rules are at "GL-OWNED DEPTH BUFFER"
+     * in ati_r350_3d.c. `gl_zres` says the GPU holds a copy of the Z
+     * buffer described by gl_z_*, good inside the seeded rectangle and
+     * newer than VRAM inside the drawn one; `gl_zpark` that the copy
+     * outlived a release and must be checked against the dirty bitmap
+     * before it is used again; `gl_ztaint` that VRAM under it was written
+     * while it was resident, so it may not be kept.
+     */
+    bool gl_depth;              /* "gl-depth": depth-tested draws on the GPU */
+    bool gl_zres, gl_zpark, gl_ztaint;
+    uint64_t gl_zepoch;
+    uint32_t gl_z_off, gl_z_pitch;
+    bool gl_z_macro, gl_z_micro, gl_z_aa, gl_z_z16;
+    int gl_zvx0, gl_zvy0, gl_zvx1, gl_zvy1;     /* seeded */
+    int gl_zdx0, gl_zdy0, gl_zdx1, gl_zdy1;     /* drawn: GPU is NEWER */
+    uint32_t *gl_zstage, *gl_zbefore, *gl_zgpu;
+    size_t gl_zstage_n, gl_zv_n;
+    uint64_t gl_zdrawn, gl_zflushes, gl_zflush_px, gl_zseed_px;
+    uint64_t gl_zclears, gl_zkept, gl_zstale, gl_zdropped;
+    /* gl=verify over the depth buffer, classed as the colour is */
+    uint64_t gl_vz_draws, gl_vz_px, gl_vz_diff, gl_vz_cover_px, gl_vz_cover;
+    /*
      * Decoded textures, keyed on everything the decode depends on.
      *
      * An entry is valid while the VRAM range it was decoded from is
@@ -1097,7 +1119,7 @@ static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
 static inline void ati_r350_gl_dirty(ATIR350State *s, uint32_t off,
                                      uint32_t len)
 {
-    if (unlikely(s->gl_res || s->gl_tex_any)) {
+    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres)) {
         ati_r350_gl_wrote(s, off, len);
     }
 }
