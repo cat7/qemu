@@ -286,6 +286,26 @@ typedef struct ATIR350Mode {
     uint32_t pix_width;  /* raw CRTC_PIX_WIDTH field, for draw dispatch */
 } ATIR350Mode;
 
+/*
+ * One frame for the display worker to convert, filled on the main loop
+ * while the worker is idle; see "ASYNC DISPLAY" in ati_r350.c.
+ */
+typedef struct ATIR350DispJob {
+    ATIR350Mode mode;
+    struct DisplaySurface *ds;
+    const uint8_t *vram;
+    unsigned xr;
+    const uint8_t (*pal)[3];    /* palette, or the device's own */
+    uint8_t palette[256][3];
+} ATIR350DispJob;
+
+enum {
+    ATI_R350_DISP_IDLE,         /* job is the main loop's */
+    ATI_R350_DISP_QUEUED,       /* job is the worker's from here ... */
+    ATI_R350_DISP_RUNNING,
+    ATI_R350_DISP_DONE,         /* ... until the hand-over takes it back */
+};
+
 struct ATIR350State {
     PCIDevice parent_obj;
 
@@ -350,6 +370,22 @@ struct ATIR350State {
     bool scan_pending;          /* atomic */
     unsigned scan_seq;          /* atomic */
     uint64_t scan_fb;           /* atomic */
+    /*
+     * Display worker; see "ASYNC DISPLAY" in ati_r350.c. disp_state and
+     * disp_quit are under disp_lock; disp_job belongs to whoever
+     * disp_state says; disp_tick_missed and the counters to the BQL.
+     */
+    OnOffAuto async_display;    /* property */
+    bool disp_on;
+    QemuThread disp_thread;
+    QemuMutex disp_lock;
+    QemuCond disp_cond;
+    QEMUBH *disp_bh;
+    unsigned disp_state;
+    bool disp_quit;
+    bool disp_tick_missed;
+    ATIR350DispJob disp_job;
+    uint64_t disp_frames, disp_deferred;
     /* R300 memory-controller indirect register file (MC_IND_INDEX/DATA) */
     uint32_t mc_ind[256];
     /*
