@@ -5714,22 +5714,27 @@ void ati_r350_gl_epoch_apply(ATIR350State *s)
 void ati_r350_gl_release(ATIR350State *s, ATIR350GlRel why)
 {
     uint64_t px;
+    bool claimed;
 
-    if (!ati_r350_gl_mine(s)) {
+    if (s->lockless && !qatomic_read(&s->gl_res) &&
+        s->gl_texlife != R350_TEXLIFE_BURST) {
+        return;         /* nothing to give back; only an owner sets it */
+    }
+    if (!ati_r350_gl_enter(s, &claimed)) {
         return;         /* the command processor's until it finishes */
     }
     if (s->gl_texlife == R350_TEXLIFE_BURST) {
         r300_gl_texdrop(s);
     }
-    if (!s->gl_res) {
-        return;
+    if (s->gl_res) {
+        px = s->gl_flush_px;
+        r300_gl_flush(s);
+        r300_gl_discard(s);
+        s->gl_res = false;
+        s->gl_rel[why]++;
+        s->gl_rel_px[why] += s->gl_flush_px - px;
     }
-    px = s->gl_flush_px;
-    r300_gl_flush(s);
-    r300_gl_discard(s);
-    s->gl_res = false;
-    s->gl_rel[why]++;
-    s->gl_rel_px[why] += s->gl_flush_px - px;
+    ati_r350_gl_leave(s, claimed);
 }
 
 /*
@@ -5758,12 +5763,15 @@ void ati_r350_gl_reset(ATIR350State *s)
 void ati_r350_gl_sync(ATIR350State *s, uint32_t off, uint32_t len)
 {
     uint32_t lo, hi;
+    bool claimed;
 
-    if (!ati_r350_gl_mine(s) ||
-        !r300_gl_span(s, &lo, &hi) || off + len <= lo || off >= hi) {
+    if (!ati_r350_gl_enter(s, &claimed)) {
         return;
     }
-    ati_r350_gl_release(s, R350_GLR_READ);
+    if (r300_gl_span(s, &lo, &hi) && off + len > lo && off < hi) {
+        ati_r350_gl_release(s, R350_GLR_READ);
+    }
+    ati_r350_gl_leave(s, claimed);
 }
 
 /* a WRITER of this range: whatever was decoded from it is now stale */

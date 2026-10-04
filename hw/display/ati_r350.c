@@ -3590,12 +3590,60 @@ static void ati_r350_pm4_indirect(ATIR350State *s, uint32_t offset,
  * command stream write to it takes.
  *
  * The GL target is the engine's while it runs: a hook on another thread
- * finds it busy and leaves the target alone (ati_r350_gl_mine()). The
+ * finds it busy and leaves the target alone (ati_r350_gl_enter()). The
  * ring and each indirect buffer end with the target handed back, and a
  * scratch register write or a read pointer write-back hands it back
  * first, so whatever the guest learns has finished is in VRAM.
  */
 static __thread bool ati_r350_engine_ctx;
+
+/*
+ * LOCKLESS REGISTER ACCESS (lockless-mmio=on, with the engine thread).
+ *
+ * The register BAR is dispatched without the BQL, and an access takes
+ * only what its register needs:
+ *
+ * - The progress registers (ati_r350_engine_status_reg(), RBBM_STATUS)
+ *   are read with no lock: they are atomics the command processor
+ *   publishes as it goes.
+ * - Any other engine register (ati_r350_engine_reg()) is accessed by a
+ *   thread that has CLAIMED the engine: engine_busy set for it, just as
+ *   the command processor holds it while it runs, so the two and any
+ *   other claimant exclude each other. A register the command processor
+ *   itself writes without the BQL (ati_r350_engine_private_reg()) needs
+ *   nothing more. The others, and the writes that run a command stream
+ *   on the calling thread (the PIO FIFO, CP_IB_BUFSZ, a CP_RB_WPTR write
+ *   narrower than the register), take the BQL inside the claim
+ *   (ati_r350_engine_bql_reg()).
+ * - Everything else -- display, cursor, interrupts, clocks, I2C/DDC, the
+ *   PCI config mirror -- takes the BQL, as before.
+ * - A full CP_RB_WPTR write kicks the command processor without the BQL.
+ *   It waits only for a claimant to finish, never for the command
+ *   processor; with RB_RPTR_WR_ENA it claims the engine, loads the read
+ *   pointer and hands the claim over as the kick.
+ *
+ * A claim is what the BQL used to guarantee a vCPU that had seen the
+ * engine idle. A thread that uses the GL target outside one (the display
+ * refresh, the cursor, a display register write) takes the engine only
+ * if it is idle (ati_r350_gl_enter()), and leaves the target alone
+ * otherwise, as it always did while the command processor ran.
+ *
+ * LOCK ORDER: BQL -> engine_lock. engine_lock is never held while taking
+ * the BQL or waiting for anything but engine_cond/engine_claim_cond. A
+ * claim is not a lock: its holder may take the BQL (a register that
+ * needs it; DMA that lands on a device region), and so no thread waits
+ * for a claim, or for the command processor, with the BQL held --
+ * ati_r350_engine_claim(), ati_r350_engine_wait() and the kick release
+ * it while they wait, and the main loop only tries. gl_tex_lock and
+ * scan_lock are taken inside a claim and never held while waiting for
+ * one. The refresh's dirty snapshot, which may wait for a vCPU, holds no
+ * claim.
+ *
+ * With lockless-mmio=off the BAR keeps the BQL and none of this runs.
+ */
+static __thread unsigned ati_r350_claim_depth;
+static __thread bool ati_r350_claim_kick;
+static __thread ATIR350SwapMemo *ati_r350_claim_memo;
 
 bool ati_r350_on_engine(void)
 {
@@ -3628,12 +3676,24 @@ static bool ati_r350_engine_private_reg(uint32_t base)
            base >= R350_PM4_FIFO_DATA_EVEN;
 }
 
-/* Wait for the engine to go idle. Called with the BQL, which is released. */
+/* engine registers a claimant accesses with the BQL as well */
+static bool ati_r350_engine_bql_reg(uint32_t base)
+{
+    return !ati_r350_engine_private_reg(base) ||
+           (base >= R350_PM4_FIFO_DATA_EVEN &&
+            base <= R350_PM4_FIFO_APER_END) ||
+           base == R350_CP_IB_BUFSZ || base == R350_CP_RB_WPTR;
+}
+
+/*
+ * Wait for the engine to go idle. Called with the BQL, which is released.
+ * A thread that has claimed the engine has it idle already.
+ */
 void ati_r350_engine_wait(ATIR350State *s)
 {
     int64_t t0;
 
-    if (!s->engine_on || ati_r350_engine_ctx ||
+    if (!s->engine_on || ati_r350_engine_ctx || ati_r350_claim_depth ||
         !qatomic_load_acquire(&s->engine_busy)) {
         return;
     }
@@ -3650,6 +3710,180 @@ void ati_r350_engine_wait(ATIR350State *s)
 static void ati_r350_engine_kick(ATIR350State *s)
 {
     qemu_mutex_lock(&s->engine_lock);
+    s->engine_kick = true;
+    s->engine_kicks++;
+    if (!s->engine_busy) {
+        qemu_event_reset(&s->engine_idle);
+        qatomic_store_release(&s->engine_busy, true);
+    }
+    qemu_cond_signal(&s->engine_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+}
+
+/* the engine is idle and engine_lock held: it is this thread's now */
+static void ati_r350_engine_take(ATIR350State *s)
+{
+    qemu_event_reset(&s->engine_idle);
+    s->engine_claimed = true;
+    s->engine_claims++;
+    qatomic_store_release(&s->engine_busy, true);
+    ati_r350_claim_depth = 1;
+    ati_r350_claim_memo = ati_r350_thread_memo;
+    ati_r350_thread_memo = &s->cswap;
+}
+
+/*
+ * Claim the engine, waiting until neither the command processor nor
+ * another claimant has it; the BQL, if held, is released meanwhile.
+ * Nests, and is a no-op on the engine thread.
+ */
+static void ati_r350_engine_claim(ATIR350State *s)
+{
+    bool bql;
+    int64_t t0;
+
+    if (ati_r350_engine_ctx) {
+        return;
+    }
+    if (ati_r350_claim_depth) {
+        ati_r350_claim_depth++;
+        return;
+    }
+    bql = bql_locked();
+    qemu_mutex_lock(&s->engine_lock);
+    if (s->engine_busy) {
+        t0 = get_clock();
+        do {
+            qemu_mutex_unlock(&s->engine_lock);
+            if (bql) {
+                bql_unlock();
+            }
+            qemu_event_wait(&s->engine_idle);
+            if (bql) {
+                bql_lock();
+            }
+            qemu_mutex_lock(&s->engine_lock);
+        } while (s->engine_busy);
+        s->engine_claim_waits++;
+        s->engine_claim_wait_us += (get_clock() - t0) / 1000;
+    }
+    ati_r350_engine_take(s);
+    qemu_mutex_unlock(&s->engine_lock);
+}
+
+/* Claim the engine only if it is idle; never waits. */
+static bool ati_r350_engine_try_claim(ATIR350State *s)
+{
+    qemu_mutex_lock(&s->engine_lock);
+    if (s->engine_busy) {
+        s->engine_claim_busy++;
+        qemu_mutex_unlock(&s->engine_lock);
+        return false;
+    }
+    ati_r350_engine_take(s);
+    qemu_mutex_unlock(&s->engine_lock);
+    return true;
+}
+
+/*
+ * Give the engine back, or with `kick` hand it to the command processor
+ * as a ring kick. A kick requested inside a nested claim is carried to
+ * the outermost one.
+ */
+static void ati_r350_engine_unclaim(ATIR350State *s, bool kick)
+{
+    if (ati_r350_engine_ctx) {
+        return;
+    }
+    if (--ati_r350_claim_depth) {
+        ati_r350_claim_kick |= kick;
+        return;
+    }
+    kick |= ati_r350_claim_kick;
+    ati_r350_claim_kick = false;
+    ati_r350_thread_memo = ati_r350_claim_memo;
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_claimed = false;
+    if (kick) {
+        s->engine_kick = true;
+        s->engine_kicks++;
+        qemu_cond_signal(&s->engine_cond);
+    } else {
+        qatomic_store_release(&s->engine_busy, false);
+        qemu_event_set(&s->engine_idle);
+    }
+    qemu_cond_broadcast(&s->engine_claim_cond);
+    qemu_mutex_unlock(&s->engine_lock);
+}
+
+bool ati_r350_gl_enter(ATIR350State *s, bool *claimed)
+{
+    *claimed = false;
+    if (!s->engine_on || ati_r350_engine_ctx || ati_r350_claim_depth) {
+        return true;
+    }
+    if (!s->lockless) {
+        return !qatomic_read(&s->engine_busy);
+    }
+    *claimed = ati_r350_engine_try_claim(s);
+    return *claimed;
+}
+
+void ati_r350_gl_leave(ATIR350State *s, bool claimed)
+{
+    if (claimed) {
+        ati_r350_engine_unclaim(s, false);
+    }
+}
+
+static void ati_r350_wptr_store(ATIR350State *s, uint32_t val)
+{
+    s->regs[R350_CP_RB_WPTR >> 2] = val;
+    qatomic_store_release(&s->pm4_wptr, s->pm4_ring_dwords ?
+                          val & (s->pm4_ring_dwords - 1) : val);
+}
+
+/* A full CP_RB_WPTR write with lockless register access. */
+static void ati_r350_engine_wptr(ATIR350State *s, uint32_t val)
+{
+    bool bql;
+
+    if (ati_r350_engine_ctx || ati_r350_claim_depth) {
+        /* this thread has the engine; the kick follows its release */
+        ati_r350_cp_rptr_load(s);
+        ati_r350_wptr_store(s, val);
+        if (ati_r350_engine_ctx) {
+            ati_r350_engine_kick(s);
+        } else {
+            ati_r350_claim_kick = true;
+        }
+        return;
+    }
+    if (qatomic_read(&s->regs[R350_CP_RB_CNTL >> 2]) & R350_RB_RPTR_WR_ENA) {
+        ati_r350_engine_claim(s);
+        ati_r350_cp_rptr_load(s);
+        ati_r350_wptr_store(s, val);
+        ati_r350_engine_unclaim(s, true);
+        return;
+    }
+    bql = bql_locked();
+    qemu_mutex_lock(&s->engine_lock);
+    while (s->engine_claimed) {
+        if (bql) {
+            qemu_mutex_unlock(&s->engine_lock);
+            bql_unlock();
+            qemu_mutex_lock(&s->engine_lock);
+        }
+        while (s->engine_claimed) {
+            qemu_cond_wait(&s->engine_claim_cond, &s->engine_lock);
+        }
+        if (bql) {
+            qemu_mutex_unlock(&s->engine_lock);
+            bql_lock();
+            qemu_mutex_lock(&s->engine_lock);
+        }
+    }
+    ati_r350_wptr_store(s, val);
     s->engine_kick = true;
     s->engine_kicks++;
     if (!s->engine_busy) {
@@ -3713,6 +3947,7 @@ static void ati_r350_engine_init(ATIR350State *s)
     }
     qemu_mutex_init(&s->engine_lock);
     qemu_cond_init(&s->engine_cond);
+    qemu_cond_init(&s->engine_claim_cond);
     qemu_event_init(&s->engine_idle, true);
     s->engine_vmse = qemu_add_vm_change_state_handler(ati_r350_engine_vm_state,
                                                       s);
@@ -3735,6 +3970,35 @@ static void ati_r350_engine_fini(ATIR350State *s)
     s->engine_on = false;
 }
 
+/* a register read with lockless register access; see above */
+static uint32_t ati_r350_read_lockless(ATIR350State *s, uint32_t base)
+{
+    bool engine = ati_r350_engine_reg(base);
+    bool bql;
+    uint32_t val;
+
+    if (ati_r350_engine_status_reg(base) || base == R350_RBBM_STATUS) {
+        return ati_r350_reg_read32(s, base);
+    }
+    if (engine) {
+        ati_r350_engine_claim(s);
+        bql = ati_r350_engine_bql_reg(base) && !bql_locked();
+    } else {
+        bql = !bql_locked();
+    }
+    if (bql) {
+        bql_lock();
+    }
+    val = ati_r350_reg_read32(s, base);
+    if (bql) {
+        bql_unlock();
+    }
+    if (engine) {
+        ati_r350_engine_unclaim(s, false);
+    }
+    return val;
+}
+
 static uint64_t ati_r350_mmio_read(void *opaque, hwaddr addr,
                                       unsigned size)
 {
@@ -3742,11 +4006,15 @@ static uint64_t ati_r350_mmio_read(void *opaque, hwaddr addr,
     uint32_t base = addr & 0xfffc;
     uint32_t val;
 
-    if (s->engine_on && qatomic_read(&s->engine_busy) &&
-        ati_r350_engine_reg(base) && !ati_r350_engine_status_reg(base)) {
-        ati_r350_engine_wait(s);
+    if (s->lockless) {
+        val = ati_r350_read_lockless(s, base);
+    } else {
+        if (s->engine_on && qatomic_read(&s->engine_busy) &&
+            ati_r350_engine_reg(base) && !ati_r350_engine_status_reg(base)) {
+            ati_r350_engine_wait(s);
+        }
+        val = ati_r350_reg_read32(s, base);
     }
-    val = ati_r350_reg_read32(s, base);
     val = extract32(val, (addr & 3) * 8, size * 8);
     if (trace_event_get_state_backends(TRACE_ATI_R350_UNK_READ) ||
         trace_event_get_state_backends(TRACE_ATI_R350_REG_READ)) {
@@ -3760,38 +4028,16 @@ static uint64_t ati_r350_mmio_read(void *opaque, hwaddr addr,
     return val;
 }
 
-static void ati_r350_mmio_write(void *opaque, hwaddr addr, uint64_t data,
-                                   unsigned size)
+/*
+ * The value a 1/2/4-byte write at `addr` leaves in its register: the
+ * written lanes merged onto the current value.
+ */
+static uint32_t ati_r350_mmio_merge(ATIR350State *s, hwaddr addr,
+                                    uint64_t data, unsigned size)
 {
-    ATIR350State *s = opaque;
     uint32_t base = addr & 0xfffc;
     uint32_t val = data;
 
-    if (trace_event_get_state_backends(TRACE_ATI_R350_UNK_WRITE) ||
-        trace_event_get_state_backends(TRACE_ATI_R350_REG_WRITE)) {
-        if (ati_r350_reg_name(base)[0] == '?') {
-            trace_ati_r350_unk_write(size, addr, data);
-        } else {
-            trace_ati_r350_reg_write(size, addr, ati_r350_reg_name(base),
-                                     data);
-        }
-    }
-    if (s->engine_on) {
-        if (base == R350_CP_RB_WPTR && size == 4 && !(addr & 3)) {
-            if (s->regs[R350_CP_RB_CNTL >> 2] & R350_RB_RPTR_WR_ENA) {
-                ati_r350_engine_wait(s);
-                ati_r350_cp_rptr_load(s);
-            }
-            s->regs[base >> 2] = val;
-            qatomic_store_release(&s->pm4_wptr, s->pm4_ring_dwords ?
-                                  val & (s->pm4_ring_dwords - 1) : val);
-            ati_r350_engine_kick(s);
-            return;
-        }
-        if (qatomic_read(&s->engine_busy) && ati_r350_engine_reg(base)) {
-            ati_r350_engine_wait(s);
-        }
-    }
     if (size != 4 || (addr & 3)) {
         /*
          * Merge the written lanes onto the register's current value.
@@ -3829,7 +4075,76 @@ static void ati_r350_mmio_write(void *opaque, hwaddr addr, uint64_t data,
             val |= R350_CUR_LOCK;
         }
     }
-    ati_r350_reg_write32(s, base, val);
+    return val;
+}
+
+/* a register write with lockless register access; see above */
+static void ati_r350_write_lockless(ATIR350State *s, hwaddr addr,
+                                    uint64_t data, unsigned size)
+{
+    uint32_t base = addr & 0xfffc;
+    bool engine = ati_r350_engine_reg(base);
+    bool bql;
+
+    if (base == R350_CP_RB_WPTR && size == 4 && !(addr & 3)) {
+        ati_r350_engine_wptr(s, data);
+        return;
+    }
+    if (engine) {
+        ati_r350_engine_claim(s);
+        bql = ati_r350_engine_bql_reg(base) && !bql_locked();
+    } else {
+        bql = !bql_locked();
+    }
+    if (bql) {
+        bql_lock();
+    }
+    ati_r350_reg_write32(s, base, ati_r350_mmio_merge(s, addr, data, size));
+    if (bql) {
+        bql_unlock();
+    }
+    if (engine) {
+        ati_r350_engine_unclaim(s, false);
+    }
+}
+
+static void ati_r350_mmio_write(void *opaque, hwaddr addr, uint64_t data,
+                                   unsigned size)
+{
+    ATIR350State *s = opaque;
+    uint32_t base = addr & 0xfffc;
+    uint32_t val = data;
+
+    if (trace_event_get_state_backends(TRACE_ATI_R350_UNK_WRITE) ||
+        trace_event_get_state_backends(TRACE_ATI_R350_REG_WRITE)) {
+        if (ati_r350_reg_name(base)[0] == '?') {
+            trace_ati_r350_unk_write(size, addr, data);
+        } else {
+            trace_ati_r350_reg_write(size, addr, ati_r350_reg_name(base),
+                                     data);
+        }
+    }
+    if (s->lockless) {
+        ati_r350_write_lockless(s, addr, data, size);
+        return;
+    }
+    if (s->engine_on) {
+        if (base == R350_CP_RB_WPTR && size == 4 && !(addr & 3)) {
+            if (s->regs[R350_CP_RB_CNTL >> 2] & R350_RB_RPTR_WR_ENA) {
+                ati_r350_engine_wait(s);
+                ati_r350_cp_rptr_load(s);
+            }
+            s->regs[base >> 2] = val;
+            qatomic_store_release(&s->pm4_wptr, s->pm4_ring_dwords ?
+                                  val & (s->pm4_ring_dwords - 1) : val);
+            ati_r350_engine_kick(s);
+            return;
+        }
+        if (qatomic_read(&s->engine_busy) && ati_r350_engine_reg(base)) {
+            ati_r350_engine_wait(s);
+        }
+    }
+    ati_r350_reg_write32(s, base, ati_r350_mmio_merge(s, addr, data, size));
 }
 
 static const MemoryRegionOps ati_r350_mmio_ops = {
@@ -3930,7 +4245,11 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
 {
     ATIR350State *s = ATI_R350(obj);
 
-    ati_r350_engine_wait(s);
+    if (s->lockless) {
+        ati_r350_engine_claim(s);
+    } else {
+        ati_r350_engine_wait(s);
+    }
     /* the surface descriptors are about to go: resolve the target first */
     ati_r350_gl_reset(s);
     memset(s->regs, 0, sizeof(s->regs));
@@ -4005,6 +4324,9 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     s->pm4_in_ring = false;
     s->vga_ddc_sda = 1;
     s->dvi_ddc_sda = 1;
+    if (s->lockless) {
+        ati_r350_engine_unclaim(s, false);
+    }
 }
 
 /*
@@ -4630,6 +4952,11 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
     }
     ati_r350_raster_init(s);
     ati_r350_engine_init(s);
+    /* see "LOCKLESS REGISTER ACCESS"; BAR1 reaches only BQL registers */
+    s->lockless = s->lockless_mmio && s->engine_on;
+    if (s->lockless) {
+        memory_region_enable_lockless_io(&s->mmio);
+    }
 }
 
 static void ati_r350_exit(PCIDevice *dev)
@@ -4727,6 +5054,8 @@ static const Property ati_r350_properties[] = {
     /* command processor on its own thread; auto is on except under qtest */
     DEFINE_PROP_ON_OFF_AUTO("async-engine", ATIR350State, engine_async,
                             ON_OFF_AUTO_AUTO),
+    /* register BAR without the BQL; needs the command processor thread */
+    DEFINE_PROP_BOOL("lockless-mmio", ATIR350State, lockless_mmio, true),
     /*
      * How long a decoded texture may live: "dirty" (the default and the
      * rule the decode depends on), "burst" (the M3 lifetime, kept as
@@ -4967,11 +5296,17 @@ static char *ati_r350_get_engine(Object *obj, Error **errp)
     return g_strdup_printf("thread, %s\nkicks %" PRIu64 "\nwaits %" PRIu64
                            ", %" PRIu64 " us\nbql writes %" PRIu64
                            "\nindirect buffers %" PRIu64
-                           "\nscratch writes %" PRIu64,
+                           "\nscratch writes %" PRIu64
+                           "\nlockless mmio %s\nclaims %" PRIu64
+                           ", waited %" PRIu64 ", %" PRIu64 " us"
+                           ", found busy %" PRIu64,
                            qatomic_read(&s->engine_busy) ? "busy" : "idle",
                            s->engine_kicks, s->engine_waits,
                            s->engine_wait_us, s->engine_bql_writes,
-                           s->engine_ibs, s->engine_scratch);
+                           s->engine_ibs, s->engine_scratch,
+                           s->lockless ? "on" : "off", s->engine_claims,
+                           s->engine_claim_waits, s->engine_claim_wait_us,
+                           s->engine_claim_busy);
 }
 
 static char *ati_r350_get_gl(Object *obj, Error **errp)
