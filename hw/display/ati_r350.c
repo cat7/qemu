@@ -5019,6 +5019,19 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
             return;
         }
     }
+    if (s->gl_tex_slots > R300_GL_TEXCACHE ||
+        (s->gl_tex_slots && s->gl_tex_slots < R300_GL_TEXCACHE_OLD)) {
+        error_setg(errp, "gl-texcache-slots must be 0 or %u to %u (got %u)",
+                   R300_GL_TEXCACHE_OLD, R300_GL_TEXCACHE, s->gl_tex_slots);
+        return;
+    }
+    s->gl_tex_n = s->gl_tex_slots ? s->gl_tex_slots : R300_GL_TEXCACHE_OLD;
+    s->gl_tex_hashed = s->gl_tex_n > R300_GL_TEXCACHE_OLD;
+    memset(s->gl_tex_bucket, 0xff, sizeof(s->gl_tex_bucket));
+    for (unsigned k = 0; k < R300_GL_TEXCACHE; k++) {
+        s->gl_tex[k].hb = R300_GL_TEXNIL;
+        s->gl_tex[k].hnext = R300_GL_TEXNIL;
+    }
 
     memory_region_init_io(&s->mmio, obj, &ati_r350_mmio_ops, s,
                           "ati-r350-mmio", ATI_R350_MMIO_SIZE);
@@ -5277,6 +5290,11 @@ static const Property ati_r350_properties[] = {
      * cache lifetime block in ati_r350_3d.c.
      */
     DEFINE_PROP_STRING("gl-texlife", ATIR350State, gl_texlife_path),
+    /*
+     * Decoded textures kept: 0 or 32 is the linear 32-entry cache, up to
+     * 256 a hashed one bounded by R300_GL_TEXCACHE_BYTES.
+     */
+    DEFINE_PROP_UINT32("gl-texcache-slots", ATIR350State, gl_tex_slots, 256),
     /*
      * Depth- and stencil-tested draws on the host GPU, against a copy of
      * the Z buffer kept beside the colour target ("GL-OWNED DEPTH
@@ -5593,6 +5611,10 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                              ? "never (CONTROL: invalidation OFF)" : "dirty",
                            s->gl_tex_noadmit, s->gl_tex_stale,
                            s->gl_tex_wrote, s->gl_tex_over, s->gl_tex_evict);
+    g_string_append_printf(out, "\n  slots %u %s, %zu KiB held, %" PRIu64
+                           " dropped for space", s->gl_tex_n,
+                           s->gl_tex_hashed ? "hashed" : "linear",
+                           s->gl_tex_bytes >> 10, s->gl_tex_trim);
     /*
      * WHICH hook ended each residency. "the target is not staying
      * resident" is a symptom whose cure depends entirely on which rule

@@ -231,13 +231,19 @@ typedef enum ATIR350GlTexLife {
 #define R300_GL_PASS_MAX    128
 
 /*
- * How many decoded textures are kept, and the largest one kept. Eight
- * entries of at most a megabyte of RGBA each: enough for a compositor
- * frame's window tiles, and bounded so a guest cannot make the device
- * allocate without limit.
+ * The decoded-texture cache: at most R300_GL_TEXCACHE entries (the
+ * gl-texcache-slots property picks how many are used), each at most
+ * R300_GL_TEXCACHE_MAX texels per face. With more than the classic 32
+ * slots, lookups go through a hash on the decode key and the decoded
+ * bytes are bounded by R300_GL_TEXCACHE_BYTES, least recently used
+ * first, so a guest cannot make the device allocate without limit.
  */
-#define R300_GL_TEXCACHE     R350_GL_TEXSLOTS
-#define R300_GL_TEXCACHE_MAX (256 * 1024)
+#define R300_GL_TEXCACHE       R350_GL_TEXSLOTS
+#define R300_GL_TEXCACHE_OLD   32
+#define R300_GL_TEXCACHE_MAX   (256 * 1024)
+#define R300_GL_TEXCACHE_BYTES (128u << 20)
+#define R300_GL_TEXHASH        512
+#define R300_GL_TEXNIL         0xffff
 
 /*
  * The guard on a cached entry (see r300_gl_tex_current()) walks the
@@ -815,7 +821,16 @@ struct ATIR350State {
         unsigned npg;               /* host pages the range spans */
         bool live;                  /* the decoded bytes are current */
         bool up;                    /* ... and the backend has them too */
+        uint16_t hb;                /* hash bucket, or R300_GL_TEXNIL */
+        uint16_t hnext;             /* next entry in that bucket */
     } gl_tex[R300_GL_TEXCACHE];
+    uint32_t gl_tex_slots;      /* "gl-texcache-slots" */
+    unsigned gl_tex_n;          /* entries in use */
+    bool gl_tex_hashed;         /* hash lookup and byte bound */
+    uint16_t gl_tex_bucket[R300_GL_TEXHASH];
+    size_t gl_tex_bytes;        /* decoded bytes held */
+    uint64_t gl_tex_pin;        /* entries used after this are this draw's */
+    uint64_t gl_tex_trim;       /* live entries dropped for the byte bound */
     uint64_t gl_tex_seq, gl_tex_hit, gl_tex_miss;
     uint64_t gl_tex_stale;      /* entries the dirty guard killed */
     /*

@@ -6176,7 +6176,7 @@ static void r300_gl_texdrop(ATIR350State *s)
 {
     unsigned k;
 
-    for (k = 0; k < R300_GL_TEXCACHE; k++) {
+    for (k = 0; k < s->gl_tex_n; k++) {
         s->gl_tex[k].live = false;
         s->gl_tex[k].up = false;
     }
@@ -6371,7 +6371,7 @@ void ati_r350_gl_epoch_apply(ATIR350State *s)
     qemu_mutex_unlock(&s->scan_lock);
 
     s->gl_epoch++;
-    for (k = 0; k < R300_GL_TEXCACHE; k++) {
+    for (k = 0; k < s->gl_tex_n; k++) {
         unsigned long p0;
         bool stale = false;
 
@@ -6476,7 +6476,7 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len)
 
     qemu_rec_mutex_lock(&s->gl_tex_lock);
     for (k = 0; s->gl_texlife != R350_TEXLIFE_NEVER &&
-                k < R300_GL_TEXCACHE; k++) {
+                k < s->gl_tex_n; k++) {
         if (s->gl_tex[k].live && off < s->gl_tex[k].off + s->gl_tex[k].len &&
             off + len > s->gl_tex[k].off) {
             s->gl_tex_wrote++;
@@ -6537,7 +6537,7 @@ static bool r300_gl_bind(ATIR350State *s, const R300DrawState *d,
         r300_gl_zdrop(s);
     }
     for (i = 0; s->gl_texlife != R350_TEXLIFE_NEVER &&
-                i < R300_GL_TEXCACHE; i++) {
+                i < s->gl_tex_n; i++) {
         /* rendering into a range some cached texture came from */
         if (s->gl_tex[i].live &&
             d->dst_off + (uint32_t)y0 * d->dst_pitch <
@@ -7390,12 +7390,82 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
            s->gl_tex[k].lay == u->loff[u->nlev - 1] - u->off;
 }
 
+static unsigned r300_gl_tex_hash(const R300TexUnit *u, uint32_t off,
+                                 uint32_t len)
+{
+    uint32_t h = off * 0x9e3779b1u;
+
+    h ^= len * 0x85ebca6bu;
+    h ^= (((uint32_t)u->w << 16) ^ (uint32_t)u->h ^ (u->code << 8)) *
+         0xc2b2ae35u;
+    h ^= h >> 15;
+    return h & (R300_GL_TEXHASH - 1);
+}
+
+static void r300_gl_tex_unhash(ATIR350State *s, unsigned k)
+{
+    uint16_t *p;
+
+    if (s->gl_tex[k].hb == R300_GL_TEXNIL) {
+        return;
+    }
+    for (p = &s->gl_tex_bucket[s->gl_tex[k].hb]; *p != R300_GL_TEXNIL;
+         p = &s->gl_tex[*p].hnext) {
+        if (*p == k) {
+            *p = s->gl_tex[k].hnext;
+            break;
+        }
+    }
+    s->gl_tex[k].hb = R300_GL_TEXNIL;
+}
+
+/*
+ * Hold the decoded bytes under R300_GL_TEXCACHE_BYTES: free the least
+ * recently used buffers, dead ones first, never one this draw uses.
+ * The backend's copy goes with each, so its memory is bounded alike.
+ */
+static void r300_gl_tex_trim(ATIR350State *s)
+{
+    while (s->gl_tex_bytes > R300_GL_TEXCACHE_BYTES) {
+        unsigned k, j = R300_GL_TEXNIL;
+
+        for (k = 0; k < s->gl_tex_n; k++) {
+            if (!s->gl_tex[k].sz || s->gl_tex[k].used > s->gl_tex_pin) {
+                continue;
+            }
+            if (j == R300_GL_TEXNIL ||
+                (s->gl_tex[j].live && !s->gl_tex[k].live) ||
+                (s->gl_tex[j].live == s->gl_tex[k].live &&
+                 s->gl_tex[k].used < s->gl_tex[j].used)) {
+                j = k;
+            }
+        }
+        if (j == R300_GL_TEXNIL) {
+            return;
+        }
+        s->gl_tex_trim += s->gl_tex[j].live;
+        s->gl_tex_bytes -= s->gl_tex[j].sz;
+        g_free(s->gl_tex[j].rgba);
+        s->gl_tex[j].rgba = NULL;
+        s->gl_tex[j].sz = 0;
+        s->gl_tex[j].live = false;
+        s->gl_tex[j].up = false;
+        r300_gl_tex_unhash(s, j);
+        ati_r350_gl_tex_forget(s->gl_ctx, j);
+    }
+}
+
 /*
  * The decoded texture for this draw: from the cache when the same bytes
- * were decoded the same way inside this burst, and decoded into the
- * least recently used entry otherwise. A texture that does not resolve
- * to a uniformly swapped range of VRAM is decoded into the scratch
- * buffer and not cached -- there would be no range to invalidate it on.
+ * were decoded the same way and have not been written since, and decoded
+ * into the least recently used entry otherwise. A texture that does not
+ * resolve to a uniformly swapped range of VRAM is decoded into the
+ * scratch buffer and not cached -- there would be no range to invalidate
+ * it on.
+ *
+ * With gl-texcache-slots at 32 the entries are scanned in order, as they
+ * always were. Above that, a hash on the decode key finds the candidate
+ * and the scan runs only on a miss, to pick the victim.
  */
 static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
                                       unsigned unit, unsigned *slot,
@@ -7403,7 +7473,7 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
 {
     const R300TexUnit *u = &d->tex[unit];
     uint32_t off, len;
-    unsigned k, victim = 0, xr = 0;
+    unsigned k, victim = 0, xr = 0, hb = R300_GL_TEXNIL;
     size_t need = u->ltexels * 4;
 
     *slot = R350_GL_TEXSLOTS;           /* the scratch: uploaded every time */
@@ -7425,7 +7495,38 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
         r300_gl_decode_tex(s, d, unit, s->gl_texbuf);
         return s->gl_texbuf;
     }
-    for (k = 0; k < R300_GL_TEXCACHE; k++) {
+    if (s->gl_tex_hashed) {
+        hb = r300_gl_tex_hash(u, off, len);
+        for (k = s->gl_tex_bucket[hb]; k != R300_GL_TEXNIL;
+             k = s->gl_tex[k].hnext) {
+            if (r300_gl_tex_same(s, k, u, off, len, xr)) {
+                break;
+            }
+        }
+        if (k != R300_GL_TEXNIL && !r300_gl_tex_current(s, k)) {
+            /* the dirty guard, on the entry this draw would use */
+            s->gl_tex[k].live = false;
+            s->gl_tex[k].up = false;
+            s->gl_tex_stale++;
+        } else if (k != R300_GL_TEXNIL) {
+            s->gl_tex[k].used = ++s->gl_tex_seq;
+            s->gl_tex_hit++;
+            *slot = k;
+            *fresh = !s->gl_tex[k].up;
+            s->gl_tex[k].up = true;
+            return s->gl_tex[k].rgba;
+        }
+        for (k = 0; k < s->gl_tex_n; k++) {
+            if (!s->gl_tex[k].live) {
+                victim = k;
+            } else if (s->gl_tex[victim].live &&
+                       s->gl_tex[k].used < s->gl_tex[victim].used) {
+                victim = k;
+            }
+        }
+        goto decode;
+    }
+    for (k = 0; k < s->gl_tex_n; k++) {
         /*
          * The dirty guard is applied to the entry this draw is about to
          * USE, and only to that one -- an entry nobody matches cannot
@@ -7460,9 +7561,11 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
             victim = k;
         }
     }
+decode:
     s->gl_tex_miss++;
     if (need > s->gl_tex[victim].sz) {
         s->gl_tex[victim].rgba = g_realloc(s->gl_tex[victim].rgba, need);
+        s->gl_tex_bytes += need - s->gl_tex[victim].sz;
         s->gl_tex[victim].sz = need;
     }
     r300_gl_decode_tex(s, d, unit, s->gl_tex[victim].rgba);
@@ -7498,6 +7601,13 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
     s->gl_tex_noadmit += !s->gl_tex[victim].live;
     s->gl_tex[victim].up = true;
     s->gl_tex_any |= s->gl_tex[victim].live;
+    if (s->gl_tex_hashed) {
+        r300_gl_tex_unhash(s, victim);
+        s->gl_tex[victim].hb = hb;
+        s->gl_tex[victim].hnext = s->gl_tex_bucket[hb];
+        s->gl_tex_bucket[hb] = victim;
+        r300_gl_tex_trim(s);
+    }
     *slot = victim;
     *fresh = 1;
     return s->gl_tex[victim].rgba;
@@ -8034,6 +8144,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
             r300_gl_tcx(s->gl_tcx + (size_t)i * tcs * 4, d->ntc, t0, t1, t2);
         }
     }
+    s->gl_tex_pin = s->gl_tex_seq;
     for (i = 0; i < R300_TEX_UNITS; i++) {
         if (d->tex[i].en && !zonly) {
             texbuf[i] = r300_gl_texture(s, d, i, &texslot[i], &texfresh[i]);
