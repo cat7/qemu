@@ -2319,7 +2319,7 @@ static const float r300_vtx_nowhere = -32768.0f;
  * filling the window with streaks.
  */
 static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
-                           R300Vtx *v, const float *clip)
+                           R300Vtx *v, const float *clip, float *cpos)
 {
     uint32_t f = s->zb.vte_fmt;
     float cx, cy, cz, cw, zw;
@@ -2344,9 +2344,17 @@ static void r300_xform_vtx(const ATIR350State *s, const R300DrawState *d,
         cw = d->mat[12] * v->x + d->mat[13] * v->y +
              d->mat[14] * v->z + d->mat[15] * v->w;
     }
+    if (cpos) {
+        /* the clip-space position, for r300_clip_draw() */
+        cpos[0] = cx;
+        cpos[1] = cy;
+        cpos[2] = cz;
+        cpos[3] = cw;
+    }
     /*
-     * Nothing here clips against the w = 0 plane, so a vertex level with
-     * or behind the eye has no screen position to compute. Refuse the
+     * A vertex level with or behind the eye has no screen position to
+     * compute; r300_clip_draw() cuts such corners away when the guest
+     * has clipping on, and otherwise they arrive here. Refuse the
      * division rather than let an infinity or a NaN reach the rasterizer:
      * a NaN compares false against every bound, so it survives the
      * scissor and floors into an INT_MIN rectangle that smears across the
@@ -8245,6 +8253,440 @@ static void r300_raster_gart(ATIR350State *s, R300DrawState *d,
     d->cb = d->vram;
 }
 
+/*
+ * VIEW-VOLUME CLIPPING. Unless VAP_CLIP_CNTL.CLIP_DISABLE is set, the VAP
+ * clips each primitive in clip space, before the divide: against the near
+ * and far planes (-w <= z <= w, or 0 <= z <= w under VAP_CNTL's
+ * DX_CLIP_SPACE_DEF) and against x and y at the guard band, +-CLIP_ADJ * w
+ * (VAP_GB_*; 1.0 is no guard band). A primitive wholly outside a plane, or
+ * wholly beyond +-DISC_ADJ * w, is discarded. A new corner takes every
+ * attribute linearly in clip space, which the rasterizer's interpolation
+ * by 1/w then makes perspective-correct.
+ *
+ * Unclipped, a corner level with or behind the eye has no screen position:
+ * r300_xform_vtx() parks it at -32768 or the divide mirrors it through the
+ * eye, and the triangle is drawn as a slab across the view.
+ *
+ * x and y: for w > 0 the plane x = a * w is the screen line x / w = a, so
+ * cutting there leaves the pixels that scissoring at that line leaves. The
+ * guard band is applied as a scissor; clip space is cut in x and y only at
+ * R300_CLIP_RANGE pixels from the viewport centre, which keeps every
+ * corner within what both rasterizers place.
+ *
+ * Strips, fans, quads and polygons with something to cut become a triangle
+ * list, each triangle wound as r300_raster_prims() faces it. Lines are cut
+ * as segments. A point is dropped when its centre is outside z or w.
+ */
+#define R300_CLIP_RANGE 16384.0f
+#define R300_CLIP_WMIN  0.00001f
+
+enum {
+    R300_CLIP_NEAR = 1 << 0,
+    R300_CLIP_FAR = 1 << 1,
+    R300_CLIP_W = 1 << 2,
+    R300_CLIP_XL = 1 << 3,
+    R300_CLIP_XR = 1 << 4,
+    R300_CLIP_YB = 1 << 5,
+    R300_CLIP_YT = 1 << 6,
+    R300_CLIP_PLANES = 7,
+    R300_CLIP_CUT = (1 << R300_CLIP_PLANES) - 1,
+    R300_CLIP_Z = R300_CLIP_NEAR | R300_CLIP_FAR | R300_CLIP_W,
+    R300_CLIP_NAN = 1 << 7,
+    /* the discard band: drops, never cuts */
+    R300_CLIP_DXL = 1 << 8,
+    R300_CLIP_DXR = 1 << 9,
+    R300_CLIP_DYB = 1 << 10,
+    R300_CLIP_DYT = 1 << 11,
+};
+
+/* clip and discard planes on 3 + R300_CLIP_PLANES corners */
+#define R300_CLIP_POLY (3 + R300_CLIP_PLANES)
+
+typedef struct R300ClipCfg {
+    bool dx;
+    float rx, ry;           /* the cut in x and y, in units of w */
+    float gx, gy;           /* discard band; 0 = none */
+} R300ClipCfg;
+
+typedef struct R300ClipVtx {
+    R300Vtx v;
+    float p[4];
+} R300ClipVtx;
+
+typedef struct R300ClipOut {
+    R300Vtx *v;
+    unsigned n, cap;
+} R300ClipOut;
+
+static inline bool r300_gb_valid(float a)
+{
+    return isfinite(a) && a > 0.0f;
+}
+
+/* signed distance to plane `pl`; inside is >= 0 */
+static float r300_clip_dist(const R300ClipCfg *c, unsigned pl, const float *p)
+{
+    switch (pl) {
+    case 0:
+        return c->dx ? p[2] : p[2] + p[3];
+    case 1:
+        return p[3] - p[2];
+    case 2:
+        return p[3] - R300_CLIP_WMIN;
+    case 3:
+        return c->rx * p[3] + p[0];
+    case 4:
+        return c->rx * p[3] - p[0];
+    case 5:
+        return c->ry * p[3] + p[1];
+    default:
+        return c->ry * p[3] - p[1];
+    }
+}
+
+static unsigned r300_clip_code(const R300ClipCfg *c, const float *p)
+{
+    unsigned oc = 0, pl;
+
+    if (!isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2]) ||
+        !isfinite(p[3])) {
+        return R300_CLIP_NAN;
+    }
+    for (pl = 0; pl < R300_CLIP_PLANES; pl++) {
+        if (r300_clip_dist(c, pl, p) < 0.0f) {
+            oc |= 1u << pl;
+        }
+    }
+    if (c->gx) {
+        oc |= p[0] < -c->gx * p[3] ? R300_CLIP_DXL : 0;
+        oc |= p[0] > c->gx * p[3] ? R300_CLIP_DXR : 0;
+    }
+    if (c->gy) {
+        oc |= p[1] < -c->gy * p[3] ? R300_CLIP_DYB : 0;
+        oc |= p[1] > c->gy * p[3] ? R300_CLIP_DYT : 0;
+    }
+    return oc;
+}
+
+/*
+ * The corner at t along a -> b. Attributes are linear in clip space. A
+ * coordinate set already divided by a q that differs between the ends
+ * (r300_vs_texcoord()) is interpolated as tc * q and q and divided again.
+ */
+static void r300_clip_lerp(const ATIR350State *s, const R300DrawState *d,
+                           R300ClipVtx *o, const R300ClipVtx *a,
+                           const R300ClipVtx *b, float t)
+{
+    const float *fa = (const float *)&a->v, *fb = (const float *)&b->v;
+    float *fo = (float *)&o->v;
+    size_t i;
+    unsigned k;
+
+    QEMU_BUILD_BUG_ON(sizeof(R300Vtx) % sizeof(float));
+    for (i = 0; i < sizeof(R300Vtx) / sizeof(float); i++) {
+        fo[i] = fa[i] + (fb[i] - fa[i]) * t;
+    }
+    for (k = 0; k < R300_TEXCOORDS; k++) {
+        float qa = a->v.tcr[k][3], qb = b->v.tcr[k][3];
+        float q = o->v.tcr[k][3];
+
+        if (qa != qb && isfinite(qa) && isfinite(qb) && qa != 0.0f &&
+            qb != 0.0f && isfinite(q) && q != 0.0f) {
+            unsigned j;
+
+            for (j = 0; j < 2; j++) {
+                float ha = a->v.tc[k][j] * qa, hb = b->v.tc[k][j] * qb;
+
+                o->v.tc[k][j] = (ha + (hb - ha) * t) / q;
+            }
+        }
+    }
+    for (k = 0; k < 4; k++) {
+        o->p[k] = a->p[k] + (b->p[k] - a->p[k]) * t;
+    }
+    r300_xform_vtx(s, d, &o->v, o->p, NULL);
+}
+
+static void r300_clip_push(R300ClipOut *o, const R300Vtx *v)
+{
+    if (o->n == o->cap) {
+        o->cap = MAX(o->cap * 2, 48);
+        o->v = g_renew(R300Vtx, o->v, o->cap);
+    }
+    o->v[o->n++] = *v;
+}
+
+/* one triangle, corners in the order the rasterizer faces them */
+static void r300_clip_tri(ATIR350State *s, const R300DrawState *d,
+                          const R300ClipCfg *c, const R300Vtx *vb,
+                          const float *cp, const uint16_t *oc,
+                          unsigned i0, unsigned i1, unsigned i2,
+                          R300ClipOut *o)
+{
+    unsigned all = oc[i0] & oc[i1] & oc[i2];
+    unsigned any = oc[i0] | oc[i1] | oc[i2];
+    R300ClipVtx pa[R300_CLIP_POLY], pb[R300_CLIP_POLY];
+    R300ClipVtx *in = pa, *op = pb, *sw;
+    unsigned idx[3] = { i0, i1, i2 };
+    unsigned np = 3, pl, i;
+
+    if (all || (any & R300_CLIP_NAN)) {
+        s->clip_drop++;
+        return;
+    }
+    if (!(any & R300_CLIP_CUT)) {
+        r300_clip_push(o, &vb[i0]);
+        r300_clip_push(o, &vb[i1]);
+        r300_clip_push(o, &vb[i2]);
+        return;
+    }
+    s->clip_tris++;
+    for (i = 0; i < 3; i++) {
+        in[i].v = vb[idx[i]];
+        memcpy(in[i].p, &cp[idx[i] * 4], sizeof(in[i].p));
+    }
+    /* Sutherland-Hodgman, one plane at a time */
+    for (pl = 0; pl < R300_CLIP_PLANES && np >= 3; pl++) {
+        float dist[R300_CLIP_POLY];
+        unsigned no = 0;
+
+        if (!(any & (1u << pl))) {
+            continue;
+        }
+        for (i = 0; i < np; i++) {
+            dist[i] = r300_clip_dist(c, pl, in[i].p);
+        }
+        for (i = 0; i < np; i++) {
+            unsigned j = i + 1 == np ? 0 : i + 1;
+            bool ain = dist[i] >= 0.0f, bin = dist[j] >= 0.0f;
+
+            if (ain) {
+                op[no++] = in[i];
+            }
+            if (ain != bin) {
+                float t = dist[i] / (dist[i] - dist[j]);
+
+                r300_clip_lerp(s, d, &op[no++], &in[i], &in[j], t);
+            }
+        }
+        np = no;
+        sw = in;
+        in = op;
+        op = sw;
+    }
+    /* a fan over the convex remainder keeps the winding */
+    for (i = 1; np >= 3 && i + 1 < np; i++) {
+        r300_clip_push(o, &in[0].v);
+        r300_clip_push(o, &in[i].v);
+        r300_clip_push(o, &in[i + 1].v);
+    }
+}
+
+/* one segment, cut parametrically against every plane it crosses */
+static void r300_clip_line(ATIR350State *s, const R300DrawState *d,
+                           const R300ClipCfg *c, const R300Vtx *vb,
+                           const float *cp, const uint16_t *oc,
+                           unsigned i0, unsigned i1, R300ClipOut *o)
+{
+    unsigned any = oc[i0] | oc[i1];
+    R300ClipVtx a, b, e;
+    float t0 = 0.0f, t1 = 1.0f;
+    unsigned pl;
+
+    if ((oc[i0] & oc[i1]) || (any & R300_CLIP_NAN)) {
+        s->clip_drop++;
+        return;
+    }
+    if (!(any & R300_CLIP_CUT)) {
+        r300_clip_push(o, &vb[i0]);
+        r300_clip_push(o, &vb[i1]);
+        return;
+    }
+    a.v = vb[i0];
+    memcpy(a.p, &cp[i0 * 4], sizeof(a.p));
+    b.v = vb[i1];
+    memcpy(b.p, &cp[i1 * 4], sizeof(b.p));
+    for (pl = 0; pl < R300_CLIP_PLANES; pl++) {
+        float da, db;
+
+        if (!(any & (1u << pl))) {
+            continue;
+        }
+        da = r300_clip_dist(c, pl, a.p);
+        db = r300_clip_dist(c, pl, b.p);
+        if (da < 0.0f) {
+            t0 = MAX(t0, da / (da - db));
+        } else if (db < 0.0f) {
+            t1 = MIN(t1, da / (da - db));
+        }
+    }
+    if (!(t0 < t1)) {
+        s->clip_drop++;
+        return;
+    }
+    s->clip_tris++;
+    if (t0 > 0.0f) {
+        r300_clip_lerp(s, d, &e, &a, &b, t0);
+        r300_clip_push(o, &e.v);
+    } else {
+        r300_clip_push(o, &a.v);
+    }
+    if (t1 < 1.0f) {
+        r300_clip_lerp(s, d, &e, &a, &b, t1);
+        r300_clip_push(o, &e.v);
+    } else {
+        r300_clip_push(o, &b.v);
+    }
+}
+
+/* the guard band in pixels, as a narrower scissor */
+static void r300_clip_scissor(const ATIR350State *s, R300DrawState *d)
+{
+    float gx = r300_f32(s->regs[R300_VAP_GB_HORZ_CLIP_ADJ >> 2]);
+    float gy = r300_f32(s->regs[R300_VAP_GB_VERT_CLIP_ADJ >> 2]);
+    float lo, hi;
+
+    if (r300_gb_valid(gx)) {
+        float half = d->vte_xs ? fabsf(d->vp[0]) * gx : gx;
+        float mid = d->vte_xo ? d->vp[1] : 0.0f;
+
+        lo = MAX(mid - half, -R300_CLIP_RANGE);
+        hi = MIN(mid + half, R300_CLIP_RANGE);
+        if (isfinite(lo) && isfinite(hi)) {
+            d->sc_x0 = MAX(d->sc_x0, (int)ceilf(lo - 0.5f));
+            d->sc_x1 = MIN(d->sc_x1, (int)ceilf(hi - 0.5f) - 1);
+        }
+    }
+    if (r300_gb_valid(gy)) {
+        float half = d->vte_ys ? fabsf(d->vp[2]) * gy : gy;
+        float mid = d->vte_yo ? d->vp[3] : 0.0f;
+
+        lo = MAX(mid - half, -R300_CLIP_RANGE);
+        hi = MIN(mid + half, R300_CLIP_RANGE);
+        if (isfinite(lo) && isfinite(hi)) {
+            d->sc_y0 = MAX(d->sc_y0, (int)ceilf(lo - 0.5f));
+            d->sc_y1 = MIN(d->sc_y1, (int)ceilf(hi - 0.5f) - 1);
+        }
+    }
+}
+
+/*
+ * Clip a draw. Returns the vertex count to draw; *out is NULL when `vb`
+ * stands as it is, else a g_free()'d list of primitive *prim.
+ */
+static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
+                               const R300Vtx *vb, const float *cp,
+                               unsigned nvtx, unsigned *prim, R300Vtx **out)
+{
+    uint32_t cntl = s->regs[R300_VAP_CLIP_CNTL >> 2];
+    g_autofree uint16_t *oc = NULL;
+    R300ClipOut o = { 0 };
+    R300ClipCfg c;
+    unsigned any = 0, i;
+    float sx, sy;
+
+    *out = NULL;
+    if (!d->xform || (cntl & R300_VAP_CLIP_DISABLE) ||
+        s->zb.vte_fmt != R300_VTE_VTX_W0_FMT) {
+        return nvtx;
+    }
+    if (cntl & R300_VAP_UCP_ENA_MASK) {
+        ati_r350_note_gap(s, R350_GAP_UCP, cntl & R300_VAP_UCP_ENA_MASK);
+    }
+    r300_clip_scissor(s, d);
+
+    c.dx = s->regs[R300_VAP_CNTL >> 2] & R300_VAP_DX_CLIP_SPACE_DEF;
+    sx = d->vte_xs ? fabsf(d->vp[0]) : 1.0f;
+    sy = d->vte_ys ? fabsf(d->vp[2]) : 1.0f;
+    c.rx = isfinite(sx) && sx > 0.0f ? R300_CLIP_RANGE / sx : R300_CLIP_RANGE;
+    c.ry = isfinite(sy) && sy > 0.0f ? R300_CLIP_RANGE / sy : R300_CLIP_RANGE;
+    c.gx = r300_f32(s->regs[R300_VAP_GB_HORZ_DISC_ADJ >> 2]);
+    c.gy = r300_f32(s->regs[R300_VAP_GB_VERT_DISC_ADJ >> 2]);
+    c.gx = r300_gb_valid(c.gx) ? c.gx : 0.0f;
+    c.gy = r300_gb_valid(c.gy) ? c.gy : 0.0f;
+
+    oc = g_new(uint16_t, nvtx);
+    for (i = 0; i < nvtx; i++) {
+        oc[i] = r300_clip_code(&c, &cp[i * 4]);
+        any |= oc[i];
+    }
+    if (!(any & (R300_CLIP_CUT | R300_CLIP_NAN))) {
+        return nvtx;
+    }
+
+    switch (*prim) {
+    case 1:
+        for (i = 0; i < nvtx; i++) {
+            if (oc[i] & (R300_CLIP_Z | R300_CLIP_NAN)) {
+                s->clip_drop++;
+            } else {
+                r300_clip_push(&o, &vb[i]);
+            }
+        }
+        break;
+    case 2:
+        for (i = 0; i + 2 <= nvtx; i += 2) {
+            r300_clip_line(s, d, &c, vb, cp, oc, i, i + 1, &o);
+        }
+        *prim = 2;
+        break;
+    case 3:
+    case 12:
+        for (i = 1; i < nvtx; i++) {
+            r300_clip_line(s, d, &c, vb, cp, oc, i - 1, i, &o);
+        }
+        if (*prim == 12 && nvtx > 2) {
+            r300_clip_line(s, d, &c, vb, cp, oc, nvtx - 1, 0, &o);
+        }
+        *prim = 2;
+        break;
+    case 4:
+    case 7:
+        for (i = 0; i + 3 <= nvtx; i += 3) {
+            r300_clip_tri(s, d, &c, vb, cp, oc, i, i + 1, i + 2, &o);
+        }
+        *prim = 4;
+        break;
+    case 5:
+    case 15:
+        for (i = 2; i < nvtx; i++) {
+            r300_clip_tri(s, d, &c, vb, cp, oc, 0, i - 1, i, &o);
+        }
+        *prim = 4;
+        break;
+    case 6:
+        /* every second triangle is wound backwards */
+        for (i = 2; i < nvtx; i++) {
+            if (i & 1) {
+                r300_clip_tri(s, d, &c, vb, cp, oc, i - 1, i - 2, i, &o);
+            } else {
+                r300_clip_tri(s, d, &c, vb, cp, oc, i - 2, i - 1, i, &o);
+            }
+        }
+        *prim = 4;
+        break;
+    case 13:
+        for (i = 0; i + 4 <= nvtx; i += 4) {
+            r300_clip_tri(s, d, &c, vb, cp, oc, i, i + 1, i + 2, &o);
+            r300_clip_tri(s, d, &c, vb, cp, oc, i, i + 2, i + 3, &o);
+        }
+        *prim = 4;
+        break;
+    case 14:
+        for (i = 2; i + 2 <= nvtx; i += 2) {
+            r300_clip_tri(s, d, &c, vb, cp, oc, i - 2, i - 1, i + 1, &o);
+            r300_clip_tri(s, d, &c, vb, cp, oc, i - 2, i + 1, i, &o);
+        }
+        *prim = 4;
+        break;
+    default:
+        return nvtx;
+    }
+    s->clip_draws++;
+    *out = o.v ? o.v : g_new(R300Vtx, 1);
+    return o.n;
+}
+
 static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
                                   const R300Vtx *vb, unsigned nvtx,
                                   unsigned prim);
@@ -8254,8 +8696,18 @@ static void r300_run_prims_locked(ATIR350State *s, R300DrawState *d,
  * the display's refresh, which runs beside the command processor thread.
  */
 static void r300_run_prims(ATIR350State *s, R300DrawState *d,
-                           const R300Vtx *vb, unsigned nvtx, unsigned prim)
+                           const R300Vtx *vb, const float *cp,
+                           unsigned nvtx, unsigned prim)
 {
+    g_autofree R300Vtx *cv = NULL;
+
+    nvtx = r300_clip_draw(s, d, vb, cp, nvtx, &prim, &cv);
+    if (cv) {
+        if (!nvtx) {
+            return;
+        }
+        vb = cv;
+    }
     qemu_rec_mutex_lock(&s->gl_tex_lock);
     ati_r350_gl_epoch_apply(s);
     r300_run_prims_locked(s, d, vb, nvtx, prim);
@@ -8398,6 +8850,7 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
+        g_autofree float *cp = g_new(float, (size_t)nvtx * 4);
         R300TexSrc ts[R300_TEXCOORDS];
 
         r300_texcoord_src(&d, vsize, vsize, ts);
@@ -8411,12 +8864,12 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
                 r300_trace_texcoord(&d, &fmt, vd, &vb[i]);
             }
             if (d.vs_run && r300_vs_vtx(s, &d, &fmt, vd, &vb[i], clip)) {
-                r300_xform_vtx(s, &d, &vb[i], clip);
+                r300_xform_vtx(s, &d, &vb[i], clip, &cp[i * 4]);
             } else {
-                r300_xform_vtx(s, &d, &vb[i], NULL);
+                r300_xform_vtx(s, &d, &vb[i], NULL, &cp[i * 4]);
             }
         }
-        r300_run_prims(s, &d, vb, nvtx, prim);
+        r300_run_prims(s, &d, vb, cp, nvtx, prim);
     }
 }
 
@@ -8555,6 +9008,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
 
     {
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
+        g_autofree float *cp = g_new(float, (size_t)nvtx * 4);
         g_autofree uint32_t *pre = NULL;
         uint32_t *arr[R300_AOS_MAX] = { NULL };
         size_t span[R300_AOS_MAX], total = 0;
@@ -8640,11 +9094,11 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                 float clip[4];
 
                 if (r300_vs_vtx(s, &d, &fmt, dw, &vb[i], clip)) {
-                    r300_xform_vtx(s, &d, &vb[i], clip);
+                    r300_xform_vtx(s, &d, &vb[i], clip, &cp[i * 4]);
                     continue;
                 }
             }
-            r300_xform_vtx(s, &d, &vb[i], NULL);
+            r300_xform_vtx(s, &d, &vb[i], NULL, &cp[i * 4]);
         }
         trace_ati_r350_3d_vbuf_vtx((int32_t)(r300_f32(dw[0]) * 1000),
                                    (int32_t)(r300_f32(dw[1]) * 1000),
@@ -8652,7 +9106,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                                    (int32_t)(r300_f32(dw[4]) * 1000) : 0,
                                    size[0] >= 4 && vsize >= 8 ?
                                    (int32_t)(r300_f32(dw[5]) * 1000) : 0);
-        r300_run_prims(s, &d, vb, nvtx, prim);
+        r300_run_prims(s, &d, vb, cp, nvtx, prim);
     }
 }
 

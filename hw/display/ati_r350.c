@@ -5313,6 +5313,7 @@ static const char *const ati_r350_gap_names[R350_GAP_MAX] = {
     [R350_GAP_ZB_FORMAT]    = "depth buffer format",
     [R350_GAP_CB_FORMAT]    = "colour buffer format",
     [R350_GAP_VS_ADDR_MODE] = "vertex operand address mode",
+    [R350_GAP_UCP]          = "user clip planes",
 };
 
 void ati_r350_note_gap(ATIR350State *s, ATIR350GapKind kind, unsigned idx)
@@ -5551,6 +5552,10 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                            ati_r350_gl_describe(s->gl_ctx), s->gl_drawn, fb,
                            s->gl_drawn + fb
                            ? 100.0 * s->gl_drawn / (s->gl_drawn + fb) : 0.0);
+    g_string_append_printf(out, "\nview volume: %" PRIu64 " draws clipped, %"
+                           PRIu64 " triangles cut, %" PRIu64
+                           " primitives dropped", s->clip_draws, s->clip_tris,
+                           s->clip_drop);
     if (s->gl_nowork) {
         /*
          * The share of the fallbacks that were proved to paint nothing
