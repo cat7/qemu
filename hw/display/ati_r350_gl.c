@@ -1515,13 +1515,17 @@ static const char *fs_src =
 "        iq = 1.0 / (pq0 + pq1 + pq2);\n"
 "        w0 = pq0 * iq; w1 = pq1 * iq; w2 = pq2 * iq;\n"
 "    }\n"
-"    c = fma(vec4(w2), f_c2, fma(vec4(w1), f_c1, w0 * f_c0));\n"
+/*
+ * A three-term sum a*b + c*d + e*f compiles to fma(e, f, fma(a, b, c*d)):
+ * the compiler fuses the left product of each addition.
+ */
+"    c = fma(vec4(w2), f_c2, fma(vec4(w0), f_c0, w1 * f_c1));\n"
 /*
  * Coordinate set 0 from the vertex array, all a simple-form program
  * reads. See the coordinate-set note in ati_r350_gl.h.
  */
 "    precise vec2 st = fma(vec2(w2), f_t2,\n"
-"                          fma(vec2(w1), f_t1, w0 * f_t0));\n"
+"                          fma(vec2(w0), f_t0, w1 * f_t1));\n"
 "    ts = st.x; tt = st.y;\n"
 /*
  * The fragment program's inputs, in the units it reads them: the texel
@@ -1530,7 +1534,7 @@ static const char *fs_src =
  * with the rasterizer's own weights. `us_main()` above is the guest's
  * program, translated; nothing here decides what it computes.
  */
-"    precise vec4 c1 = fma(vec4(w2), f_s2, fma(vec4(w1), f_s1, w0 * f_s0));\n"
+"    precise vec4 c1 = fma(vec4(w2), f_s2, fma(vec4(w0), f_s0, w1 * f_s1));\n"
 "#ifdef R350_USGEN\n"
 /*
  * Every coordinate set r300_raster_tri() interpolates, with its weights,
@@ -1561,8 +1565,8 @@ static const char *fs_src =
 "            vec4 s0 = texelFetch(u_tcbuf, tb + k * 6);\n"
 "            vec4 s1 = texelFetch(u_tcbuf, tb + k * 6 + 2);\n"
 "            vec4 s2 = texelFetch(u_tcbuf, tb + k * 6 + 4);\n"
-"            precise float is = fma(w2, s2.x, fma(w1, s1.x, w0 * s0.x));\n"
-"            precise float it = fma(w2, s2.y, fma(w1, s1.y, w0 * s0.y));\n"
+"            precise float is = fma(w2, s2.x, fma(w0, s0.x, w1 * s1.x));\n"
+"            precise float it = fma(w2, s2.y, fma(w0, s0.y, w1 * s1.y));\n"
 "            precise float ns = is * u_tcinv[k].x;\n"
 "            precise float nt = it * u_tcinv[k].y;\n"
 "            precise vec4 tc = vec4(ns, nt, 0.0, 1.0);\n"
@@ -1580,7 +1584,7 @@ static const char *fs_src =
 "                vec4 r0 = texelFetch(u_tcbuf, tb + k * 6 + 1);\n"
 "                vec4 r1 = texelFetch(u_tcbuf, tb + k * 6 + 3);\n"
 "                vec4 r2 = texelFetch(u_tcbuf, tb + k * 6 + 5);\n"
-"                tc = fma(vec4(w2), r2, fma(vec4(w1), r1, w0 * r0));\n"
+"                tc = fma(vec4(w2), r2, fma(vec4(w0), r0, w1 * r1));\n"
 "            }\n"
 "            us_tc[k] = tc;\n"
 "        }\n"
