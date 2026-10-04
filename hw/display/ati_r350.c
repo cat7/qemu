@@ -291,24 +291,29 @@ uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off)
            ((uint32_t)vram[(off + 3) ^ xr] << 24);
 }
 
-static void ati_r350_draw_8bpp(ATIR350State *s, DisplaySurface *ds,
-                                  const ATIR350Mode *mode)
+static uint32_t *ati_r350_draw_row(const ATIR350DispJob *j, int y)
 {
-    uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                   mode->fb_offset;
-    unsigned xr = ati_r350_vram_xor(s, mode->fb_offset);
+    return (uint32_t *)((uint8_t *)surface_data(j->ds) +
+                        y * surface_stride(j->ds));
+}
+
+static void ati_r350_draw_8bpp(const ATIR350DispJob *j)
+{
+    const ATIR350Mode *mode = &j->mode;
+    const uint8_t *src = j->vram + mode->fb_offset;
+    const uint8_t (*pal)[3] = j->pal;
+    unsigned xr = j->xr;
     uint32_t *dst;
     int x, y;
 
     for (y = 0; y < mode->height; y++) {
-        dst = (uint32_t *)((uint8_t *)surface_data(ds) +
-                           y * surface_stride(ds));
+        dst = ati_r350_draw_row(j, y);
         for (x = 0; x < mode->width; x++) {
             uint8_t idx = src[x ^ xr];
             dst[x] = 0xff000000u |
-                     ((uint32_t)s->palette[idx][0] << 16) |
-                     ((uint32_t)s->palette[idx][1] << 8) |
-                     s->palette[idx][2];
+                     ((uint32_t)pal[idx][0] << 16) |
+                     ((uint32_t)pal[idx][1] << 8) |
+                     pal[idx][2];
         }
         src += mode->pitch;
     }
@@ -325,13 +330,12 @@ static void ati_r350_palette_reset(ATIR350State *s)
     }
 }
 
-static bool ati_r350_palette_identity(ATIR350State *s)
+static bool ati_r350_palette_identity(const uint8_t (*pal)[3])
 {
     int i;
 
     for (i = 0; i < 256; i++) {
-        if (s->palette[i][0] != i || s->palette[i][1] != i ||
-            s->palette[i][2] != i) {
+        if (pal[i][0] != i || pal[i][1] != i || pal[i][2] != i) {
             return false;
         }
     }
@@ -343,19 +347,18 @@ static bool ati_r350_palette_identity(ATIR350State *s)
  * entry c << 3, a 6-bit one at c << 2. With the identity ramp the plain
  * bit expansion is kept.
  */
-static void ati_r350_draw_16bpp(ATIR350State *s, DisplaySurface *ds,
-                                   const ATIR350Mode *mode, bool rgb565)
+static void ati_r350_draw_16bpp(const ATIR350DispJob *j, bool rgb565)
 {
-    uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                   mode->fb_offset;
-    unsigned xr = ati_r350_vram_xor(s, mode->fb_offset);
-    bool lut = !ati_r350_palette_identity(s);
+    const ATIR350Mode *mode = &j->mode;
+    const uint8_t *src = j->vram + mode->fb_offset;
+    const uint8_t (*pal)[3] = j->pal;
+    unsigned xr = j->xr;
+    bool lut = !ati_r350_palette_identity(pal);
     uint32_t *dst;
     int x, y;
 
     for (y = 0; y < mode->height; y++) {
-        dst = (uint32_t *)((uint8_t *)surface_data(ds) +
-                           y * surface_stride(ds));
+        dst = ati_r350_draw_row(j, y);
         for (x = 0; x < mode->width; x++) {
             uint16_t pixel = ((uint16_t)src[(2 * x + 1) ^ xr] << 8) |
                              src[(2 * x) ^ xr];
@@ -371,9 +374,9 @@ static void ati_r350_draw_16bpp(ATIR350State *s, DisplaySurface *ds,
                 b = (pixel & 0x1f) << 3;
             }
             if (lut) {
-                r = s->palette[r][0];
-                g = s->palette[g][1];
-                b = s->palette[b][2];
+                r = pal[r][0];
+                g = pal[g][1];
+                b = pal[b][2];
             } else {
                 g |= rgb565 ? g >> 6 : g >> 5;
                 r |= r >> 5;
@@ -386,18 +389,17 @@ static void ati_r350_draw_16bpp(ATIR350State *s, DisplaySurface *ds,
     }
 }
 
-static void ati_r350_draw_32bpp(ATIR350State *s, DisplaySurface *ds,
-                                   const ATIR350Mode *mode)
+static void ati_r350_draw_32bpp(const ATIR350DispJob *j)
 {
-    uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                   mode->fb_offset;
-    unsigned xr = ati_r350_vram_xor(s, mode->fb_offset);
+    const ATIR350Mode *mode = &j->mode;
+    const uint8_t *src = j->vram + mode->fb_offset;
+    const uint8_t (*pal)[3] = j->pal;
+    unsigned xr = j->xr;
     uint32_t *dst;
     int x, y;
 
     for (y = 0; y < mode->height; y++) {
-        dst = (uint32_t *)((uint8_t *)surface_data(ds) +
-                           y * surface_stride(ds));
+        dst = ati_r350_draw_row(j, y);
         for (x = 0; x < mode->width; x++) {
             /*
              * Chip-native little-endian: B,G,R,X in VRAM. The DAC's
@@ -408,35 +410,58 @@ static void ati_r350_draw_32bpp(ATIR350State *s, DisplaySurface *ds,
              * only becomes the Aqua blue through the LUT).
              */
             dst[x] = 0xff000000u |
-                     ((uint32_t)s->palette[src[(4 * x + 2) ^ xr]][0] << 16) |
-                     ((uint32_t)s->palette[src[(4 * x + 1) ^ xr]][1] << 8) |
-                     s->palette[src[(4 * x) ^ xr]][2];
+                     ((uint32_t)pal[src[(4 * x + 2) ^ xr]][0] << 16) |
+                     ((uint32_t)pal[src[(4 * x + 1) ^ xr]][1] << 8) |
+                     pal[src[(4 * x) ^ xr]][2];
         }
         src += mode->pitch;
     }
 }
 
-static void ati_r350_draw_24bpp(ATIR350State *s, DisplaySurface *ds,
-                                   const ATIR350Mode *mode)
+static void ati_r350_draw_24bpp(const ATIR350DispJob *j)
 {
-    uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                   mode->fb_offset;
-    unsigned xr = ati_r350_vram_xor(s, mode->fb_offset);
+    const ATIR350Mode *mode = &j->mode;
+    const uint8_t *src = j->vram + mode->fb_offset;
+    const uint8_t (*pal)[3] = j->pal;
+    unsigned xr = j->xr;
     uint32_t *dst;
     int x, y;
 
     for (y = 0; y < mode->height; y++) {
-        dst = (uint32_t *)((uint8_t *)surface_data(ds) +
-                           y * surface_stride(ds));
+        dst = ati_r350_draw_row(j, y);
         for (x = 0; x < mode->width; x++) {
             /* chip-native little-endian: B,G,R in VRAM; palette RAM
              * doubles as the per-channel gamma LUT, as in 32bpp */
             dst[x] = 0xff000000u |
-                     ((uint32_t)s->palette[src[(3 * x + 2) ^ xr]][0] << 16) |
-                     ((uint32_t)s->palette[src[(3 * x + 1) ^ xr]][1] << 8) |
-                     s->palette[src[(3 * x) ^ xr]][2];
+                     ((uint32_t)pal[src[(3 * x + 2) ^ xr]][0] << 16) |
+                     ((uint32_t)pal[src[(3 * x + 1) ^ xr]][1] << 8) |
+                     pal[src[(3 * x) ^ xr]][2];
         }
         src += mode->pitch;
+    }
+}
+
+/* convert the job's frame into its surface; touches nothing else */
+static void ati_r350_draw(const ATIR350DispJob *j)
+{
+    switch (j->mode.pix_width) {
+    case R350_PIX_WIDTH_8BPP:
+        ati_r350_draw_8bpp(j);
+        break;
+    case R350_PIX_WIDTH_15BPP:
+        ati_r350_draw_16bpp(j, false);
+        break;
+    case R350_PIX_WIDTH_16BPP:
+        ati_r350_draw_16bpp(j, true);
+        break;
+    case R350_PIX_WIDTH_24BPP:
+        ati_r350_draw_24bpp(j);
+        break;
+    case R350_PIX_WIDTH_32BPP:
+        ati_r350_draw_32bpp(j);
+        break;
+    default:
+        break;
     }
 }
 
@@ -777,22 +802,20 @@ bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len)
 static void ati_r350_cursor_update(ATIR350State *s);
 static void ati_r350_cursor_apply(ATIR350State *s);
 
-static bool ati_r350_update_display(void *opaque)
+/*
+ * The refresh's decisions, BQL held: consume the dirty bitmap, settle
+ * the mode, give the console a surface of its size, and say whether the
+ * picture changed. Returns false when there is nothing to show at all.
+ */
+static bool ati_r350_refresh_prepare(ATIR350State *s, ATIR350Mode *out,
+                                     bool *out_redraw)
 {
-    ATIR350State *s = opaque;
     ATIR350Mode mode;
     DisplaySurface *ds;
     DirtyBitmapSnapshot *snap;
     bool valid, blanked, redraw;
     uint64_t fb_len;
 
-    /*
-     * Before the dirty snapshot, not after: a flush marks the rows it
-     * writes, and those marks are how this function decides to redraw
-     * at all. Releasing later would let a frame the GPU rendered sit
-     * unnoticed until something else dirtied the same page.
-     */
-    ati_r350_gl_release(s, R350_GLR_SCANOUT);
     snap = ati_r350_take_dirty(s);
     ati_r350_get_mode(s, &mode);
     valid = ati_r350_mode_valid(s, &mode);
@@ -813,7 +836,7 @@ static bool ati_r350_update_display(void *opaque)
     if (!valid) {
         if (!s->have_valid_mode) {
             g_free(snap);
-            return true;
+            return false;
         }
         /*
          * CRTC_EN/CRTC_EXT_DISP_EN going away doesn't necessarily mean
@@ -964,15 +987,17 @@ static bool ati_r350_update_display(void *opaque)
     qatomic_set(&s->scan_fb, (uint64_t)mode.fb_offset << 32 |
                 (fb_len <= UINT32_MAX ? fb_len : UINT32_MAX));
     s->mode_dirty = false;
-    if (!redraw) {
-        ati_r350_cursor_update(s);
-        return true;
-    }
-    s->force_redraw = false;
+    *out = mode;
+    *out_redraw = redraw;
+    return true;
+}
+
+static void ati_r350_vram_peek(ATIR350State *s, const ATIR350Mode *mode)
+{
     if (trace_event_get_state_backends(TRACE_ATI_R350_VRAM_PEEK)) {
         uint8_t *vp = (uint8_t *)memory_region_get_ram_ptr(&s->vram);
-        uint32_t o5 = mode.fb_offset + 5 * mode.pitch;
-        uint32_t o30 = mode.fb_offset + 30 * mode.pitch;
+        uint32_t o5 = mode->fb_offset + 5 * mode->pitch;
+        uint32_t o30 = mode->fb_offset + 30 * mode->pitch;
         trace_ati_r350_vram_peek(5, o5, ldl_le_p(vp + o5),
                                     ldl_le_p(vp + o5 + 4),
                                     ldl_le_p(vp + o5 + 8),
@@ -982,27 +1007,207 @@ static bool ati_r350_update_display(void *opaque)
                                     ldl_le_p(vp + o30 + 8),
                                     ldl_le_p(vp + o30 + 12));
     }
-    ds = qemu_console_surface(s->con);
-    s->draw_xr = (int)ati_r350_vram_xor(s, mode.fb_offset);
-    switch (mode.pix_width) {
-    case R350_PIX_WIDTH_8BPP:
-        ati_r350_draw_8bpp(s, ds, &mode);
-        break;
-    case R350_PIX_WIDTH_15BPP:
-        ati_r350_draw_16bpp(s, ds, &mode, false);
-        break;
-    case R350_PIX_WIDTH_16BPP:
-        ati_r350_draw_16bpp(s, ds, &mode, true);
-        break;
-    case R350_PIX_WIDTH_24BPP:
-        ati_r350_draw_24bpp(s, ds, &mode);
-        break;
-    case R350_PIX_WIDTH_32BPP:
-        ati_r350_draw_32bpp(s, ds, &mode);
-        break;
-    default:
-        break;
+}
+
+/*
+ * ASYNC DISPLAY (async-display=on). The refresh's per-pixel work -- the
+ * conversion of the scanned-out VRAM into the console's 32bpp surface --
+ * runs on a worker thread; the main loop keeps everything that decides
+ * or publishes:
+ *
+ * - main loop, BQL: the GL target release, the dirty-bitmap snapshot,
+ *   the mode and framebuffer choice, surface reallocation, the cursor;
+ *   then a job -- mode, surface, xor, a copy of the palette -- that the
+ *   worker converts straight into the console's surface;
+ * - worker: reads VRAM and the job, writes the surface, nothing else;
+ * - hand-over, a bottom half on the main loop: the cursor and
+ *   dpy_gfx_update, then any refresh that came in meanwhile.
+ *
+ * One job at most is in flight. A refresh tick that finds the worker
+ * busy takes no snapshot -- the dirty bits it would have consumed stay
+ * in the bitmap -- and the hand-over runs that tick when the frame is
+ * in, so no write is lost and a busy worker only lowers the frame rate.
+ * The surface is replaced only by the refresh, and only while the worker
+ * is idle, so the surface a job names lives until its hand-over. A
+ * guest write landing during the conversion is in the next snapshot,
+ * so a frame can be torn for one refresh at most -- as it could before,
+ * since vCPUs and the command processor never stopped for the refresh,
+ * and a UI that draws on its own thread could always read a surface
+ * mid-conversion.
+ *
+ * LOCK ORDER: BQL -> disp_lock, and disp_lock is a leaf: nothing else
+ * is taken under it. The worker takes neither the BQL nor a claim nor
+ * any other lock while converting, and waits for nothing but its
+ * condition variable, so the main loop may wait for it with the BQL
+ * held (unrealize); it never does so on a refresh.
+ */
+static void ati_r350_disp_post(ATIR350State *s, const ATIR350Mode *mode)
+{
+    ATIR350DispJob *j = &s->disp_job;
+
+    j->mode = *mode;
+    j->ds = qemu_console_surface(s->con);
+    j->vram = memory_region_get_ram_ptr(&s->vram);
+    j->xr = s->draw_xr;
+    memcpy(j->palette, s->palette, sizeof(j->palette));
+    j->pal = (const uint8_t (*)[3])j->palette;
+    qemu_mutex_lock(&s->disp_lock);
+    s->disp_state = ATI_R350_DISP_QUEUED;
+    qemu_cond_signal(&s->disp_cond);
+    qemu_mutex_unlock(&s->disp_lock);
+}
+
+static bool ati_r350_update_async(ATIR350State *s)
+{
+    ATIR350Mode mode;
+    bool redraw;
+    unsigned state;
+
+    qemu_mutex_lock(&s->disp_lock);
+    state = s->disp_state;
+    qemu_mutex_unlock(&s->disp_lock);
+    if (state != ATI_R350_DISP_IDLE) {
+        s->disp_tick_missed = true;
+        s->disp_deferred++;
+        ati_r350_cursor_update(s);
+        return false;
     }
+    /* see ati_r350_update_display() */
+    ati_r350_gl_release(s, R350_GLR_SCANOUT);
+    if (!ati_r350_refresh_prepare(s, &mode, &redraw)) {
+        return true;
+    }
+    if (!redraw) {
+        ati_r350_cursor_update(s);
+        return true;
+    }
+    s->force_redraw = false;
+    ati_r350_vram_peek(s, &mode);
+    s->draw_xr = (int)ati_r350_vram_xor(s, mode.fb_offset);
+    ati_r350_disp_post(s, &mode);
+    return false;
+}
+
+/* the frame is in: publish it, then run a tick that found the worker busy */
+static void ati_r350_disp_handover(void *opaque)
+{
+    ATIR350State *s = opaque;
+
+    qemu_mutex_lock(&s->disp_lock);
+    if (s->disp_state != ATI_R350_DISP_DONE) {
+        qemu_mutex_unlock(&s->disp_lock);
+        return;
+    }
+    s->disp_state = ATI_R350_DISP_IDLE;
+    qemu_mutex_unlock(&s->disp_lock);
+
+    if (qemu_console_surface(s->con) == s->disp_job.ds) {
+        s->disp_frames++;
+        ati_r350_cursor_apply(s);
+        qemu_console_update_full(s->con);
+    } else {
+        s->force_redraw = true;
+    }
+    if (s->disp_tick_missed) {
+        s->disp_tick_missed = false;
+        if (!ati_r350_update_async(s)) {
+            return;                 /* that job's hand-over finishes it */
+        }
+    }
+    qemu_console_hw_update_done(s->con);
+}
+
+static void *ati_r350_disp_thread(void *opaque)
+{
+    ATIR350State *s = opaque;
+
+    qemu_mutex_lock(&s->disp_lock);
+    for (;;) {
+        while (s->disp_state != ATI_R350_DISP_QUEUED && !s->disp_quit) {
+            qemu_cond_wait(&s->disp_cond, &s->disp_lock);
+        }
+        if (s->disp_quit) {
+            break;
+        }
+        s->disp_state = ATI_R350_DISP_RUNNING;
+        qemu_mutex_unlock(&s->disp_lock);
+
+        ati_r350_draw(&s->disp_job);
+
+        qemu_mutex_lock(&s->disp_lock);
+        s->disp_state = ATI_R350_DISP_DONE;
+        qemu_bh_schedule(s->disp_bh);
+    }
+    qemu_mutex_unlock(&s->disp_lock);
+    return NULL;
+}
+
+static void ati_r350_disp_init(ATIR350State *s)
+{
+    s->disp_on = s->async_display == ON_OFF_AUTO_ON ||
+                 (s->async_display == ON_OFF_AUTO_AUTO && !qtest_enabled());
+    if (!s->disp_on) {
+        return;
+    }
+    qemu_mutex_init(&s->disp_lock);
+    qemu_cond_init(&s->disp_cond);
+    s->disp_state = ATI_R350_DISP_IDLE;
+    s->disp_bh = qemu_bh_new(ati_r350_disp_handover, s);
+    qemu_thread_create(&s->disp_thread, "ati-r350-disp",
+                       ati_r350_disp_thread, s, QEMU_THREAD_JOINABLE);
+}
+
+/* waits for a frame in flight; the worker needs no lock to finish it */
+static void ati_r350_disp_fini(ATIR350State *s)
+{
+    if (!s->disp_on) {
+        return;
+    }
+    qemu_mutex_lock(&s->disp_lock);
+    s->disp_quit = true;
+    qemu_cond_signal(&s->disp_cond);
+    qemu_mutex_unlock(&s->disp_lock);
+    qemu_thread_join(&s->disp_thread);
+    qemu_bh_delete(s->disp_bh);
+    s->disp_bh = NULL;
+    qemu_cond_destroy(&s->disp_cond);
+    qemu_mutex_destroy(&s->disp_lock);
+    s->disp_on = false;
+}
+
+static bool ati_r350_update_display(void *opaque)
+{
+    ATIR350State *s = opaque;
+    ATIR350DispJob j;
+    ATIR350Mode mode;
+    bool redraw;
+
+    if (s->disp_on) {
+        return ati_r350_update_async(s);
+    }
+    /*
+     * Before the dirty snapshot, not after: a flush marks the rows it
+     * writes, and those marks are how this function decides to redraw
+     * at all. Releasing later would let a frame the GPU rendered sit
+     * unnoticed until something else dirtied the same page.
+     */
+    ati_r350_gl_release(s, R350_GLR_SCANOUT);
+    if (!ati_r350_refresh_prepare(s, &mode, &redraw)) {
+        return true;
+    }
+    if (!redraw) {
+        ati_r350_cursor_update(s);
+        return true;
+    }
+    s->force_redraw = false;
+    ati_r350_vram_peek(s, &mode);
+    s->draw_xr = (int)ati_r350_vram_xor(s, mode.fb_offset);
+    j.mode = mode;
+    j.ds = qemu_console_surface(s->con);
+    j.vram = memory_region_get_ram_ptr(&s->vram);
+    j.xr = s->draw_xr;
+    j.pal = (const uint8_t (*)[3])s->palette;
+    ati_r350_draw(&j);
     ati_r350_cursor_apply(s);
     qemu_console_update_full(s->con);
 
@@ -4952,6 +5157,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
     }
     ati_r350_raster_init(s);
     ati_r350_engine_init(s);
+    ati_r350_disp_init(s);
     /* see "LOCKLESS REGISTER ACCESS"; BAR1 reaches only BQL registers */
     s->lockless = s->lockless_mmio && s->engine_on;
     if (s->lockless) {
@@ -4964,6 +5170,7 @@ static void ati_r350_exit(PCIDevice *dev)
     ATIR350State *s = ATI_R350(dev);
     unsigned i;
 
+    ati_r350_disp_fini(s);
     ati_r350_engine_fini(s);
     ati_r350_raster_fini(s);
     timer_free(s->vblank_timer);
@@ -5056,6 +5263,9 @@ static const Property ati_r350_properties[] = {
                             ON_OFF_AUTO_AUTO),
     /* register BAR without the BQL; needs the command processor thread */
     DEFINE_PROP_BOOL("lockless-mmio", ATIR350State, lockless_mmio, true),
+    /* refresh conversion on its own thread; auto is on except under qtest */
+    DEFINE_PROP_ON_OFF_AUTO("async-display", ATIR350State, async_display,
+                            ON_OFF_AUTO_AUTO),
     /*
      * How long a decoded texture may live: "dirty" (the default and the
      * rule the decode depends on), "burst" (the M3 lifetime, kept as
@@ -5522,7 +5732,8 @@ static char *ati_r350_get_scanout(Object *obj, Error **errp)
         "auto_fb: valid=%d %ux%u bpp=%u fb_offset=0x%x\n"
         "swapper: xr now %u for fb_offset (SURFACE_CNTL=0x%08x), "
         "xr at last redraw %d, force_redraw=%d\n"
-        "activity: %d/%d blocks live, longest run %d blocks at 0x%x",
+        "activity: %d/%d blocks live, longest run %d blocks at 0x%x\n"
+        "async display: %s, frames %" PRIu64 ", deferred ticks %" PRIu64,
         s->auto_fb_overriding ? "activity heuristic (CRTC overridden)"
                               : "CRTC registers",
         s->mode.width, s->mode.height, s->mode.bpp, s->mode.pitch,
@@ -5536,7 +5747,8 @@ static char *ati_r350_get_scanout(Object *obj, Error **errp)
         ati_r350_vram_xor(s, s->mode.fb_offset),
         s->regs[R350_SURFACE_CNTL >> 2], s->draw_xr, s->force_redraw,
         active, nblocks, best,
-        best_start < 0 ? 0 : best_start * ATI_R350_FB_SCAN_BLOCK);
+        best_start < 0 ? 0 : best_start * ATI_R350_FB_SCAN_BLOCK,
+        s->disp_on ? "on" : "off", s->disp_frames, s->disp_deferred);
 
     return g_string_free(out, FALSE);
 }
