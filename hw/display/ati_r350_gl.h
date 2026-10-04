@@ -165,6 +165,11 @@ typedef struct R350GlReq {
      */
     int levels[R350_GL_TEXUNITS];
     int filt[R350_GL_TEXUNITS][11];
+    /*
+     * A cube map: each level of `tex` is its six faces (+X -X +Y -Y +Z
+     * -Z) stacked, w x 6h, and the general form's fetch picks the face.
+     */
+    int cube[R350_GL_TEXUNITS];
     uint8_t border[R350_GL_TEXUNITS][4];
     uint32_t textured;
 

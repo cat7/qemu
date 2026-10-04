@@ -781,6 +781,7 @@ struct ATIR350State {
         unsigned sel[4];
         int w, h;
         unsigned nlev;              /* mip levels decoded, one after another */
+        bool cube;                  /* each level six faces tall */
         uint32_t lay;               /* offset of the last of them */
         uint8_t *rgba;
         size_t sz;
@@ -969,6 +970,13 @@ struct ATIR350State {
     bool us_glsl_ok;
     uint64_t us_glsl_key;
     uint64_t us_glsl_ok_n, us_glsl_refused_n;
+    /*
+     * A `gl_simple` program in the general form, for a draw that needs
+     * its fetch inside the shader (a cube map); made on demand for the
+     * program `us_glsl_gen_for` names, keyed by `us_glsl_gen_key`.
+     */
+    char us_glsl_gen[64 * 1024];
+    uint64_t us_glsl_gen_for, us_glsl_gen_key;
     float us_konst_flat[R300_US_CONSTS * 4];
 
     /*

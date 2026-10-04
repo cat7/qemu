@@ -75,6 +75,7 @@
 #include "ati_r350_gl.h"
 #include <float.h>
 #include <math.h>
+#include "ati_r350_us.h"
 
 #if defined(CONFIG_DARWIN) || defined(_WIN32)
 
@@ -796,6 +797,7 @@ struct R350GlCtx {
     GLuint tex[R350_GL_TEXSLOTS + 1];
     int tex_w[R350_GL_TEXSLOTS + 1], tex_h[R350_GL_TEXSLOTS + 1];
     int tex_nl[R350_GL_TEXSLOTS + 1];   /* mip levels specified */
+    int tex_cb[R350_GL_TEXSLOTS + 1];   /* levels hold six cube faces */
     GLuint white;                   /* the 1x1 an untextured draw samples */
     /* the resident target's size; a request smaller than it reuses it */
     int fb_w, fb_h;
@@ -1202,6 +1204,9 @@ static const char *fs_src =
 "uniform int u_tcraw;\n"
 "uniform int u_lodany;\n"
 "vec4 us_der[8];\n"
+"vec3 us_cdx[8];\n"
+"vec3 us_cdy[8];\n"
+R300_CUBE_GLSL
 "\n"
 "uvec4 gtexel(int un, int l, ivec2 ij)\n"
 "{\n"
@@ -1215,15 +1220,15 @@ static const char *fs_src =
 "    return texelFetch(u_txs[7], ij, l);\n"
 "}\n"
 "\n"
-"uvec4 gfetch(int un, int l, int i, int j)\n"
+"uvec4 gfetch(int un, int l, int f, int i, int j)\n"
 "{\n"
 "    if (i < 0 || j < 0)\n"
 "        return uvec4(u_txtf[un * 16 + 11], u_txtf[un * 16 + 12],\n"
 "                     u_txtf[un * 16 + 13], u_txtf[un * 16 + 14]);\n"
-"    return gtexel(un, l, ivec2(i, j));\n"
+"    return gtexel(un, l, ivec2(i, j + f * max(u_txsize[un].y >> l, 1)));\n"
 "}\n"
 "\n"
-"uvec4 glevel(int un, int l, float fs, float ft, bool lin)\n"
+"uvec4 glevel(int un, int f, int l, float fs, float ft, bool lin)\n"
 "{\n"
 "    ivec2 cl = u_txclamp[un];\n"
 "    int w = max(u_txsize[un].x >> l, 1), h = max(u_txsize[un].y >> l, 1);\n"
@@ -1232,7 +1237,7 @@ static const char *fs_src =
 "    precise float tt = tc_pre(ldexp(ft, -min(l, u_txtf[un * 16 + 10])), h,\n"
 "                              cl.y);\n"
 "    if (!lin)\n"
-"        return gfetch(un, l, tc_idx(int(floor(ss)), w, cl.x, true),\n"
+"        return gfetch(un, l, f, tc_idx(int(floor(ss)), w, cl.x, true),\n"
 "                      tc_idx(int(floor(tt)), h, cl.y, true));\n"
 "    precise float fx = ss - 0.5;\n"
 "    precise float fy = tt - 0.5;\n"
@@ -1249,32 +1254,32 @@ static const char *fs_src =
 "    int j1 = tc_idx(j0 + 1, h, cl.y, false);\n"
 "    i0 = tc_idx(i0, w, cl.x, false);\n"
 "    j0 = tc_idx(j0, h, cl.y, false);\n"
-"    uvec4 t00 = gfetch(un, l, i0, j0);\n"
-"    uvec4 t10 = wx != 0 ? gfetch(un, l, i1, j0) : t00;\n"
+"    uvec4 t00 = gfetch(un, l, f, i0, j0);\n"
+"    uvec4 t10 = wx != 0 ? gfetch(un, l, f, i1, j0) : t00;\n"
 "    if (wy == 0) return wx != 0 ? tlerp(t00, t10, wx) : t00;\n"
-"    uvec4 t01 = gfetch(un, l, i0, j1);\n"
-"    uvec4 t11 = wx != 0 ? gfetch(un, l, i1, j1) : t01;\n"
+"    uvec4 t01 = gfetch(un, l, f, i0, j1);\n"
+"    uvec4 t11 = wx != 0 ? gfetch(un, l, f, i1, j1) : t01;\n"
 "    ivec4 top = ivec4(t00) * (256 - wx) + ivec4(t10) * wx;\n"
 "    ivec4 bot = ivec4(t01) * (256 - wx) + ivec4(t11) * wx;\n"
 "    return uvec4((top * (256 - wy) + bot * wy + 32768) >> 16);\n"
 "}\n"
 "\n"
-"uvec4 gmip(int un, int lod, float fs, float ft)\n"
+"uvec4 gmip(int un, int f, int lod, float fs, float ft)\n"
 "{\n"
 "    int b = un * 16;\n"
 "    bool lin = u_txtf[b + 3] != 1;\n"
 "    int lo = min(max(lod, u_txtf[b + 6] * 256), u_txtf[b + 7] * 256);\n"
 "    if (u_txtf[b + 4] == 1)\n"
-"        return glevel(un, min((lo + 128) >> 8, u_txtf[b + 7]), fs, ft,\n"
+"        return glevel(un, f, min((lo + 128) >> 8, u_txtf[b + 7]), fs, ft,\n"
 "                      lin);\n"
 "    int l = lo >> 8;\n"
 "    if (u_txtf[b + 4] != 2 || l >= u_txtf[b + 7] || (lo & 255) == 0)\n"
-"        return glevel(un, l, fs, ft, lin);\n"
-"    return tlerp(glevel(un, l, fs, ft, lin),\n"
-"                 glevel(un, l + 1, fs, ft, lin), lo & 255);\n"
+"        return glevel(un, f, l, fs, ft, lin);\n"
+"    return tlerp(glevel(un, f, l, fs, ft, lin),\n"
+"                 glevel(un, f, l + 1, fs, ft, lin), lo & 255);\n"
 "}\n"
 "\n"
-"uvec4 gfilter(int un, float fs, float ft, vec4 der)\n"
+"uvec4 gfilter(int un, int f, float fs, float ft, vec4 der)\n"
 "{\n"
 "    int b = un * 16;\n"
 "    int lod = 0, nl = 0;\n"
@@ -1298,8 +1303,9 @@ static const char *fs_src =
 "        }\n"
 "        lod += u_txtf[b + 8];\n"
 "    }\n"
-"    if (lod <= 0) return glevel(un, u_txtf[b + 6], fs, ft, u_txtf[b + 2] != 1);\n"
-"    if (nl == 0) return gmip(un, lod, fs, ft);\n"
+"    if (lod <= 0)\n"
+"        return glevel(un, f, u_txtf[b + 6], fs, ft, u_txtf[b + 2] != 1);\n"
+"    if (nl == 0) return gmip(un, f, lod, fs, ft);\n"
 "    int N = 1 << nl;\n"
 "    uvec4 sum = uvec4(0u);\n"
 "    for (int k = 0; k < N; k++) {\n"
@@ -1308,7 +1314,7 @@ static const char *fs_src =
 "        precise float dt = ay * ok;\n"
 "        precise float s1 = fs + ds;\n"
 "        precise float t1 = ft + dt;\n"
-"        sum += gmip(un, lod, s1, t1);\n"
+"        sum += gmip(un, f, lod, s1, t1);\n"
 "    }\n"
 "    return (sum + uint(N >> 1)) >> uint(nl);\n"
 "}\n"
@@ -1320,7 +1326,14 @@ static const char *fs_src =
 "    precise float fs = coord.x * float(w);\n"
 "    precise float ft = coord.y * float(h);\n"
 "    uvec4 tu;\n"
-"    if (u_txtf[un * 16] != 0) {\n"
+"    if (u_txtf[un * 16 + 15] != 0) {\n"
+"        vec2 fd;\n"
+"        vec4 der;\n"
+"        bool lod = u_txtf[un * 16 + 1] != 0 && ((u_tcraw >> dset) & 1) != 0;\n"
+"        int f = cube_coord(coord.xyz, us_cdx[dset], us_cdy[dset], lod,\n"
+"                           w, h, fd, der);\n"
+"        tu = gfilter(un, f, fd.x, fd.y, der);\n"
+"    } else if (u_txtf[un * 16] != 0) {\n"
 "        vec4 der = vec4(0.0);\n"
 "        if (u_txtf[un * 16 + 1] != 0) {\n"
 "            vec4 g = us_der[dset];\n"
@@ -1330,7 +1343,7 @@ static const char *fs_src =
 "            precise float d3 = g.w * float(h);\n"
 "            der = vec4(d0, d1, d2, d3);\n"
 "        }\n"
-"        tu = gfilter(un, fs, ft, der);\n"
+"        tu = gfilter(un, 0, fs, ft, der);\n"
 "    } else {\n"
 "        int tx = int(fs);\n"
 "        int ty = int(ft);\n"
@@ -1425,6 +1438,8 @@ static const char *fs_src =
 "        for (int k = 0; k < 8; k++) {\n"
 "            us_tc[k] = vec4(0.0, 0.0, 0.0, 1.0);\n"
 "            us_der[k] = vec4(0.0);\n"
+"            us_cdx[k] = vec3(0.0);\n"
+"            us_cdy[k] = vec3(0.0);\n"
 "        }\n"
 "        for (int k = 0; k < US_NTC; k++) {\n"
 "            vec4 s0 = texelFetch(u_tcbuf, tb + k * 6);\n"
@@ -1450,6 +1465,14 @@ static const char *fs_src =
 "                vec4 r1 = texelFetch(u_tcbuf, tb + k * 6 + 3);\n"
 "                vec4 r2 = texelFetch(u_tcbuf, tb + k * 6 + 5);\n"
 "                tc = fma(vec4(w2), r2, fma(vec4(w1), r1, w0 * r0));\n"
+"                if (u_lodany != 0) {\n"
+"                    float x0, y0, x1, y1, x2, y2;\n"
+"                    tc_der(ga, gb, r0.x, r1.x, r2.x, tc.x, iq, x0, y0);\n"
+"                    tc_der(ga, gb, r0.y, r1.y, r2.y, tc.y, iq, x1, y1);\n"
+"                    tc_der(ga, gb, r0.z, r1.z, r2.z, tc.z, iq, x2, y2);\n"
+"                    us_cdx[k] = vec3(x0, x1, x2);\n"
+"                    us_cdy[k] = vec3(y0, y1, y2);\n"
+"                }\n"
 "            }\n"
 "            us_tc[k] = tc;\n"
 "        }\n"
@@ -2220,7 +2243,7 @@ static void gl_tf_unit(const R350GlReq *r, unsigned un, GLint *tf)
     for (k = 0; k < 4; k++) {
         tf[11 + k] = r->border[un][k];
     }
-    tf[15] = 0;
+    tf[15] = r->cube[un];
 }
 
 static void gl_tf(const R350GlReq *r, GLint *tf)
@@ -2247,8 +2270,10 @@ static void gl_upload_tex_unit(R350GlCtx *g, unsigned slot,
                                const R350GlReq *r, unsigned un)
 {
     int nl = gl_levels_unit(r, un), l;
+    int nf = r->cube[un] ? 6 : 1;
     bool same = g->tex_w[slot] == r->tex_w[un] &&
-                g->tex_h[slot] == r->tex_h[un] && g->tex_nl[slot] == nl;
+                g->tex_h[slot] == r->tex_h[un] && g->tex_nl[slot] == nl &&
+                g->tex_cb[slot] == r->cube[un];
     const uint8_t *p = r->tex[un];
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
@@ -2257,7 +2282,8 @@ static void gl_upload_tex_unit(R350GlCtx *g, unsigned slot,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, nl - 1);
     for (l = 0; l < nl; l++) {
-        int w = MAX(r->tex_w[un] >> l, 1), h = MAX(r->tex_h[un] >> l, 1);
+        int w = MAX(r->tex_w[un] >> l, 1);
+        int h = MAX(r->tex_h[un] >> l, 1) * nf;
 
         if (same) {
             glTexSubImage2D(GL_TEXTURE_2D, l, 0, 0, w, h, GL_RGBA_INTEGER,
@@ -2271,6 +2297,7 @@ static void gl_upload_tex_unit(R350GlCtx *g, unsigned slot,
     g->tex_w[slot] = r->tex_w[un];
     g->tex_h[slot] = r->tex_h[un];
     g->tex_nl[slot] = nl;
+    g->tex_cb[slot] = r->cube[un];
 }
 
 static void gl_upload_tex(R350GlCtx *g, unsigned slot, const R350GlReq *r)
@@ -2350,7 +2377,8 @@ static bool gl_bind_units(R350GlCtx *g, const R350GlReq *r, bool queue)
             gl_upload_tex_unit(g, sl, r, un);
         } else if (g->tex_w[sl] != r->tex_w[un] ||
                    g->tex_h[sl] != r->tex_h[un] ||
-                   g->tex_nl[sl] != gl_levels_unit(r, un)) {
+                   g->tex_nl[sl] != gl_levels_unit(r, un) ||
+                   g->tex_cb[sl] != r->cube[un]) {
             return false;
         }
     }

@@ -90,6 +90,8 @@ typedef struct R300TexUnit {
     unsigned clamp_s, clamp_t;  /* TX_FILTER0 clamp modes (0 = repeat) */
     unsigned lanes;         /* TX_OFFSET ENDIAN_SWAP as a byte-lane xor */
     unsigned yuv;           /* 4:2:2 only: YUV_TO_RGB, SWAP_YUV in bit 2 */
+    unsigned dxt;           /* 1, 3 or 5 for S3TC; `pitch` is per block row */
+    bool cube;              /* TEX_COORD_TYPE cube: six faces per level */
     /*
      * Filtering. A unit with `filt` clear samples one texel of level 0
      * through r300_sample_tex() exactly as before; see r300_tex_filter()
@@ -105,6 +107,7 @@ typedef struct R300TexUnit {
     uint32_t border;        /* TX_BORDER_COLOR as a texel of this format */
     uint32_t loff[R300_TEX_LEVELS];     /* card address of each level */
     uint32_t lpitch[R300_TEX_LEVELS];   /* bytes per row of each level */
+    uint32_t fsz[R300_TEX_LEVELS];      /* bytes per face of each level */
     int lw[R300_TEX_LEVELS], lh[R300_TEX_LEVELS];
     unsigned nlev;          /* levels the GL backend is handed: 0..nlev-1 */
     uint32_t chain;         /* bytes from `off` to the end of that chain */
@@ -196,6 +199,9 @@ typedef struct R300DrawState {
     unsigned ntc;
     /* sets read by no LD/PROJ/LODBIAS: the frame gets tcr, all four */
     unsigned tc_raw;
+    uint32_t tgen;          /* this draw's key for decoded texel blocks */
+    bool cube_any;          /* the program fetches from a cube map */
+    bool fs_fast;           /* fs->fast, and no cube map to address */
     float flat_r, flat_g, flat_b, flat_a;
     uint8_t *vram;
     /*
@@ -626,6 +632,58 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
     return r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes);
 }
 
+/*
+ * One S3TC block, its dwords read as a 32bpp texel's are: through the
+ * aperture swapper in VRAM, through the TX_OFFSET swap over the bus.
+ */
+static void r300_dxt_block(ATIR350State *s, const R300DrawState *d,
+                           unsigned unit, uint32_t a, uint32_t out[16])
+{
+    const R300TexUnit *u = &d->tex[unit];
+    unsigned bs = r300_dxt_block_bytes(u->dxt), k;
+    uint8_t b[16];
+
+    for (k = 0; k < bs; k += 4) {
+        uint32_t v = r300_tex_at(s, d, unit, a + k);
+
+        b[k] = v;
+        b[k + 1] = v >> 8;
+        b[k + 2] = v >> 16;
+        b[k + 3] = v >> 24;
+    }
+    r300_dxt_decode(u->dxt, b, out);
+}
+
+/* decoded blocks, per thread, valid for one draw */
+#define R300_DXT_TC 64
+
+typedef struct R300DxtTc {
+    uint32_t gen, a;
+    unsigned dxt;
+    uint32_t t[16];
+} R300DxtTc;
+
+static __thread R300DxtTc r300_dxt_tc[R300_DXT_TC];
+
+/* texel (i, j) of the S3TC image at `base` with `pitch` bytes per block row */
+static uint32_t r300_dxt_texel(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit, uint32_t base, uint32_t pitch,
+                               int i, int j)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    uint32_t a = base + (uint32_t)(j >> 2) * pitch +
+                 (uint32_t)(i >> 2) * r300_dxt_block_bytes(u->dxt);
+    R300DxtTc *c = &r300_dxt_tc[((a >> 3) ^ (a >> 11)) & (R300_DXT_TC - 1)];
+
+    if (c->gen != d->tgen || c->a != a || c->dxt != u->dxt) {
+        r300_dxt_block(s, d, unit, a, c->t);
+        c->gen = d->tgen;
+        c->a = a;
+        c->dxt = u->dxt;
+    }
+    return c->t[(j & 3) * 4 + (i & 3)];
+}
+
 static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
                                 unsigned unit, int tx, int ty)
 {
@@ -653,6 +711,9 @@ static uint32_t r300_sample_tex(ATIR350State *s, const R300DrawState *d,
         }
     } else {
         ty = MIN(MAX(ty, 0), u->h - 1);
+    }
+    if (u->dxt) {
+        return r300_dxt_texel(s, d, unit, u->off, u->pitch, tx, ty);
     }
     return r300_tex_at(s, d, unit, u->off + (uint32_t)ty * u->pitch +
                                    (uint32_t)tx * (u->bpp / 8));
@@ -730,17 +791,22 @@ static inline int r300_tc_idx(int i, int n, unsigned mode, bool point)
     }
 }
 
+/* texel (i, j) of level l, face f (0 unless a cube map) */
 static inline uint32_t r300_tex_lvl_texel(ATIR350State *s,
                                           const R300DrawState *d,
                                           unsigned unit, unsigned l,
-                                          int i, int j)
+                                          unsigned f, int i, int j)
 {
     const R300TexUnit *u = &d->tex[unit];
+    uint32_t base = u->loff[l] + f * u->fsz[l];
 
     if (i < 0 || j < 0) {
         return u->border;
     }
-    return r300_tex_at(s, d, unit, u->loff[l] + (uint32_t)j * u->lpitch[l] +
+    if (u->dxt) {
+        return r300_dxt_texel(s, d, unit, base, u->lpitch[l], i, j);
+    }
+    return r300_tex_at(s, d, unit, base + (uint32_t)j * u->lpitch[l] +
                                    (uint32_t)i * (u->bpp / 8));
 }
 
@@ -759,8 +825,8 @@ static inline uint32_t r300_lerp4(uint32_t a, uint32_t b, int f)
 
 /* one level: `fs`, `ft` in level-0 texels */
 static uint32_t r300_tex_level(ATIR350State *s, const R300DrawState *d,
-                               unsigned unit, unsigned l, float fs, float ft,
-                               bool lin)
+                               unsigned unit, unsigned face, unsigned l,
+                               float fs, float ft, bool lin)
 {
     const R300TexUnit *u = &d->tex[unit];
     int w = u->lw[l], h = u->lh[l];
@@ -772,7 +838,7 @@ static uint32_t r300_tex_level(ATIR350State *s, const R300DrawState *d,
     unsigned c;
 
     if (!lin) {
-        return r300_tex_lvl_texel(s, d, unit, l,
+        return r300_tex_lvl_texel(s, d, unit, l, face,
                                   r300_tc_idx((int)floorf(ss), w,
                                               u->clamp_s, true),
                                   r300_tc_idx((int)floorf(tt), h,
@@ -798,13 +864,13 @@ static uint32_t r300_tex_level(ATIR350State *s, const R300DrawState *d,
     j1 = r300_tc_idx(j0 + 1, h, u->clamp_t, false);
     i0 = r300_tc_idx(i0, w, u->clamp_s, false);
     j0 = r300_tc_idx(j0, h, u->clamp_t, false);
-    t00 = r300_tex_lvl_texel(s, d, unit, l, i0, j0);
-    t10 = wx ? r300_tex_lvl_texel(s, d, unit, l, i1, j0) : t00;
+    t00 = r300_tex_lvl_texel(s, d, unit, l, face, i0, j0);
+    t10 = wx ? r300_tex_lvl_texel(s, d, unit, l, face, i1, j0) : t00;
     if (!wy) {
         return wx ? r300_lerp4(t00, t10, wx) : t00;
     }
-    t01 = r300_tex_lvl_texel(s, d, unit, l, i0, j1);
-    t11 = wx ? r300_tex_lvl_texel(s, d, unit, l, i1, j1) : t01;
+    t01 = r300_tex_lvl_texel(s, d, unit, l, face, i0, j1);
+    t11 = wx ? r300_tex_lvl_texel(s, d, unit, l, face, i1, j1) : t01;
     for (c = 0; c < 32; c += 8) {
         int a = (t00 >> c) & 0xff, b = (t10 >> c) & 0xff;
         int e = (t01 >> c) & 0xff, f = (t11 >> c) & 0xff;
@@ -818,7 +884,8 @@ static uint32_t r300_tex_level(ATIR350State *s, const R300DrawState *d,
 
 /* the mip stage at `lod` (1/256 levels, > 0) */
 static uint32_t r300_tex_mip(ATIR350State *s, const R300DrawState *d,
-                             unsigned unit, int lod, float fs, float ft)
+                             unsigned unit, unsigned f, int lod, float fs,
+                             float ft)
 {
     const R300TexUnit *u = &d->tex[unit];
     bool lin = u->min != R300_TX_FILTER_POINT;
@@ -826,15 +893,16 @@ static uint32_t r300_tex_mip(ATIR350State *s, const R300DrawState *d,
     unsigned l;
 
     if (u->mip == R300_TX_FILTER_POINT) {
-        return r300_tex_level(s, d, unit, MIN((unsigned)(lo + 128) >> 8,
-                                              u->last), fs, ft, lin);
+        return r300_tex_level(s, d, unit, f,
+                              MIN((unsigned)(lo + 128) >> 8, u->last),
+                              fs, ft, lin);
     }
     l = lo >> 8;
     if (u->mip != R300_TX_FILTER_LINEAR || l >= u->last || !(lo & 255)) {
-        return r300_tex_level(s, d, unit, l, fs, ft, lin);
+        return r300_tex_level(s, d, unit, f, l, fs, ft, lin);
     }
-    return r300_lerp4(r300_tex_level(s, d, unit, l, fs, ft, lin),
-                      r300_tex_level(s, d, unit, l + 1, fs, ft, lin),
+    return r300_lerp4(r300_tex_level(s, d, unit, f, l, fs, ft, lin),
+                      r300_tex_level(s, d, unit, f, l + 1, fs, ft, lin),
                       lo & 255);
 }
 
@@ -854,7 +922,7 @@ static inline int r300_log2_fx(float v)
 }
 
 static uint32_t r300_tex_filter(ATIR350State *s, const R300DrawState *d,
-                                unsigned unit, float fs, float ft,
+                                unsigned unit, unsigned f, float fs, float ft,
                                 const float der[4])
 {
     const R300TexUnit *u = &d->tex[unit];
@@ -885,17 +953,17 @@ static uint32_t r300_tex_filter(ATIR350State *s, const R300DrawState *d,
         lod += u->bias;
     }
     if (lod <= 0) {
-        return r300_tex_level(s, d, unit, u->first, fs, ft,
+        return r300_tex_level(s, d, unit, f, u->first, fs, ft,
                               u->mag != R300_TX_FILTER_POINT);
     }
     if (!nl) {
-        return r300_tex_mip(s, d, unit, lod, fs, ft);
+        return r300_tex_mip(s, d, unit, f, lod, fs, ft);
     }
     N = 1 << nl;
     for (k = 0; k < N; k++) {
         float o_k = (float)(2 * k + 1 - N) / (float)(2 * N);
         float ds = ax * o_k, dt = ay * o_k;
-        uint32_t t = r300_tex_mip(s, d, unit, lod, fs + ds, ft + dt);
+        uint32_t t = r300_tex_mip(s, d, unit, f, lod, fs + ds, ft + dt);
 
         for (c = 0; c < 4; c++) {
             sum[c] += (t >> (c * 8)) & 0xff;
@@ -1467,6 +1535,8 @@ typedef struct R300SampleCtx {
      * unit needs a level of detail.
      */
     float der[R300_TEXCOORDS][4];
+    /* for a set read raw: d/dx and d/dy of its x, y and z */
+    float cder[R300_TEXCOORDS][3][2];
 } R300SampleCtx;
 
 /*
@@ -1475,23 +1545,28 @@ typedef struct R300SampleCtx {
  * ALU result, whose derivatives this model does not have: it takes those
  * of the set that addresses the same unit, else of set 0.
  */
-static const float *r300_us_der(const R300SampleCtx *c, unsigned unit,
-                                unsigned src)
+static unsigned r300_us_dset(const R300DrawState *d, unsigned unit,
+                             unsigned src)
 {
-    const R300DrawState *d = c->d;
     unsigned n;
 
     for (n = 0; n < d->ntc; n++) {
         if (d->fs->rs.tex_reg[n] == (int)src) {
-            return c->der[n];
+            return n;
         }
     }
     for (n = 0; n < d->ntc; n++) {
         if (d->tc_unit[n] == unit) {
-            return c->der[n];
+            return n;
         }
     }
-    return c->der[0];
+    return 0;
+}
+
+static const float *r300_us_der(const R300SampleCtx *c, unsigned unit,
+                                unsigned src)
+{
+    return c->der[r300_us_dset(c->d, unit, src)];
 }
 
 static void r300_us_sample(void *ctx, unsigned unit, bool proj,
@@ -1508,7 +1583,20 @@ static void r300_us_sample(void *ctx, unsigned unit, bool proj,
         return;
     }
     u = &d->tex[unit];
-    if (u->filt) {
+    if (u->cube) {
+        /*
+         * (s, t, r) is a direction; its derivatives are known for a set
+         * the rasterizer interpolates raw, and taken as zero otherwise.
+         */
+        unsigned n = r300_us_dset(d, unit, src);
+        float der[4], fs, ft;
+        unsigned f;
+
+        f = r300_cube_coord(coord, u->need_lod && (d->tc_raw >> n) & 1
+                                   ? c->cder[n] : NULL,
+                            u->w, u->h, &fs, &ft, der);
+        t = r300_tex_filter(c->s, d, unit, f, fs, ft, der);
+    } else if (u->filt) {
         float der[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
         if (u->need_lod) {
@@ -1519,7 +1607,7 @@ static void r300_us_sample(void *ctx, unsigned unit, bool proj,
             der[2] = g[2] * (float)u->w;
             der[3] = g[3] * (float)u->h;
         }
-        t = r300_tex_filter(c->s, d, unit, coord[0] * (float)u->w,
+        t = r300_tex_filter(c->s, d, unit, 0, coord[0] * (float)u->w,
                             coord[1] * (float)u->h, der);
     } else {
         t = r300_sample_tex(c->s, d, unit, (int)(coord[0] * (float)u->w),
@@ -1706,7 +1794,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
      * there for a compiler that cannot follow this guard to the one
      * below, and for nothing else.
      */
-    if (d->fs_run && !d->fs->fast) {
+    if (d->fs_run && !d->fs_fast) {
         for (n = 0; n < d->ntc && n < R300_TEXCOORDS; n++) {
             const R300TexUnit *u = &d->tex[d->tc_unit[n]];
 
@@ -1913,7 +2001,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 float tt = pw0 * v0->tc[0][1] + pw1 * v1->tc[0][1] +
                            pw2 * v2->tc[0][1];
 
-                if (d->fs->fast) {
+                if (d->fs_fast) {
                     /*
                      * The specialised path is handed a finished texel,
                      * so its one fetch is done for it here -- the same
@@ -1938,7 +2026,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                                             v1->tc[0][1], v2->tc[0][1], tt,
                                             iq, &der[1], &der[3]);
                             }
-                            texel = r300_tex_filter(s, d, 0, ts, tt, der);
+                            texel = r300_tex_filter(s, d, 0, 0, ts, tt, der);
                         } else {
                             texel = r300_sample_tex(s, d, 0, (int)ts,
                                                     (int)tt);
@@ -1964,7 +2052,7 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 } else {
                     col[1][0] = col[1][1] = col[1][2] = col[1][3] = 0.0f;
                 }
-                if (d->fs->fast) {
+                if (d->fs_fast) {
                     /*
                      * Every program any guest in this project uploads is
                      * of the shape the analyser resolves at decode time.
@@ -2047,6 +2135,12 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                             tc[k][c] = pw0 * v0->tcr[k][c] +
                                        pw1 * v1->tcr[k][c] +
                                        pw2 * v2->tcr[k][c];
+                        }
+                        for (c = 0; d->lod_any && c < 3; c++) {
+                            r300_tc_der(ga, gb, v0->tcr[k][c],
+                                        v1->tcr[k][c], v2->tcr[k][c],
+                                        tc[k][c], iq, &sc.cder[k][c][0],
+                                        &sc.cder[k][c][1]);
                         }
                     }
                     r300_fs_frame(d, &f, tc, col);
@@ -3475,6 +3569,7 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
          * translator refuses is refused before any pixel depends on it.
          */
         s->us_glsl_ok = r300_us_glsl(p, s->us_glsl, sizeof(s->us_glsl));
+        s->us_glsl_gen_for = 0;     /* its general form is made on demand */
         /*
          * The key the GL backend caches its linked shader under is a
          * hash of the TEXT, not of the control words. Those change far
@@ -3545,6 +3640,29 @@ static bool r300_fs_setup(ATIR350State *s, R300DrawState *d)
     for (i = 0; i < R300_TEXCOORDS; i++) {
         d->tc_unit[i] = p->tc_unit[i];
     }
+    /*
+     * A cube map is addressed by (s, t, r): the set that feeds its fetch
+     * reaches the frame raw, not as (s/q, t/q, 0, 1), and the program is
+     * run by the interpreter, whose fetch knows faces.
+     */
+    d->cube_any = false;
+    for (i = 0; d->fs_run && i < p->ntex; i++) {
+        const R300UsTex *t = &p->tex[i];
+        unsigned k;
+
+        if (t->op == R300_US_TEXOP_NOP || t->op == R300_US_TEXOP_TEXKILL ||
+            t->unit >= R300_TEX_UNITS || !d->tex[t->unit].en ||
+            !d->tex[t->unit].cube) {
+            continue;
+        }
+        d->cube_any = true;
+        for (k = 0; k < p->ntc; k++) {
+            if (p->rs.tex_reg[k] == t->src) {
+                d->tc_raw |= 1u << k;
+            }
+        }
+    }
+    d->fs_fast = p->fast && !d->cube_any;
     s->us_draws++;
     if (p->valid && !p->expressible) {
         s->us_refused++;
@@ -3668,7 +3786,7 @@ static void r300_tex_filter_setup(ATIR350State *s, R300TexUnit *u,
     u->hl2 = r300_ilog2(u->h);
 
     u->filt = u->mag != R300_TX_FILTER_POINT ||
-              u->min != R300_TX_FILTER_POINT || u->last != 0;
+              u->min != R300_TX_FILTER_POINT || u->last != 0 || u->cube;
     u->need_lod = u->mag != u->min || u->last > u->first;
 
     switch (u->bpp) {
@@ -3727,14 +3845,44 @@ static void r300_tex_filter_setup(ATIR350State *s, R300TexUnit *u,
         u->lh[l] = h;
         u->loff[l] = a;
         u->lpitch[l] = l ? ROUND_UP(w, aw) * bytes : u->pitch;
-        a += ROUND_UP(w, aw) * bytes * ROUND_UP(h, ah);
+        u->fsz[l] = ROUND_UP(w, aw) * bytes * ROUND_UP(h, ah);
+        /* a cube map's six faces follow one another (R5xx guide 4.6) */
+        a += u->fsz[l] * (u->cube ? 6 : 1);
+    }
+    if (u->dxt) {
+        /*
+         * Rows of 4x4 blocks, each row padded to 32 bytes, levels packed
+         * one after another; the tile bits do not apply (Mesa
+         * r300_texture_desc.c: compressed strides, untiled).
+         */
+        a = u->off;
+        for (l = 0; l <= u->last; l++) {
+            uint32_t bw = (uint32_t)(u->lw[l] + 3) / 4;
+            uint32_t bh = (uint32_t)(u->lh[l] + 3) / 4;
+
+            u->loff[l] = a;
+            u->lpitch[l] = l ? ROUND_UP(bw * r300_dxt_block_bytes(u->dxt), 32)
+                             : u->pitch;
+            u->fsz[l] = u->lpitch[l] * bh;
+            a += u->fsz[l] * (u->cube ? 6 : 1);
+        }
     }
     /* one level is addressed, and cached, exactly as before */
     u->nlev = u->filt ? u->last + 1 : 1;
-    u->chain = u->nlev > 1 ? a - u->off : (uint32_t)u->h * u->pitch;
+    if (u->cube) {
+        u->chain = u->nlev > 1 ? a - u->off : u->fsz[0] * 6;
+    } else if (u->dxt) {
+        u->chain = u->nlev > 1 ? a - u->off
+                               : (uint32_t)(u->h + 3) / 4 * u->pitch;
+    } else {
+        u->chain = u->nlev > 1 ? a - u->off : (uint32_t)u->h * u->pitch;
+    }
     u->ltexels = 0;
     for (l = 0; l < u->nlev; l++) {
         u->ltexels += (size_t)u->lw[l] * u->lh[l];
+    }
+    if (u->cube) {
+        u->ltexels *= 6;
     }
 }
 
@@ -3775,6 +3923,7 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
      */
     u->code = txcode;
     u->yuv = 0;
+    u->dxt = 0;
     switch (txcode) {
     case R300_TX_FMT_8:
         u->bpp = 8;
@@ -3797,6 +3946,14 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
         break;
     case R300_TX_FMT_8_8_8_8:
         u->bpp = 32;
+        break;
+    case R300_TX_FMT_DXT1:
+    case R300_TX_FMT_DXT3:
+    case R300_TX_FMT_DXT5:
+        /* decoded to 32-bit XYZW texels; see r300_dxt_decode() */
+        u->bpp = 32;
+        u->dxt = txcode == R300_TX_FMT_DXT1 ? 1 :
+                 txcode == R300_TX_FMT_DXT3 ? 3 : 5;
         break;
     default:
         /* the rest are being read as if their components were bytes */
@@ -3824,14 +3981,50 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
         if (u->en && u->sel[ch] > R300_TX_SEL_ONE) {
             ati_r350_note_gap(s, R350_GAP_TEX_SWIZZLE, u->sel[ch]);
         }
+        /*
+         * R3xx does not permute compressed texels (Mesa r300_screen.c,
+         * texture_swizzle; DXTC_SWIZZLE_ENABLE is R400 and later): the
+         * block's own R, G, B, A come out whatever component the select
+         * names, and only the constants apply. Mac OS X selects DXT1 as
+         * (1, Z, Y, X) and DXT3/5 as (X, W, Z, Y); Mesa as (W, X, Y, Z).
+         */
+        if (u->dxt && u->sel[ch] < R300_TX_SEL_ZERO) {
+            u->sel[ch] = R300_TX_SEL_W - ch;
+        }
     }
     u->clamp_s = filt0 & 7;
     u->clamp_t = (filt0 >> 3) & 7;
+    /* TEX_COORD_TYPE: 0 2D, 1 3D, 2 cube */
+    switch ((txfmt1 >> R300_TX_FORMAT1_COORD_SHIFT) & 3) {
+    case 0:
+        u->cube = false;
+        break;
+    case 2:
+        u->cube = !u->yuv;
+        break;
+    default:
+        u->cube = false;
+        if (u->en) {
+            ati_r350_note_gap(s, R350_GAP_TEX_FORMAT,
+                              0x20 | ((txfmt1 >> R300_TX_FORMAT1_COORD_SHIFT) &
+                                      3));
+        }
+        break;
+    }
     /*
      * The pitch register only applies when TX_FORMAT0 says so;
      * otherwise rows are exactly the texture's width.
      */
-    if (txfmt0 & R300_TX_PITCH_EN) {
+    if (u->dxt) {
+        /* bytes per row of blocks; TXPITCH counts texels */
+        unsigned bs = r300_dxt_block_bytes(u->dxt);
+
+        if (txfmt0 & R300_TX_PITCH_EN) {
+            u->pitch = ((txfmt2 & 0x3fff) + 4) / 4 * bs;
+        } else {
+            u->pitch = ROUND_UP((uint32_t)(u->w + 3) / 4 * bs, 32);
+        }
+    } else if (txfmt0 & R300_TX_PITCH_EN) {
         u->pitch = ((txfmt2 & 0x3fff) + 1) * (u->bpp / 8);
     } else {
         u->pitch = (uint32_t)u->w * (u->bpp / 8);
@@ -4168,6 +4361,14 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->af_ref = (af & 0xff) / 255.0f;
     }
     d->lod_any = false;
+    {
+        static uint32_t tgen;
+
+        d->tgen = qatomic_fetch_inc(&tgen) + 1;
+        if (!d->tgen) {
+            d->tgen = qatomic_fetch_inc(&tgen) + 1;
+        }
+    }
     for (i = 0; i < R300_TEX_UNITS; i++) {
         r300_tex_setup(s, d, i);
         d->lod_any |= d->tex[i].en && d->tex[i].need_lod;
@@ -4588,7 +4789,9 @@ static bool r300_raster_prepare(ATIR350State *s, R300Raster *q,
         if (t->w <= 0 || t->h <= 0) {
             return false;
         }
-        len = (uint32_t)(t->h - 1) * t->pitch + (uint32_t)t->w * (t->bpp / 8);
+        len = t->dxt || t->cube ? t->chain
+                     : (uint32_t)(t->h - 1) * t->pitch +
+                       (uint32_t)t->w * (t->bpp / 8);
         if (ati_r350_mc_to_vram(s, t->off, &first) &&
             ati_r350_mc_to_vram(s, t->off + len - 1, &last) &&
             last == first + len - 1) {
@@ -6502,7 +6705,7 @@ static bool r300_gl_decode_tex32(ATIR350State *s, const R300DrawState *d,
     g_autofree uint32_t *row = NULL;
     int tx, ty;
 
-    if (u->bpp != 32 || u->w <= 0 || u->h <= 0) {
+    if (u->bpp != 32 || u->dxt || u->w <= 0 || u->h <= 0) {
         return false;
     }
     row = g_new(uint32_t, u->w);
@@ -6541,6 +6744,36 @@ static bool r300_gl_decode_tex32(ATIR350State *s, const R300DrawState *d,
     return true;
 }
 
+/* an S3TC level a block at a time, `lw` x `lh` texels into `p` */
+static void r300_gl_decode_dxt(ATIR350State *s, const R300DrawState *d,
+                               unsigned unit, uint32_t base, uint32_t pitch,
+                               int lw, int lh, uint8_t *p)
+{
+    const R300TexUnit *u = &d->tex[unit];
+    unsigned bs = r300_dxt_block_bytes(u->dxt);
+    int bx, by, x, y;
+
+    for (by = 0; by < lh; by += 4) {
+        for (bx = 0; bx < lw; bx += 4) {
+            uint32_t t[16];
+
+            r300_dxt_block(s, d, unit, base + (uint32_t)(by >> 2) * pitch +
+                                       (uint32_t)(bx >> 2) * bs, t);
+            for (y = 0; y < 4 && by + y < lh; y++) {
+                for (x = 0; x < 4 && bx + x < lw; x++) {
+                    uint32_t texel = t[y * 4 + x];
+                    uint8_t *q = p + ((size_t)(by + y) * lw + bx + x) * 4;
+
+                    q[0] = r300_texel_byte(u, texel, 1);
+                    q[1] = r300_texel_byte(u, texel, 2);
+                    q[2] = r300_texel_byte(u, texel, 3);
+                    q[3] = r300_texel_byte(u, texel, 0);
+                }
+            }
+        }
+    }
+}
+
 static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
                                unsigned unit, uint8_t *rgba)
 {
@@ -6549,11 +6782,39 @@ static void r300_gl_decode_tex(ATIR350State *s, const R300DrawState *d,
     unsigned l;
     int tx, ty;
 
+    if (u->dxt || u->cube) {
+        /* every level, a cube map's faces stacked within each */
+        unsigned f, nf = u->cube ? 6 : 1;
+
+        for (l = 0, p = rgba; l < u->nlev; l++) {
+            for (f = 0; f < nf; f++) {
+                if (u->dxt) {
+                    r300_gl_decode_dxt(s, d, unit, u->loff[l] + f * u->fsz[l],
+                                       u->lpitch[l], u->lw[l], u->lh[l], p);
+                    p += (size_t)u->lw[l] * u->lh[l] * 4;
+                    continue;
+                }
+                for (ty = 0; ty < u->lh[l]; ty++) {
+                    for (tx = 0; tx < u->lw[l]; tx++, p += 4) {
+                        uint32_t texel = r300_tex_lvl_texel(s, d, unit, l, f,
+                                                            tx, ty);
+
+                        p[0] = r300_texel_byte(u, texel, 1);
+                        p[1] = r300_texel_byte(u, texel, 2);
+                        p[2] = r300_texel_byte(u, texel, 3);
+                        p[3] = r300_texel_byte(u, texel, 0);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     /* the levels after the first, one after another behind it */
     for (l = 1; l < u->nlev; l++) {
         for (ty = 0; ty < u->lh[l]; ty++) {
             for (tx = 0; tx < u->lw[l]; tx++, p += 4) {
-                uint32_t texel = r300_tex_lvl_texel(s, d, unit, l, tx, ty);
+                uint32_t texel = r300_tex_lvl_texel(s, d, unit, l, 0, tx, ty);
 
                 p[0] = r300_texel_byte(u, texel, 1);
                 p[1] = r300_texel_byte(u, texel, 2);
@@ -6619,6 +6880,7 @@ static bool r300_gl_tex_same(const ATIR350State *s, unsigned k,
            s->gl_tex[k].sel[2] == u->sel[2] &&
            s->gl_tex[k].sel[3] == u->sel[3] &&
            s->gl_tex[k].nlev == u->nlev &&
+           s->gl_tex[k].cube == u->cube &&
            s->gl_tex[k].lay == u->loff[u->nlev - 1] - u->off;
 }
 
@@ -6711,6 +6973,7 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
         s->gl_tex[victim].sel[k] = u->sel[k];
     }
     s->gl_tex[victim].nlev = u->nlev;
+    s->gl_tex[victim].cube = u->cube;
     s->gl_tex[victim].lay = u->loff[u->nlev - 1] - u->off;
     s->gl_tex[victim].used = ++s->gl_tex_seq;
     s->gl_tex[victim].epoch = s->gl_epoch;
@@ -6942,8 +7205,25 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * more than that stays on the path whose expansion it was written
      * against.
      */
-    gen = !d->fs->gl_simple;
+    gen = !d->fs->gl_simple || d->cube_any;
     if (gen && (prim == 1 || prim == 8)) {
+        return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
+    }
+    if (gen && d->fs->gl_simple && s->us_glsl_gen_for != s->us_glsl_key) {
+        s->us_glsl_gen_for = s->us_glsl_key;
+        s->us_glsl_gen_key = 0;
+        if (r300_us_glsl_general(d->fs, s->us_glsl_gen,
+                                 sizeof(s->us_glsl_gen))) {
+            const char *c = s->us_glsl_gen;
+            uint64_t hh = 1469598103934665603ULL;
+
+            while (*c) {
+                hh = (hh ^ (uint8_t)*c++) * 1099511628211ULL;
+            }
+            s->us_glsl_gen_key = hh | 1;
+        }
+    }
+    if (gen && d->fs->gl_simple && !s->us_glsl_gen_key) {
         return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
     }
     /* the GL target has no depth or stencil buffer: the Z buffer is ours */
@@ -7160,6 +7440,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
         req.clamp_s[i] = d->tex[i].clamp_s;
         req.clamp_t[i] = d->tex[i].clamp_t;
         r300_gl_filt(&d->tex[i], &req, i);
+        req.cube[i] = d->tex[i].en && d->tex[i].cube;
         req.textured |= d->tex[i].en ? (1u << i) : 0;
     }
     req.wmask = d->wmask;
@@ -7182,6 +7463,10 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     req.us_glsl = s->us_glsl;
     req.us_key = s->us_glsl_key;
     req.us_konst = s->us_konst_flat;
+    if (gen && d->fs->gl_simple) {
+        req.us_glsl = s->us_glsl_gen;
+        req.us_key = s->us_glsl_gen_key;
+    }
     if (gen) {
         req.tcx = s->gl_tcx;
         req.tc_stride = tcs;
