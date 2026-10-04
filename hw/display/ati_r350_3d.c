@@ -7502,6 +7502,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     bool gpuz = s->zb.z_en && r300_gl_zok(s);
     bool zonly = !d->wmask;
     bool twoside = gpuz && s->zb.s_en && s->zb.s_fb && !s->zb.z16;
+    bool dkeep;
     unsigned cullw = (prim >= 4 && prim <= 7) || (prim >= 13 && prim <= 15)
                      ? s->regs[R300_RE_CULL_CNTL >> 2] & 7 : 8;
 
@@ -7546,11 +7547,10 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     }
     /*
      * DISCARD_SRC_PIXELS skips the colour write after the depth test and
-     * keeps the Z write; a GL discard drops both.
+     * keeps the Z write; a GL discard drops both, so the backend writes
+     * the destination back instead and the draw reads it like a blend.
      */
-    if (gpuz && !zonly && d->discard && r300_gl_zwrites(s)) {
-        return r300_gl_fallback(s, R350_GLF_ZDISCARD, prim, nvtx);
-    }
+    dkeep = gpuz && !zonly && d->discard && r300_gl_zwrites(s);
     /*
      * Assemble first: a primitive this path does not know is the
      * commonest fallback and the cheapest one to detect. `vb`/`nvtx`
@@ -7600,7 +7600,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if (!r300_gl_clip(d, &req.sx0, &req.sy0, &req.sx1, &req.sy1)) {
         return r300_gl_fallback(s, R350_GLF_CLIPRULE, prim, nvtx);
     }
-    if (!zonly && d->blend && d->blend_read && ntri > 1) {
+    if (!zonly && ((d->blend && d->blend_read) || dkeep) && ntri > 1) {
         npass = ntri > R300_GL_TRI_MAX
                 ? 0 : r300_gl_passes(s, gvb, idx, ntri);
         /*
@@ -7611,7 +7611,8 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
          * and only under gl=fast, because the hand-off is a measured
          * trade of accuracy for frame rate rather than a free win.
          */
-        if (s->gl_fast && npass != 1 && r300_gl_addblend(d)) {
+        if (s->gl_fast && npass != 1 && d->blend && d->blend_read &&
+            r300_gl_addblend(d)) {
             req.add_blend = 1;
             npass = 1;
             s->gl_addblend++;
@@ -7825,6 +7826,7 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     }
     if (gpuz) {
         r300_gl_zreq(s, &req.z);
+        req.dkeep = dkeep;
     }
 
     if (s->gl_mode == R350_GL_VERIFY) {

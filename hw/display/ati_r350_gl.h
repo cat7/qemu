@@ -272,6 +272,13 @@ typedef struct R350GlReq {
     R350GlZ z;
     int zonly;
     uint32_t *zout;
+    /*
+     * DISCARD_SRC_PIXELS on a draw that writes Z: the device skips only
+     * the colour write, after the depth and stencil test. A discarded
+     * fragment then writes the destination back unchanged instead of
+     * being killed, so the draw reads its destination as a blend does.
+     */
+    int dkeep;
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;

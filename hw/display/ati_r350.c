@@ -5413,7 +5413,6 @@ static const char *const ati_r350_gl_fb_names[R350_GLF_MAX] = {
     [R350_GLF_FSPROG]   = "fragment program refused",
     [R350_GLF_CBFMT]    = "16bpp or GART colour buffer",
     [R350_GLF_ZTEST]    = "depth or stencil test",
-    [R350_GLF_ZDISCARD] = "source discard writing Z",
 };
 
 const char *ati_r350_gl_fb_name(ATIR350GlFallback why)

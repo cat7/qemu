@@ -786,7 +786,7 @@ typedef struct R350GlProg {
     /* the general form's; -1 in a program of the simple form */
     GLint u_txsize, u_txclamp, u_txtf, u_txen;
     GLint u_tcbase, u_tcstride, u_tcinv, u_tcraw, u_lodany;
-    GLint u_zscale, u_zonly;
+    GLint u_zscale, u_zonly, u_dkeep;
 } R350GlProg;
 
 /*
@@ -1088,6 +1088,7 @@ static const char *fs_src =
 "flat in vec4 f_z;\n"
 "uniform float u_zscale;\n"
 "uniform int u_zonly;\n"
+"uniform int u_dkeep;\n"
 "uniform usampler2D u_tex;\n"
 "uniform usampler2D u_dst;\n"
 "uniform float u_n255[256];\n"
@@ -1666,6 +1667,14 @@ static const char *fs_src =
 "        else if (u_discard == 4) kill = a1;\n"
 "        else if (u_discard == 5) kill = z1;\n"
 "        else if (u_discard == 6) kill = a1 && z1;\n"
+"        if (kill && u_dkeep != 0) {\n"
+"#ifdef R350_ADD\n"
+"            o_col = vec4(0.25 / 255.0);\n"
+"#else\n"
+"            o_col = texelFetch(u_dst, ivec2(gl_FragCoord.xy), 0);\n"
+"#endif\n"
+"            return;\n"
+"        }\n"
 "        if (kill) discard;\n"
 "    }\n"
 "#ifdef R350_ADD\n"
@@ -1864,6 +1873,7 @@ static void gl_prog_locs(R350GlProg *p)
     p->u_lodany = glGetUniformLocation(p->prog, "u_lodany");
     p->u_zscale = glGetUniformLocation(p->prog, "u_zscale");
     p->u_zonly = glGetUniformLocation(p->prog, "u_zonly");
+    p->u_dkeep = glGetUniformLocation(p->prog, "u_dkeep");
 }
 
 /*
@@ -2366,7 +2376,7 @@ typedef struct R350GlUnit {
     int tcbase;
     R350GlGen ge;
     R350GlZ z;
-    int zonly;
+    int zonly, dkeep;
 } R350GlUnit;
 
 /* one unit's filter uniform: `filt`, then the border colour */
@@ -2617,6 +2627,7 @@ static void gl_emit(R350GlCtx *g, const R350GlUnit *u, const R350GlUnit *prev)
                 !!(u->wmask & 0x000000ff), !!(u->wmask & 0xff000000));
     glUniform1f(p->u_zscale, gl_zscale(&u->z));
     glUniform1i(p->u_zonly, u->zonly);
+    glUniform1i(p->u_dkeep, u->dkeep);
     gl_zstate(g, &u->z);
     glDrawArrays(GL_TRIANGLES, (GLint)u->first, (GLsizei)u->count);
 }
@@ -2740,7 +2751,7 @@ static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
         u->rx0 = u->sx0; u->ry0 = u->sy0;
         u->rx1 = u->sx1; u->ry1 = u->sy1;
     }
-    u->reads = r->blend && r->blend_read;
+    u->reads = (r->blend && r->blend_read) || r->dkeep;
     u->surf_w = r->surf_w;
     u->surf_h = r->surf_h;
     u->tex_slot = u->gen ? R350_GL_TEXSLOTS + 1 : slot;
@@ -2770,6 +2781,7 @@ static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
     }
     u->z = r->z;
     u->zonly = r->zonly;
+    u->dkeep = r->dkeep;
     u->wave = 0;
     if (u->rx1 > u->rx0 && u->ry1 > u->ry0) {
         for (k = 0; k < g->nq; k++) {
@@ -3006,7 +3018,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      * uploaded them from the host for every draw, which the bench
      * measures at 1.44 ms full screen against 0.074 ms for the copy.
      */
-    if (r->blend && r->blend_read && !r->add_blend) {
+    if (((r->blend && r->blend_read) || r->dkeep) && !r->add_blend) {
         glActiveTexture(GL_TEXTURE1);
         if (g->barrier) {
             /*
@@ -3095,6 +3107,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     glUniform4f(p->u_konst, r->k_r, r->k_g, r->k_b, r->k_a);
     glUniform1f(p->u_zscale, gl_zscale(&r->z));
     glUniform1i(p->u_zonly, r->zonly);
+    glUniform1i(p->u_dkeep, r->dkeep);
 
     /*
      * Scissor, the one cliprect it absorbed, AND the draw's rectangle.

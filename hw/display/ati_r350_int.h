@@ -151,7 +151,6 @@ typedef enum ATIR350GlFallback {
     R350_GLF_FSPROG,        /* fragment program the translator refused */
     R350_GLF_CBFMT,         /* 16bpp or GART colour buffer */
     R350_GLF_ZTEST,         /* depth or stencil test */
-    R350_GLF_ZDISCARD,      /* source discard on a draw that writes Z */
     R350_GLF_MAX
 } ATIR350GlFallback;
 
