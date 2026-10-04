@@ -12,7 +12,12 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
-#define TB_JMP_CACHE_BITS 12
+/*
+ * 4096 entries thrash under a Mac OS X guest, whose hot code covers 100k+
+ * TBs; most indirect branches, including every PowerPC blr, then miss and
+ * fall back to the hash table.  64K entries cost 1.5 MB per vCPU.
+ */
+#define TB_JMP_CACHE_BITS 16
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*
@@ -21,12 +26,17 @@
  * no need for qatomic_rcu_read() and pc is always consistent with a
  * non-NULL value of 'tb'.  Strictly speaking pc is only needed for
  * CF_PCREL, but it's used always for simplicity.
+ *
+ * An entry is live only while its gen equals the cache's gen: emptying
+ * the cache bumps gen instead of clearing every entry.
  */
 typedef struct CPUJumpCache {
     struct rcu_head rcu;
+    uint32_t gen;
     struct {
         TranslationBlock *tb;
         vaddr pc;
+        uint32_t gen;
     } array[TB_JMP_CACHE_SIZE];
 } CPUJumpCache;
 
