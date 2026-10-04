@@ -1022,6 +1022,7 @@
 #define R300_TX_FORMAT1_YUV_SHIFT     22
 #define R300_TX_FORMAT1_YUV_MASK      0x3
 #define R300_TX_FORMAT1_SWAP_YUV      (1u << 24)
+#define R300_TX_FORMAT1_COORD_SHIFT   25      /* TEX_COORD_TYPE */
 #define R300_TX_OFFSET_0              0x4540
 #define R300_TXO_ENDIAN_MASK          0x3     /* ENDIAN_SWAP [1:0] */
 #define R300_TXO_MACRO_TILE           (1u << 2)

@@ -435,6 +435,16 @@ static bool us_glsl_general(const R300UsProgram *p, UsBuf *b)
     return !b->full;
 }
 
+bool r300_us_glsl_general(const R300UsProgram *p, char *buf, size_t cap)
+{
+    UsBuf b = { .p = buf, .cap = cap };
+
+    if (!p->valid || !p->expressible) {
+        return false;
+    }
+    return us_glsl_general(p, &b);
+}
+
 bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap)
 {
     UsBuf b = { .p = buf, .cap = cap };
