@@ -237,12 +237,25 @@ typedef char GLchar;
 typedef ptrdiff_t GLsizeiptr;
 
 #define GL_FALSE                        0
+#define GL_ZERO                         0
 #define GL_TRUE                         1
 #define GL_NO_ERROR                     0
 #define GL_ONE                          1
+#define GL_NEVER                        0x0200
+#define GL_LESS                         0x0201
+#define GL_EQUAL                        0x0202
+#define GL_LEQUAL                       0x0203
+#define GL_GREATER                      0x0204
+#define GL_NOTEQUAL                     0x0205
+#define GL_GEQUAL                       0x0206
+#define GL_ALWAYS                       0x0207
+#define GL_FRONT                        0x0404
+#define GL_BACK                         0x0405
+#define GL_FRONT_AND_BACK               0x0408
 #define GL_TRIANGLES                    0x0004
 #define GL_CULL_FACE                    0x0B44
 #define GL_DEPTH_TEST                   0x0B71
+#define GL_STENCIL_TEST                 0x0B90
 #define GL_BLEND                        0x0BE2
 #define GL_SCISSOR_TEST                 0x0C11
 #define GL_UNPACK_ALIGNMENT             0x0CF5
@@ -251,6 +264,17 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_UNSIGNED_BYTE                0x1401
 #define GL_FLOAT                        0x1406
 #define GL_RGBA                         0x1908
+#define GL_INVERT                       0x150A
+#define GL_KEEP                         0x1E00
+#define GL_REPLACE                      0x1E01
+#define GL_INCR                         0x1E02
+#define GL_DECR                         0x1E03
+#define GL_INCR_WRAP                    0x8507
+#define GL_DECR_WRAP                    0x8508
+#define GL_DEPTH_STENCIL                0x84F9
+#define GL_DEPTH_STENCIL_ATTACHMENT     0x821A
+#define GL_DEPTH32F_STENCIL8            0x8CAD
+#define GL_FLOAT_32_UNSIGNED_INT_24_8_REV 0x8DAD
 #define GL_VERSION                      0x1F02
 #define GL_EXTENSIONS                   0x1F03
 #define GL_NEAREST                      0x2600
@@ -289,6 +313,8 @@ static void (APIENTRY *glColorMask)(GLboolean, GLboolean, GLboolean,
 static void (APIENTRY *glCopyTexSubImage2D)(GLenum, GLint, GLint, GLint,
                                             GLint, GLint, GLsizei, GLsizei);
 static void (APIENTRY *glDeleteTextures)(GLsizei, const GLuint *);
+static void (APIENTRY *glDepthFunc)(GLenum);
+static void (APIENTRY *glDepthMask)(GLboolean);
 static void (APIENTRY *glDisable)(GLenum);
 static void (APIENTRY *glDrawArrays)(GLenum, GLint, GLsizei);
 static void (APIENTRY *glEnable)(GLenum);
@@ -300,6 +326,7 @@ static void (APIENTRY *glPixelStorei)(GLenum, GLint);
 static void (APIENTRY *glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum,
                                      GLenum, void *);
 static void (APIENTRY *glScissor)(GLint, GLint, GLsizei, GLsizei);
+static void (APIENTRY *glStencilMask)(GLuint);
 static void (APIENTRY *glTexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei,
                                      GLint, GLenum, GLenum, const void *);
 static void (APIENTRY *glTexParameteri)(GLenum, GLenum, GLint);
@@ -317,6 +344,7 @@ static void (APIENTRY *glBlendEquation)(GLenum);
 static void (APIENTRY *glBufferData)(GLenum, GLsizeiptr, const void *,
                                      GLenum);
 static GLenum (APIENTRY *glCheckFramebufferStatus)(GLenum);
+static void (APIENTRY *glClearBufferfi)(GLenum, GLint, GLfloat, GLint);
 static void (APIENTRY *glCompileShader)(GLuint);
 static GLuint (APIENTRY *glCreateProgram)(void);
 static GLuint (APIENTRY *glCreateShader)(GLenum);
@@ -338,6 +366,8 @@ static GLint (APIENTRY *glGetUniformLocation)(GLuint, const GLchar *);
 static void (APIENTRY *glLinkProgram)(GLuint);
 static void (APIENTRY *glShaderSource)(GLuint, GLsizei,
                                        const GLchar *const *, const GLint *);
+static void (APIENTRY *glStencilFuncSeparate)(GLenum, GLenum, GLint, GLuint);
+static void (APIENTRY *glStencilOpSeparate)(GLenum, GLenum, GLenum, GLenum);
 static void (APIENTRY *glUniform1f)(GLint, GLfloat);
 static void (APIENTRY *glUniform1fv)(GLint, GLsizei, const GLfloat *);
 static void (APIENTRY *glUniform1i)(GLint, GLint);
@@ -372,6 +402,8 @@ static const struct {
     R350_GL_PROC(glColorMask),
     R350_GL_PROC(glCopyTexSubImage2D),
     R350_GL_PROC(glDeleteTextures),
+    R350_GL_PROC(glDepthFunc),
+    R350_GL_PROC(glDepthMask),
     R350_GL_PROC(glDisable),
     R350_GL_PROC(glDrawArrays),
     R350_GL_PROC(glEnable),
@@ -382,6 +414,7 @@ static const struct {
     R350_GL_PROC(glPixelStorei),
     R350_GL_PROC(glReadPixels),
     R350_GL_PROC(glScissor),
+    R350_GL_PROC(glStencilMask),
     R350_GL_PROC(glTexImage2D),
     R350_GL_PROC(glTexParameteri),
     R350_GL_PROC(glTexSubImage2D),
@@ -394,6 +427,7 @@ static const struct {
     R350_GL_PROC(glBlendEquation),
     R350_GL_PROC(glBufferData),
     R350_GL_PROC(glCheckFramebufferStatus),
+    R350_GL_PROC(glClearBufferfi),
     R350_GL_PROC(glCompileShader),
     R350_GL_PROC(glCreateProgram),
     R350_GL_PROC(glCreateShader),
@@ -413,6 +447,8 @@ static const struct {
     R350_GL_PROC(glGetUniformLocation),
     R350_GL_PROC(glLinkProgram),
     R350_GL_PROC(glShaderSource),
+    R350_GL_PROC(glStencilFuncSeparate),
+    R350_GL_PROC(glStencilOpSeparate),
     R350_GL_PROC(glUniform1f),
     R350_GL_PROC(glUniform1fv),
     R350_GL_PROC(glUniform1i),
@@ -750,6 +786,7 @@ typedef struct R350GlProg {
     /* the general form's; -1 in a program of the simple form */
     GLint u_txsize, u_txclamp, u_txtf, u_txen;
     GLint u_tcbase, u_tcstride, u_tcinv, u_tcraw, u_lodany;
+    GLint u_zscale, u_zonly;
 } R350GlProg;
 
 /*
@@ -792,6 +829,16 @@ struct R350GlCtx {
     GLuint vao, vbo, fbo, cbuf, dst;
     /* the normalized colour buffer GL's own blender can write into */
     GLuint acc;
+    /*
+     * The depth/stencil buffer, GL_DEPTH32F_STENCIL8 beside the colour
+     * buffer. A Z value z is stored as z * 2^-24, which the float format
+     * holds exactly, so GL's compare is the device's integer compare.
+     * `zcur` is the test state last applied, valid while `zset`.
+     */
+    GLuint zbuf;
+    bool has_z;
+    R350GlZ zcur;
+    bool zset;
     /* uploaded textures by caller slot, plus the scratch at the end */
     GLuint tex[R350_GL_TEXSLOTS + 1];
     int tex_w[R350_GL_TEXSLOTS + 1], tex_h[R350_GL_TEXSLOTS + 1];
@@ -890,12 +937,70 @@ static void gl_before_read(R350GlCtx *g, int x0, int y0, int x1, int y1)
     }
 }
 
+/*
+ * The depth and stencil test state of a draw, applied only when it
+ * changes. ZB_ZSTENCILCNTL's codes are GL's order with LEQUAL and EQUAL
+ * swapped, and its stencil operations are GL's in the usual order.
+ */
+static const GLenum gl_zfunc[8] = {
+    GL_NEVER, GL_LESS, GL_LEQUAL, GL_EQUAL,
+    GL_GEQUAL, GL_GREATER, GL_NOTEQUAL, GL_ALWAYS,
+};
+
+static const GLenum gl_sop[8] = {
+    GL_KEEP, GL_ZERO, GL_REPLACE, GL_INCR,
+    GL_DECR, GL_INVERT, GL_INCR_WRAP, GL_DECR_WRAP,
+};
+
+static void gl_zstate(R350GlCtx *g, const R350GlZ *z)
+{
+    static const R350GlZ none;
+    unsigned f;
+
+    if (!z || !z->mode) {
+        z = &none;
+    }
+    if (g->zset && !memcmp(&g->zcur, z, sizeof(*z))) {
+        return;
+    }
+    g->zcur = *z;
+    g->zset = true;
+    if (z->mode && z->test) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(gl_zfunc[z->func & 7]);
+        glDepthMask(z->write ? GL_TRUE : GL_FALSE);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+    }
+    if (z->mode == 1 && z->stencil) {
+        glEnable(GL_STENCIL_TEST);
+        for (f = 0; f < 2; f++) {
+            GLenum face = f ? GL_BACK : GL_FRONT;
+
+            glStencilFuncSeparate(face, gl_zfunc[z->sfunc[f] & 7],
+                                  z->sref & 0xff, z->smask & 0xff);
+            glStencilOpSeparate(face, gl_sop[z->sfail[f] & 7],
+                                gl_sop[z->szfail[f] & 7],
+                                gl_sop[z->szpass[f] & 7]);
+        }
+        glStencilMask(z->swmask & 0xff);
+    } else {
+        glDisable(GL_STENCIL_TEST);
+    }
+}
+
+static inline float gl_zscale(const R350GlZ *z)
+{
+    return z->mode == 2 ? 65535.0f : 16777215.0f;
+}
+
 static const char *vs_src =
 "#version 330 core\n"
 "#extension GL_ARB_gpu_shader5 : require\n"
 "layout(location = 0) in vec2 a_pos;\n"
 "layout(location = 1) in vec4 a_col;\n"
-"layout(location = 2) in vec2 a_st;\n"
+"layout(location = 2) in vec4 a_z;\n"
 "layout(location = 3) in vec2 a_p0;\n"
 "layout(location = 4) in vec2 a_p1;\n"
 "layout(location = 5) in vec2 a_p2;\n"
@@ -923,6 +1028,7 @@ static const char *vs_src =
 "flat out vec4 f_s0;\n"
 "flat out vec4 f_s1;\n"
 "flat out vec4 f_s2;\n"
+"flat out vec4 f_z;\n"
 "void main()\n"
 "{\n"
 "    float nx = (a_pos.x - u_rect.x) / u_rect.z * 2.0 - 1.0;\n"
@@ -939,6 +1045,7 @@ static const char *vs_src =
 "    f_t0 = a_t0; f_t1 = a_t1; f_t2 = a_t2;\n"
 "    f_inv = a_inv;\n"
 "    f_s0 = a_s0; f_s1 = a_s1; f_s2 = a_s2;\n"
+"    f_z = a_z;\n"
 "}\n";
 
 /*
@@ -953,6 +1060,7 @@ static const char *fs_head_main =
 "#version 330 core\n"
 "#extension GL_ARB_gpu_shader5 : require\n"
 "uniform vec4 USK[32];\n"
+"#define R350_OZERO uvec4(0u)\n"
 "out uvec4 o_col;\n";
 
 static const char *fs_head_add =
@@ -960,6 +1068,7 @@ static const char *fs_head_add =
 "#extension GL_ARB_gpu_shader5 : require\n"
 "#define R350_ADD 1\n"
 "uniform vec4 USK[32];\n"
+"#define R350_OZERO vec4(0.0)\n"
 "out vec4 o_col;\n";
 
 static const char *fs_src =
@@ -976,6 +1085,9 @@ static const char *fs_src =
 "flat in vec4 f_s0;\n"
 "flat in vec4 f_s1;\n"
 "flat in vec4 f_s2;\n"
+"flat in vec4 f_z;\n"
+"uniform float u_zscale;\n"
+"uniform int u_zonly;\n"
 "uniform usampler2D u_tex;\n"
 "uniform usampler2D u_dst;\n"
 "uniform float u_n255[256];\n"
@@ -1372,6 +1484,24 @@ static const char *fs_src =
 "    precise float w1 = d1 * inv;\n"
 "    precise float w2 = 1.0 - w0 - w1;\n"
 /*
+ * Z, screen-linear, with r300_raster_tri()'s weights and the fusion the
+ * C compiler gives its three-term sum; then r300_zb_pixel()'s clamp,
+ * scale and truncation. The integer goes out as z * 2^-24, exact.
+ */
+"    {\n"
+"        precise float zp = w1 * f_z.y;\n"
+"        precise float zf = fma(w2, f_z.z, fma(w0, f_z.x, zp));\n"
+"        float zc = zf > 0.0 ? zf : 0.0;\n"
+"        zc = zc < 1.0 ? zc : 1.0;\n"
+"        precise float zs = zc * u_zscale;\n"
+"        gl_FragDepth = float(uint(zs)) * 5.9604644775390625e-8;\n"
+"    }\n"
+/* a depth-only pass shades nothing and kills nothing */
+"    if (u_zonly != 0) {\n"
+"        o_col = R350_OZERO;\n"
+"        return;\n"
+"    }\n"
+/*
  * Perspective-correct weights when the corners' 1/w differ, as
  * r300_raster_tri() computes them.
  */
@@ -1732,6 +1862,8 @@ static void gl_prog_locs(R350GlProg *p)
     p->u_tcinv = glGetUniformLocation(p->prog, "u_tcinv");
     p->u_tcraw = glGetUniformLocation(p->prog, "u_tcraw");
     p->u_lodany = glGetUniformLocation(p->prog, "u_lodany");
+    p->u_zscale = glGetUniformLocation(p->prog, "u_zscale");
+    p->u_zonly = glGetUniformLocation(p->prog, "u_zonly");
 }
 
 /*
@@ -1825,6 +1957,8 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     glGenTextures(1, &g->white);
     glGenTextures(1, &g->dst);
     glGenTextures(1, &g->acc);
+    glGenTextures(1, &g->zbuf);
+    g->has_z = true;
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     {
@@ -1855,7 +1989,7 @@ R350GlCtx *ati_r350_gl_open(const char **err)
          */
         const int C = R350_GL_TEXCOORDS;
         const struct { GLint loc, n, off; } at[] = {
-            { 0, 2, 0 }, { 1, 4, 2 }, { 2, 2 * C, 6 },
+            { 0, 2, 0 }, { 1, 4, 2 }, { 2, 4, 41 + 8 * C },
             { 3, 2, 6 + 2 * C }, { 4, 2, 8 + 2 * C }, { 5, 2, 10 + 2 * C },
             { 6, 4, 12 + 2 * C }, { 7, 4, 16 + 2 * C }, { 8, 4, 20 + 2 * C },
             { 9, 2 * C, 24 + 2 * C }, { 10, 2 * C, 24 + 4 * C },
@@ -1915,6 +2049,7 @@ void ati_r350_gl_close(R350GlCtx *g)
         gl_flush_queue(g);
         glDeleteTextures(1, &g->dst);
         glDeleteTextures(1, &g->acc);
+        glDeleteTextures(1, &g->zbuf);
         glDeleteTextures(R350_GL_TEXSLOTS + 1, g->tex);
         glDeleteTextures(1, &g->white);
         glDeleteTextures(1, &g->cbuf);
@@ -2062,6 +2197,29 @@ bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)
     g->att = 0;
     gl_attach(g, g->cbuf);
     gl_wrote(g, 0, 0, w, h);
+    if (glGetError() == GL_NO_ERROR && g->has_z) {
+        /*
+         * The depth buffer, the same size. A host that cannot give one
+         * keeps the colour target and refuses depth-tested draws.
+         */
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g->zbuf);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH32F_STENCIL8, w, h, 0,
+                     GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV,
+                     NULL);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                               GL_TEXTURE_2D, g->zbuf, 0);
+        if (glGetError() != GL_NO_ERROR ||
+            glCheckFramebufferStatus(GL_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                                   GL_TEXTURE_2D, 0, 0);
+            g->has_z = false;
+        }
+        g->zset = false;
+    }
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
         glGetError() != GL_NO_ERROR) {
         g->fb_w = g->fb_h = 0;
@@ -2207,6 +2365,8 @@ typedef struct R350GlUnit {
     bool gen;
     int tcbase;
     R350GlGen ge;
+    R350GlZ z;
+    int zonly;
 } R350GlUnit;
 
 /* one unit's filter uniform: `filt`, then the border colour */
@@ -2455,6 +2615,9 @@ static void gl_emit(R350GlCtx *g, const R350GlUnit *u, const R350GlUnit *prev)
               MAX(u->sy1 - u->sy0, 0));
     glColorMask(!!(u->wmask & 0x00ff0000), !!(u->wmask & 0x0000ff00),
                 !!(u->wmask & 0x000000ff), !!(u->wmask & 0xff000000));
+    glUniform1f(p->u_zscale, gl_zscale(&u->z));
+    glUniform1i(p->u_zonly, u->zonly);
+    gl_zstate(g, &u->z);
     glDrawArrays(GL_TRIANGLES, (GLint)u->first, (GLsizei)u->count);
 }
 
@@ -2504,6 +2667,7 @@ static void gl_flush_queue(R350GlCtx *g)
     }
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_SCISSOR_TEST);
+    gl_zstate(g, NULL);
     glActiveTexture(GL_TEXTURE0);
     g->q_flushes++;
     g->q_waves += maxw + 1;
@@ -2604,6 +2768,8 @@ static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
     if (u->usk) {
         memcpy(u->usk_v, r->us_konst, sizeof(u->usk_v));
     }
+    u->z = r->z;
+    u->zonly = r->zonly;
     u->wave = 0;
     if (u->rx1 > u->rx0 && u->ry1 > u->ry0) {
         for (k = 0; k < g->nq; k++) {
@@ -2677,6 +2843,113 @@ static bool gl_enqueue(R350GlCtx *g, const R350GlReq *r)
     return glGetError() == GL_NO_ERROR;
 }
 
+/*
+ * Depth words to and from the depth buffer. A Z value z travels as the
+ * float z * 2^-24 and the stencil in the low byte of the second word,
+ * which is GL_FLOAT_32_UNSIGNED_INT_24_8_REV; both conversions are exact.
+ */
+#define R350_GL_ZUNIT (1.0f / 16777216.0f)
+
+static void gl_zread(R350GlCtx *g, int x0, int y0, int w, int h,
+                     uint32_t *z, int mode)
+{
+    size_t n = (size_t)w * h, i;
+    uint32_t *st = (uint32_t *)gl_stage(g, n * 8);
+
+    glReadPixels(x0, y0, w, h, GL_DEPTH_STENCIL,
+                 GL_FLOAT_32_UNSIGNED_INT_24_8_REV, st);
+    for (i = 0; i < n; i++) {
+        float f;
+        uint32_t zi;
+
+        memcpy(&f, &st[2 * i], sizeof(f));
+        zi = (uint32_t)(f * 16777216.0f);
+        z[i] = mode == 2 ? zi & 0xffff : (zi << 8) | (st[2 * i + 1] & 0xff);
+    }
+}
+
+bool ati_r350_gl_depth(R350GlCtx *g)
+{
+    return g && g->has_z;
+}
+
+static bool gl_zrect_ok(R350GlCtx *g, int x0, int y0, int w, int h)
+{
+    return g && g->has_z && w > 0 && h > 0 && x0 >= 0 && y0 >= 0 &&
+           x0 + w <= g->fb_w && y0 + h <= g->fb_h;
+}
+
+bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
+                       const uint32_t *z, int mode)
+{
+    size_t n = (size_t)w * h, i;
+    uint32_t *st;
+    bool ok;
+
+    if (!gl_zrect_ok(g, x0, y0, w, h)) {
+        return false;
+    }
+    st = (uint32_t *)gl_stage(g, n * 8);
+    for (i = 0; i < n; i++) {
+        uint32_t zi = mode == 2 ? z[i] & 0xffff : z[i] >> 8;
+        float f = (float)zi * R350_GL_ZUNIT;
+
+        memcpy(&st[2 * i], &f, sizeof(f));
+        st[2 * i + 1] = mode == 2 ? 0 : z[i] & 0xff;
+    }
+    r350_gl_makecurrent(&g->plat);
+    /* a queued draw may test against what is about to be replaced */
+    gl_flush_queue(g);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g->zbuf);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, w, h, GL_DEPTH_STENCIL,
+                    GL_FLOAT_32_UNSIGNED_INT_24_8_REV, st);
+    ok = glGetError() == GL_NO_ERROR;
+    r350_gl_done(&g->plat);
+    return ok;
+}
+
+bool ati_r350_gl_zfetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t *z, int mode)
+{
+    bool ok;
+
+    if (!gl_zrect_ok(g, x0, y0, w, h)) {
+        return false;
+    }
+    r350_gl_makecurrent(&g->plat);
+    gl_flush_queue(g);
+    gl_zread(g, x0, y0, w, h, z, mode);
+    ok = glGetError() == GL_NO_ERROR;
+    r350_gl_done(&g->plat);
+    return ok;
+}
+
+bool ati_r350_gl_zclear(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t z, int mode)
+{
+    uint32_t zi = mode == 2 ? z & 0xffff : z >> 8;
+    bool ok;
+
+    if (!gl_zrect_ok(g, x0, y0, w, h)) {
+        return false;
+    }
+    r350_gl_makecurrent(&g->plat);
+    gl_flush_queue(g);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x0, y0, w, h);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0xff);
+    g->zset = false;
+    glClearBufferfi(GL_DEPTH_STENCIL, 0,
+                    (float)zi * R350_GL_ZUNIT,
+                    mode == 2 ? 0 : (GLint)(z & 0xff));
+    glDisable(GL_SCISSOR_TEST);
+    ok = glGetError() == GL_NO_ERROR;
+    r350_gl_done(&g->plat);
+    return ok;
+}
+
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 {
     const R350GlProg *p;
@@ -2684,7 +2957,8 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     bool ok;
 
     if (!g || r->w <= 0 || r->h <= 0 || !r->nvert ||
-        r->surf_w > g->fb_w || r->surf_h > g->fb_h) {
+        r->surf_w > g->fb_w || r->surf_h > g->fb_h ||
+        (r->z.mode && !g->has_z)) {
         return false;
     }
     /*
@@ -2819,6 +3093,8 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     glUniform3i(p->u_cfac, r->src_factor, r->dst_factor, r->comb_fcn);
     glUniform3i(p->u_afac, r->a_src_factor, r->a_dst_factor, r->a_comb_fcn);
     glUniform4f(p->u_konst, r->k_r, r->k_g, r->k_b, r->k_a);
+    glUniform1f(p->u_zscale, gl_zscale(&r->z));
+    glUniform1i(p->u_zonly, r->zonly);
 
     /*
      * Scissor, the one cliprect it absorbed, AND the draw's rectangle.
@@ -2860,6 +3136,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
          * chain, one integer step per primitive.
          */
         gl_attach(g, g->acc);
+        gl_zstate(g, NULL);
         glUseProgram(g->ui2n);
         glBindVertexArray(g->vao_blit);
         glActiveTexture(GL_TEXTURE2);
@@ -2874,7 +3151,9 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
         glEnable(GL_BLEND);
         glBlendEquation(GL_FUNC_ADD);
         glBlendFunc(GL_ONE, GL_ONE);
+        gl_zstate(g, &r->z);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
+        gl_zstate(g, NULL);
         glDisable(GL_BLEND);
 
         gl_attach(g, g->cbuf);
@@ -2893,6 +3172,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
     } else if (r->npass > 1) {
         unsigned k;
 
+        gl_zstate(g, &r->z);
         for (k = 0; k < r->npass; k++) {
             if (k && g->barrier) {
                 gl_barrier(g);
@@ -2907,12 +3187,17 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
                          (GLsizei)(r->pass[k + 1] - r->pass[k]));
         }
     } else {
+        gl_zstate(g, &r->z);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
     }
+    gl_zstate(g, NULL);
     if (r->out) {
         /* gl=verify only; the resident target keeps the pixels otherwise */
         glReadPixels(r->x0, r->y0, r->w, r->h, GL_RGBA_INTEGER,
                      GL_UNSIGNED_BYTE, r->out);
+    }
+    if (r->zout && r->z.mode) {
+        gl_zread(g, r->x0, r->y0, r->w, r->h, r->zout, r->z.mode);
     }
 
     gl_wrote(g, r->x0, r->y0, r->x0 + r->w, r->y0 + r->h);
@@ -2955,6 +3240,29 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
 }
 
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req)
+{
+    return false;
+}
+
+bool ati_r350_gl_depth(R350GlCtx *g)
+{
+    return false;
+}
+
+bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
+                       const uint32_t *z, int mode)
+{
+    return false;
+}
+
+bool ati_r350_gl_zfetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t *z, int mode)
+{
+    return false;
+}
+
+bool ati_r350_gl_zclear(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t z, int mode)
 {
     return false;
 }

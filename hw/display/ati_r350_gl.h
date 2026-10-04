@@ -72,13 +72,15 @@
  *   (25+8C)..(36+8C)  triangle vertex 0/1/2 SECOND colours
  *   (37+8C)           1.0f / signed area again
  *   (38+8C)..(40+8C)  triangle vertex 0/1/2 1/w
+ *   (41+8C)..(43+8C)  triangle vertex 0/1/2 Z, screen-linear
+ *   (44+8C)           unused
  *
  * The second colour is the one a fragment program can add to the
  * modulated texel -- Chess.app's specular term -- and it is carried at
  * the corners like the first so the fragment stage interpolates it with
  * the same weights.
  */
-#define R350_GL_VSTRIDE (41 + 8 * R350_GL_TEXCOORDS)
+#define R350_GL_VSTRIDE (45 + 8 * R350_GL_TEXCOORDS)
 
 /*
  * How many uploaded textures the backend keeps, plus one: slot
@@ -98,6 +100,20 @@
 
 /* rectangles the texture-barrier bookkeeping keeps apart */
 #define R350_GL_WRITTEN 32
+
+/*
+ * The depth and stencil test of one draw, as r300_zb_pixel() defines it.
+ * `mode` 0 leaves both tests off; 1 is 24-bit Z above 8 stencil bits, 2
+ * is 16-bit Z without stencil. Compare functions and stencil operations
+ * are the ZB_ZSTENCILCNTL codes; index 0 is the front face, 1 the back.
+ */
+typedef struct R350GlZ {
+    int mode;
+    int test, func, write;
+    int stencil;
+    int sfunc[2], sfail[2], szfail[2], szpass[2];
+    int sref, smask, swmask;
+} R350GlZ;
 
 typedef struct R350GlReq {
     /*
@@ -246,6 +262,16 @@ typedef struct R350GlReq {
     float tcinv[R350_GL_TCSETS][2];
     uint32_t tc_raw;
     int lod_any;
+
+    /*
+     * The depth and stencil test, against the resident depth buffer.
+     * `zonly` is a pass with every colour channel masked: it runs no
+     * fragment program and no alpha test, as r300_raster_tri() does not.
+     * `zout`, for gl=verify, receives the drawn rectangle's Z words.
+     */
+    R350GlZ z;
+    int zonly;
+    uint32_t *zout;
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;
@@ -279,6 +305,21 @@ bool ati_r350_gl_seed(R350GlCtx *g, int x0, int y0, int w, int h,
                       const uint8_t *base, unsigned pitch, unsigned xr);
 bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
                        uint8_t *base, unsigned pitch, unsigned xr);
+
+/*
+ * The resident DEPTH buffer, the size of the colour target, attached
+ * beside it. A word is a pixel's Z as r300_zb_pixel() reads it: (z24 <<
+ * 8) | stencil for `mode` 1, the 16-bit Z for `mode` 2. The caller does
+ * the tiling and the swapper. depth() is false when the host gave no
+ * depth buffer; the others then refuse.
+ */
+bool ati_r350_gl_depth(R350GlCtx *g);
+bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
+                       const uint32_t *z, int mode);
+bool ati_r350_gl_zfetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t *z, int mode);
+bool ati_r350_gl_zclear(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t z, int mode);
 
 /*
  * Render one request into the resident target. Returns false if the
