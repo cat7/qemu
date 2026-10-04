@@ -113,6 +113,7 @@ typedef enum ATIR350GapKind {
     R350_GAP_ZB_FORMAT,      /* ZB_FORMAT depth format not modelled */
     R350_GAP_CB_FORMAT,      /* COLORFORMAT the rasteriser cannot store */
     R350_GAP_VS_ADDR_MODE,   /* PVS operand addressing mode not modelled */
+    R350_GAP_UCP,            /* VAP_CLIP_CNTL user clip planes enabled */
     R350_GAP_MAX
 } ATIR350GapKind;
 
@@ -712,6 +713,8 @@ struct ATIR350State {
      * flush count that went down.
      */
     uint64_t gl_nowork;
+    /* view-volume clipping: draws cut, triangles cut, primitives dropped */
+    uint64_t clip_draws, clip_tris, clip_drop;
     /* gl=verify: the per-pixel agreement between the two paths */
     uint64_t gl_v_px, gl_v_hist[4];     /* delta 0, 1, 2-4, above 4 */
     uint64_t gl_v_draws, gl_v_bad;      /* draws compared / with delta > 1 */

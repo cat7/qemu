@@ -975,6 +975,22 @@
 #define R300_VTE_VTX_Z_FMT            0x00000200
 #define R300_VTE_VTX_W0_FMT           0x00000400
 #define R300_VAP_VTX_SIZE             0x20b4
+/*
+ * View-volume clipping (R3xx 3D register reference, VAP_CNTL, VAP_CLIP_CNTL
+ * and VAP_GB_*). DX_CLIP_SPACE_DEF picks 0 < z < w over -w < z < w. The
+ * guard band registers are clip-space distances in units of w, 1.0 meaning
+ * no guard band: x and y are clipped at +-CLIP_ADJ * w, and a primitive
+ * wholly beyond +-DISC_ADJ * w is discarded.
+ */
+#define R300_VAP_CNTL                 0x2080
+#define R300_VAP_DX_CLIP_SPACE_DEF    0x00400000
+#define R300_VAP_CLIP_CNTL            0x221c
+#define R300_VAP_UCP_ENA_MASK         0x0000003f
+#define R300_VAP_CLIP_DISABLE         0x00010000
+#define R300_VAP_GB_VERT_CLIP_ADJ     0x2220
+#define R300_VAP_GB_VERT_DISC_ADJ     0x2224
+#define R300_VAP_GB_HORZ_CLIP_ADJ     0x2228
+#define R300_VAP_GB_HORZ_DISC_ADJ     0x222c
 #define R300_TX_ENABLE                0x4104
 #define R300_TX_FORMAT0_0             0x4480
 #define R300_TX_FORMAT1_0             0x44c0
