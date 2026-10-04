@@ -114,10 +114,14 @@ typedef enum ATIR350GapKind {
     R350_GAP_CB_FORMAT,      /* COLORFORMAT the rasteriser cannot store */
     R350_GAP_VS_ADDR_MODE,   /* PVS operand addressing mode not modelled */
     R350_GAP_UCP,            /* VAP_CLIP_CNTL user clip planes enabled */
+    R350_GAP_ZPASS,          /* occlusion counter use not modelled */
     R350_GAP_MAX
 } ATIR350GapKind;
 
 #define R350_GAP_SLOTS 256
+
+/* dumps of the occlusion counter waiting for the GPU's count */
+#define R350_ZQ_PEND 16
 
 /*
  * How the "gl" property is set: whether the host-GPU backend renders a
@@ -152,6 +156,7 @@ typedef enum ATIR350GlFallback {
     R350_GLF_FSPROG,        /* fragment program the translator refused */
     R350_GLF_CBFMT,         /* 16bpp or GART colour buffer */
     R350_GLF_ZTEST,         /* depth or stencil test */
+    R350_GLF_ZPASS,         /* counted by an occlusion query, gl-zpass=off */
     R350_GLF_MAX
 } ATIR350GlFallback;
 
@@ -825,6 +830,31 @@ struct ATIR350State {
     /* gl=verify over the depth buffer, classed as the colour is */
     uint64_t gl_vz_draws, gl_vz_px, gl_vz_diff, gl_vz_cover_px, gl_vz_cover;
     /*
+     * The occlusion counter (ZB_ZPASS_DATA, ZB_ZPASS_ADDR); the rules
+     * are at "ZPASS COUNTER" in ati_r350_3d.c. Engine state, except
+     * zq_draw, which the raster threads add to.
+     */
+    bool gl_zpass;              /* "gl-zpass": count queried draws on the GPU */
+    bool zq_on;                 /* reset since the last dump: counting */
+    bool zq_late;               /* drawn uncounted since the last dump */
+    bool zq_gl;                 /* GL counted a draw since the reset */
+    uint32_t zq_base;           /* the value ZB_ZPASS_DATA was given */
+    uint64_t zq_sw;             /* software samples since the reset */
+    uint64_t zq_draw;           /* the current draw's software samples */
+    uint64_t zq_t0;             /* backend ticket at the reset */
+    bool zq_cv;                 /* zq_cp is the backend's sum at zq_ct */
+    uint64_t zq_ct, zq_cp;
+    struct {
+        uint32_t addr, part;    /* where, and base + software samples */
+        unsigned swap;          /* ZB_DEPTHPITCH DEPTHENDIAN */
+        uint64_t t0, t;         /* backend tickets: reset, dump */
+    } zq_pend[R350_ZQ_PEND];
+    unsigned zq_npend;
+    uint64_t zq_resets, zq_dumps, zq_deferred, zq_gldraws, zq_swdraws;
+    uint64_t zq_offdraws, zq_reads;
+    /* gl=verify: each draw counted both ways */
+    uint64_t zq_v_draws, zq_v_bad, zq_v_sw, zq_v_gl;
+    /*
      * Decoded textures, keyed on everything the decode depends on.
      *
      * An entry is valid while the VRAM range it was decoded from is
@@ -1114,6 +1144,18 @@ void ati_r350_gl_wrote(ATIR350State *s, uint32_t off, uint32_t len);
 const char *ati_r350_gl_rel_name(ATIR350GlRel why);
 /* the 2D sub-tally's row label -- see ATIR350Gl2dPath */
 const char *ati_r350_gl_2d_path_name(ATIR350Gl2dPath path);
+
+/*
+ * The occlusion counter; see "ZPASS COUNTER" in ati_r350_3d.c. Called
+ * by the thread that has the engine: the ZB_ZPASS_DATA and ZB_ZPASS_ADDR
+ * writes, a ZB_ZPASS_DATA read, the guest-visible points where pending
+ * dumps must have landed (settle), and reset.
+ */
+void ati_r350_zpass_reset(ATIR350State *s, uint32_t val);
+void ati_r350_zpass_dump(ATIR350State *s, uint32_t addr);
+uint32_t ati_r350_zpass_read(ATIR350State *s);
+void ati_r350_zpass_settle(ATIR350State *s);
+void ati_r350_zpass_drop(ATIR350State *s);
 
 /*
  * The display refresh has just snapshotted and CLEARED the VGA dirty

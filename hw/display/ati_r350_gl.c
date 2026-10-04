@@ -304,6 +304,9 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_NUM_EXTENSIONS               0x821D
 #define GL_RGBA32F                      0x8814
 #define GL_TEXTURE_BUFFER               0x8C2A
+#define GL_SAMPLES_PASSED               0x8914
+#define GL_QUERY_RESULT                 0x8866
+#define GL_QUERY_RESULT_AVAILABLE       0x8867
 #define GL_MAX_TEXTURE_BUFFER_SIZE      0x8C2B
 
 /* GL 1.1: opengl32.dll's own exports */
@@ -389,6 +392,11 @@ static void (APIENTRY *glUseProgram)(GLuint);
 static void (APIENTRY *glVertexAttribPointer)(GLuint, GLint, GLenum,
                                               GLboolean, GLsizei,
                                               const void *);
+static void (APIENTRY *glGenQueries)(GLsizei, GLuint *);
+static void (APIENTRY *glDeleteQueries)(GLsizei, const GLuint *);
+static void (APIENTRY *glBeginQuery)(GLenum, GLuint);
+static void (APIENTRY *glEndQuery)(GLenum);
+static void (APIENTRY *glGetQueryObjectuiv)(GLuint, GLenum, GLuint *);
 
 typedef void (APIENTRY *R350GlProc)(void);
 
@@ -464,6 +472,11 @@ static const struct {
     R350_GL_PROC(glTexBuffer),
     R350_GL_PROC(glUseProgram),
     R350_GL_PROC(glVertexAttribPointer),
+    R350_GL_PROC(glGenQueries),
+    R350_GL_PROC(glDeleteQueries),
+    R350_GL_PROC(glBeginQuery),
+    R350_GL_PROC(glEndQuery),
+    R350_GL_PROC(glGetQueryObjectuiv),
 };
 
 /*
@@ -875,10 +888,58 @@ struct R350GlCtx {
     float *qt;
     size_t nqt, qt_cap;
     size_t tc_max;                      /* texels a buffer texture holds */
+    /*
+     * Occlusion counting; see ati_r350_gl_zq_mark(). `zq_q` holds the
+     * issued queries not yet summed, oldest first from `zq_head`;
+     * `zq_done` of the `zq_issued` have been, adding up to `zq_sum`.
+     * `zq_free` keeps summed query objects for reuse, `zq_one` is the
+     * query a verify draw reads back at once, and `q_zq` counts the
+     * queued units that are counted.
+     */
+    GLuint *zq_q, *zq_free;
+    size_t zq_head, zq_n, zq_cap, zq_nfree, zq_free_cap;
+    bool zq_open;
+    uint64_t zq_issued, zq_done, zq_sum;
+    GLuint zq_one;
+    unsigned q_zq;
     char desc[128];
 };
 
 static void gl_flush_queue(R350GlCtx *g);
+
+/* begin an occlusion query that adds to the running count */
+static void gl_zq_begin(R350GlCtx *g)
+{
+    GLuint q;
+
+    if (g->zq_nfree) {
+        q = g->zq_free[--g->zq_nfree];
+    } else {
+        glGenQueries(1, &q);
+    }
+    if (g->zq_head + g->zq_n == g->zq_cap) {
+        if (g->zq_head) {
+            memmove(g->zq_q, g->zq_q + g->zq_head, g->zq_n * sizeof(GLuint));
+            g->zq_head = 0;
+        }
+        if (g->zq_n == g->zq_cap) {
+            g->zq_cap = MAX(g->zq_cap * 2, 64);
+            g->zq_q = g_renew(GLuint, g->zq_q, g->zq_cap);
+        }
+    }
+    g->zq_q[g->zq_head + g->zq_n++] = q;
+    glBeginQuery(GL_SAMPLES_PASSED, q);
+    g->zq_open = true;
+}
+
+static void gl_zq_end(R350GlCtx *g)
+{
+    if (g->zq_open) {
+        glEndQuery(GL_SAMPLES_PASSED);
+        g->zq_open = false;
+        g->zq_issued++;
+    }
+}
 
 /*
  * Attaching a texture to the framebuffer ends the render pass on this
@@ -2112,8 +2173,19 @@ void ati_r350_gl_close(R350GlCtx *g)
         }
         glDeleteProgram(g->ui2n);
         glDeleteProgram(g->n2ui);
+        if (g->zq_n) {
+            glDeleteQueries(g->zq_n, g->zq_q + g->zq_head);
+        }
+        if (g->zq_nfree) {
+            glDeleteQueries(g->zq_nfree, g->zq_free);
+        }
+        if (g->zq_one) {
+            glDeleteQueries(1, &g->zq_one);
+        }
         r350_gl_plat_close(&g->plat);
     }
+    g_free(g->zq_q);
+    g_free(g->zq_free);
     g_free(g->stage);
     g_free(g->q);
     g_free(g->qv);
@@ -2413,6 +2485,7 @@ typedef struct R350GlUnit {
     R350GlGen ge;
     R350GlZ z;
     int zonly, dkeep;
+    int zq;
 } R350GlUnit;
 
 /* one unit's filter uniform: `filt`, then the border colour */
@@ -2711,12 +2784,18 @@ static void gl_flush_queue(R350GlCtx *g)
             const R350GlUnit *u = &g->q[k];
 
             if (u->wave == w) {
+                if (u->zq && !g->zq_open) {
+                    gl_zq_begin(g);
+                } else if (!u->zq && g->zq_open) {
+                    gl_zq_end(g);
+                }
                 gl_emit(g, u, prev);
                 gl_wrote(g, u->rx0, u->ry0, u->rx1, u->ry1);
                 prev = u;
             }
         }
     }
+    gl_zq_end(g);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_SCISSOR_TEST);
     gl_zstate(g, NULL);
@@ -2726,6 +2805,7 @@ static void gl_flush_queue(R350GlCtx *g)
     g->nq = 0;
     g->nqv = 0;
     g->nqt = 0;
+    g->q_zq = 0;
     g->q_prebarrier = false;
 }
 
@@ -2823,6 +2903,8 @@ static void gl_enqueue_pass(R350GlCtx *g, const R350GlReq *r,
     u->z = r->z;
     u->zonly = r->zonly;
     u->dkeep = r->dkeep;
+    u->zq = r->zq;
+    g->q_zq += u->zq != 0;
     u->wave = 0;
     if (u->rx1 > u->rx0 && u->ry1 > u->ry0) {
         for (k = 0; k < g->nq; k++) {
@@ -3003,6 +3085,59 @@ bool ati_r350_gl_zclear(R350GlCtx *g, int x0, int y0, int w, int h,
     return ok;
 }
 
+uint64_t ati_r350_gl_zq_mark(R350GlCtx *g)
+{
+    if (!g) {
+        return 0;
+    }
+    if (g->q_zq) {
+        r350_gl_makecurrent(&g->plat);
+        gl_flush_queue(g);
+        r350_gl_done(&g->plat);
+    }
+    return g->zq_issued;
+}
+
+bool ati_r350_gl_zq_sum(R350GlCtx *g, uint64_t ticket, bool wait,
+                        uint64_t *sum)
+{
+    bool ok = true;
+
+    if (!g || ticket < g->zq_done || ticket > g->zq_issued) {
+        return false;
+    }
+    if (ticket > g->zq_done) {
+        r350_gl_makecurrent(&g->plat);
+        while (g->zq_done < ticket) {
+            GLuint q = g->zq_q[g->zq_head], n = 0;
+
+            if (!wait) {
+                glGetQueryObjectuiv(q, GL_QUERY_RESULT_AVAILABLE, &n);
+                if (!n) {
+                    ok = false;
+                    break;
+                }
+            }
+            glGetQueryObjectuiv(q, GL_QUERY_RESULT, &n);
+            g->zq_sum += n;
+            g->zq_done++;
+            g->zq_head++;
+            g->zq_n--;
+            if (g->zq_nfree == g->zq_free_cap) {
+                g->zq_free_cap = MAX(g->zq_free_cap * 2, 64);
+                g->zq_free = g_renew(GLuint, g->zq_free, g->zq_free_cap);
+            }
+            g->zq_free[g->zq_nfree++] = q;
+        }
+        if (!g->zq_n) {
+            g->zq_head = 0;
+        }
+        r350_gl_done(&g->plat);
+    }
+    *sum = g->zq_sum;
+    return ok;
+}
+
 void ati_r350_gl_tex_forget(R350GlCtx *g, unsigned slot)
 {
     if (!g || slot >= R350_GL_TEXSLOTS) {
@@ -3018,6 +3153,32 @@ void ati_r350_gl_tex_forget(R350GlCtx *g, unsigned slot)
     g->tex_nl[slot] = 0;
     g->tex_cb[slot] = 0;
     r350_gl_done(&g->plat);
+}
+
+/* the occlusion query around one request's own draws */
+static void gl_zq_draw_begin(R350GlCtx *g, const R350GlReq *r)
+{
+    if (r->zq_out) {
+        if (!g->zq_one) {
+            glGenQueries(1, &g->zq_one);
+        }
+        glBeginQuery(GL_SAMPLES_PASSED, g->zq_one);
+    } else if (r->zq) {
+        gl_zq_begin(g);
+    }
+}
+
+static void gl_zq_draw_end(R350GlCtx *g, const R350GlReq *r)
+{
+    if (r->zq_out) {
+        GLuint n = 0;
+
+        glEndQuery(GL_SAMPLES_PASSED);
+        glGetQueryObjectuiv(g->zq_one, GL_QUERY_RESULT, &n);
+        *r->zq_out = n;
+    } else if (r->zq) {
+        gl_zq_end(g);
+    }
 }
 
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
@@ -3040,7 +3201,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
      * comment.
      */
     r350_gl_makecurrent(&g->plat);
-    if (g->barrier && !r->add_blend && !r->out) {
+    if (g->barrier && !r->add_blend && !r->out && !r->zq_out) {
         ok = gl_enqueue(g, r);
         r350_gl_done(&g->plat);
         return ok;
@@ -3223,7 +3384,9 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
         glBlendEquation(GL_FUNC_ADD);
         glBlendFunc(GL_ONE, GL_ONE);
         gl_zstate(g, &r->z);
+        gl_zq_draw_begin(g, r);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
+        gl_zq_draw_end(g, r);
         gl_zstate(g, NULL);
         glDisable(GL_BLEND);
 
@@ -3244,6 +3407,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
         unsigned k;
 
         gl_zstate(g, &r->z);
+        gl_zq_draw_begin(g, r);
         for (k = 0; k < r->npass; k++) {
             if (k && g->barrier) {
                 gl_barrier(g);
@@ -3257,9 +3421,12 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
             glDrawArrays(GL_TRIANGLES, (GLint)r->pass[k],
                          (GLsizei)(r->pass[k + 1] - r->pass[k]));
         }
+        gl_zq_draw_end(g, r);
     } else {
         gl_zstate(g, &r->z);
+        gl_zq_draw_begin(g, r);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)r->nvert);
+        gl_zq_draw_end(g, r);
     }
     gl_zstate(g, NULL);
     if (r->out) {
@@ -3317,6 +3484,18 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req)
 
 void ati_r350_gl_tex_forget(R350GlCtx *g, unsigned slot)
 {
+}
+
+uint64_t ati_r350_gl_zq_mark(R350GlCtx *g)
+{
+    return 0;
+}
+
+bool ati_r350_gl_zq_sum(R350GlCtx *g, uint64_t ticket, bool wait,
+                        uint64_t *sum)
+{
+    *sum = 0;
+    return ticket == 0;
 }
 
 bool ati_r350_gl_depth(R350GlCtx *g)
