@@ -10212,6 +10212,8 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
         g_autofree R300Vtx *vb = g_new(R300Vtx, nvtx);
         g_autofree float *cp = g_new(float, (size_t)nvtx * 4);
         g_autofree uint32_t *pre = NULL;
+        /* with indices: the position of each vertex's first shading */
+        g_autofree int32_t *first = idx ? g_new(int32_t, nfetch) : NULL;
         uint32_t *arr[R300_AOS_MAX] = { NULL };
         size_t span[R300_AOS_MAX], total = 0;
         /*
@@ -10268,6 +10270,9 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
             }
         }
         r300_texcoord_src(&d, vsize, pos, ts);
+        if (first) {
+            memset(first, 0xff, (size_t)nfetch * sizeof(*first));
+        }
         for (i = 0; i < nvtx; i++) {
             unsigned n = 0;
             unsigned vi = idx ? idx[i] : i;
@@ -10320,6 +10325,16 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                         n > base + 2 ? dw[base + 2] : 0,
                         n > base + 3 ? dw[base + 3] : 0);
                 }
+            }
+            if (first && first[vi] >= 0) {
+                /* shaded already: a vertex is a function of its dwords */
+                vb[i] = vb[first[vi]];
+                memcpy(&cp[i * 4], &cp[(size_t)first[vi] * 4],
+                       4 * sizeof(float));
+                continue;
+            }
+            if (first) {
+                first[vi] = i;
             }
             r300_load_vtx(&d, &fmt, dw, vsize, pos, &vb[i]);
             r300_attr_texcoord(&d, &fmt, dw, ts, &vb[i]);
