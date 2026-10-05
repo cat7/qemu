@@ -157,6 +157,7 @@ typedef enum ATIR350GlFallback {
     R350_GLF_CBFMT,         /* 16bpp or GART colour buffer */
     R350_GLF_ZTEST,         /* depth or stencil test */
     R350_GLF_ZPASS,         /* counted by an occlusion query, gl-zpass=off */
+    R350_GLF_PROGWAIT,      /* the program worker still has the program */
     R350_GLF_MAX
 } ATIR350GlFallback;
 
@@ -835,6 +836,7 @@ struct ATIR350State {
      * zq_draw, which the raster threads add to.
      */
     bool gl_zpass;              /* "gl-zpass": count queried draws on the GPU */
+    bool gl_async;              /* "gl-async-compile": worker thread */
     bool zq_on;                 /* reset since the last dump: counting */
     bool zq_late;               /* drawn uncounted since the last dump */
     bool zq_gl;                 /* GL counted a draw since the reset */

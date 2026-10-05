@@ -301,8 +301,19 @@ typedef struct R350GlCtx R350GlCtx;
  * string on failure -- a host without a usable GL context is a
  * configuration fact to report, not an abort.
  */
-R350GlCtx *ati_r350_gl_open(const char **err);
+R350GlCtx *ati_r350_gl_open(const char **err, bool async);
 void ati_r350_gl_close(R350GlCtx *g);
+
+/*
+ * Whether a draw with this fragment program, blend variant and colour
+ * write mask would find its host pipeline built: 1 yes, 0 not yet (a
+ * worker thread is building it; the caller draws in software meanwhile),
+ * -1 the program will not link. See "THE PROGRAM WORKER".
+ */
+int ati_r350_gl_prog_ready(R350GlCtx *g, uint64_t key, bool add,
+                           const char *glsl, uint32_t wmask);
+void ati_r350_gl_worker_stats(R350GlCtx *g, uint64_t *warms, uint64_t *failed,
+                              uint64_t *waits, unsigned *inflight);
 
 /*
  * Size the resident render target to at least w x h. Returns false if
