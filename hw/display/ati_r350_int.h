@@ -836,7 +836,8 @@ struct ATIR350State {
      * zq_draw, which the raster threads add to.
      */
     bool gl_zpass;              /* "gl-zpass": count queried draws on the GPU */
-    bool gl_async;              /* "gl-async-compile": worker thread */
+    bool gl_async;              /* "gl-async-compile": worker threads */
+    uint32_t gl_workers;        /* "gl-compile-workers": 1..8 */
     bool zq_on;                 /* reset since the last dump: counting */
     bool zq_late;               /* drawn uncounted since the last dump */
     bool zq_gl;                 /* GL counted a draw since the reset */
