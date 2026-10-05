@@ -7345,6 +7345,13 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
                               &env->fp_status);
     /* Similarly for flush-to-zero */
     set_float_ftz_detection(float_ftz_before_rounding, &env->fp_status);
+    /*
+     * AltiVec non-Java mode flushes a result that is tiny before rounding
+     * to zero, even if it rounds to the smallest normal.
+     */
+    set_float_detect_tininess(float_tininess_before_rounding,
+                              &env->vec_status);
+    set_float_ftz_detection(float_ftz_before_rounding, &env->vec_status);
 
     /*
      * PowerPC propagation rules:
