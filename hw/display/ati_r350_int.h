@@ -739,7 +739,7 @@ struct ATIR350State {
      */
     uint64_t gl_nowork;
     /* view-volume clipping: draws cut, triangles cut, primitives dropped */
-    uint64_t clip_draws, clip_tris, clip_drop;
+    uint64_t clip_draws, clip_tris, clip_drop, clip_ucp;
     /* gl=verify: the per-pixel agreement between the two paths */
     uint64_t gl_v_px, gl_v_hist[4];     /* delta 0, 1, 2-4, above 4 */
     uint64_t gl_v_draws, gl_v_bad;      /* draws compared / with delta > 1 */
@@ -991,6 +991,8 @@ struct ATIR350State {
     uint32_t pvs_upload_cnt;
     uint32_t pvs_const[R300_PVS_CONST_SLOTS * 4];
     uint32_t pvs_const_dwords;
+    /* user clip planes and point sprite state, R300_PVS_UCP_START on */
+    uint32_t pvs_clip[R300_PVS_CLIP_VECS * 4];
     uint32_t pvs_code[R300_PVS_CODE_SLOTS * 4];
     uint32_t pvs_code_slot_valid[R300_PVS_CODE_SLOTS / 32];
     /* dwords ever uploaded to the code region: is there a program at all */

@@ -987,6 +987,7 @@
 #define R300_VAP_CLIP_CNTL            0x221c
 #define R300_VAP_UCP_ENA_MASK         0x0000003f
 #define R300_VAP_CLIP_DISABLE         0x00010000
+#define R300_VAP_UCP_CULL_ONLY_ENA    0x00020000
 #define R300_VAP_GB_VERT_CLIP_ADJ     0x2220
 #define R300_VAP_GB_VERT_DISC_ADJ     0x2224
 #define R300_VAP_GB_HORZ_CLIP_ADJ     0x2228
@@ -1248,6 +1249,14 @@
  * the constant file, four dwords to a vector.
  */
 #define R300_PVS_CONST_START          0x200
+/*
+ * Past the constants, the clip state (R5xx acceleration guide 7.4.10,
+ * "R300 1024"): user clip planes 0-5, then the point sprite viewport
+ * scale and texture corners. Auto-increment wraps from the seventh
+ * vector back to the first.
+ */
+#define R300_PVS_UCP_START            0x400
+#define R300_PVS_CLIP_WRAP            7
 #define R300_VAP_PVS_UPLOAD_DATA      0x2208
 /*
  * Which instruction slots the program in force occupies (FIRST [9:0],

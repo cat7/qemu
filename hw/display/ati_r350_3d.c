@@ -9045,12 +9045,22 @@ static void r300_raster_gart(ATIR350State *s, R300DrawState *d,
  * R300_CLIP_RANGE pixels from the viewport centre, which keeps every
  * corner within what both rasterizers place.
  *
+ * USER CLIP PLANES. VAP_CLIP_CNTL.UCP_ENA_n adds plane n of the six the
+ * guest uploads past the vertex constants (R300_PVS_UCP_START): a corner
+ * p is inside when dot(plane, p) >= 0, p being the clip-space position,
+ * and the cut is the same Sutherland-Hodgman pass as the view volume's.
+ * UCP_CULL_ONLY_ENA keeps the culling and drops the cut: a primitive
+ * wholly outside a plane goes, any other stays whole.
+ *
  * Strips, fans, quads and polygons with something to cut become a triangle
  * list, each triangle wound as r300_raster_prims() faces it. Lines are cut
- * as segments. A point is dropped when its centre is outside z or w.
+ * as segments. A point is dropped when its centre is outside z or w, or
+ * outside a user plane (PS_UCP_MODE 0; the radius-based modes are taken
+ * the same way, which is exact for points of one pixel).
  */
 #define R300_CLIP_RANGE 16384.0f
 #define R300_CLIP_WMIN  0.00001f
+#define R300_CLIP_UCPS  6
 
 enum {
     R300_CLIP_NEAR = 1 << 0,
@@ -9060,15 +9070,19 @@ enum {
     R300_CLIP_XR = 1 << 4,
     R300_CLIP_YB = 1 << 5,
     R300_CLIP_YT = 1 << 6,
-    R300_CLIP_PLANES = 7,
+    R300_CLIP_VIEW = 7,
+    /* user planes 0-5 */
+    R300_CLIP_UCP0 = 1 << R300_CLIP_VIEW,
+    R300_CLIP_PLANES = R300_CLIP_VIEW + R300_CLIP_UCPS,
     R300_CLIP_CUT = (1 << R300_CLIP_PLANES) - 1,
+    R300_CLIP_UCP = R300_CLIP_CUT & ~((1 << R300_CLIP_VIEW) - 1),
     R300_CLIP_Z = R300_CLIP_NEAR | R300_CLIP_FAR | R300_CLIP_W,
-    R300_CLIP_NAN = 1 << 7,
+    R300_CLIP_NAN = 1 << R300_CLIP_PLANES,
     /* the discard band: drops, never cuts */
-    R300_CLIP_DXL = 1 << 8,
-    R300_CLIP_DXR = 1 << 9,
-    R300_CLIP_DYB = 1 << 10,
-    R300_CLIP_DYT = 1 << 11,
+    R300_CLIP_DXL = R300_CLIP_NAN << 1,
+    R300_CLIP_DXR = R300_CLIP_NAN << 2,
+    R300_CLIP_DYB = R300_CLIP_NAN << 3,
+    R300_CLIP_DYT = R300_CLIP_NAN << 4,
 };
 
 /* clip and discard planes on 3 + R300_CLIP_PLANES corners */
@@ -9078,6 +9092,9 @@ typedef struct R300ClipCfg {
     bool dx;
     float rx, ry;           /* the cut in x and y, in units of w */
     float gx, gy;           /* discard band; 0 = none */
+    unsigned ucp;           /* enabled user planes, as R300_CLIP_UCP0 bits */
+    unsigned cut;           /* the planes that cut rather than only cull */
+    float uc[R300_CLIP_UCPS][4];
 } R300ClipCfg;
 
 typedef struct R300ClipVtx {
@@ -9111,8 +9128,12 @@ static float r300_clip_dist(const R300ClipCfg *c, unsigned pl, const float *p)
         return c->rx * p[3] - p[0];
     case 5:
         return c->ry * p[3] + p[1];
-    default:
+    case 6:
         return c->ry * p[3] - p[1];
+    default:
+        pl -= R300_CLIP_VIEW;
+        return c->uc[pl][0] * p[0] + c->uc[pl][1] * p[1] +
+               c->uc[pl][2] * p[2] + c->uc[pl][3] * p[3];
     }
 }
 
@@ -9125,7 +9146,8 @@ static unsigned r300_clip_code(const R300ClipCfg *c, const float *p)
         return R300_CLIP_NAN;
     }
     for (pl = 0; pl < R300_CLIP_PLANES; pl++) {
-        if (r300_clip_dist(c, pl, p) < 0.0f) {
+        if ((pl < R300_CLIP_VIEW || (c->ucp & (1u << pl))) &&
+            r300_clip_dist(c, pl, p) < 0.0f) {
             oc |= 1u << pl;
         }
     }
@@ -9191,7 +9213,7 @@ static void r300_clip_push(R300ClipOut *o, const R300Vtx *v)
 /* one triangle, corners in the order the rasterizer faces them */
 static void r300_clip_tri(ATIR350State *s, const R300DrawState *d,
                           const R300ClipCfg *c, const R300Vtx *vb,
-                          const float *cp, const uint16_t *oc,
+                          const float *cp, const uint32_t *oc,
                           unsigned i0, unsigned i1, unsigned i2,
                           R300ClipOut *o)
 {
@@ -9206,7 +9228,8 @@ static void r300_clip_tri(ATIR350State *s, const R300DrawState *d,
         s->clip_drop++;
         return;
     }
-    if (!(any & R300_CLIP_CUT)) {
+    any &= c->cut;
+    if (!any) {
         r300_clip_push(o, &vb[i0]);
         r300_clip_push(o, &vb[i1]);
         r300_clip_push(o, &vb[i2]);
@@ -9257,7 +9280,7 @@ static void r300_clip_tri(ATIR350State *s, const R300DrawState *d,
 /* one segment, cut parametrically against every plane it crosses */
 static void r300_clip_line(ATIR350State *s, const R300DrawState *d,
                            const R300ClipCfg *c, const R300Vtx *vb,
-                           const float *cp, const uint16_t *oc,
+                           const float *cp, const uint32_t *oc,
                            unsigned i0, unsigned i1, R300ClipOut *o)
 {
     unsigned any = oc[i0] | oc[i1];
@@ -9269,7 +9292,8 @@ static void r300_clip_line(ATIR350State *s, const R300DrawState *d,
         s->clip_drop++;
         return;
     }
-    if (!(any & R300_CLIP_CUT)) {
+    any &= c->cut;
+    if (!any) {
         r300_clip_push(o, &vb[i0]);
         r300_clip_push(o, &vb[i1]);
         return;
@@ -9351,7 +9375,7 @@ static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
                                unsigned nvtx, unsigned *prim, R300Vtx **out)
 {
     uint32_t cntl = s->regs[R300_VAP_CLIP_CNTL >> 2];
-    g_autofree uint16_t *oc = NULL;
+    g_autofree uint32_t *oc = NULL;
     R300ClipOut o = { 0 };
     R300ClipCfg c;
     unsigned any = 0, i;
@@ -9362,8 +9386,14 @@ static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
         s->zb.vte_fmt != R300_VTE_VTX_W0_FMT) {
         return nvtx;
     }
-    if (cntl & R300_VAP_UCP_ENA_MASK) {
-        ati_r350_note_gap(s, R350_GAP_UCP, cntl & R300_VAP_UCP_ENA_MASK);
+    c.ucp = (cntl & R300_VAP_UCP_ENA_MASK) << R300_CLIP_VIEW;
+    c.cut = cntl & R300_VAP_UCP_CULL_ONLY_ENA ? R300_CLIP_CUT & ~R300_CLIP_UCP
+                                              : R300_CLIP_CUT;
+    if (c.ucp) {
+        for (i = 0; i < R300_CLIP_UCPS * 4; i++) {
+            c.uc[i / 4][i % 4] = r300_f32(s->pvs_clip[i]);
+        }
+        s->clip_ucp++;
     }
     r300_clip_scissor(s, d);
 
@@ -9377,7 +9407,7 @@ static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
     c.gx = r300_gb_valid(c.gx) ? c.gx : 0.0f;
     c.gy = r300_gb_valid(c.gy) ? c.gy : 0.0f;
 
-    oc = g_new(uint16_t, nvtx);
+    oc = g_new(uint32_t, nvtx);
     for (i = 0; i < nvtx; i++) {
         oc[i] = r300_clip_code(&c, &cp[i * 4]);
         any |= oc[i];
@@ -9389,7 +9419,7 @@ static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
     switch (*prim) {
     case 1:
         for (i = 0; i < nvtx; i++) {
-            if (oc[i] & (R300_CLIP_Z | R300_CLIP_NAN)) {
+            if (oc[i] & (R300_CLIP_Z | R300_CLIP_UCP | R300_CLIP_NAN)) {
                 s->clip_drop++;
             } else {
                 r300_clip_push(&o, &vb[i]);
