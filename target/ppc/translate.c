@@ -2887,11 +2887,11 @@ GEN_STX(stwbr, st32r, 0x16, 0x14, PPC_INTEGER);
 
 /***                    Integer load and store multiple                    ***/
 
-/* lmw */
-static void gen_lmw(DisasContext *ctx)
+/* lmw and stmw */
+static void gen_ldst_multiple(DisasContext *ctx, bool store)
 {
     TCGv t0;
-    TCGv_i32 t1;
+    int rt = store ? rS(ctx->opcode) : rD(ctx->opcode);
 
     if (ctx->le_mode) {
         gen_align_no_le(ctx);
@@ -2899,26 +2899,45 @@ static void gen_lmw(DisasContext *ctx)
     }
     gen_set_access_type(ctx, ACCESS_INT);
     t0 = tcg_temp_new();
-    t1 = tcg_constant_i32(rD(ctx->opcode));
     gen_addr_imm_index(ctx, t0, 0);
-    gen_helper_lmw(tcg_env, t0, t1);
+
+    /*
+     * A load with rA in the range is an invalid form. Keep the helper for
+     * it, so that a fault part-way through cannot leave rA modified for
+     * the restart.
+     */
+    if (!store && rA(ctx->opcode) != 0 && rA(ctx->opcode) >= rt) {
+        gen_helper_lmw(tcg_env, t0, tcg_constant_i32(rt));
+        return;
+    }
+
+    /*
+     * One access per word. A fault part-way through leaves the earlier
+     * words transferred and the instruction is restarted from the start,
+     * as the architecture allows for load/store multiple.
+     */
+    for (int r = rt; r < 32; r++) {
+        if (store) {
+            tcg_gen_qemu_st_tl(cpu_gpr[r], t0, ctx->mem_idx,
+                               DEF_MEMOP(MO_UL));
+        } else {
+            tcg_gen_qemu_ld_tl(cpu_gpr[r], t0, ctx->mem_idx,
+                               DEF_MEMOP(MO_UL));
+        }
+        if (r < 31) {
+            gen_addr_add(ctx, t0, t0, 4);
+        }
+    }
 }
 
-/* stmw */
+static void gen_lmw(DisasContext *ctx)
+{
+    gen_ldst_multiple(ctx, false);
+}
+
 static void gen_stmw(DisasContext *ctx)
 {
-    TCGv t0;
-    TCGv_i32 t1;
-
-    if (ctx->le_mode) {
-        gen_align_no_le(ctx);
-        return;
-    }
-    gen_set_access_type(ctx, ACCESS_INT);
-    t0 = tcg_temp_new();
-    t1 = tcg_constant_i32(rS(ctx->opcode));
-    gen_addr_imm_index(ctx, t0, 0);
-    gen_helper_stmw(tcg_env, t0, t1);
+    gen_ldst_multiple(ctx, true);
 }
 
 /***                    Integer load and store strings                     ***/
