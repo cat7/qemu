@@ -987,6 +987,7 @@
 #define R300_VAP_CLIP_CNTL            0x221c
 #define R300_VAP_UCP_ENA_MASK         0x0000003f
 #define R300_VAP_CLIP_DISABLE         0x00010000
+#define R300_VAP_UCP_CULL_ONLY_ENA    0x00020000
 #define R300_VAP_GB_VERT_CLIP_ADJ     0x2220
 #define R300_VAP_GB_VERT_DISC_ADJ     0x2224
 #define R300_VAP_GB_HORZ_CLIP_ADJ     0x2228
@@ -1023,6 +1024,7 @@
 #define R300_TX_FMT_1_5_5_5           0x0b    /* X[4:0] Y[9:5] Z[14:10] W[15] */
 #define R300_TX_FMT_8_8_8_8           0x0c    /* four, X the low byte */
 #define R300_TX_FMT_16_16_16_16       0x0e    /* four 16-bit, X the low half */
+#define R300_TX_FMT_16F_16F_16F_16F   0x1a    /* four S10E5 halves, likewise */
 #define R300_TX_FMT_DXT1              0x0f    /* S3TC 4x4 blocks, 8 bytes */
 #define R300_TX_FMT_DXT3              0x10    /* 16 bytes, explicit alpha */
 #define R300_TX_FMT_DXT5              0x11    /* 16 bytes, interpolated alpha */
@@ -1248,6 +1250,14 @@
  * the constant file, four dwords to a vector.
  */
 #define R300_PVS_CONST_START          0x200
+/*
+ * Past the constants, the clip state (R5xx acceleration guide 7.4.10,
+ * "R300 1024"): user clip planes 0-5, then the point sprite viewport
+ * scale and texture corners. Auto-increment wraps from the seventh
+ * vector back to the first.
+ */
+#define R300_PVS_UCP_START            0x400
+#define R300_PVS_CLIP_WRAP            7
 #define R300_VAP_PVS_UPLOAD_DATA      0x2208
 /*
  * Which instruction slots the program in force occupies (FIRST [9:0],

@@ -2279,7 +2279,21 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         break;
     case R300_VAP_PVS_UPLOAD_DATA:
         s->regs[base >> 2] = val;
-        if (s->pvs_upload_addr >= R300_PVS_CONST_START) {
+        if (s->pvs_upload_addr >= R300_PVS_UCP_START) {
+            unsigned v = s->pvs_upload_addr - R300_PVS_UCP_START;
+
+            if (v < R300_PVS_CLIP_VECS) {
+                v += s->pvs_upload_cnt / 4;
+                if (v >= R300_PVS_CLIP_WRAP &&
+                    s->pvs_upload_addr - R300_PVS_UCP_START <
+                    R300_PVS_CLIP_WRAP) {
+                    v %= R300_PVS_CLIP_WRAP;
+                }
+                if (v < R300_PVS_CLIP_VECS) {
+                    s->pvs_clip[v * 4 + s->pvs_upload_cnt % 4] = val;
+                }
+            }
+        } else if (s->pvs_upload_addr >= R300_PVS_CONST_START) {
             /*
              * The constants are a register file addressed by vector, four
              * dwords to a vector, and an upload writes into it starting
@@ -4593,6 +4607,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     /* the surface descriptors are about to go: resolve the target first */
     ati_r350_gl_reset(s);
     ati_r350_zpass_drop(s);
+    s->zclr_pend = false;
     if (s->zg_on) {
         ati_r350_zguard_set(s, 0, 0, 0, 0);
     }
@@ -5754,8 +5769,9 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
                            ? 100.0 * s->gl_drawn / (s->gl_drawn + fb) : 0.0);
     g_string_append_printf(out, "\nview volume: %" PRIu64 " draws clipped, %"
                            PRIu64 " triangles cut, %" PRIu64
-                           " primitives dropped", s->clip_draws, s->clip_tris,
-                           s->clip_drop);
+                           " primitives dropped, %" PRIu64
+                           " draws with user planes", s->clip_draws,
+                           s->clip_tris, s->clip_drop, s->clip_ucp);
     if (s->gl_nowork) {
         /*
          * The share of the fallbacks that were proved to paint nothing

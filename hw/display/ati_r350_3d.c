@@ -156,7 +156,8 @@ typedef struct R300DrawState {
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
     unsigned cb_fmt;        /* RB3D_COLORPITCH0 COLORFORMAT */
-    unsigned cb_bpp;        /* bytes per colour buffer pixel: 1, 2 or 4 */
+    unsigned cb_bpp;        /* bytes per colour buffer pixel: 1, 2, 4, 8 */
+    bool cb_fp16;           /* 8: S10E5 halves (US_OUT_FMT C4_16_FP) */
     unsigned cb_sel;        /* I8: bit position of the stored channel */
     uint32_t wmask;         /* RB3D_COLOR_CHANNEL_MASK as an ARGB byte mask */
     bool resolve;           /* colour buffer in AA-resolve mode */
@@ -472,6 +473,28 @@ static inline uint32_t r300_texel_16x4(uint32_t lo, uint32_t hi)
     return r300_pack_xyzw(lo >> 8, lo >> 24, hi >> 8, hi >> 24);
 }
 
+/* TX_FMT_16F_16F_16F_16F (code 0x1a): the same layout, S10E5 halves */
+static inline unsigned r300_h2c8(uint16_t h)
+{
+    unsigned e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    float f;
+
+    if (h & 0x8000) {
+        return 0;
+    }
+    if (e == 0x1f) {
+        return m ? 0 : 255;
+    }
+    f = e ? ldexpf((float)(m | 0x400), (int)e - 25) : ldexpf((float)m, -24);
+    return f >= 1.0f ? 255 : (unsigned)(f * 255.0f + 0.5f);
+}
+
+static inline uint32_t r300_texel_16fx4(uint32_t lo, uint32_t hi)
+{
+    return r300_pack_xyzw(r300_h2c8(lo), r300_h2c8(lo >> 16),
+                          r300_h2c8(hi), r300_h2c8(hi >> 16));
+}
+
 static inline bool r300_tex_yuv422(unsigned code)
 {
     return code == R300_TX_FMT_VYUY422 || code == R300_TX_FMT_YVYU422;
@@ -547,7 +570,7 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
                             unsigned unit, uint32_t addr)
 {
     const R300TexUnit *u = &d->tex[unit];
-    uint32_t off;
+    uint32_t off, lo, hi;
 
     if (u->bpp == 8) {
         /* single-component format: the byte is component X */
@@ -619,12 +642,15 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
             if (off + 8 > ATI_R350_VRAM_SIZE) {
                 return 0;
             }
-            return r300_texel_16x4(ati_r350_vram_ld32(s, off),
-                                   ati_r350_vram_ld32(s, off + 4));
+            lo = ati_r350_vram_ld32(s, off);
+            hi = ati_r350_vram_ld32(s, off + 4);
+        } else {
+            lo = r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes);
+            hi = r300_lane_xor32(r300_tex_bus32(s, unit, addr + 4),
+                                 u->lanes);
         }
-        return r300_texel_16x4(
-            r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes),
-            r300_lane_xor32(r300_tex_bus32(s, unit, addr + 4), u->lanes));
+        return u->code == R300_TX_FMT_16F_16F_16F_16F
+               ? r300_texel_16fx4(lo, hi) : r300_texel_16x4(lo, hi);
     }
     if (ati_r350_mc_to_vram(s, addr, &off)) {
         if (off + 4 > ATI_R350_VRAM_SIZE) {
@@ -1051,10 +1077,142 @@ static bool r300_cb_modelled(unsigned fmt)
     case R300_COLORFORMAT_RGB565:
     case R300_COLORFORMAT_ARGB4444:
     case R300_COLORFORMAT_ARGB8888:
+    case R300_COLORFORMAT_ARGB16161616:
         return true;
     default:
         return false;
     }
+}
+
+/*
+ * ARGB16161616: one 64-bit pixel, B in the low half of the first dword
+ * and A in the high half of the second, as ARGB8888 orders its bytes and
+ * as TX_FMT_16_16_16_16 reads them back. The shader's output format
+ * picks the encoding: C4_16_FP stores S10E5 halves, anything else
+ * unsigned 16-bit fractions.
+ */
+static uint16_t r300_f2h(float f)
+{
+    uint32_t u, sign, e, m, v, rem, half, sh;
+
+    memcpy(&u, &f, sizeof(u));
+    sign = (u >> 16) & 0x8000;
+    e = (u >> 23) & 0xff;
+    m = u & 0x7fffff;
+    if (e == 0xff) {
+        return sign | 0x7c00 | (m ? 0x200 : 0);
+    }
+    if (e > 142) {
+        return sign | 0x7c00;
+    }
+    if (e < 113) {
+        /* a half subnormal, or zero */
+        if (e < 102) {
+            return sign;
+        }
+        m |= 0x800000;
+        sh = 126 - e;
+        v = m >> sh;
+        rem = m & ((1u << sh) - 1);
+        half = 1u << (sh - 1);
+    } else {
+        v = ((e - 112) << 10) | (m >> 13);
+        rem = m & 0x1fff;
+        half = 0x1000;
+    }
+    /* to nearest, ties to even; a carry moves into the exponent */
+    if (rem > half || (rem == half && (v & 1))) {
+        v++;
+    }
+    return sign | v;
+}
+
+static float r300_h2f(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t e = (h >> 10) & 0x1f, m = h & 0x3ff, u;
+    float f;
+
+    if (e == 0) {
+        f = ldexpf((float)m, -24);
+        return sign ? -f : f;
+    }
+    if (e == 0x1f) {
+        u = sign | 0x7f800000 | (m << 13);
+    } else {
+        u = sign | ((e + 112) << 23) | (m << 13);
+    }
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static uint16_t r300_cb_enc16(const R300DrawState *d, float v)
+{
+    if (d->cb_fp16) {
+        return r300_f2h(v);
+    }
+    return (uint16_t)(MIN(MAX(v, 0.0f), 1.0f) * 65535.0f + 0.5f);
+}
+
+static float r300_cb_dec16(const R300DrawState *d, uint16_t v)
+{
+    return d->cb_fp16 ? r300_h2f(v) : v / 65535.0f;
+}
+
+static uint32_t r300_cb_ld32(ATIR350State *s, const R300DrawState *d,
+                             uint32_t addr)
+{
+    unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+
+    return (uint32_t)d->cb[addr ^ xr] |
+           ((uint32_t)d->cb[(addr + 1) ^ xr] << 8) |
+           ((uint32_t)d->cb[(addr + 2) ^ xr] << 16) |
+           ((uint32_t)d->cb[(addr + 3) ^ xr] << 24);
+}
+
+static void r300_cb_st32(ATIR350State *s, const R300DrawState *d,
+                         uint32_t addr, uint32_t v)
+{
+    unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+
+    d->cb[addr ^ xr] = v & 0xff;
+    d->cb[(addr + 1) ^ xr] = (v >> 8) & 0xff;
+    d->cb[(addr + 2) ^ xr] = (v >> 16) & 0xff;
+    d->cb[(addr + 3) ^ xr] = (v >> 24) & 0xff;
+}
+
+/* argb[] = A, R, G, B */
+static void r300_read_dst64(ATIR350State *s, const R300DrawState *d,
+                            uint32_t addr, float *argb)
+{
+    uint32_t lo = r300_cb_ld32(s, d, addr), hi = r300_cb_ld32(s, d, addr + 4);
+
+    argb[0] = r300_cb_dec16(d, hi >> 16);
+    argb[1] = r300_cb_dec16(d, hi & 0xffff);
+    argb[2] = r300_cb_dec16(d, lo >> 16);
+    argb[3] = r300_cb_dec16(d, lo & 0xffff);
+}
+
+static void r300_write_dst64(ATIR350State *s, const R300DrawState *d,
+                             uint32_t addr, const float *argb)
+{
+    uint32_t lo = r300_cb_ld32(s, d, addr), hi = r300_cb_ld32(s, d, addr + 4);
+    uint16_t a = hi >> 16, r = hi & 0xffff, g = lo >> 16, b = lo & 0xffff;
+
+    if (d->wmask & 0xff000000u) {
+        a = r300_cb_enc16(d, argb[0]);
+    }
+    if (d->wmask & 0x00ff0000u) {
+        r = r300_cb_enc16(d, argb[1]);
+    }
+    if (d->wmask & 0x0000ff00u) {
+        g = r300_cb_enc16(d, argb[2]);
+    }
+    if (d->wmask & 0x000000ffu) {
+        b = r300_cb_enc16(d, argb[3]);
+    }
+    r300_cb_st32(s, d, addr, (uint32_t)g << 16 | b);
+    r300_cb_st32(s, d, addr + 4, (uint32_t)a << 16 | r);
 }
 
 /*
@@ -1321,27 +1479,44 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
  * the clear writes that value into the tiles. One dword covers 32x16
  * pixels (8x4 tiles of 4x4 on two pipes), row-major over
  * ZB_ZMASK_PITCH pixels: a 640x480 clear is 600 dwords.
+ *
+ * A cleared tile takes the clear value when it is read, not when the
+ * packet arrives: the OS X driver sends the packet first and the
+ * ZB_DEPTHCLEARVALUE of the new context after it, before the first
+ * depth-tested draw. So the clear is held and written at the first draw
+ * that uses a depth or stencil buffer, with the registers of that draw,
+ * provided it is the same buffer (ZB_DEPTHOFFSET); r300_run_prims().
  */
+typedef struct R300ZClear {
+    uint32_t zoff, zp, clr, zfmt, bw, smp;
+} R300ZClear;
+
 static bool r300_gl_zclear(ATIR350State *s, uint32_t first, uint32_t n,
                            unsigned bw, uint32_t clr, int *keep);
 
-void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
-                               uint32_t val)
+static void r300_zclear_regs(ATIR350State *s, R300ZClear *c)
+{
+    c->zoff = s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu;
+    c->zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
+    c->clr = s->regs[R300_ZB_DEPTHCLEARVALUE >> 2];
+    c->zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
+    c->bw = (s->regs[R300_ZB_ZMASK_PITCH >> 2] & 0x3fff) / 32;
+    c->smp = (s->regs[R300_GB_AA_CONFIG >> 2] & R300_AA_ENABLE) ? 2 : 1;
+}
+
+static void r300_zclear_run(ATIR350State *s, const R300ZClear *c,
+                            uint32_t first, uint32_t n)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    uint32_t zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
-    uint32_t clr = s->regs[R300_ZB_DEPTHCLEARVALUE >> 2];
-    unsigned bw = (s->regs[R300_ZB_ZMASK_PITCH >> 2] & 0x3fff) / 32;
-    unsigned smp = (s->regs[R300_GB_AA_CONFIG >> 2] & R300_AA_ENABLE) ? 2 : 1;
-    unsigned zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
+    uint32_t clr = c->clr, zp = c->zp;
+    unsigned bw = c->bw, smp = c->smp;
     uint32_t i, off;
     unsigned x, y, k;
     int keep[4];
 
-    if (val || !bw || !((zp >> 2) & 0xfff) ||
-        (zfmt != R300_ZB_FORMAT_24_8 && zfmt != R300_ZB_FORMAT_16) ||
-        !ati_r350_mc_to_vram(s, s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
-                             &off)) {
+    if (!bw || !((zp >> 2) & 0xfff) ||
+        (c->zfmt != R300_ZB_FORMAT_24_8 && c->zfmt != R300_ZB_FORMAT_16) ||
+        !ati_r350_mc_to_vram(s, c->zoff, &off)) {
         return;
     }
     s->zb.off = off;
@@ -1349,7 +1524,7 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
     s->zb.macro = zp & R300_ZB_MACROTILE;
     s->zb.micro = (zp >> R300_ZB_MICROTILE_SHIFT) & 3;
     s->zb.aa = smp == 2;
-    s->zb.z16 = zfmt == R300_ZB_FORMAT_16;
+    s->zb.z16 = c->zfmt == R300_ZB_FORMAT_16;
     n = MIN(n, 0x100000);
     /*
      * A GPU copy of this buffer is cleared alike; any other goes back.
@@ -1394,6 +1569,59 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
             }
         }
     }
+}
+
+/* a held clear, with the registers it was sent with */
+static void r300_zclear_flush(ATIR350State *s)
+{
+    R300ZClear c;
+
+    if (!s->zclr_pend) {
+        return;
+    }
+    s->zclr_pend = false;
+    c = (R300ZClear) {
+        .zoff = s->zclr_zoff, .zp = s->zclr_zp, .clr = s->zclr_clr,
+        .zfmt = s->zclr_zfmt, .bw = s->zclr_bw, .smp = s->zclr_smp,
+    };
+    r300_zclear_run(s, &c, s->zclr_first, s->zclr_n);
+}
+
+/* the first draw on the held clear's buffer: written with its registers */
+static void r300_zclear_draw(ATIR350State *s)
+{
+    R300ZClear c;
+
+    r300_zclear_regs(s, &c);
+    if (c.zoff != s->zclr_zoff) {
+        return;
+    }
+    s->zclr_pend = false;
+    r300_zclear_run(s, &c, s->zclr_first, s->zclr_n);
+}
+
+void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
+                               uint32_t val)
+{
+    R300ZClear c;
+
+    if (val) {
+        return;
+    }
+    r300_zclear_regs(s, &c);
+    if (s->zclr_pend && (s->zclr_zoff != c.zoff || s->zclr_first != first ||
+                         s->zclr_n != n)) {
+        r300_zclear_flush(s);
+    }
+    s->zclr_pend = true;
+    s->zclr_first = first;
+    s->zclr_n = n;
+    s->zclr_zoff = c.zoff;
+    s->zclr_zp = c.zp;
+    s->zclr_clr = c.clr;
+    s->zclr_zfmt = c.zfmt;
+    s->zclr_bw = c.bw;
+    s->zclr_smp = c.smp;
 }
 
 /* the factor codes r300_blend_f() below actually implements */
@@ -1996,7 +2224,14 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                                (uint32_t)x * d->cb_bpp;
 
                 if (src + d->cb_bpp <= ATI_R350_VRAM_SIZE) {
-                    r300_write_dst(s, d, addr, r300_read_dst(s, d, src));
+                    if (d->cb_bpp == 8) {
+                        float px[4];
+
+                        r300_read_dst64(s, d, src, px);
+                        r300_write_dst64(s, d, addr, px);
+                    } else {
+                        r300_write_dst(s, d, addr, r300_read_dst(s, d, src));
+                    }
                 }
                 continue;
             }
@@ -2255,12 +2490,28 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                  * the destination at all; the destination terms then
                  * see zero rather than whatever is in memory.
                  */
-                uint32_t dst = d->blend_read ? r300_read_dst(s, d, addr) : 0;
-                float dr = ((dst >> 16) & 0xff) / 255.0f;
-                float dg = ((dst >> 8) & 0xff) / 255.0f;
-                float db = (dst & 0xff) / 255.0f;
-                float da = ((dst >> 24) & 0xff) / 255.0f;
+                float dr, dg, db, da;
                 float nr, ng, nb;
+
+                if (d->cb_bpp == 8) {
+                    float px[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+                    if (d->blend_read) {
+                        r300_read_dst64(s, d, addr, px);
+                    }
+                    da = px[0];
+                    dr = px[1];
+                    dg = px[2];
+                    db = px[3];
+                } else {
+                    uint32_t dst = d->blend_read ? r300_read_dst(s, d, addr)
+                                                 : 0;
+
+                    dr = ((dst >> 16) & 0xff) / 255.0f;
+                    dg = ((dst >> 8) & 0xff) / 255.0f;
+                    db = (dst & 0xff) / 255.0f;
+                    da = ((dst >> 24) & 0xff) / 255.0f;
+                }
 
                 nr = r300_blend_comb(d->comb_fcn,
                         cr * r300_blend_f(d->src_factor, cr, ca, dr, da,
@@ -2285,6 +2536,12 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 cr = nr;
                 cg = ng;
                 cb = nb;
+            }
+            if (d->cb_bpp == 8) {
+                float px[4] = { ca, cr, cg, cb };
+
+                r300_write_dst64(s, d, addr, px);
+                continue;
             }
             out = ((uint32_t)(MIN(MAX(ca, 0.0f), 1.0f) * 255.0f) << 24) |
                   ((uint32_t)(MIN(MAX(cr, 0.0f), 1.0f) * 255.0f) << 16) |
@@ -3998,6 +4255,7 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
                  (txfmt1 & R300_TX_FORMAT1_SWAP_YUV ? 4 : 0);
         break;
     case R300_TX_FMT_16_16_16_16:
+    case R300_TX_FMT_16F_16F_16F_16F:
         u->bpp = 64;
         break;
     case R300_TX_FMT_8_8_8_8:
@@ -4214,6 +4472,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->cb_sel = sel_shift[(s->regs[R300_US_OUT_FMT_0 >> 2] >>
                                R300_US_OUT_C0_SEL_SHIFT) & 3];
     }
+    d->cb_fp16 = (s->regs[R300_US_OUT_FMT_0 >> 2] & R300_US_OUT_FMT_MASK) ==
+                 R300_US_OUT_FMT_C4_16_FP;
     d->dst_pitch = (colorpitch & 0x3fff) * d->cb_bpp;
     if (!d->dst_pitch) {
         return false;
@@ -5360,24 +5620,31 @@ static bool r300_cap_xor(ATIR350State *s, uint32_t off, uint32_t len,
 }
 
 /*
- * Where this draw can write: the primitive's own bounding box, widened
- * by a pixel because a line is expanded across its direction and a
- * rectangle list implies a fourth corner, then clipped exactly the way
- * r300_raster_tri() clips its scan.
+ * Where this draw can write: the pixels whose centres the primitive's
+ * own bounding box holds, within R300_CAP_EPS, then clipped exactly the
+ * way r300_raster_tri() clips its scan. A rectangle list adds the fourth
+ * corner it implies and a point sprite its RE_POINTSIZE extent; lines,
+ * expanded across their direction, are widened by a pixel instead.
+ *
+ * Not a pixel more: the GL path writes this rectangle back to VRAM, and
+ * the OS X driver clears a window with an inclusive scissor one pixel
+ * past its last row and column. Widened, the rectangle reached the depth
+ * buffer packed after the colour buffer and wrote stale words over it.
  *
  * `empty`, when not NULL, comes back true for the ONE refusal that is a
  * PROOF that the software rasterizer would paint nothing either: the
- * widened bounding box is empty after the scissor. That is a proof and
- * not an impression, because this box is a superset of every box
- * r300_raster_tri() will scan for this draw --
+ * rectangle is empty after the scissor. That is a proof and not an
+ * impression, because this rectangle holds every pixel
+ * r300_raster_tri() will write for this draw --
  *
  *   - the vertex loop above takes the minimum/maximum over ALL of `vb`
  *     (plus the corner a rectangle list implies, plus the point
  *     sprite's RE_POINTSIZE half-extent, both of which the rasterizer
  *     synthesises from the same registers), so any triangle it
  *     assembles has its own min/max inside fx0..fx1, fy0..fy1;
- *   - floorf()-1 / ceilf()+1 widen that by a further pixel, so the
- *     rasterizer's un-widened floorf()/ceilf() bounds stay inside;
+ *   - a triangle writes only pixels whose centre (x + 0.5, y + 0.5) it
+ *     holds, and those lie in that box; a line's quad reaches half a
+ *     pixel past it, inside the pixel lines are widened by;
  *   - the four clamps below are character for character the ones
  *     r300_raster_tri() applies, and r300_span_clip() only ever
  *     narrows a row further.
@@ -5389,6 +5656,8 @@ static bool r300_cap_xor(ATIR350State *s, uint32_t off, uint32_t len,
  * rasterizer write row 0 over and over, and the VRAM trim below drops
  * rows using a widened x1 the real primitive may fall well short of.
  */
+#define R300_CAP_EPS (1.0f / 16.0f)
+
 static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
                           const R300Vtx *vb, unsigned nvtx, unsigned prim,
                           int *rx0, int *ry0, int *rx1, int *ry1,
@@ -5428,10 +5697,17 @@ static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
         fy0 < -100000.0f || fy1 > 100000.0f) {
         return false;
     }
-    x0 = (int)floorf(fx0) - 1;
-    y0 = (int)floorf(fy0) - 1;
-    x1 = (int)ceilf(fx1) + 1;
-    y1 = (int)ceilf(fy1) + 1;
+    if (prim == 2 || prim == 3 || prim == 12) {
+        x0 = (int)floorf(fx0) - 1;
+        y0 = (int)floorf(fy0) - 1;
+        x1 = (int)ceilf(fx1) + 1;
+        y1 = (int)ceilf(fy1) + 1;
+    } else {
+        x0 = (int)ceilf(fx0 - 0.5f - R300_CAP_EPS);
+        y0 = (int)ceilf(fy0 - 0.5f - R300_CAP_EPS);
+        x1 = (int)floorf(fx1 - 0.5f + R300_CAP_EPS) + 1;
+        y1 = (int)floorf(fy1 - 0.5f + R300_CAP_EPS) + 1;
+    }
     x0 = MAX(x0, MAX(d->sc_x0, 0));
     y0 = MAX(y0, MAX(d->sc_y0, 0));
     x1 = MIN(x1, MIN(d->sc_x1 + 1, 8191));
@@ -6216,6 +6492,12 @@ static void r300_gl_zsoft(ATIR350State *s, const R300DrawState *d,
 
     zr[0] = zr[1] = zr[2] = zr[3] = 0;
     if (!s->gl_zres) {
+        return;
+    }
+    if (s->zb.z_en && nvtx &&
+        !r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1, &empty) &&
+        empty) {
+        /* the draw paints nothing, so it reads and writes no Z either */
         return;
     }
     if (s->zb.z_en && s->gl_zlazy && r300_gl_zsame(s) && nvtx &&
@@ -8953,12 +9235,22 @@ static void r300_raster_gart(ATIR350State *s, R300DrawState *d,
  * R300_CLIP_RANGE pixels from the viewport centre, which keeps every
  * corner within what both rasterizers place.
  *
+ * USER CLIP PLANES. VAP_CLIP_CNTL.UCP_ENA_n adds plane n of the six the
+ * guest uploads past the vertex constants (R300_PVS_UCP_START): a corner
+ * p is inside when dot(plane, p) >= 0, p being the clip-space position,
+ * and the cut is the same Sutherland-Hodgman pass as the view volume's.
+ * UCP_CULL_ONLY_ENA keeps the culling and drops the cut: a primitive
+ * wholly outside a plane goes, any other stays whole.
+ *
  * Strips, fans, quads and polygons with something to cut become a triangle
  * list, each triangle wound as r300_raster_prims() faces it. Lines are cut
- * as segments. A point is dropped when its centre is outside z or w.
+ * as segments. A point is dropped when its centre is outside z or w, or
+ * outside a user plane (PS_UCP_MODE 0; the radius-based modes are taken
+ * the same way, which is exact for points of one pixel).
  */
 #define R300_CLIP_RANGE 16384.0f
 #define R300_CLIP_WMIN  0.00001f
+#define R300_CLIP_UCPS  6
 
 enum {
     R300_CLIP_NEAR = 1 << 0,
@@ -8968,15 +9260,19 @@ enum {
     R300_CLIP_XR = 1 << 4,
     R300_CLIP_YB = 1 << 5,
     R300_CLIP_YT = 1 << 6,
-    R300_CLIP_PLANES = 7,
+    R300_CLIP_VIEW = 7,
+    /* user planes 0-5 */
+    R300_CLIP_UCP0 = 1 << R300_CLIP_VIEW,
+    R300_CLIP_PLANES = R300_CLIP_VIEW + R300_CLIP_UCPS,
     R300_CLIP_CUT = (1 << R300_CLIP_PLANES) - 1,
+    R300_CLIP_UCP = R300_CLIP_CUT & ~((1 << R300_CLIP_VIEW) - 1),
     R300_CLIP_Z = R300_CLIP_NEAR | R300_CLIP_FAR | R300_CLIP_W,
-    R300_CLIP_NAN = 1 << 7,
+    R300_CLIP_NAN = 1 << R300_CLIP_PLANES,
     /* the discard band: drops, never cuts */
-    R300_CLIP_DXL = 1 << 8,
-    R300_CLIP_DXR = 1 << 9,
-    R300_CLIP_DYB = 1 << 10,
-    R300_CLIP_DYT = 1 << 11,
+    R300_CLIP_DXL = R300_CLIP_NAN << 1,
+    R300_CLIP_DXR = R300_CLIP_NAN << 2,
+    R300_CLIP_DYB = R300_CLIP_NAN << 3,
+    R300_CLIP_DYT = R300_CLIP_NAN << 4,
 };
 
 /* clip and discard planes on 3 + R300_CLIP_PLANES corners */
@@ -8986,6 +9282,9 @@ typedef struct R300ClipCfg {
     bool dx;
     float rx, ry;           /* the cut in x and y, in units of w */
     float gx, gy;           /* discard band; 0 = none */
+    unsigned ucp;           /* enabled user planes, as R300_CLIP_UCP0 bits */
+    unsigned cut;           /* the planes that cut rather than only cull */
+    float uc[R300_CLIP_UCPS][4];
 } R300ClipCfg;
 
 typedef struct R300ClipVtx {
@@ -9019,8 +9318,12 @@ static float r300_clip_dist(const R300ClipCfg *c, unsigned pl, const float *p)
         return c->rx * p[3] - p[0];
     case 5:
         return c->ry * p[3] + p[1];
-    default:
+    case 6:
         return c->ry * p[3] - p[1];
+    default:
+        pl -= R300_CLIP_VIEW;
+        return c->uc[pl][0] * p[0] + c->uc[pl][1] * p[1] +
+               c->uc[pl][2] * p[2] + c->uc[pl][3] * p[3];
     }
 }
 
@@ -9033,7 +9336,8 @@ static unsigned r300_clip_code(const R300ClipCfg *c, const float *p)
         return R300_CLIP_NAN;
     }
     for (pl = 0; pl < R300_CLIP_PLANES; pl++) {
-        if (r300_clip_dist(c, pl, p) < 0.0f) {
+        if ((pl < R300_CLIP_VIEW || (c->ucp & (1u << pl))) &&
+            r300_clip_dist(c, pl, p) < 0.0f) {
             oc |= 1u << pl;
         }
     }
@@ -9099,7 +9403,7 @@ static void r300_clip_push(R300ClipOut *o, const R300Vtx *v)
 /* one triangle, corners in the order the rasterizer faces them */
 static void r300_clip_tri(ATIR350State *s, const R300DrawState *d,
                           const R300ClipCfg *c, const R300Vtx *vb,
-                          const float *cp, const uint16_t *oc,
+                          const float *cp, const uint32_t *oc,
                           unsigned i0, unsigned i1, unsigned i2,
                           R300ClipOut *o)
 {
@@ -9114,7 +9418,8 @@ static void r300_clip_tri(ATIR350State *s, const R300DrawState *d,
         s->clip_drop++;
         return;
     }
-    if (!(any & R300_CLIP_CUT)) {
+    any &= c->cut;
+    if (!any) {
         r300_clip_push(o, &vb[i0]);
         r300_clip_push(o, &vb[i1]);
         r300_clip_push(o, &vb[i2]);
@@ -9165,7 +9470,7 @@ static void r300_clip_tri(ATIR350State *s, const R300DrawState *d,
 /* one segment, cut parametrically against every plane it crosses */
 static void r300_clip_line(ATIR350State *s, const R300DrawState *d,
                            const R300ClipCfg *c, const R300Vtx *vb,
-                           const float *cp, const uint16_t *oc,
+                           const float *cp, const uint32_t *oc,
                            unsigned i0, unsigned i1, R300ClipOut *o)
 {
     unsigned any = oc[i0] | oc[i1];
@@ -9177,7 +9482,8 @@ static void r300_clip_line(ATIR350State *s, const R300DrawState *d,
         s->clip_drop++;
         return;
     }
-    if (!(any & R300_CLIP_CUT)) {
+    any &= c->cut;
+    if (!any) {
         r300_clip_push(o, &vb[i0]);
         r300_clip_push(o, &vb[i1]);
         return;
@@ -9259,7 +9565,7 @@ static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
                                unsigned nvtx, unsigned *prim, R300Vtx **out)
 {
     uint32_t cntl = s->regs[R300_VAP_CLIP_CNTL >> 2];
-    g_autofree uint16_t *oc = NULL;
+    g_autofree uint32_t *oc = NULL;
     R300ClipOut o = { 0 };
     R300ClipCfg c;
     unsigned any = 0, i;
@@ -9270,8 +9576,14 @@ static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
         s->zb.vte_fmt != R300_VTE_VTX_W0_FMT) {
         return nvtx;
     }
-    if (cntl & R300_VAP_UCP_ENA_MASK) {
-        ati_r350_note_gap(s, R350_GAP_UCP, cntl & R300_VAP_UCP_ENA_MASK);
+    c.ucp = (cntl & R300_VAP_UCP_ENA_MASK) << R300_CLIP_VIEW;
+    c.cut = cntl & R300_VAP_UCP_CULL_ONLY_ENA ? R300_CLIP_CUT & ~R300_CLIP_UCP
+                                              : R300_CLIP_CUT;
+    if (c.ucp) {
+        for (i = 0; i < R300_CLIP_UCPS * 4; i++) {
+            c.uc[i / 4][i % 4] = r300_f32(s->pvs_clip[i]);
+        }
+        s->clip_ucp++;
     }
     r300_clip_scissor(s, d);
 
@@ -9285,7 +9597,7 @@ static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
     c.gx = r300_gb_valid(c.gx) ? c.gx : 0.0f;
     c.gy = r300_gb_valid(c.gy) ? c.gy : 0.0f;
 
-    oc = g_new(uint16_t, nvtx);
+    oc = g_new(uint32_t, nvtx);
     for (i = 0; i < nvtx; i++) {
         oc[i] = r300_clip_code(&c, &cp[i * 4]);
         any |= oc[i];
@@ -9297,7 +9609,7 @@ static unsigned r300_clip_draw(ATIR350State *s, R300DrawState *d,
     switch (*prim) {
     case 1:
         for (i = 0; i < nvtx; i++) {
-            if (oc[i] & (R300_CLIP_Z | R300_CLIP_NAN)) {
+            if (oc[i] & (R300_CLIP_Z | R300_CLIP_UCP | R300_CLIP_NAN)) {
                 s->clip_drop++;
             } else {
                 r300_clip_push(&o, &vb[i]);
@@ -9381,6 +9693,9 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
 {
     g_autofree R300Vtx *cv = NULL;
 
+    if (s->zclr_pend && s->zb.z_en) {
+        r300_zclear_draw(s);
+    }
     nvtx = r300_clip_draw(s, d, vb, cp, nvtx, &prim, &cv);
     if (cv) {
         if (!nvtx) {
