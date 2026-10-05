@@ -223,6 +223,8 @@ typedef struct R300DrawState {
      */
     unsigned cb_sv, zb_sv;
     uint32_t cb_slo, cb_shi, zb_slo, zb_shi;
+    /* d->vs with its operands decoded, for the per-vertex loop; or NULL */
+    const R300PvsCompiled *vsc;
     /* count the samples passing the depth test, zq_spp to a pixel */
     bool zq;
     unsigned zq_spp;
@@ -3687,7 +3689,11 @@ static bool r300_vs_vtx(ATIR350State *s, const R300DrawState *d,
         r300_vs_input(d, f, dw, a, r.in[a]);
     }
     memset(&g, 0, sizeof(g));
-    r300_pvs_run(&d->vs, &r, &g);
+    if (d->vsc) {
+        r300_pvs_exec(d->vsc, &r, &g);
+    } else {
+        r300_pvs_run(&d->vs, &r, &g);
+    }
     if (g.has_vec_op) {
         ati_r350_note_gap(s, R350_GAP_VS_VECTOR_OP, g.vec_op);
     }
@@ -5036,6 +5042,14 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * instead of for every pixel. The surface registers cannot change
      * before the draw is done.
      */
+    d->vsc = NULL;
+    if (d->vs_run && d->vs.valid && !d->vs.plain_matrix) {
+        if (!s->pvs_cc) {
+            s->pvs_cc = g_new(R300PvsCompiled, 1);
+        }
+        r300_pvs_compile(&d->vs, s->pvs_cc);
+        d->vsc = s->pvs_cc;
+    }
     d->cb_slo = d->zb_slo = 1;
     d->cb_shi = d->zb_shi = 0;
     d->cb_sv = d->zb_sv = 0;

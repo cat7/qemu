@@ -240,6 +240,48 @@ bool r300_pvs_texmat(const R300PvsProgram *p, unsigned out,
  */
 void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps);
 
+/*
+ * The same program with its operands decoded once, for running over
+ * every vertex of a draw: r300_pvs_compile() when the draw is set up,
+ * r300_pvs_exec() per vertex. It computes what r300_pvs_run() does and
+ * is valid only while the program and its constant file are unchanged,
+ * i.e. for one draw.
+ */
+enum {
+    R300_PVS_CSRC_IN,
+    R300_PVS_CSRC_CONST,
+    R300_PVS_CSRC_ATMP,
+    R300_PVS_CSRC_TMP,
+    R300_PVS_CSRC_RAW,          /* addressing mode: read from `dw` */
+};
+
+typedef struct R300PvsCSrc {
+    uint8_t file;
+    uint8_t idx;
+    uint8_t sel[4];
+    uint8_t neg;                /* a bit per channel */
+    bool abs;
+    bool plain;                 /* .xyzw, no abs, no negate: a copy */
+    uint32_t dw;
+    float kv[4];                /* a constant operand, finished */
+} R300PvsCSrc;
+
+typedef struct R300PvsCIns {
+    const uint32_t *w;          /* the instruction's four dwords */
+    bool dual;
+    R300PvsCSrc a, b, c;
+} R300PvsCIns;
+
+typedef struct R300PvsCompiled {
+    const R300PvsProgram *p;
+    unsigned n;
+    R300PvsCIns ins[R300_PVS_CODE_SLOTS];
+} R300PvsCompiled;
+
+void r300_pvs_compile(const R300PvsProgram *p, R300PvsCompiled *cp);
+void r300_pvs_exec(const R300PvsCompiled *cp, R300PvsRegs *r,
+                   R300PvsGaps *gaps);
+
 /* one constant vector as the program addresses it, cmax applied */
 void r300_pvs_const(const R300PvsProgram *p, unsigned off, float v[4]);
 

@@ -410,6 +410,149 @@ static int r300_pvs_dst_slot(unsigned mode, unsigned doff, int32_t a0,
     return idx >= 0 && idx < (int)n ? idx : -1;
 }
 
+/*
+ * One instruction, its sources read. The dual-issue math half has run
+ * already, after `a` and `b` were read and before this writes.
+ */
+static inline void r300_pvs_ins(const R300PvsProgram *p, R300PvsRegs *r,
+                                R300PvsGaps *gaps, const uint32_t *w,
+                                const float a[4], const float b[4],
+                                const float c[4])
+{
+    uint32_t op = w[0];
+    unsigned opcode = op & R300_PVS_DST_OPCODE_MASK;
+    bool math = op & R300_PVS_DST_MATH_INST;
+    unsigned dtype = (op >> R300_PVS_DST_REG_TYPE_SHIFT) &
+                     R300_PVS_DST_REG_TYPE_MASK;
+    unsigned doff = (op >> R300_PVS_DST_OFFSET_SHIFT) &
+                    R300_PVS_DST_OFFSET_MASK;
+    unsigned we = (op >> R300_PVS_DST_WE_SHIFT) & R300_PVS_DST_WE_MASK;
+    float res[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    unsigned dmode = r300_pvs_addr_mode(op & R300_PVS_DST_ADDR_MODE_1,
+                                        op & R300_PVS_DST_ADDR_MODE_0);
+    unsigned dsel = (op >> R300_PVS_DST_ADDR_SEL_SHIFT) &
+                    R300_PVS_DST_ADDR_SEL_MASK;
+    float *dst;
+    int idx;
+    unsigned k;
+
+    if (op & R300_PVS_DST_MACRO_INST) {
+        /*
+         * The macro bit only ever marks a multiply-add whose three
+         * temporaries the hardware has to read in two passes; the
+         * arithmetic is the plain one, with opcode 1 selecting the
+         * doubling form.
+         */
+        for (k = 0; k < 4; k++) {
+            res[k] = a[k] * b[k] * (opcode ? 2.0f : 1.0f) + c[k];
+        }
+    } else if (math) {
+        if (opcode == R300_ME_NO_OP) {
+            return;
+        }
+        if (!r300_pvs_math(opcode, a, b, c, res)) {
+            if (gaps && !gaps->has_math_op) {
+                gaps->has_math_op = true;
+                gaps->math_op = opcode;
+            }
+            return;
+        }
+    } else {
+        if (opcode == R300_VE_NO_OP) {
+            return;
+        }
+        if (!r300_pvs_vector(opcode, a, b, c, res)) {
+            if (gaps && !gaps->has_vec_op) {
+                gaps->has_vec_op = true;
+                gaps->vec_op = opcode;
+            }
+            return;
+        }
+    }
+
+    if (op & (math ? R300_PVS_DST_ME_SAT : R300_PVS_DST_VE_SAT)) {
+        for (k = 0; k < 4; k++) {
+            res[k] = MIN(MAX(res[k], 0.0f), 1.0f);
+        }
+    }
+
+    if (dtype == R300_PVS_DST_REG_A0 && !math &&
+        !(op & R300_PVS_DST_MACRO_INST) &&
+        (opcode == R300_VE_FLT2FIX_DX ||
+         opcode == R300_VE_FLT2FIX_DX_RND)) {
+        /*
+         * The only writers of A0 (R5xx guide 7.5.9): the integral
+         * result, clamped to -256..255. The register is a single
+         * vector, so the destination offset and addressing mode are
+         * meaningless here.
+         */
+        for (k = 0; k < 4; k++) {
+            if (we & (1u << k)) {
+                float f = res[k] > R300_PVS_ADDR_MIN ?
+                          (res[k] < R300_PVS_ADDR_MAX ?
+                           res[k] : R300_PVS_ADDR_MAX) :
+                          R300_PVS_ADDR_MIN;
+
+                r->a0[k] = (int32_t)f;
+            }
+        }
+        return;
+    }
+
+    if (dmode != R300_PVS_ADDR_ABSOLUTE &&
+        dmode != R300_PVS_ADDR_RELATIVE_A0) {
+        r300_pvs_addr_gap(gaps, dmode);
+        return;
+    }
+
+    switch (dtype) {
+    case R300_PVS_DST_REG_OUT:
+    case R300_PVS_DST_REG_OUT_REPL_X:
+        idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
+                                R300_PVS_OUT_REGS);
+        if (idx < 0) {
+            return;
+        }
+        dst = r->out[idx];
+        r->out_written |= 1u << idx;
+        break;
+    case R300_PVS_DST_REG_TEMPORARY:
+        idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
+                                R300_PVS_TMP_REGS);
+        if (idx < 0) {
+            return;
+        }
+        dst = r->tmp[idx];
+        break;
+    case R300_PVS_DST_REG_ALT_TEMP:
+        idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
+                                R300_PVS_ATMP_REGS);
+        if (idx < 0) {
+            return;
+        }
+        dst = r->atmp[idx];
+        break;
+    default:
+        /*
+         * Writing the input file back is a shader-model-3 trick, and
+         * A0 is written only by the float-to-fixed loads above;
+         * either would give a wrong answer silently rather than an
+         * approximate one.
+         */
+        if (gaps && !gaps->has_dst_file) {
+            gaps->has_dst_file = true;
+            gaps->dst_file = dtype;
+        }
+        return;
+    }
+    for (k = 0; k < 4; k++) {
+        if (we & (1u << k)) {
+            dst[k] = dtype == R300_PVS_DST_REG_OUT_REPL_X ?
+                     res[0] : res[k];
+        }
+    }
+}
+
 void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
 {
     unsigned i;
@@ -419,150 +562,173 @@ void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps)
     }
     for (i = p->first; i <= p->last; i++) {
         const uint32_t *w = &p->code[i * 4];
-        uint32_t op = w[0];
-        unsigned opcode = op & R300_PVS_DST_OPCODE_MASK;
-        bool math = op & R300_PVS_DST_MATH_INST;
-        bool dual = op & R300_PVS_DST_DUAL_MATH_OP;
-        unsigned dtype = (op >> R300_PVS_DST_REG_TYPE_SHIFT) &
-                         R300_PVS_DST_REG_TYPE_MASK;
-        unsigned doff = (op >> R300_PVS_DST_OFFSET_SHIFT) &
-                        R300_PVS_DST_OFFSET_MASK;
-        unsigned we = (op >> R300_PVS_DST_WE_SHIFT) & R300_PVS_DST_WE_MASK;
         float a[4], b[4], c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        float res[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        unsigned dmode = r300_pvs_addr_mode(op & R300_PVS_DST_ADDR_MODE_1,
-                                            op & R300_PVS_DST_ADDR_MODE_0);
-        unsigned dsel = (op >> R300_PVS_DST_ADDR_SEL_SHIFT) &
-                        R300_PVS_DST_ADDR_SEL_MASK;
-        float *dst;
-        int idx;
-        unsigned k;
 
         if (!r300_pvs_src(p, r, w[1], a, gaps) ||
             !r300_pvs_src(p, r, w[2], b, gaps)) {
             continue;
         }
-        if (dual) {
+        if (w[0] & R300_PVS_DST_DUAL_MATH_OP) {
             r300_pvs_dual_math(p, r, w[3], gaps);
         } else if (!r300_pvs_src(p, r, w[3], c, gaps)) {
             continue;
         }
+        r300_pvs_ins(p, r, gaps, w, a, b, c);
+    }
+}
 
-        if (op & R300_PVS_DST_MACRO_INST) {
-            /*
-             * The macro bit only ever marks a multiply-add whose three
-             * temporaries the hardware has to read in two passes; the
-             * arithmetic is the plain one, with opcode 1 selecting the
-             * doubling form.
-             */
-            for (k = 0; k < 4; k++) {
-                res[k] = a[k] * b[k] * (opcode ? 2.0f : 1.0f) + c[k];
-            }
-        } else if (math) {
-            if (opcode == R300_ME_NO_OP) {
-                continue;
-            }
-            if (!r300_pvs_math(opcode, a, b, c, res)) {
-                if (gaps && !gaps->has_math_op) {
-                    gaps->has_math_op = true;
-                    gaps->math_op = opcode;
-                }
-                continue;
-            }
+/*
+ * The compiled form. r300_pvs_run() decodes every operand's register
+ * file, offset, swizzles, abs and negate, and converts and bounds checks
+ * every constant, for every instruction of every vertex. None of that
+ * changes within a draw, so it is done once here; a constant operand is
+ * kept finished. An operand with an addressing mode keeps its raw word
+ * and goes through r300_pvs_src(). The arithmetic is r300_pvs_ins(),
+ * shared with the interpreter.
+ */
+static void r300_pvs_csrc_make(const R300PvsProgram *p, uint32_t dw,
+                               R300PvsCSrc *o)
+{
+    static const R300PvsRegs none;
+    unsigned type = dw & R300_PVS_SRC_REG_TYPE_MASK;
+    unsigned off = (dw >> R300_PVS_SRC_OFFSET_SHIFT) &
+                   R300_PVS_SRC_OFFSET_MASK;
+    unsigned c;
+
+    o->dw = dw;
+    o->abs = (dw & R300_PVS_SRC_ABS_XYZW) != 0;
+    o->neg = 0;
+    o->plain = !o->abs;
+    for (c = 0; c < 4; c++) {
+        o->sel[c] = (dw >> (R300_PVS_SRC_SWIZZLE_SHIFT + 3 * c)) &
+                    R300_PVS_SRC_SWIZZLE_MASK;
+        if ((dw >> (R300_PVS_SRC_MODIFIER_SHIFT + c)) & 1) {
+            o->neg |= 1u << c;
+        }
+        if (o->sel[c] != c) {
+            o->plain = false;
+        }
+    }
+    if (o->neg) {
+        o->plain = false;
+    }
+    if (r300_pvs_addr_mode(dw & R300_PVS_SRC_ADDR_MODE_1,
+                           dw & R300_PVS_SRC_ADDR_MODE_0) !=
+        R300_PVS_ADDR_ABSOLUTE) {
+        o->file = R300_PVS_CSRC_RAW;
+        return;
+    }
+    switch (type) {
+    case R300_PVS_SRC_REG_INPUT:
+        o->file = R300_PVS_CSRC_IN;
+        o->idx = off % R300_PVS_IN_REGS;
+        break;
+    case R300_PVS_SRC_REG_CONSTANT:
+        o->file = R300_PVS_CSRC_CONST;
+        o->idx = 0;
+        r300_pvs_src(p, &none, dw, o->kv, NULL);
+        break;
+    case R300_PVS_SRC_REG_ALT_TEMP:
+        o->file = R300_PVS_CSRC_ATMP;
+        o->idx = off % R300_PVS_ATMP_REGS;
+        break;
+    default:
+        o->file = R300_PVS_CSRC_TMP;
+        o->idx = off % R300_PVS_TMP_REGS;
+        break;
+    }
+}
+
+static inline bool r300_pvs_csrc(const R300PvsProgram *p, const R300PvsCSrc *o,
+                                 const R300PvsRegs *r, float out[4],
+                                 R300PvsGaps *gaps)
+{
+    const float *v;
+    unsigned c;
+
+    switch (o->file) {
+    case R300_PVS_CSRC_RAW:
+        return r300_pvs_src(p, r, o->dw, out, gaps);
+    case R300_PVS_CSRC_CONST:
+        memcpy(out, o->kv, sizeof(o->kv));
+        return true;
+    case R300_PVS_CSRC_IN:
+        v = r->in[o->idx];
+        break;
+    case R300_PVS_CSRC_ATMP:
+        v = r->atmp[o->idx];
+        break;
+    default:
+        v = r->tmp[o->idx];
+        break;
+    }
+    if (o->plain) {
+        memcpy(out, v, 4 * sizeof(float));
+        return true;
+    }
+    for (c = 0; c < 4; c++) {
+        unsigned sel = o->sel[c];
+        float f;
+
+        if (sel < 4) {
+            f = v[sel];
         } else {
-            if (opcode == R300_VE_NO_OP) {
-                continue;
-            }
-            if (!r300_pvs_vector(opcode, a, b, c, res)) {
-                if (gaps && !gaps->has_vec_op) {
-                    gaps->has_vec_op = true;
-                    gaps->vec_op = opcode;
-                }
-                continue;
-            }
+            f = sel == R300_PVS_SRC_SELECT_FORCE_1 ? 1.0f : 0.0f;
         }
-
-        if (op & (math ? R300_PVS_DST_ME_SAT : R300_PVS_DST_VE_SAT)) {
-            for (k = 0; k < 4; k++) {
-                res[k] = MIN(MAX(res[k], 0.0f), 1.0f);
-            }
+        if (o->abs) {
+            f = fabsf(f);
         }
+        if ((o->neg >> c) & 1) {
+            f = -f;
+        }
+        out[c] = f;
+    }
+    return true;
+}
 
-        if (dtype == R300_PVS_DST_REG_A0 && !math &&
-            !(op & R300_PVS_DST_MACRO_INST) &&
-            (opcode == R300_VE_FLT2FIX_DX ||
-             opcode == R300_VE_FLT2FIX_DX_RND)) {
-            /*
-             * The only writers of A0 (R5xx guide 7.5.9): the integral
-             * result, clamped to -256..255. The register is a single
-             * vector, so the destination offset and addressing mode are
-             * meaningless here.
-             */
-            for (k = 0; k < 4; k++) {
-                if (we & (1u << k)) {
-                    float f = res[k] > R300_PVS_ADDR_MIN ?
-                              (res[k] < R300_PVS_ADDR_MAX ?
-                               res[k] : R300_PVS_ADDR_MAX) :
-                              R300_PVS_ADDR_MIN;
+void r300_pvs_compile(const R300PvsProgram *p, R300PvsCompiled *cp)
+{
+    unsigned i;
 
-                    r->a0[k] = (int32_t)f;
-                }
-            }
+    cp->p = p;
+    cp->n = 0;
+    if (!p->valid) {
+        return;
+    }
+    for (i = p->first; i <= p->last && cp->n < R300_PVS_CODE_SLOTS; i++) {
+        const uint32_t *w = &p->code[i * 4];
+        R300PvsCIns *in = &cp->ins[cp->n++];
+
+        in->w = w;
+        r300_pvs_csrc_make(p, w[1], &in->a);
+        r300_pvs_csrc_make(p, w[2], &in->b);
+        in->dual = (w[0] & R300_PVS_DST_DUAL_MATH_OP) != 0;
+        if (!in->dual) {
+            r300_pvs_csrc_make(p, w[3], &in->c);
+        }
+    }
+}
+
+void r300_pvs_exec(const R300PvsCompiled *cp, R300PvsRegs *r,
+                   R300PvsGaps *gaps)
+{
+    const R300PvsProgram *p = cp->p;
+    unsigned i;
+
+    for (i = 0; i < cp->n; i++) {
+        const R300PvsCIns *in = &cp->ins[i];
+        float a[4], b[4], c[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        if (!r300_pvs_csrc(p, &in->a, r, a, gaps) ||
+            !r300_pvs_csrc(p, &in->b, r, b, gaps)) {
             continue;
         }
-
-        if (dmode != R300_PVS_ADDR_ABSOLUTE &&
-            dmode != R300_PVS_ADDR_RELATIVE_A0) {
-            r300_pvs_addr_gap(gaps, dmode);
+        if (in->dual) {
+            r300_pvs_dual_math(p, r, in->w[3], gaps);
+        } else if (!r300_pvs_csrc(p, &in->c, r, c, gaps)) {
             continue;
         }
-
-        switch (dtype) {
-        case R300_PVS_DST_REG_OUT:
-        case R300_PVS_DST_REG_OUT_REPL_X:
-            idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
-                                    R300_PVS_OUT_REGS);
-            if (idx < 0) {
-                continue;
-            }
-            dst = r->out[idx];
-            r->out_written |= 1u << idx;
-            break;
-        case R300_PVS_DST_REG_TEMPORARY:
-            idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
-                                    R300_PVS_TMP_REGS);
-            if (idx < 0) {
-                continue;
-            }
-            dst = r->tmp[idx];
-            break;
-        case R300_PVS_DST_REG_ALT_TEMP:
-            idx = r300_pvs_dst_slot(dmode, doff, r->a0[dsel],
-                                    R300_PVS_ATMP_REGS);
-            if (idx < 0) {
-                continue;
-            }
-            dst = r->atmp[idx];
-            break;
-        default:
-            /*
-             * Writing the input file back is a shader-model-3 trick, and
-             * A0 is written only by the float-to-fixed loads above;
-             * either would give a wrong answer silently rather than an
-             * approximate one.
-             */
-            if (gaps && !gaps->has_dst_file) {
-                gaps->has_dst_file = true;
-                gaps->dst_file = dtype;
-            }
-            continue;
-        }
-        for (k = 0; k < 4; k++) {
-            if (we & (1u << k)) {
-                dst[k] = dtype == R300_PVS_DST_REG_OUT_REPL_X ?
-                         res[0] : res[k];
-            }
-        }
+        r300_pvs_ins(p, r, gaps, in->w, a, b, c);
     }
 }
 

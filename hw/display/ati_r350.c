@@ -5404,6 +5404,7 @@ static void ati_r350_exit(PCIDevice *dev)
     g_free(s->scan_work);
     g_free(s->gl_verts);
     g_free(s->gl_zstage);
+    g_free(s->pvs_cc);
     g_free(s->gl_zbefore);
     g_free(s->gl_zgpu);
     g_free(s->gl_tcx);
