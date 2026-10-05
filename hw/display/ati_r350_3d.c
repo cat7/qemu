@@ -8678,6 +8678,32 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
      * which the draw can still be refused: everything above it is pure
      * inspection, nothing has been seeded, and a fallback costs nothing.
      */
+    /*
+     * The program's first draw is the worker's, not this thread's (see
+     * "THE PROGRAM WORKER" in ati_r350_gl.c); until it has drawn with
+     * this program and write mask the draw stays on the software path.
+     */
+    {
+        const char *glsl = s->us_glsl;
+        uint64_t key = s->us_glsl_key;
+        int ready;
+
+        if (zonly) {
+            glsl = r300_gl_zonly_us;
+            key = R300_GL_ZONLY_KEY;
+        } else if (gen && d->fs->gl_simple) {
+            glsl = s->us_glsl_gen;
+            key = s->us_glsl_gen_key;
+        }
+        ready = ati_r350_gl_prog_ready(s->gl_ctx, key, req.add_blend, glsl,
+                                       d->wmask);
+        if (ready < 0) {
+            return r300_gl_fallback(s, R350_GLF_FSPROG, prim, nvtx);
+        }
+        if (!ready) {
+            return r300_gl_fallback(s, R350_GLF_PROGWAIT, prim, nvtx);
+        }
+    }
     if (!r300_gl_bind(s, d, xr, x0, y0, x1, y1)) {
         return r300_gl_fallback(s, R350_GLF_SURFACE, prim, nvtx);
     }

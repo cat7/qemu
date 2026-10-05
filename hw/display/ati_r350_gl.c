@@ -76,6 +76,9 @@
 #include <float.h>
 #include <math.h>
 #include "ati_r350_us.h"
+#include "qemu/queue.h"
+#include "qemu/thread.h"
+#include "qemu/host-utils.h"
 
 #if defined(CONFIG_DARWIN) || defined(_WIN32)
 
@@ -118,7 +121,13 @@ typedef struct R350GlPlat {
     CGLContextObj ctx;
 } R350GlPlat;
 
-static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
+/*
+ * A context, current on the calling thread; or, with `second`, another
+ * independent one that is left for its own thread to take (see "THE
+ * PROGRAM WORKER").
+ */
+static bool r350_gl_plat_open_any(R350GlPlat *pl, bool second,
+                                  const char **err)
 {
     CGLPixelFormatAttribute attrs[] = {
         kCGLPFAOpenGLProfile,
@@ -141,8 +150,15 @@ static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
         return false;
     }
     CGLDestroyPixelFormat(pix);
-    CGLSetCurrentContext(pl->ctx);
+    if (!second) {
+        CGLSetCurrentContext(pl->ctx);
+    }
     return true;
+}
+
+static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
+{
+    return r350_gl_plat_open_any(pl, false, err);
 }
 
 static void r350_gl_plat_close(R350GlPlat *pl)
@@ -193,6 +209,12 @@ static inline void r350_gl_plat_hold(bool hold)
 
 static inline void r350_gl_plat_unbind(R350GlPlat *pl)
 {
+}
+
+/* a thread that is exiting lets go of the context it held */
+static inline void r350_gl_plat_release(R350GlPlat *pl)
+{
+    CGLSetCurrentContext(NULL);
 }
 
 #else /* _WIN32 */
@@ -324,6 +346,7 @@ static void (APIENTRY *glDrawArrays)(GLenum, GLint, GLsizei);
 static void (APIENTRY *glEnable)(GLenum);
 static void (APIENTRY *glGenTextures)(GLsizei, GLuint *);
 static GLenum (APIENTRY *glGetError)(void);
+static void (APIENTRY *glFinish)(void);
 static void (APIENTRY *glGetIntegerv)(GLenum, GLint *);
 static const GLubyte *(APIENTRY *glGetString)(GLenum);
 static void (APIENTRY *glPixelStorei)(GLenum, GLint);
@@ -418,6 +441,7 @@ static const struct {
     R350_GL_PROC(glEnable),
     R350_GL_PROC(glGenTextures),
     R350_GL_PROC(glGetError),
+    R350_GL_PROC(glFinish),
     R350_GL_PROC(glGetIntegerv),
     R350_GL_PROC(glGetString),
     R350_GL_PROC(glPixelStorei),
@@ -583,7 +607,8 @@ static void r350_gl_plat_close(R350GlPlat *pl)
  * shader compile with the file's own "would not compile" message rather
  * than render something subtly different.
  */
-static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
+static bool r350_gl_plat_open_any(R350GlPlat *pl, bool second,
+                                  const char **err)
 {
     static const char cls[] = "qemu-ati-r350-gl";
     static bool cls_done;
@@ -672,6 +697,10 @@ static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
         *err = "host GL offers no 3.3 core profile context";
         goto fail;
     }
+    if (second) {
+        /* its own thread makes it current; the entry points are loaded */
+        return true;
+    }
     if (!wglMakeCurrent(pl->dc, pl->ctx)) {
         *err = "the 3.3 core context could not be made current";
         goto fail;
@@ -684,6 +713,11 @@ static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
 fail:
     r350_gl_plat_close(pl);
     return false;
+}
+
+static bool r350_gl_plat_open(R350GlPlat *pl, const char **err)
+{
+    return r350_gl_plat_open_any(pl, false, err);
 }
 
 /*
@@ -735,6 +769,12 @@ static inline void r350_gl_plat_unbind(R350GlPlat *pl)
         wglMakeCurrent(NULL, NULL);
         r350_gl_cur = NULL;
     }
+}
+
+static inline void r350_gl_plat_release(R350GlPlat *pl)
+{
+    r350_gl_keep = false;
+    r350_gl_plat_unbind(pl);
 }
 
 /*
@@ -830,14 +870,45 @@ static inline unsigned gl_txunit(unsigned un)
 typedef struct R350GlProgSlot {
     uint64_t key;               /* 0 = empty */
     bool add;                   /* which blend variant this is */
+    bool tried;                 /* a link was attempted; prog 0 = refused */
+    unsigned pending;           /* worker jobs in flight for this slot */
+    uint16_t warm;              /* colour-mask variants drawn once already */
     R350GlProg p;
 } R350GlProgSlot;
+
+/* one job for the program worker; see "THE PROGRAM WORKER" */
+typedef struct R350GlJob {
+    QSIMPLEQ_ENTRY(R350GlJob) next;
+    unsigned slot;              /* R350_GL_PROGSLOTS: a blit program */
+    unsigned kind;              /* R350_GL_WARM_* */
+    uint16_t mask;              /* the colour-mask variant to draw once */
+    char *glsl;                 /* the guest fragment program, or NULL */
+    bool failed;                /* it would not link */
+} R350GlJob;
+
+enum {
+    R350_GL_WARM_MAIN,          /* a draw program into the integer target */
+    R350_GL_WARM_ADD,           /* its add variant, blending into the twin */
+    R350_GL_WARM_UI2N,          /* the twin's two conversions */
+    R350_GL_WARM_N2UI,
+};
 
 struct R350GlCtx {
     R350GlPlat plat;
     R350GlProgSlot prog[R350_GL_PROGSLOTS];
     unsigned prog_next;         /* round-robin victim */
     uint64_t prog_hits, prog_links, prog_failed;
+    /* the program worker */
+    bool async;
+    R350GlPlat wplat;
+    QemuThread wthread;
+    QemuMutex wlock;
+    QemuCond wcond;
+    QSIMPLEQ_HEAD(, R350GlJob) wpending, wdone;
+    bool wquit, wrunning;
+    GLuint wvao, wvao_blit, wvbo, wfbo, wcbuf, wacc, wzbuf, wui, wn, wtcbo,
+           wtctex;
+    uint64_t w_warms, w_failed, w_waits;
     /* the two format conversions the add-blend path needs, and their VAO */
     GLuint ui2n, n2ui, vao_blit;
     GLuint vao, vbo, fbo, cbuf, dst;
@@ -1920,28 +1991,36 @@ static GLuint gl_link(const char *vsrc, const char *fhead, const char *fmid,
 }
 
 /* the draw programs differ in one #define; their uniforms are the same */
+/*
+ * The samplers' units. Program state, so set once per link -- and set
+ * by the worker before its first draw too, because the host specialises
+ * a pipeline on the texture type each sampler finds on its unit.
+ */
+static void gl_prog_samplers(GLuint prog)
+{
+    GLint su[R350_GL_TEXUNITS];
+    unsigned k;
+
+    glUseProgram(prog);
+    glUniform1i(glGetUniformLocation(prog, "u_tex"), 0);
+    glUniform1i(glGetUniformLocation(prog, "u_dst"), 1);
+    for (k = 0; k < R350_GL_TEXUNITS; k++) {
+        su[k] = gl_txunit(k);
+    }
+    glUniform1iv(glGetUniformLocation(prog, "u_txs"), R350_GL_TEXUNITS, su);
+    glUniform1i(glGetUniformLocation(prog, "u_tcbuf"), R350_GL_TCUNIT);
+}
+
 static void gl_prog_locs(R350GlProg *p)
 {
     unsigned k;
     float n255[256];
 
-    glUseProgram(p->prog);
-    glUniform1i(glGetUniformLocation(p->prog, "u_tex"), 0);
-    glUniform1i(glGetUniformLocation(p->prog, "u_dst"), 1);
+    gl_prog_samplers(p->prog);
     for (k = 0; k < 256; k++) {
         n255[k] = k / 255.0f;
     }
     glUniform1fv(glGetUniformLocation(p->prog, "u_n255"), 256, n255);
-    {
-        GLint su[R350_GL_TEXUNITS];
-
-        for (k = 0; k < R350_GL_TEXUNITS; k++) {
-            su[k] = gl_txunit(k);
-        }
-        glUniform1iv(glGetUniformLocation(p->prog, "u_txs"),
-                     R350_GL_TEXUNITS, su);
-        glUniform1i(glGetUniformLocation(p->prog, "u_tcbuf"), R350_GL_TCUNIT);
-    }
 
     p->u_rect = glGetUniformLocation(p->prog, "u_rect");
     p->u_org = glGetUniformLocation(p->prog, "u_org");
@@ -1983,6 +2062,441 @@ static void gl_prog_locs(R350GlProg *p)
  * where the interpreter computes the same thing this text does. So a
  * failed link costs correctness nothing and is counted.
  */
+/*
+ * =====================================================================
+ * THE PROGRAM WORKER (gl-async-compile=on)
+ * =====================================================================
+ *
+ * Linking a program costs about 10 ms on this host; the first DRAW with
+ * it costs about two seconds. The host builds its pipeline state the
+ * first time a program is drawn with, specialised on the program, the
+ * colour write mask, the render target's format and the blend state,
+ * and it builds it synchronously, inside glDrawArrays, on the calling
+ * thread. The command processor's thread was that thread, so every new
+ * guest program held the guest's GPU for seconds -- once per program
+ * per write mask, in every run whose shader text the host had not
+ * cached, which after a rebuild of this file is every program.
+ *
+ * So a program is never first drawn by the command processor. The
+ * caller asks ati_r350_gl_prog_ready() before it offers a draw; a
+ * program not yet drawn with that mask is handed to this worker, which
+ * links its own copy of it and draws one triangle with it on a second
+ * context, with the same vertex layout, target formats, sampler units,
+ * texture types and mask. Meanwhile the caller's draw runs on the
+ * software rasterizer, which computes the same pixels, so nothing is
+ * lost but the offload of a few draws. Once the job is done the command
+ * processor links the program itself (about 10 ms) and its first draw
+ * finds the pipeline built: 4 ms against 2.1 s.
+ *
+ * The second context is NOT in the main one's share group, and that is
+ * measured rather than chosen: the host serialises the contexts of a
+ * share group on one mutex that it holds across the whole pipeline
+ * build, so a shared worker blocks every main-context draw for exactly
+ * as long as the stall it was meant to remove (2.25 s held, 2.25 s
+ * blocked, in the host test), while an independent context blocks
+ * nothing (4 ms worst). The pipeline is found again from the other
+ * context because the host keys its pipeline cache on the shader text
+ * and the fixed state, not on the program object -- which also means
+ * the warm draw's state must match the real draw's in everything the
+ * pipeline is specialised on. The worker's framebuffer, vertex array,
+ * sampler units and bound texture types are therefore built exactly as
+ * the main context's are, and they are the first thing to check if
+ * `gl-stats` ever reports a first draw that was still slow.
+ *
+ * THREADS. The worker owns its context and every GL object it touches;
+ * nothing is shared with the main context. The slots are the command
+ * processor's alone: it submits a job for a slot only while none is in
+ * flight for it, never evicts a slot with a job in flight, and learns
+ * the outcome from the done queue.
+ *
+ * LOCK ORDER: wlock is a leaf. The worker takes no other lock and waits
+ * for nothing but wcond and the GL driver; the command processor holds
+ * wlock only to move jobs between the queues and never waits for the
+ * worker. ati_r350_gl_close() joins it, which is safe under any lock
+ * the worker does not take, which is every other lock.
+ */
+
+/* the sixteen attributes, on the bound vertex array over the bound buffer */
+static void gl_vao_layout(void)
+{
+    /*
+     * Sixteen attributes exactly, which is all GL 3.3 core guarantees
+     * -- see the coordinate-set note in ati_r350_gl.h. Every offset is
+     * derived from C rather than written out, so the table and
+     * R350_GL_VSTRIDE cannot drift apart.
+     */
+    const int C = R350_GL_TEXCOORDS;
+    const struct { GLint loc, n, off; } at[] = {
+        { 0, 2, 0 }, { 1, 4, 2 }, { 2, 4, 41 + 8 * C },
+        { 3, 2, 6 + 2 * C }, { 4, 2, 8 + 2 * C }, { 5, 2, 10 + 2 * C },
+        { 6, 4, 12 + 2 * C }, { 7, 4, 16 + 2 * C }, { 8, 4, 20 + 2 * C },
+        { 9, 2 * C, 24 + 2 * C }, { 10, 2 * C, 24 + 4 * C },
+        { 11, 2 * C, 24 + 6 * C },
+        { 12, 4, 37 + 8 * C },
+        { 13, 4, 25 + 8 * C }, { 14, 4, 29 + 8 * C },
+        { 15, 4, 33 + 8 * C },
+    };
+    unsigned k;
+
+    for (k = 0; k < ARRAY_SIZE(at); k++) {
+        glEnableVertexAttribArray(at[k].loc);
+        glVertexAttribPointer(at[k].loc, at[k].n, GL_FLOAT, GL_FALSE,
+                              R350_GL_VSTRIDE * 4,
+                              (void *)(size_t)(at[k].off * 4));
+    }
+}
+
+/* the write mask's variant: one bit per combination of enabled channels */
+static uint16_t gl_mask_bit(uint32_t wmask)
+{
+    unsigned r = !!(wmask & 0x00ff0000), gr = !!(wmask & 0x0000ff00);
+    unsigned b = !!(wmask & 0x000000ff), a = !!(wmask & 0xff000000);
+
+    return 1u << (r | gr << 1 | b << 2 | a << 3);
+}
+
+static void gl_tex2d(GLuint tex, GLint ifmt, GLenum fmt, GLenum type, int w,
+                     int h, const void *px)
+{
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, px);
+}
+
+/* the worker's copy of the main context's draw state; its thread only */
+static void gl_worker_setup(R350GlCtx *g)
+{
+    static const uint8_t white[4] = { 255, 255, 255, 255 };
+    unsigned un;
+
+    glGenVertexArrays(1, &g->wvao);
+    glGenVertexArrays(1, &g->wvao_blit);
+    glGenBuffers(1, &g->wvbo);
+    glBindVertexArray(g->wvao);
+    glBindBuffer(GL_ARRAY_BUFFER, g->wvbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(float) *
+                 R350_GL_VSTRIDE * 3, NULL, GL_STREAM_DRAW);
+    gl_vao_layout();
+    glGenTextures(1, &g->wcbuf);
+    glGenTextures(1, &g->wacc);
+    glGenTextures(1, &g->wzbuf);
+    glGenTextures(1, &g->wui);
+    glGenTextures(1, &g->wn);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glActiveTexture(GL_TEXTURE0);
+    gl_tex2d(g->wcbuf, GL_RGBA8UI, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, 4, 4,
+             NULL);
+    gl_tex2d(g->wacc, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 4, 4, NULL);
+    gl_tex2d(g->wzbuf, GL_DEPTH32F_STENCIL8, GL_DEPTH_STENCIL,
+             GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 4, 4, NULL);
+    gl_tex2d(g->wui, GL_RGBA8UI, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, 1, 1,
+             white);
+    gl_tex2d(g->wn, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 1, 1, white);
+    /* an integer texture on every unit a draw program samples */
+    for (un = 0; un < R350_GL_TEXUNITS; un++) {
+        glActiveTexture(GL_TEXTURE0 + gl_txunit(un));
+        glBindTexture(GL_TEXTURE_2D, g->wui);
+    }
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g->wui);
+    glGenBuffers(1, &g->wtcbo);
+    glGenTextures(1, &g->wtctex);
+    glBindBuffer(GL_TEXTURE_BUFFER, g->wtcbo);
+    glBufferData(GL_TEXTURE_BUFFER, 16, NULL, GL_STREAM_DRAW);
+    glActiveTexture(GL_TEXTURE0 + R350_GL_TCUNIT);
+    glBindTexture(GL_TEXTURE_BUFFER, g->wtctex);
+    glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, g->wtcbo);
+    glActiveTexture(GL_TEXTURE0);
+    glGenFramebuffers(1, &g->wfbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g->wfbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                           GL_TEXTURE_2D, g->wzbuf, 0);
+    glViewport(0, 0, 4, 4);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
+}
+
+static void gl_worker_teardown(R350GlCtx *g)
+{
+    glDeleteFramebuffers(1, &g->wfbo);
+    glDeleteTextures(1, &g->wcbuf);
+    glDeleteTextures(1, &g->wacc);
+    glDeleteTextures(1, &g->wzbuf);
+    glDeleteTextures(1, &g->wui);
+    glDeleteTextures(1, &g->wn);
+    glDeleteTextures(1, &g->wtctex);
+    glDeleteBuffers(1, &g->wtcbo);
+    glDeleteBuffers(1, &g->wvbo);
+    glDeleteVertexArrays(1, &g->wvao);
+    glDeleteVertexArrays(1, &g->wvao_blit);
+}
+
+/* link the worker's own copy, then draw once the way the main context will */
+static void gl_worker_run(R350GlCtx *g, R350GlJob *j)
+{
+    unsigned m = ctz32(j->mask);
+    const char *err = NULL;
+    GLuint prog;
+
+    switch (j->kind) {
+    case R350_GL_WARM_UI2N:
+        prog = gl_link(vs_blit_src, NULL, NULL, fs_ui2n_src, &err);
+        break;
+    case R350_GL_WARM_N2UI:
+        prog = gl_link(vs_blit_src, NULL, NULL, fs_n2ui_src, &err);
+        break;
+    default:
+        prog = gl_link(vs_src, j->kind == R350_GL_WARM_ADD ? fs_head_add
+                                                            : fs_head_main,
+                       j->glsl, fs_src, &err);
+        break;
+    }
+    g_free(j->glsl);
+    j->glsl = NULL;
+    if (!prog) {
+        j->failed = true;
+        return;
+    }
+    if (j->kind == R350_GL_WARM_UI2N || j->kind == R350_GL_WARM_N2UI) {
+        glUseProgram(prog);
+        glUniform1i(glGetUniformLocation(prog, "u_src"), 2);
+    } else {
+        gl_prog_samplers(prog);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g->wfbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D,
+                           j->kind == R350_GL_WARM_MAIN ||
+                           j->kind == R350_GL_WARM_N2UI ? g->wcbuf : g->wacc,
+                           0);
+    glBindVertexArray(j->kind == R350_GL_WARM_UI2N ||
+                      j->kind == R350_GL_WARM_N2UI ? g->wvao_blit : g->wvao);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, j->kind == R350_GL_WARM_N2UI ? g->wn
+                                                              : g->wui);
+    glActiveTexture(GL_TEXTURE0);
+    if (j->kind == R350_GL_WARM_ADD) {
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFunc(GL_ONE, GL_ONE);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    glColorMask(!!(m & 1), !!(m & 2), !!(m & 4), !!(m & 8));
+    glUseProgram(prog);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glFinish();
+    glDeleteProgram(prog);
+    while (glGetError() != GL_NO_ERROR) {
+        /* a warm draw that failed costs the main context one slow draw */
+    }
+}
+
+static void *gl_worker(void *arg)
+{
+    R350GlCtx *g = arg;
+
+    r350_gl_makecurrent(&g->wplat);
+    r350_gl_plat_hold(true);
+    gl_worker_setup(g);
+    qemu_mutex_lock(&g->wlock);
+    while (!g->wquit) {
+        R350GlJob *j = QSIMPLEQ_FIRST(&g->wpending);
+
+        if (!j) {
+            qemu_cond_wait(&g->wcond, &g->wlock);
+            continue;
+        }
+        QSIMPLEQ_REMOVE_HEAD(&g->wpending, next);
+        qemu_mutex_unlock(&g->wlock);
+        gl_worker_run(g, j);
+        qemu_mutex_lock(&g->wlock);
+        QSIMPLEQ_INSERT_TAIL(&g->wdone, j, next);
+    }
+    qemu_mutex_unlock(&g->wlock);
+    gl_worker_teardown(g);
+    r350_gl_plat_release(&g->wplat);
+    return NULL;
+}
+
+static void gl_worker_submit(R350GlCtx *g, unsigned slot, unsigned kind,
+                             uint16_t mask, char *glsl)
+{
+    R350GlJob *j = g_new0(R350GlJob, 1);
+
+    j->slot = slot;
+    j->kind = kind;
+    j->mask = mask;
+    j->glsl = glsl;
+    if (slot < R350_GL_PROGSLOTS) {
+        g->prog[slot].pending++;
+    }
+    qemu_mutex_lock(&g->wlock);
+    QSIMPLEQ_INSERT_TAIL(&g->wpending, j, next);
+    qemu_cond_signal(&g->wcond);
+    qemu_mutex_unlock(&g->wlock);
+}
+
+/* take in what the worker finished */
+static void gl_worker_drain(R350GlCtx *g)
+{
+    QSIMPLEQ_HEAD(, R350GlJob) done = QSIMPLEQ_HEAD_INITIALIZER(done);
+    R350GlJob *j, *n;
+
+    qemu_mutex_lock(&g->wlock);
+    QSIMPLEQ_CONCAT(&done, &g->wdone);
+    qemu_mutex_unlock(&g->wlock);
+    QSIMPLEQ_FOREACH_SAFE(j, &done, next, n) {
+        if (j->slot < R350_GL_PROGSLOTS) {
+            R350GlProgSlot *sl = &g->prog[j->slot];
+
+            sl->pending--;
+            if (j->failed) {
+                /* the main context's link would fail the same way */
+                sl->tried = true;
+                g->prog_failed++;
+                g->w_failed++;
+            } else {
+                sl->warm |= j->mask;
+                g->w_warms++;
+            }
+        }
+        g_free(j);
+    }
+}
+
+static bool gl_worker_start(R350GlCtx *g, const char **err)
+{
+    if (!r350_gl_plat_open_any(&g->wplat, true, err)) {
+        return false;
+    }
+    qemu_mutex_init(&g->wlock);
+    qemu_cond_init(&g->wcond);
+    QSIMPLEQ_INIT(&g->wpending);
+    QSIMPLEQ_INIT(&g->wdone);
+    qemu_thread_create(&g->wthread, "ati-r350-gl", gl_worker, g,
+                       QEMU_THREAD_JOINABLE);
+    g->wrunning = true;
+    /* the add path's two conversions, before it first needs them */
+    gl_worker_submit(g, R350_GL_PROGSLOTS, R350_GL_WARM_UI2N,
+                     gl_mask_bit(0xffffffff), NULL);
+    gl_worker_submit(g, R350_GL_PROGSLOTS, R350_GL_WARM_N2UI,
+                     gl_mask_bit(0xffffffff), NULL);
+    return true;
+}
+
+static void gl_worker_stop(R350GlCtx *g)
+{
+    R350GlJob *j, *n;
+
+    if (!g->wrunning) {
+        return;
+    }
+    qemu_mutex_lock(&g->wlock);
+    g->wquit = true;
+    qemu_cond_signal(&g->wcond);
+    qemu_mutex_unlock(&g->wlock);
+    qemu_thread_join(&g->wthread);
+    g->wrunning = false;
+    QSIMPLEQ_CONCAT(&g->wdone, &g->wpending);
+    QSIMPLEQ_FOREACH_SAFE(j, &g->wdone, next, n) {
+        g_free(j->glsl);
+        g_free(j);
+    }
+    QSIMPLEQ_INIT(&g->wdone);
+    r350_gl_plat_close(&g->wplat);
+    qemu_cond_destroy(&g->wcond);
+    qemu_mutex_destroy(&g->wlock);
+}
+
+/*
+ * Whether a draw with this program and write mask would find its
+ * pipeline built: 1 yes, 0 not yet (the worker has it; draw in
+ * software), -1 the program would not link (nor will it). Without the
+ * worker every program is "ready", and the first draw pays.
+ */
+int ati_r350_gl_prog_ready(R350GlCtx *g, uint64_t key, bool add,
+                           const char *glsl, uint32_t wmask)
+{
+    uint16_t m = gl_mask_bit(wmask);
+    R350GlProgSlot *sl = NULL;
+    unsigned k, v = 0;
+    int ret = 0;
+
+    if (!g) {
+        return -1;
+    }
+    if (!g->async) {
+        return 1;
+    }
+    r350_gl_makecurrent(&g->plat);
+    gl_worker_drain(g);
+    for (k = 0; k < R350_GL_PROGSLOTS; k++) {
+        if (g->prog[k].key == key && g->prog[k].add == add) {
+            sl = &g->prog[k];
+            v = k;
+            break;
+        }
+    }
+    if (sl) {
+        if (sl->warm & m) {
+            ret = 1;
+        } else if (sl->pending) {
+            g->w_waits++;
+        } else if (sl->tried && !sl->p.prog) {
+            ret = -1;                   /* the link was refused */
+        } else {
+            gl_worker_submit(g, v, add ? R350_GL_WARM_ADD : R350_GL_WARM_MAIN,
+                             m, g_strdup(glsl));
+            g->w_waits++;
+        }
+        r350_gl_done(&g->plat);
+        return ret;
+    }
+    /* a victim with no job in flight; none free means wait */
+    for (k = 0; k < R350_GL_PROGSLOTS; k++) {
+        v = (g->prog_next + k) % R350_GL_PROGSLOTS;
+        if (!g->prog[v].pending) {
+            break;
+        }
+    }
+    g->w_waits++;
+    if (k == R350_GL_PROGSLOTS) {
+        r350_gl_done(&g->plat);
+        return 0;
+    }
+    g->prog_next = (v + 1) % R350_GL_PROGSLOTS;
+    sl = &g->prog[v];
+    if (sl->p.prog) {
+        gl_flush_queue(g);              /* a queued draw may still use it */
+        glDeleteProgram(sl->p.prog);
+    }
+    memset(sl, 0, sizeof(*sl));
+    sl->key = key;
+    sl->add = add;
+    gl_worker_submit(g, v, add ? R350_GL_WARM_ADD : R350_GL_WARM_MAIN, m,
+                     g_strdup(glsl));
+    r350_gl_done(&g->plat);
+    return 0;
+}
+
+void ati_r350_gl_worker_stats(R350GlCtx *g, uint64_t *warms, uint64_t *failed,
+                              uint64_t *waits, unsigned *inflight)
+{
+    unsigned k, n = 0;
+
+    *warms = g ? g->w_warms : 0;
+    *failed = g ? g->w_failed : 0;
+    *waits = g ? g->w_waits : 0;
+    for (k = 0; g && k < R350_GL_PROGSLOTS; k++) {
+        n += g->prog[k].pending;
+    }
+    *inflight = n;
+}
+
 /* the linked program for this request if there is one, without linking */
 static bool gl_prog_cached(R350GlCtx *g, const R350GlReq *r, bool add)
 {
@@ -2004,22 +2518,40 @@ static R350GlProg *gl_prog_for(R350GlCtx *g, const R350GlReq *r, bool add)
     GLuint prog;
 
     for (k = 0; k < R350_GL_PROGSLOTS; k++) {
-        if (g->prog[k].key == r->us_key && g->prog[k].add == add) {
-            g->prog_hits++;
-            return g->prog[k].p.prog ? &g->prog[k].p : NULL;
+        sl = &g->prog[k];
+        if (sl->key == r->us_key && sl->add == add) {
+            if (sl->p.prog) {
+                g->prog_hits++;
+                return &sl->p;
+            }
+            if (sl->tried) {
+                return NULL;
+            }
+            break;              /* the worker's slot: link into it */
         }
+    }
+    if (k == R350_GL_PROGSLOTS) {
+        /* a slot with a worker job in flight is never the victim */
+        for (k = 0; k < R350_GL_PROGSLOTS && g->prog[g->prog_next].pending;
+             k++) {
+            g->prog_next = (g->prog_next + 1) % R350_GL_PROGSLOTS;
+        }
+        if (k == R350_GL_PROGSLOTS) {
+            return NULL;
+        }
+        sl = &g->prog[g->prog_next];
+        g->prog_next = (g->prog_next + 1) % R350_GL_PROGSLOTS;
+        if (sl->p.prog) {
+            glDeleteProgram(sl->p.prog);
+        }
+        memset(sl, 0, sizeof(*sl));
+        sl->key = r->us_key;
+        sl->add = add;
     }
     prog = gl_link(vs_src, add ? fs_head_add : fs_head_main,
                    r->us_glsl, fs_src, &err);
-    sl = &g->prog[g->prog_next];
-    g->prog_next = (g->prog_next + 1) % R350_GL_PROGSLOTS;
-    if (sl->p.prog) {
-        glDeleteProgram(sl->p.prog);
-    }
-    memset(sl, 0, sizeof(*sl));
-    sl->key = r->us_key;
-    sl->add = add;
     sl->p.prog = prog;
+    sl->tried = true;
     if (!prog) {
         g->prog_failed++;
         return NULL;
@@ -2029,10 +2561,9 @@ static R350GlProg *gl_prog_for(R350GlCtx *g, const R350GlReq *r, bool add)
     return &sl->p;
 }
 
-R350GlCtx *ati_r350_gl_open(const char **err)
+R350GlCtx *ati_r350_gl_open(const char **err, bool async)
 {
     R350GlCtx *g;
-    unsigned k;
 
     *err = NULL;
     g = g_new0(R350GlCtx, 1);
@@ -2087,33 +2618,8 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
 
-    {
-        /*
-         * Sixteen attributes exactly, which is all GL 3.3 core
-         * guarantees -- see the coordinate-set note in ati_r350_gl.h.
-         * Every offset is derived from C rather than written out, so
-         * the table and R350_GL_VSTRIDE cannot drift apart.
-         */
-        const int C = R350_GL_TEXCOORDS;
-        const struct { GLint loc, n, off; } at[] = {
-            { 0, 2, 0 }, { 1, 4, 2 }, { 2, 4, 41 + 8 * C },
-            { 3, 2, 6 + 2 * C }, { 4, 2, 8 + 2 * C }, { 5, 2, 10 + 2 * C },
-            { 6, 4, 12 + 2 * C }, { 7, 4, 16 + 2 * C }, { 8, 4, 20 + 2 * C },
-            { 9, 2 * C, 24 + 2 * C }, { 10, 2 * C, 24 + 4 * C },
-            { 11, 2 * C, 24 + 6 * C },
-            { 12, 4, 37 + 8 * C },
-            { 13, 4, 25 + 8 * C }, { 14, 4, 29 + 8 * C },
-            { 15, 4, 33 + 8 * C },
-        };
-
-        glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
-        for (k = 0; k < ARRAY_SIZE(at); k++) {
-            glEnableVertexAttribArray(at[k].loc);
-            glVertexAttribPointer(at[k].loc, at[k].n, GL_FLOAT, GL_FALSE,
-                                  R350_GL_VSTRIDE * 4,
-                                  (void *)(size_t)(at[k].off * 4));
-        }
-    }
+    glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
+    gl_vao_layout();
 
     {
         GLint mx = 0;
@@ -2131,15 +2637,22 @@ R350GlCtx *ati_r350_gl_open(const char **err)
     }
 
     g->barrier = r350_gl_plat_has_barrier();
-    snprintf(g->desc, sizeof(g->desc), R350_GL_BACKEND_NAME ", %s / GLSL %s%s",
-             (const char *)glGetString(GL_VERSION),
-             (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION),
-             g->barrier ? ", texture barrier" : "");
     if (glGetError() != GL_NO_ERROR) {
         ati_r350_gl_close(g);
         *err = "GL reported an error while setting the backend up";
         return NULL;
     }
+    if (async) {
+        const char *werr = NULL;
+
+        g->async = gl_worker_start(g, &werr);
+    }
+    snprintf(g->desc, sizeof(g->desc),
+             R350_GL_BACKEND_NAME ", %s / GLSL %s%s%s",
+             (const char *)glGetString(GL_VERSION),
+             (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION),
+             g->barrier ? ", texture barrier" : "",
+             g->async ? ", program worker" : "");
     r350_gl_done(&g->plat);
     return g;
 }
@@ -2153,6 +2666,7 @@ void ati_r350_gl_close(R350GlCtx *g)
         unsigned k;
 
         r350_gl_makecurrent(&g->plat);
+        gl_worker_stop(g);
         gl_flush_queue(g);
         glDeleteTextures(1, &g->dst);
         glDeleteTextures(1, &g->acc);
@@ -3449,7 +3963,7 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
 
 #else /* no host GL backend */
 
-R350GlCtx *ati_r350_gl_open(const char **err)
+R350GlCtx *ati_r350_gl_open(const char **err, bool async)
 {
     *err = "no host GL backend is built for this platform";
     return NULL;
@@ -3457,6 +3971,19 @@ R350GlCtx *ati_r350_gl_open(const char **err)
 
 void ati_r350_gl_close(R350GlCtx *g)
 {
+}
+
+int ati_r350_gl_prog_ready(R350GlCtx *g, uint64_t key, bool add,
+                           const char *glsl, uint32_t wmask)
+{
+    return -1;
+}
+
+void ati_r350_gl_worker_stats(R350GlCtx *g, uint64_t *links, uint64_t *warms,
+                              uint64_t *waits, unsigned *inflight)
+{
+    *links = *warms = *waits = 0;
+    *inflight = 0;
 }
 
 bool ati_r350_gl_target(R350GlCtx *g, int w, int h, bool *lost)

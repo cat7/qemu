@@ -5134,7 +5134,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                        s->gl_path);
             return;
         }
-        s->gl_ctx = ati_r350_gl_open(&why);
+        s->gl_ctx = ati_r350_gl_open(&why, s->gl_async);
         if (!s->gl_ctx) {
             error_setg(errp, "gl=%s: %s", s->gl_path, why);
             return;
@@ -5453,6 +5453,7 @@ static const Property ati_r350_properties[] = {
     DEFINE_PROP_BOOL("gl-depth", ATIR350State, gl_depth, true),
     /* occlusion-queried draws: counted on the GPU, or off = software */
     DEFINE_PROP_BOOL("gl-zpass", ATIR350State, gl_zpass, true),
+    DEFINE_PROP_BOOL("gl-async-compile", ATIR350State, gl_async, true),
     /*
      * Keep the GPU's depth buffer across releases and write it back only
      * when something reads it; off writes it back at every release.
@@ -5591,6 +5592,7 @@ static const char *const ati_r350_gl_fb_names[R350_GLF_MAX] = {
     [R350_GLF_CBFMT]    = "16bpp or GART colour buffer",
     [R350_GLF_ZTEST]    = "depth or stencil test",
     [R350_GLF_ZPASS]    = "occlusion query (gl-zpass=off)",
+    [R350_GLF_PROGWAIT] = "program still being built",
 };
 
 const char *ati_r350_gl_fb_name(ATIR350GlFallback why)
@@ -5830,6 +5832,17 @@ static char *ati_r350_get_gl(Object *obj, Error **errp)
         g_string_append_printf(out, "\nfragment shaders: %" PRIu64
                                " cache hits, %" PRIu64 " linked, %" PRIu64
                                " would not build", ph, pl, pf);
+        if (s->gl_async) {
+            uint64_t wl, ww, wq;
+            unsigned wi;
+
+            ati_r350_gl_worker_stats(s->gl_ctx, &ww, &wl, &wq, &wi);
+            g_string_append_printf(out, "\nprogram worker: %" PRIu64
+                                   " variants drawn once, %" PRIu64
+                                   " would not link, %" PRIu64
+                                   " draws not waited for, %u in flight",
+                                   ww, wl, wq, wi);
+        }
         if (ati_r350_gl_barriers(s->gl_ctx)) {
             uint64_t qu, qf, qw;
 
