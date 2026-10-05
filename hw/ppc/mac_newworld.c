@@ -73,6 +73,7 @@
 #include "system/reset.h"
 #include "kvm_ppc.h"
 #include "hw/usb/usb.h"
+#include "hw/pci/pci_ids.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/cpu.h"
@@ -109,6 +110,7 @@ struct Core99MachineState {
     MachineState parent;
 
     Core99ViaConfig via_config;
+    bool nec_usb;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -530,6 +532,30 @@ static void ppc_core99_init(MachineState *machine)
         }
     }
 
+    if (core99_machine->nec_usb) {
+        /*
+         * NEC uPD720101 in slot 25: EHCI at function 2, OHCI companions
+         * for ports 1-3 and 4-5 at functions 0 and 1
+         */
+        PCIDevice *ehci, *ohci;
+        BusState *ehci_bus;
+
+        ehci = pci_new_multifunction(PCI_DEVFN(25, 2), "nec-usb-ehci");
+        pci_realize_and_unref(ehci, pci_bus, &error_fatal);
+        ehci_bus = QLIST_FIRST(&DEVICE(ehci)->child_bus);
+        for (i = 0; i < 2; i++) {
+            ohci = pci_new_multifunction(PCI_DEVFN(25, i), "pci-ohci");
+            qdev_prop_set_string(DEVICE(ohci), "masterbus", ehci_bus->name);
+            qdev_prop_set_uint32(DEVICE(ohci), "firstport", i * 3);
+            qdev_prop_set_uint32(DEVICE(ohci), "num-ports", 3 - i);
+            pci_realize_and_unref(ohci, pci_bus, &error_fatal);
+            pci_config_set_vendor_id(ohci->config, PCI_VENDOR_ID_NEC);
+            pci_config_set_device_id(ohci->config,
+                                     PCI_DEVICE_ID_NEC_UPD720101_OHCI);
+            pci_config_set_revision(ohci->config, 0x43);
+        }
+    }
+
     pci_vga_init(pci_bus);
 
     if (!graphic_width) {
@@ -722,6 +748,16 @@ static void core99_set_via_config(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool core99_get_nec_usb(Object *obj, Error **errp)
+{
+    return CORE99_MACHINE(obj)->nec_usb;
+}
+
+static void core99_set_nec_usb(Object *obj, bool value, Error **errp)
+{
+    CORE99_MACHINE(obj)->nec_usb = value;
+}
+
 static void core99_instance_init(Object *obj)
 {
     Core99MachineState *cms = CORE99_MACHINE(obj);
@@ -733,6 +769,11 @@ static void core99_instance_init(Object *obj)
     object_property_set_description(obj, "via",
                                     "Set VIA configuration. "
                                     "Valid values are cuda, pmu and pmu-adb");
+    object_property_add_bool(obj, "nec-usb", core99_get_nec_usb,
+                             core99_set_nec_usb);
+    object_property_set_description(obj, "nec-usb",
+                                    "Add a NEC uPD720101 USB 2.0 card "
+                                    "(EHCI plus two OHCI companions)");
 }
 
 static const TypeInfo core99_machine_info = {
