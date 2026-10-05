@@ -10140,6 +10140,16 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
         g_autofree uint32_t *pre = NULL;
         uint32_t *arr[R300_AOS_MAX] = { NULL };
         size_t span[R300_AOS_MAX], total = 0;
+        /*
+         * A VRAM array that is one contiguous, uniformly swapped range is
+         * read straight out of VRAM: one coherency touch and one swapper
+         * lookup for the array instead of a memory-controller walk, a
+         * touch and a lookup per dword.
+         */
+        const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+        bool vp[R300_AOS_MAX] = { false };
+        uint32_t voff[R300_AOS_MAX] = { 0 };
+        unsigned vxr[R300_AOS_MAX] = { 0 };
         R300TexSrc ts[R300_TEXCOORDS];
         uint32_t dw[R300_VTX_DWORDS_MAX];
 
@@ -10155,6 +10165,19 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
             if (span[a] && !ati_r350_mc_to_vram(s, addr[a], &off)) {
                 total += span[a];
             } else {
+                uint32_t end;
+
+                if (span[a] && span[a] < 0x1000000 &&
+                    ati_r350_mc_to_vram(s, addr[a] +
+                                        (uint32_t)(span[a] - 1) * 4, &end) &&
+                    end == off + (uint32_t)(span[a] - 1) * 4 &&
+                    (uint64_t)off + span[a] * 4 <= ATI_R350_VRAM_SIZE &&
+                    ati_r350_vram_xor_span(s, off, (uint32_t)span[a] * 4,
+                                           &vxr[a])) {
+                    ati_r350_gl_touch(s, off, (uint32_t)span[a] * 4);
+                    vp[a] = true;
+                    voff[a] = off;
+                }
                 span[a] = 0;
             }
         }
@@ -10179,11 +10202,22 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                 unsigned base = n;
 
                 for (c = 0; c < size[a] && n < R300_VTX_DWORDS_MAX; c++) {
-                    uint32_t card = addr[a] + (vi * stride[a] + c) * 4;
-                    uint32_t val = arr[a] ? arr[a][vi * stride[a] + c]
-                                          : ati_r350_mc_read32(s, card);
-                    uint32_t off;
+                    uint32_t card, val, off;
 
+                    if (vp[a]) {
+                        /* VRAM: the VC swap never applies there */
+                        uint32_t o = voff[a] + (vi * stride[a] + c) * 4;
+                        unsigned x = vxr[a];
+
+                        dw[n++] = (uint32_t)vram[o ^ x] |
+                                  (uint32_t)vram[(o + 1) ^ x] << 8 |
+                                  (uint32_t)vram[(o + 2) ^ x] << 16 |
+                                  (uint32_t)vram[(o + 3) ^ x] << 24;
+                        continue;
+                    }
+                    card = addr[a] + (vi * stride[a] + c) * 4;
+                    val = arr[a] ? arr[a][vi * stride[a] + c]
+                                 : ati_r350_mc_read32(s, card);
                     if (swap && !ati_r350_mc_to_vram(s, card, &off)) {
                         val = r300_vc_swap(val, swap);
                     }

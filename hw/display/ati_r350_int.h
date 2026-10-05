@@ -1292,6 +1292,8 @@ unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off);
  */
 unsigned ati_r350_vram_xor_range(ATIR350State *s, uint32_t off,
                                  uint32_t *lo, uint32_t *hi);
+bool ati_r350_vram_xor_span(ATIR350State *s, uint32_t off, uint32_t len,
+                            unsigned *xr);
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off);
 
 #endif /* ATI_R350_INT_H */

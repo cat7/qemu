@@ -287,6 +287,20 @@ unsigned ati_r350_vram_xor_range(ATIR350State *s, uint32_t off,
     return m.val;
 }
 
+/* the lane xor for every byte of [off, off + len); false if it varies */
+bool ati_r350_vram_xor_span(ATIR350State *s, uint32_t off, uint32_t len,
+                            unsigned *xr)
+{
+    ATIR350SwapMemo m;
+
+    ati_r350_swap_resolve(s, off, &m);
+    if ((uint64_t)off + (len ? len : 1) - 1 > m.hi) {
+        return false;
+    }
+    *xr = m.val;
+    return true;
+}
+
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off)
 {
     const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
