@@ -1284,6 +1284,13 @@ void ati_r350_host_cursor(int x, int y, bool on);
  * swap, 1 = 16-bit swap, 3 = 32-bit swap. See ati_r350_vram_xor().
  */
 unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off);
+/*
+ * The same lane XOR, and the inclusive offset range [*lo, *hi] around
+ * `off` over which ati_r350_vram_xor() returns it while the surface
+ * registers stay as they are.
+ */
+unsigned ati_r350_vram_xor_range(ATIR350State *s, uint32_t off,
+                                 uint32_t *lo, uint32_t *hi);
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off);
 
 #endif /* ATI_R350_INT_H */

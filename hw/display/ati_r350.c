@@ -276,6 +276,17 @@ unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
     return m->val;
 }
 
+unsigned ati_r350_vram_xor_range(ATIR350State *s, uint32_t off,
+                                 uint32_t *lo, uint32_t *hi)
+{
+    ATIR350SwapMemo m;
+
+    ati_r350_swap_resolve(s, off, &m);
+    *lo = m.lo;
+    *hi = m.hi;
+    return m.val;
+}
+
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off)
 {
     const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);

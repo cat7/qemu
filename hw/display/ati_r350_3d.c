@@ -216,6 +216,13 @@ typedef struct R300DrawState {
     uint32_t cb_card;
     unsigned cb_xr;
     bool cb_host;
+    /*
+     * The aperture lane xor at the VRAM colour and Z buffers, resolved
+     * once per draw: `cb_sv` holds for offsets in [cb_slo, cb_shi],
+     * `zb_sv` for [zb_slo, zb_shi]. An empty range resolves per access.
+     */
+    unsigned cb_sv, zb_sv;
+    uint32_t cb_slo, cb_shi, zb_slo, zb_shi;
     /* count the samples passing the depth test, zq_spp to a pixel */
     bool zq;
     unsigned zq_spp;
@@ -1159,10 +1166,33 @@ static float r300_cb_dec16(const R300DrawState *d, uint16_t v)
     return d->cb_fp16 ? r300_h2f(v) : v / 65535.0f;
 }
 
+/* the lane xor the colour buffer's bytes at `addr` are stored under */
+static inline unsigned r300_cb_xor(ATIR350State *s, const R300DrawState *d,
+                                   uint32_t addr)
+{
+    if (d->cb_host) {
+        return d->cb_xr;
+    }
+    if (addr >= d->cb_slo && addr <= d->cb_shi) {
+        return d->cb_sv;
+    }
+    return ati_r350_vram_xor(s, addr);
+}
+
+/* ... and the Z buffer's */
+static inline unsigned r300_zb_xor(ATIR350State *s, const R300DrawState *d,
+                                   uint32_t addr)
+{
+    if (addr >= d->zb_slo && addr <= d->zb_shi) {
+        return d->zb_sv;
+    }
+    return ati_r350_vram_xor(s, addr);
+}
+
 static uint32_t r300_cb_ld32(ATIR350State *s, const R300DrawState *d,
                              uint32_t addr)
 {
-    unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+    unsigned xr = r300_cb_xor(s, d, addr);
 
     return (uint32_t)d->cb[addr ^ xr] |
            ((uint32_t)d->cb[(addr + 1) ^ xr] << 8) |
@@ -1173,7 +1203,7 @@ static uint32_t r300_cb_ld32(ATIR350State *s, const R300DrawState *d,
 static void r300_cb_st32(ATIR350State *s, const R300DrawState *d,
                          uint32_t addr, uint32_t v)
 {
-    unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+    unsigned xr = r300_cb_xor(s, d, addr);
 
     d->cb[addr ^ xr] = v & 0xff;
     d->cb[(addr + 1) ^ xr] = (v >> 8) & 0xff;
@@ -1268,7 +1298,7 @@ static uint32_t r300_cb_pack16(unsigned fmt, uint32_t argb)
 static uint32_t r300_read_dst(ATIR350State *s, const R300DrawState *d,
                               uint32_t addr)
 {
-    unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+    unsigned xr = r300_cb_xor(s, d, addr);
 
     if (d->cb_bpp == 1) {
         return d->cb[addr ^ xr] * 0x01010101u;
@@ -1293,7 +1323,7 @@ static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
         /* masked-off channels keep whatever the destination holds */
         argb = (argb & d->wmask) | (r300_read_dst(s, d, addr) & ~d->wmask);
     }
-    xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+    xr = r300_cb_xor(s, d, addr);
     if (d->cb_bpp == 1) {
         d->cb[addr ^ xr] = argb >> d->cb_sel;
         return;
@@ -1310,11 +1340,9 @@ static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
     d->cb[(addr + 3) ^ xr] = (argb >> 24) & 0xff;
 }
 
-static void r300_st32(ATIR350State *s, const R300DrawState *d,
-                      uint32_t addr, uint32_t val)
+static void r300_st32x(const R300DrawState *d, uint32_t addr, uint32_t val,
+                       unsigned xr)
 {
-    unsigned xr = ati_r350_vram_xor(s, addr);
-
     d->vram[(addr + 0) ^ xr] = val & 0xff;
     d->vram[(addr + 1) ^ xr] = (val >> 8) & 0xff;
     d->vram[(addr + 2) ^ xr] = (val >> 16) & 0xff;
@@ -1414,6 +1442,7 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
     uint32_t addr = r300_zb_addr(s, x, y, 0);
     uint32_t old, znew, zold, sold, snew, val;
     bool zpass, spass = true;
+    unsigned xr;
 
     if (s->zb.z16) {
         /*
@@ -1421,13 +1450,11 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
          * of a tiled 16-bit surface is unmeasured, and nothing but
          * this model has been seen to read one.
          */
-        unsigned xr;
-
         addr = s->zb.off + ((uint32_t)y * s->zb.pitch + x) * 2;
         if (addr + 2 > ATI_R350_VRAM_SIZE) {
             return true;
         }
-        xr = ati_r350_vram_xor(s, addr);
+        xr = r300_zb_xor(s, d, addr);
         zold = d->vram[addr ^ xr] | (uint32_t)d->vram[(addr + 1) ^ xr] << 8;
         znew = (uint32_t)(MIN(MAX(zf, 0.0f), 1.0f) * 65535.0f);
         zpass = !s->zb.z_test || r300_zs_cmp(s->zb.zsc & 7, znew, zold);
@@ -1440,7 +1467,11 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
     if (addr + 4 > ATI_R350_VRAM_SIZE) {
         return true;
     }
-    old = r300_ld32(s, d, addr);
+    xr = r300_zb_xor(s, d, addr);
+    old = (uint32_t)d->vram[addr ^ xr] |
+          ((uint32_t)d->vram[(addr + 1) ^ xr] << 8) |
+          ((uint32_t)d->vram[(addr + 2) ^ xr] << 16) |
+          ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
     zold = old >> 8;
     sold = old & 0xff;
     snew = sold;
@@ -1462,11 +1493,11 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
     }
     if (znew != zold || snew != sold) {
         val = (znew << 8) | snew;
-        r300_st32(s, d, addr, val);
+        r300_st32x(d, addr, val, xr);
         if (s->zb.aa) {
             addr = r300_zb_addr(s, x, y, 1);
             if (addr + 4 <= ATI_R350_VRAM_SIZE) {
-                r300_st32(s, d, addr, val);
+                r300_st32x(d, addr, val, r300_zb_xor(s, d, addr));
             }
         }
     }
@@ -1513,7 +1544,24 @@ static void r300_zclear_run(ATIR350State *s, const R300ZClear *c,
     uint32_t i, off;
     unsigned x, y, k;
     int keep[4];
+    /*
+     * The swapper over the range last resolved, and the cleared word as
+     * it is stored under each lane xor: a 24-bit sample is then one
+     * aligned store, with one surface walk per range instead of one per
+     * sample.
+     */
+    uint32_t xlo = 1, xhi = 0, word[4];
+    unsigned xr = 0;
 
+    for (k = 0; k < 4; k++) {
+        uint8_t b[4];
+        unsigned j;
+
+        for (j = 0; j < 4; j++) {
+            b[j ^ k] = clr >> (j * 8);
+        }
+        memcpy(&word[k], b, 4);
+    }
     if (!bw || !((zp >> 2) & 0xfff) ||
         (c->zfmt != R300_ZB_FORMAT_24_8 && c->zfmt != R300_ZB_FORMAT_16) ||
         !ati_r350_mc_to_vram(s, c->zoff, &off)) {
@@ -1543,24 +1591,30 @@ static void r300_zclear_run(ATIR350State *s, const R300ZClear *c,
                 if (s->zb.z16) {
                     /* the linear layout r300_zb_pixel() uses */
                     uint32_t a = off + (y * s->zb.pitch + x) * 2;
-                    unsigned xr;
 
                     if (a + 2 > ATI_R350_VRAM_SIZE) {
                         continue;
                     }
-                    xr = ati_r350_vram_xor(s, a);
+                    if (a < xlo || a > xhi) {
+                        xr = ati_r350_vram_xor_range(s, a, &xlo, &xhi);
+                    }
                     vram[a ^ xr] = clr & 0xff;
                     vram[(a + 1) ^ xr] = (clr >> 8) & 0xff;
                     continue;
                 }
                 for (k = 0; k < smp; k++) {
                     uint32_t a = r300_zb_addr(s, x, y, k);
-                    unsigned xr;
 
                     if (a + 4 > ATI_R350_VRAM_SIZE) {
                         continue;
                     }
-                    xr = ati_r350_vram_xor(s, a);
+                    if (a < xlo || a > xhi) {
+                        xr = ati_r350_vram_xor_range(s, a, &xlo, &xhi);
+                    }
+                    if (!(a & 3)) {
+                        memcpy(vram + a, &word[xr], 4);
+                        continue;
+                    }
                     vram[(a + 0) ^ xr] = clr & 0xff;
                     vram[(a + 1) ^ xr] = (clr >> 8) & 0xff;
                     vram[(a + 2) ^ xr] = (clr >> 16) & 0xff;
@@ -4977,6 +5031,22 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      */
     trace_ati_r350_3d_cb(d->dst_off, d->dst_pitch, d->wmask, d->resolve,
                          d->res_off, d->res_pitch);
+    /*
+     * The swapper over the colour and Z buffers, resolved here once
+     * instead of for every pixel. The surface registers cannot change
+     * before the draw is done.
+     */
+    d->cb_slo = d->zb_slo = 1;
+    d->cb_shi = d->zb_shi = 0;
+    d->cb_sv = d->zb_sv = 0;
+    if (!d->cb_host) {
+        d->cb_sv = ati_r350_vram_xor_range(s, d->dst_off, &d->cb_slo,
+                                           &d->cb_shi);
+    }
+    if (s->zb.z_en) {
+        d->zb_sv = ati_r350_vram_xor_range(s, s->zb.off, &d->zb_slo,
+                                           &d->zb_shi);
+    }
     return true;
 }
 
