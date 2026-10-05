@@ -5430,24 +5430,31 @@ static bool r300_cap_xor(ATIR350State *s, uint32_t off, uint32_t len,
 }
 
 /*
- * Where this draw can write: the primitive's own bounding box, widened
- * by a pixel because a line is expanded across its direction and a
- * rectangle list implies a fourth corner, then clipped exactly the way
- * r300_raster_tri() clips its scan.
+ * Where this draw can write: the pixels whose centres the primitive's
+ * own bounding box holds, within R300_CAP_EPS, then clipped exactly the
+ * way r300_raster_tri() clips its scan. A rectangle list adds the fourth
+ * corner it implies and a point sprite its RE_POINTSIZE extent; lines,
+ * expanded across their direction, are widened by a pixel instead.
+ *
+ * Not a pixel more: the GL path writes this rectangle back to VRAM, and
+ * the OS X driver clears a window with an inclusive scissor one pixel
+ * past its last row and column. Widened, the rectangle reached the depth
+ * buffer packed after the colour buffer and wrote stale words over it.
  *
  * `empty`, when not NULL, comes back true for the ONE refusal that is a
  * PROOF that the software rasterizer would paint nothing either: the
- * widened bounding box is empty after the scissor. That is a proof and
- * not an impression, because this box is a superset of every box
- * r300_raster_tri() will scan for this draw --
+ * rectangle is empty after the scissor. That is a proof and not an
+ * impression, because this rectangle holds every pixel
+ * r300_raster_tri() will write for this draw --
  *
  *   - the vertex loop above takes the minimum/maximum over ALL of `vb`
  *     (plus the corner a rectangle list implies, plus the point
  *     sprite's RE_POINTSIZE half-extent, both of which the rasterizer
  *     synthesises from the same registers), so any triangle it
  *     assembles has its own min/max inside fx0..fx1, fy0..fy1;
- *   - floorf()-1 / ceilf()+1 widen that by a further pixel, so the
- *     rasterizer's un-widened floorf()/ceilf() bounds stay inside;
+ *   - a triangle writes only pixels whose centre (x + 0.5, y + 0.5) it
+ *     holds, and those lie in that box; a line's quad reaches half a
+ *     pixel past it, inside the pixel lines are widened by;
  *   - the four clamps below are character for character the ones
  *     r300_raster_tri() applies, and r300_span_clip() only ever
  *     narrows a row further.
@@ -5459,6 +5466,8 @@ static bool r300_cap_xor(ATIR350State *s, uint32_t off, uint32_t len,
  * rasterizer write row 0 over and over, and the VRAM trim below drops
  * rows using a widened x1 the real primitive may fall well short of.
  */
+#define R300_CAP_EPS (1.0f / 16.0f)
+
 static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
                           const R300Vtx *vb, unsigned nvtx, unsigned prim,
                           int *rx0, int *ry0, int *rx1, int *ry1,
@@ -5498,10 +5507,17 @@ static bool r300_cap_rect(ATIR350State *s, const R300DrawState *d,
         fy0 < -100000.0f || fy1 > 100000.0f) {
         return false;
     }
-    x0 = (int)floorf(fx0) - 1;
-    y0 = (int)floorf(fy0) - 1;
-    x1 = (int)ceilf(fx1) + 1;
-    y1 = (int)ceilf(fy1) + 1;
+    if (prim == 2 || prim == 3 || prim == 12) {
+        x0 = (int)floorf(fx0) - 1;
+        y0 = (int)floorf(fy0) - 1;
+        x1 = (int)ceilf(fx1) + 1;
+        y1 = (int)ceilf(fy1) + 1;
+    } else {
+        x0 = (int)ceilf(fx0 - 0.5f - R300_CAP_EPS);
+        y0 = (int)ceilf(fy0 - 0.5f - R300_CAP_EPS);
+        x1 = (int)floorf(fx1 - 0.5f + R300_CAP_EPS) + 1;
+        y1 = (int)floorf(fy1 - 0.5f + R300_CAP_EPS) + 1;
+    }
     x0 = MAX(x0, MAX(d->sc_x0, 0));
     y0 = MAX(y0, MAX(d->sc_y0, 0));
     x1 = MIN(x1, MIN(d->sc_x1 + 1, 8191));
@@ -6286,6 +6302,12 @@ static void r300_gl_zsoft(ATIR350State *s, const R300DrawState *d,
 
     zr[0] = zr[1] = zr[2] = zr[3] = 0;
     if (!s->gl_zres) {
+        return;
+    }
+    if (s->zb.z_en && nvtx &&
+        !r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1, &empty) &&
+        empty) {
+        /* the draw paints nothing, so it reads and writes no Z either */
         return;
     }
     if (s->zb.z_en && s->gl_zlazy && r300_gl_zsame(s) && nvtx &&
