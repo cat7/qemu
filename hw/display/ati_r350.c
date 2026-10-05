@@ -5149,7 +5149,12 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                        s->gl_path);
             return;
         }
-        s->gl_ctx = ati_r350_gl_open(&why, s->gl_async);
+        if (s->gl_workers < 1 || s->gl_workers > R350_GL_MAXWORKERS) {
+            error_setg(errp, "gl-compile-workers must be 1..%d",
+                       R350_GL_MAXWORKERS);
+            return;
+        }
+        s->gl_ctx = ati_r350_gl_open(&why, s->gl_async ? s->gl_workers : 0);
         if (!s->gl_ctx) {
             error_setg(errp, "gl=%s: %s", s->gl_path, why);
             return;
@@ -5469,6 +5474,7 @@ static const Property ati_r350_properties[] = {
     /* occlusion-queried draws: counted on the GPU, or off = software */
     DEFINE_PROP_BOOL("gl-zpass", ATIR350State, gl_zpass, true),
     DEFINE_PROP_BOOL("gl-async-compile", ATIR350State, gl_async, true),
+    DEFINE_PROP_UINT32("gl-compile-workers", ATIR350State, gl_workers, 2),
     /*
      * Keep the GPU's depth buffer across releases and write it back only
      * when something reads it; off writes it back at every release.

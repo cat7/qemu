@@ -301,7 +301,9 @@ typedef struct R350GlCtx R350GlCtx;
  * string on failure -- a host without a usable GL context is a
  * configuration fact to report, not an abort.
  */
-R350GlCtx *ati_r350_gl_open(const char **err, bool async);
+#define R350_GL_MAXWORKERS 8
+
+R350GlCtx *ati_r350_gl_open(const char **err, unsigned workers);
 void ati_r350_gl_close(R350GlCtx *g);
 
 /*
