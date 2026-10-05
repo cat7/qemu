@@ -3964,6 +3964,11 @@ bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *r)
                                     r->x0, r->y0, r->w, r->h);
                 glActiveTexture(GL_TEXTURE0);
             }
+            if (r->tcx) {
+                /* gl_PrimitiveID restarts at 0 in every draw call */
+                glUniform1i(p->u_tcbase,
+                            (GLint)(r->pass[k] / 3 * r->tc_stride));
+            }
             glDrawArrays(GL_TRIANGLES, (GLint)r->pass[k],
                          (GLsizei)(r->pass[k + 1] - r->pass[k]));
         }
