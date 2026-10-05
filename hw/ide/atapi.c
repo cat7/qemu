@@ -989,31 +989,44 @@ static int atapi_mode_page(IDEState *s, int code, uint8_t *p)
 
 static void atapi_mode_sense(IDEState *s, uint8_t *buf, bool ten)
 {
+    static const uint8_t all_pages[] = {
+        MODE_PAGE_R_W_ERROR, MODE_PAGE_AUDIO_CTL, MODE_PAGE_CAPABILITIES,
+        MODE_PAGE_APPLE_VENDOR, 0x31,
+    };
     int action = buf[2] >> 6;
     int code = buf[2] & 0x3f;
     int head = ten ? 8 : 4;
     int max_len = ten ? lduw_be_p(buf + 7) : buf[4];
-    int page;
+    int page = 0;
+    int i;
 
-    switch (action) {
-    case 0: /* current values */
-        break;
-    case 1: /* changeable values */
-    case 2: /* default values */
-        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
-        return;
-    default:
-    case 3: /* saved values */
+    if (action == 3) { /* saved values */
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
                             ASC_SAVING_PARAMETERS_NOT_SUPPORTED);
         return;
     }
 
     memset(buf, 0, head);
-    page = atapi_mode_page(s, code, buf + head);
+    if (code == 0x3f) {
+        for (i = 0; i < ARRAY_SIZE(all_pages); i++) {
+            page += atapi_mode_page(s, all_pages[i], buf + head + page);
+        }
+    } else {
+        page = atapi_mode_page(s, code, buf + head);
+    }
     if (page == 0) {
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
         return;
+    }
+
+    if (action == 1) {
+        /* Changeable values: no parameter is changeable. */
+        for (i = 0; i < page;) {
+            int len = buf[head + i + 1] + 2;
+
+            memset(buf + head + i + 2, 0, len - 2);
+            i += len;
+        }
     }
 
     if (ten) {
