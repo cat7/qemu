@@ -98,31 +98,6 @@ void helper_LMW(CPUPPCState *env, target_ulong addr, uint32_t reg)
     }
 }
 
-void helper_STMW(CPUPPCState *env, target_ulong addr, uint32_t reg)
-{
-    uintptr_t raddr = GETPC();
-    int mmu_idx = ppc_env_mmu_index(env, false);
-    void *host = probe_contiguous(env, addr, (32 - reg) * 4,
-                                  MMU_DATA_STORE, mmu_idx, raddr);
-
-    if (likely(host)) {
-        /* Fast path -- the entire operation is in RAM at host.  */
-        for (; reg < 32; reg++) {
-            stl_be_p(host, env->gpr[reg]);
-            host += 4;
-        }
-    } else {
-        /* Slow path -- at least some of the operation requires i/o.  */
-        for (; reg < 32; reg++) {
-            MemOp op = ppc_data_endian_env(env) | MO_UL | MO_UNALN;
-            MemOpIdx oi = make_memop_idx(op, mmu_idx);
-
-            cpu_stl_mmu(env, addr, env->gpr[reg], oi, raddr);
-            addr = addr_add(env, addr, 4);
-        }
-    }
-}
-
 static void do_lsw(CPUPPCState *env, target_ulong addr, uint32_t nb,
                    uint32_t reg, uintptr_t raddr)
 {

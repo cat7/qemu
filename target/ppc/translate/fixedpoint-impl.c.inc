@@ -352,14 +352,35 @@ static bool do_ldst_multiple(DisasContext *ctx, arg_D *a, bool store)
 
     gen_set_access_type(ctx, ACCESS_INT);
 
-    reg = tcg_constant_i32(a->rt);
     ea = do_ea_calc(ctx, a->ra, tcg_constant_tl(a->si));
 
-    /* Call the appropriate helper function */
-    if (store) {
-        gen_helper_STMW(tcg_env, ea, reg);
-    } else {
+    /*
+     * A load with rA in the range is an invalid form. Keep the helper for
+     * it, so that a fault part-way through cannot leave rA modified for
+     * the restart.
+     */
+    if (!store && a->ra != 0 && a->ra >= a->rt) {
+        reg = tcg_constant_i32(a->rt);
         gen_helper_LMW(tcg_env, ea, reg);
+        return true;
+    }
+
+    /*
+     * One access per word. A fault part-way through leaves the earlier
+     * words transferred and the instruction is restarted from the start,
+     * as the architecture allows for load/store multiple.
+     */
+    for (int r = a->rt; r < 32; r++) {
+        if (store) {
+            tcg_gen_qemu_st_tl(cpu_gpr[r], ea, ctx->mem_idx,
+                               DEF_MEMOP(MO_UL));
+        } else {
+            tcg_gen_qemu_ld_tl(cpu_gpr[r], ea, ctx->mem_idx,
+                               DEF_MEMOP(MO_UL));
+        }
+        if (r < 31) {
+            gen_addr_add(ctx, ea, ea, 4);
+        }
     }
 
     return true;
