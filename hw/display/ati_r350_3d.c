@@ -228,6 +228,16 @@ typedef struct R300DrawState {
     /* count the samples passing the depth test, zq_spp to a pixel */
     bool zq;
     unsigned zq_spp;
+    /*
+     * A texture unit's whole mip chain as one contiguous, uniformly
+     * swapped VRAM range, when it is one: a texel is then read straight
+     * from it instead of through the memory controller and the swapper.
+     */
+    struct {
+        bool ok;
+        uint32_t off, len;
+        unsigned xr;
+    } tvx[R300_TEX_UNITS];
 } R300DrawState;
 
 /*
@@ -574,6 +584,16 @@ static inline uint32_t r300_lane_xor32(uint32_t v, unsigned x)
     }
 }
 
+/* a VRAM dword with the swapper already resolved */
+static inline uint32_t r300_ld32x(const R300DrawState *d, uint32_t addr,
+                                  unsigned xr)
+{
+    return (uint32_t)d->vram[addr ^ xr] |
+           ((uint32_t)d->vram[(addr + 1) ^ xr] << 8) |
+           ((uint32_t)d->vram[(addr + 2) ^ xr] << 16) |
+           ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
+}
+
 /* the texel at card address `addr`, in the unit's format */
 static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
                             unsigned unit, uint32_t addr)
@@ -581,6 +601,38 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
     const R300TexUnit *u = &d->tex[unit];
     uint32_t off, lo, hi;
 
+    if (d->tvx[unit].ok && addr - u->off < d->tvx[unit].len) {
+        /* the resolved chain: the bytes the paths below would read */
+        unsigned x = d->tvx[unit].xr;
+        uint32_t o = d->tvx[unit].off + (addr - u->off);
+
+        switch (u->bpp) {
+        case 8:
+            return d->vram[o ^ (x & 3)];
+        case 16: {
+            uint32_t v = (uint32_t)d->vram[o ^ x] |
+                         ((uint32_t)d->vram[(o + 1) ^ x] << 8);
+
+            switch (u->code) {
+            case R300_TX_FMT_1_5_5_5:
+                return r300_texel_1555(v);
+            case R300_TX_FMT_5_6_5:
+                return r300_texel_565(v);
+            case R300_TX_FMT_4_4_4_4:
+                return r300_texel_4444(v);
+            default:
+                return v;
+            }
+        }
+        case 64:
+            lo = r300_ld32x(d, o, x);
+            hi = r300_ld32x(d, o + 4, x);
+            return u->code == R300_TX_FMT_16F_16F_16F_16F
+                   ? r300_texel_16fx4(lo, hi) : r300_texel_16x4(lo, hi);
+        default:
+            return r300_ld32x(d, o, x);
+        }
+    }
     if (u->bpp == 8) {
         /* single-component format: the byte is component X */
         uint8_t a;
@@ -5042,6 +5094,28 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      * instead of for every pixel. The surface registers cannot change
      * before the draw is done.
      */
+    {
+        unsigned tu;
+
+        for (tu = 0; tu < R300_TEX_UNITS; tu++) {
+            const R300TexUnit *u = &d->tex[tu];
+            uint32_t o0, o1;
+
+            d->tvx[tu].ok = false;
+            if (u->en && u->chain && !(u->bpp == 16 &&
+                                       r300_tex_yuv422(u->code)) &&
+                ati_r350_mc_to_vram(s, u->off, &o0) &&
+                ati_r350_mc_to_vram(s, u->off + u->chain - 1, &o1) &&
+                o1 == o0 + u->chain - 1 &&
+                (uint64_t)o0 + u->chain + 8 <= ATI_R350_VRAM_SIZE &&
+                ati_r350_vram_xor_span(s, o0, u->chain + 8,
+                                       &d->tvx[tu].xr)) {
+                d->tvx[tu].ok = true;
+                d->tvx[tu].off = o0;
+                d->tvx[tu].len = u->chain;
+            }
+        }
+    }
     d->vsc = NULL;
     if (d->vs_run && d->vs.valid && !d->vs.plain_matrix) {
         if (!s->pvs_cc) {
