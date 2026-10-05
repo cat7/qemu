@@ -1321,27 +1321,44 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
  * the clear writes that value into the tiles. One dword covers 32x16
  * pixels (8x4 tiles of 4x4 on two pipes), row-major over
  * ZB_ZMASK_PITCH pixels: a 640x480 clear is 600 dwords.
+ *
+ * A cleared tile takes the clear value when it is read, not when the
+ * packet arrives: the OS X driver sends the packet first and the
+ * ZB_DEPTHCLEARVALUE of the new context after it, before the first
+ * depth-tested draw. So the clear is held and written at the first draw
+ * that uses a depth or stencil buffer, with the registers of that draw,
+ * provided it is the same buffer (ZB_DEPTHOFFSET); r300_run_prims().
  */
+typedef struct R300ZClear {
+    uint32_t zoff, zp, clr, zfmt, bw, smp;
+} R300ZClear;
+
 static bool r300_gl_zclear(ATIR350State *s, uint32_t first, uint32_t n,
                            unsigned bw, uint32_t clr, int *keep);
 
-void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
-                               uint32_t val)
+static void r300_zclear_regs(ATIR350State *s, R300ZClear *c)
+{
+    c->zoff = s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu;
+    c->zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
+    c->clr = s->regs[R300_ZB_DEPTHCLEARVALUE >> 2];
+    c->zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
+    c->bw = (s->regs[R300_ZB_ZMASK_PITCH >> 2] & 0x3fff) / 32;
+    c->smp = (s->regs[R300_GB_AA_CONFIG >> 2] & R300_AA_ENABLE) ? 2 : 1;
+}
+
+static void r300_zclear_run(ATIR350State *s, const R300ZClear *c,
+                            uint32_t first, uint32_t n)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    uint32_t zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
-    uint32_t clr = s->regs[R300_ZB_DEPTHCLEARVALUE >> 2];
-    unsigned bw = (s->regs[R300_ZB_ZMASK_PITCH >> 2] & 0x3fff) / 32;
-    unsigned smp = (s->regs[R300_GB_AA_CONFIG >> 2] & R300_AA_ENABLE) ? 2 : 1;
-    unsigned zfmt = s->regs[R300_ZB_FORMAT >> 2] & 0xf;
+    uint32_t clr = c->clr, zp = c->zp;
+    unsigned bw = c->bw, smp = c->smp;
     uint32_t i, off;
     unsigned x, y, k;
     int keep[4];
 
-    if (val || !bw || !((zp >> 2) & 0xfff) ||
-        (zfmt != R300_ZB_FORMAT_24_8 && zfmt != R300_ZB_FORMAT_16) ||
-        !ati_r350_mc_to_vram(s, s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
-                             &off)) {
+    if (!bw || !((zp >> 2) & 0xfff) ||
+        (c->zfmt != R300_ZB_FORMAT_24_8 && c->zfmt != R300_ZB_FORMAT_16) ||
+        !ati_r350_mc_to_vram(s, c->zoff, &off)) {
         return;
     }
     s->zb.off = off;
@@ -1349,7 +1366,7 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
     s->zb.macro = zp & R300_ZB_MACROTILE;
     s->zb.micro = (zp >> R300_ZB_MICROTILE_SHIFT) & 3;
     s->zb.aa = smp == 2;
-    s->zb.z16 = zfmt == R300_ZB_FORMAT_16;
+    s->zb.z16 = c->zfmt == R300_ZB_FORMAT_16;
     n = MIN(n, 0x100000);
     /*
      * A GPU copy of this buffer is cleared alike; any other goes back.
@@ -1394,6 +1411,59 @@ void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
             }
         }
     }
+}
+
+/* a held clear, with the registers it was sent with */
+static void r300_zclear_flush(ATIR350State *s)
+{
+    R300ZClear c;
+
+    if (!s->zclr_pend) {
+        return;
+    }
+    s->zclr_pend = false;
+    c = (R300ZClear) {
+        .zoff = s->zclr_zoff, .zp = s->zclr_zp, .clr = s->zclr_clr,
+        .zfmt = s->zclr_zfmt, .bw = s->zclr_bw, .smp = s->zclr_smp,
+    };
+    r300_zclear_run(s, &c, s->zclr_first, s->zclr_n);
+}
+
+/* the first draw on the held clear's buffer: written with its registers */
+static void r300_zclear_draw(ATIR350State *s)
+{
+    R300ZClear c;
+
+    r300_zclear_regs(s, &c);
+    if (c.zoff != s->zclr_zoff) {
+        return;
+    }
+    s->zclr_pend = false;
+    r300_zclear_run(s, &c, s->zclr_first, s->zclr_n);
+}
+
+void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
+                               uint32_t val)
+{
+    R300ZClear c;
+
+    if (val) {
+        return;
+    }
+    r300_zclear_regs(s, &c);
+    if (s->zclr_pend && (s->zclr_zoff != c.zoff || s->zclr_first != first ||
+                         s->zclr_n != n)) {
+        r300_zclear_flush(s);
+    }
+    s->zclr_pend = true;
+    s->zclr_first = first;
+    s->zclr_n = n;
+    s->zclr_zoff = c.zoff;
+    s->zclr_zp = c.zp;
+    s->zclr_clr = c.clr;
+    s->zclr_zfmt = c.zfmt;
+    s->zclr_bw = c.bw;
+    s->zclr_smp = c.smp;
 }
 
 /* the factor codes r300_blend_f() below actually implements */
@@ -9381,6 +9451,9 @@ static void r300_run_prims(ATIR350State *s, R300DrawState *d,
 {
     g_autofree R300Vtx *cv = NULL;
 
+    if (s->zclr_pend && s->zb.z_en) {
+        r300_zclear_draw(s);
+    }
     nvtx = r300_clip_draw(s, d, vb, cp, nvtx, &prim, &cv);
     if (cv) {
         if (!nvtx) {

@@ -4593,6 +4593,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     /* the surface descriptors are about to go: resolve the target first */
     ati_r350_gl_reset(s);
     ati_r350_zpass_drop(s);
+    s->zclr_pend = false;
     if (s->zg_on) {
         ati_r350_zguard_set(s, 0, 0, 0, 0);
     }

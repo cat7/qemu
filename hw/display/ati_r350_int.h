@@ -840,6 +840,10 @@ struct ATIR350State {
     bool zq_on;                 /* reset since the last dump: counting */
     bool zq_late;               /* drawn uncounted since the last dump */
     bool zq_gl;                 /* GL counted a draw since the reset */
+    /* a 3D_CLEAR_ZMASK held for the first draw on its buffer */
+    bool zclr_pend;
+    uint32_t zclr_first, zclr_n, zclr_zoff, zclr_zp, zclr_clr;
+    uint32_t zclr_zfmt, zclr_bw, zclr_smp;
     uint32_t zq_base;           /* the value ZB_ZPASS_DATA was given */
     uint64_t zq_sw;             /* software samples since the reset */
     uint64_t zq_draw;           /* the current draw's software samples */
