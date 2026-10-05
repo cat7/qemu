@@ -1,0 +1,1370 @@
+/*
+ * QEMU ATI Rage 128 Pro emulation -- register definitions
+ *
+ * All offsets, field positions and reset defaults below are taken from
+ * the official "RAGE 128 PRO Register Reference Guide" RRG-G04500-C
+ * Rev 1.01 (ATI, January 2000) unless a comment says otherwise. The
+ * register file is accessible identically through the BAR2 memory
+ * aperture (MMR), the BAR1 I/O window (IOR, low 256 bytes + the
+ * MM_INDEX/MM_DATA indirection for the rest) and the VGA index port
+ * (IND, unmodeled). PCI configuration space is additionally mirrored
+ * read-only at register offsets 0x0F00-0x0FFF.
+ *
+ * This work is licensed under the GNU GPL license version 2 or later.
+ */
+
+#ifndef ATI_R350_REGS_H
+#define ATI_R350_REGS_H
+
+#define R350_MM_INDEX                0x0000
+#define R350_MM_DATA                 0x0004
+#define R350_CLOCK_CNTL_INDEX        0x0008
+#define R350_CLOCK_CNTL_DATA         0x000c
+#define R350_BIOS_0_SCRATCH          0x0010
+#define R350_BIOS_1_SCRATCH          0x0014
+#define R350_BIOS_2_SCRATCH          0x0018
+#define R350_BIOS_3_SCRATCH          0x001c
+#define R350_BUS_CNTL                0x0030
+#define R350_BUS_CNTL1               0x0034
+#define R350_MEM_VGA_WP_SEL          0x0038
+#define R350_MEM_VGA_RP_SEL          0x003c
+#define R350_GEN_INT_CNTL            0x0040
+#define R350_GEN_INT_STATUS          0x0044
+#define R350_CRTC_GEN_CNTL           0x0050
+#define R350_CRTC_EXT_CNTL           0x0054
+#define R350_DAC_CNTL                0x0058
+#define R350_CRTC_STATUS             0x005c
+#define R350_GPIO_MONID              0x0068
+#define R350_SEPROM_CNTL             0x006c
+/*
+ * The retail card's FCode drives 0x6C as a second GPIO port ("GPIO
+ * MONID B": A [3:0], Y [11:8] read-only, EN [19:16], MASK [27:24] --
+ * same lane layout as GPIO_MONID) for its DDC/EDID path: its word
+ * 0x918 sets MASK=0xf, toggles CRTC_OFFSET bit 23 and expects pad 3
+ * (Y bit 3) to follow -- a cable/DDC presence handshake -- before the
+ * bulk EDID read. The RRG names 0x6C SEPROM_CNTL; both uses share the
+ * pads on real silicon.
+ */
+#define R350_GPIO_MONIDB             0x006c
+/*
+ * The hardware I2C engine (0x0090/0x0094/0x0098) is NOT documented in
+ * RRG-G04500-C at all, but the OEM Mac FCode ROM's constant table
+ * includes all three offsets and XFree86's r128_reg.h names them
+ * I2C_CNTL_0/I2C_CNTL_1/I2C_DATA. Bit layout below is from XFree86 /
+ * the abandoned SourceFiles/ATI reference, to be validated against
+ * live FCode traces.
+ */
+#define R350_I2C_CNTL_0              0x0090
+#define R350_I2C_CNTL_1              0x0094
+#define R350_I2C_DATA                0x0098
+#define R350_AMCGPIO_MASK_MIR        0x009c
+#define R350_AMCGPIO_A_MIR           0x00a0
+#define R350_AMCGPIO_Y_MIR           0x00a4
+#define R350_AMCGPIO_EN_MIR          0x00a8
+#define R350_PALETTE_INDEX           0x00b0
+#define R350_PALETTE_DATA            0x00b4
+#define R350_CONFIG_CNTL             0x00e0
+#define R350_CONFIG_XSTRAP           0x00e4
+#define R350_CONFIG_BONDS            0x00e8
+#define R350_GEN_RESET_CNTL          0x00f0
+#define R350_GEN_STATUS              0x00f4
+#define R350_CONFIG_MEMSIZE          0x00f8
+#define R350_CONFIG_APER_0_BASE      0x0100
+#define R350_CONFIG_APER_1_BASE      0x0104
+#define R350_CONFIG_APER_SIZE        0x0108
+#define R350_CONFIG_REG_1_BASE       0x010c
+#define R350_CONFIG_REG_APER_SIZE    0x0110
+#define R350_CONFIG_MEMSIZE_EMBEDDED 0x0114
+#define R350_TEST_DEBUG_CNTL         0x0120
+#define R350_HOST_PATH_CNTL          0x0130
+#define R350_SW_SEMAPHORE            0x013c
+#define R350_MEM_CNTL                0x0140
+#define R350_EXT_MEM_CNTL            0x0144
+#define R350_MEM_ADDR_CONFIG         0x0148
+#define R350_MEM_INTF_CNTL           0x014c
+#define R350_MEM_STR_CNTL            0x0150
+#define R350_MEM_INIT_LAT_TIMER      0x0154
+#define R350_MEM_SDRAM_MODE_REG      0x0158
+#define R350_AGP_BASE                0x0170
+#define R350_AGP_CNTL                0x0174
+#define R350_AGP_APER_OFFSET         0x0178
+#define R350_PCI_GART_PAGE           0x017c
+/*
+ * The ATI PCI GART table (whose guest-physical base page the driver
+ * writes into PCI_GART_PAGE): 8192 little-endian 32-bit entries, one
+ * per 4KB page of a 32MB card-address "VM" window, each entry the
+ * bus/physical address of the backing page (ati_pcigart.c,
+ * DRM_ATI_GART_PCI flavor: plain LE32 page address, no flag bits).
+ */
+#define R350_PCIGART_TABLE_ENTRIES   8192
+#define R350_SOFT_RESET_GUI          (1u << 0)
+#define R350_PC_NGUI_MODE            0x0180
+#define R350_PC_NGUI_CTLSTAT         0x0184
+#define R350_PC_MISC_CTL             0x0188
+#define R350_CRTC_H_TOTAL_DISP       0x0200
+#define R350_CRTC_H_SYNC_STRT_WID    0x0204
+#define R350_CRTC_V_TOTAL_DISP       0x0208
+#define R350_CRTC_V_SYNC_STRT_WID    0x020c
+#define R350_CRTC_VLINE_CRNT_VLINE   0x0210
+#define R350_CRTC_CRNT_FRAME         0x0214
+#define R350_CRTC_GUI_TRIG_VLINE     0x0218
+#define R350_CRTC_OFFSET             0x0224
+#define R350_CRTC_OFFSET_CNTL        0x0228
+#define R350_CRTC_PITCH              0x022c
+#define R350_OVR_CLR                 0x0230
+#define R350_OVR_WID_LEFT_RIGHT      0x0234
+#define R350_OVR_WID_TOP_BOTTOM      0x0238
+#define R350_CUR_OFFSET              0x0260
+#define R350_CUR_HORZ_VERT_POSN      0x0264
+#define R350_CUR_HORZ_VERT_OFF       0x0268
+#define R350_CUR_CLR0                0x026c
+#define R350_CUR_CLR1                0x0270
+
+/* Hardware cursor field layout (RRG-G04500-C 3.13) */
+#define R350_CUR_OFFSET_MASK         0x01fffff0 /* [24:0], [3:0] hardwired 0 */
+#define R350_CUR_LOCK                (1u << 31) /* atomic shape/move update */
+#define R350_CUR_VERT_POSN_MASK      0x7ff      /* [10:0] */
+#define R350_CUR_HORZ_POSN_SHIFT     16         /* [26:16] */
+#define R350_CUR_HORZ_POSN_MASK      0x7ff
+#define R350_CUR_VERT_OFF_MASK       0x3f       /* [5:0] */
+#define R350_CUR_HORZ_OFF_SHIFT      16         /* [21:16] */
+#define R350_CUR_HORZ_OFF_MASK       0x3f
+/*
+ * 64x64 pixels in every mode. CUR_MODE 0 packs a row into 16 bytes (8 of
+ * AND mask then 8 of XOR mask); modes 1 and 3 store one little-endian
+ * 32-bit pixel each, so 256 bytes per row and a 16KB image.
+ */
+#define R350_CUR_WIDTH               64
+#define R350_CUR_HEIGHT              64
+#define R350_CUR_ROW_BYTES           16
+#define R350_CUR_IMAGE_BYTES         (R350_CUR_HEIGHT * R350_CUR_ROW_BYTES)
+#define R350_CUR_ARGB_ROW_BYTES      (R350_CUR_WIDTH * 4)
+#define R350_CUR_ARGB_IMAGE_BYTES    (R350_CUR_HEIGHT * R350_CUR_ARGB_ROW_BYTES)
+#define R350_DAC_EXT_CNTL            0x0280
+#define R350_DDA_CONFIG              0x02e0
+#define R350_DDA_ON_OFF              0x02e4
+#define R350_VGA_DDA_CONFIG          0x02e8
+#define R350_VGA_DDA_ON_OFF          0x02ec
+#define R350_GUI_DEBUG0              0x16a0
+#define R350_WAIT_UNTIL              0x1720
+#define R350_GUI_STAT                0x1740
+#define R350_GUI_SCRATCH_REG0        0x15e0
+#define R350_GUI_SCRATCH_REG1        0x15e4
+
+/*
+ * PM4/CCE (Concurrent Command Engine) GUI command-FIFO ring buffer --
+ * the mechanism the real classic Mac driver actually uses for register
+ * and 2D command submission on this card, reached after the older
+ * one-shot BM_GUI_TABLE descriptor engine's own smoke test succeeds.
+ * RRG-G04500-C's coverage of this whole area is minimal (only
+ * PM4_VC_TIMESTAMP0/1 at 0x7B0/0x7B4 and PM4_BUFFER_DL_WPTR_DELAY at
+ * 0x718 have real register pages; the manual's PM4 vertex-engine
+ * block simply stops there). These offsets are cross-verified two
+ * ways: live-traced (2026-08-02, retail PCI card ROM/NDRV) against a
+ * prior, independent reference implementation of this same engine
+ * (SourceFiles/ATI/qemu/ati_cce.c, read-only project reference
+ * material) -- R350_PM4_STAT's offset in particular was *predicted*
+ * by that reference and then found to match a live guest poll byte-
+ * for-byte, and PM4_BUFFER_DL_WPTR (0x714) sits exactly 4 bytes before
+ * the manual-documented PM4_BUFFER_DL_WPTR_DELAY (0x718), which is
+ * exactly the layout that register's own name implies.
+ *
+ * The ring buffer lives in VRAM (byte offset given by
+ * R350_PM4_BUFFER_OFFSET), not system memory -- this PCI, non-AGP
+ * variant has no GART/system-memory command access, unlike later
+ * AGP/PCIe parts. Packet format (from the same reference, itself
+ * textbook ATI PM4: type in bits[31:30] of each ring dword): type 0 =
+ * sequential register writes starting at ((header&0x1FFF)<<2), count
+ * ((header>>16)&0x3FFF)+1, one-register-repeated if bit15 set; type 1
+ * = two register writes (rare, not modeled); type 2 = NOP/padding;
+ * type 3 = a 2D/3D draw command (opcode in bits[15:8], not modeled
+ * yet -- consumed and traced as unimplemented so the ring position
+ * stays correct).
+ */
+#define R350_PM4_BUFFER_OFFSET       0x0700
+#define R350_PM4_BUFFER_CNTL         0x0704
+#define R350_PM4_BUFFER_WM_CNTL      0x0708
+#define R350_PM4_BUFFER_DL_RPTR_ADDR 0x070c
+#define R350_PM4_BUFFER_DL_RPTR      0x0710
+#define R350_PM4_BUFFER_DL_WPTR      0x0714
+#define R350_PM4_IW_INDOFF           0x0738
+#define R350_PM4_IW_INDSIZE          0x073c
+#define R350_PM4_STAT                0x07b8
+#define R350_PM4_MICROCODE_ADDR      0x07d4
+#define R350_PM4_MICROCODE_RADDR     0x07d8
+#define R350_PM4_MICROCODE_DATAH     0x07dc
+#define R350_PM4_MICROCODE_DATAL     0x07e0
+#define R350_PM4_BUFFER_ADDR         0x07f0
+#define R350_PM4_MICRO_CNTL          0x07fc
+
+/*
+ * PM4_BUFFER_CNTL semantics per the Linux r128 DRM driver
+ * (r128_drv.h, the authoritative public reference for this engine --
+ * our previous START/RESET bit-0/bit-4 interpretation, inherited from
+ * the SourceFiles reference implementation, was wrong): bits [31:28]
+ * select the command-FIFO partitioning MODE (0 = NONPM4/none, odd
+ * values are PIO variants, even values 2-8 give the primary stream a
+ * bus-master ring; mode 7 "64PIO_64VCBM_64INDBM" -- PIO primary
+ * stream + bus-master vertex/indirect buffers -- is what Mac OS X
+ * 10.2's driver uses, value 0x78000000 with NOUPDATE), bit 27 =
+ * NOUPDATE (don't DMA the read pointer to memory), and the low bits
+ * hold log2 of the ring size in qwords for the ring modes.
+ */
+#define R350_PM4_MODE_MASK           (15u << 28)
+#define R350_PM4_NONPM4              (0u << 28)
+#define R350_PM4_192BM               (2u << 28)
+#define R350_PM4_128BM_64INDBM       (4u << 28)
+#define R350_PM4_64BM_128INDBM       (6u << 28)
+#define R350_PM4_64BM_64VCBM_64INDBM (8u << 28)
+#define R350_PM4_BUFFER_CNTL_NOUPDATE (1u << 27)
+#define R350_PM4_BUFFER_SIZE_L2QW(c) ((c) & 0xff)
+#define R350_PM4_BUFFER_DL_DONE      (1u << 31)
+#define R350_PM4_MICRO_FREERUN       (1u << 30)
+#define R350_PM4_MICROCODE_WORDS     256
+
+/*
+ * PM4_BUFFER_OFFSET flag: ring lives in AGP/"VM" (GART-translated)
+ * space rather than local VRAM; the rest of the value is the offset
+ * within that space (Linux: "ring_start | R350_AGP_OFFSET").
+ */
+#define R350_AGP_OFFSET_FLAG         0x02000000
+
+#define R350_PM4_PACKET_TYPE(h)      (((h) >> 30) & 3)
+#define R350_PM4_PACKET0_REG(h)      (((h) & 0x1fff) << 2)
+#define R350_PM4_PACKET0_ONE_REG(h)  (((h) >> 15) & 1)
+#define R350_PM4_PACKET_COUNT(h)     ((((h) >> 16) & 0x3fff) + 1)
+#define R350_PM4_PACKET3_OPCODE(h)   (((h) >> 8) & 0xff)
+#define R350_PM4_PACKET1_REG1(h)     (((h) & 0x7ff) << 2)
+#define R350_PM4_PACKET1_REG2(h)     ((((h) >> 11) & 0x7ff) << 2)
+
+/*
+ * PM4 packet3 2D draw opcodes actually needed to make PAINT (solid
+ * fill) and BITBLT (screen-to-screen copy, including cross-card
+ * copies staged through HOSTDATA_BLT) work -- offsets/semantics from
+ * SourceFiles/ATI/qemu/ati_int.h, cross-checked against real ATI
+ * driver conventions (same opcode values used by every Rage/Radeon
+ * generation's PM4 parser).
+ */
+#define R350_PM4_OPCODE_PAINT         0x91
+/*
+ * PAINT_MULTI: the same solid-fill operation as PAINT, but carrying
+ * several rectangles in one packet -- the payload is consecutive
+ * (DST_Y_X, DST_HEIGHT_WIDTH) pairs, with the drawing context set up
+ * beforehand through ordinary register writes (the Mac driver programs
+ * it via the GUI context "_C" aliases). Classic Mac OS paints every
+ * window panel, button and dialog background with these, so dropping
+ * them leaves only text and lines on screen -- the long-standing
+ * "ghost window" rendering on this card.
+ */
+#define R350_PM4_OPCODE_PAINT_MULTI   0x9a
+#define R350_PM4_OPCODE_BITBLT        0x92
+/*
+ * CNTL_BITBLT_MULTI: BITBLT carrying its own destination pitch/offset, so
+ * a run of copies can share one context dword. Mac OS X issues exactly one
+ * of these per frame of a window drag -- while it went unimplemented the
+ * copy simply never happened, and every later blit out of the driver's
+ * offscreen surface propagated whatever stale content was left there.
+ * That was the garbled window contents on this card.
+ *
+ * Two header dwords and then a RUN of rectangles, three dwords each -- the
+ * MULTI is not decoration:
+ *   [0]      GMC (DP_GUI_MASTER_CNTL)
+ *   [1]      SRC_PITCH_OFFSET (observed 0x10000400 = offset 0x8000, pitch
+ *            128 -- the screen; see the ring parser for why this is the
+ *            source and not the destination)
+ *   [2+3k]   SRC_X_Y
+ *   [3+3k]   DST_X_Y
+ *   [4+3k]   DST_WIDTH_HEIGHT
+ * X/WIDTH live in the HIGH half and Y/HEIGHT in the low half, the same way
+ * round as PAINT_MULTI and plain BITBLT on this driver.
+ *
+ * Captured live, iTunes sends 29 dwords = 2 + NINE rectangles, and they
+ * tile one window exactly: 590x1, 594x1, 596x1, 598x2, then 600x390, then
+ * 598x2, 596x1, 594x1, 590x1, with the destination Y running 10, 11, 12,
+ * 13, 15, 405, 407, 408, 409 -- contiguous, narrow at top and bottom and
+ * wide in between. That is a rounded-corner window, the same shape the
+ * BITBLT and PAINT_MULTI comments describe. Handling only the first
+ * rectangle copied a single 1-pixel-high strip and threw away the 600x390
+ * body, which is why window CHROME came out right while the CONTENTS were
+ * garbage.
+ */
+#define R350_PM4_OPCODE_BITBLT_MULTI  0x9b
+/* header dwords plus at least one 3-dword rectangle */
+#define R350_BITBLT_MULTI_MIN_DWORDS  5
+/*
+ * Rectangle-only blit continuation (not in any public register guide;
+ * established from live OS X 10.4 window-drag captures). Three dwords
+ * -- SRC_X_Y, DST_X_Y, DST_WIDTH_HEIGHT in BITBLT's trajectory layout
+ * -- with the whole drawing context (GMC, pitches, offsets) inherited
+ * from the registers as left by the preceding packet. Every drag step
+ * pairs one with the BITBLT_MULTI title strip: a window-body-sized
+ * screen-to-layer copy (e.g. 785x421) plus a bottom-edge strip
+ * (763x11), re-homing the window image inside the re-anchored drag
+ * layer. Dropping them leaves the body at its old layer rows: one
+ * ghost title bar per drag step, shredding on fast drags.
+ */
+#define R350_PM4_OPCODE_BITBLT_RECT   0x1b
+#define R350_PM4_OPCODE_HOSTDATA_BLT  0x94
+
+/*
+ * PIO alternative submission path for the same PM4 stream: undocumented
+ * in RRG-G04500-C (whose own "GUI Bus Mastering Registers" section is a
+ * stub -- see above), but live-traced 2026-08-02 against the retail PCI
+ * card's real NDRV, and named/offset-confirmed against the independent
+ * reference (SourceFiles/ATI/qemu/ati_regs.h). Both addresses are the
+ * same push port -- consecutive writes there (regardless of which of
+ * the two addresses each individual write lands on) feed the next dword
+ * of an ordinary PM4 packet stream, identical in format to the ring's.
+ * Confirmed live: a 6-dword stream across 3 writes decoded as two
+ * type-0 packets, the second of which wrote the exact 64-bit fence
+ * value the driver polls for at GUI_SCRATCH_REG0/1 -- i.e. this IS the
+ * real driver's actual submission path, not a secondary/optional one.
+ */
+#define R350_PM4_FIFO_DATA_EVEN      0x1000
+#define R350_PM4_FIFO_DATA_ODD       0x1004
+/*
+ * The whole 0x1000-0x13ff range is the Concurrent Command Engine's
+ * FIFO aperture (RRG-G04500-C, 2.2 "Memory Mapping": "Concurrent
+ * Command Engine registers 1000h - 13FFh"): a dword written anywhere in
+ * it is a command-FIFO push. FIFO_DATA_EVEN/ODD are merely its first
+ * two names -- the DRM driver only ever uses those two, but Mac OS's
+ * Rage 128 driver bursts up to eight dwords at 0x1000..0x101c.
+ */
+#define R350_PM4_FIFO_APER_END       0x13fc
+
+/*
+ * 2D GUI (destination datapath) engine. Offsets cross-verified directly
+ * against RRG-G04500-C (unlike the PM4/CCE block above, this whole area
+ * IS fully documented in the manual, chapter "Destination GUI
+ * Registers"/"Datapath Registers") AND against the real, shipped,
+ * upstream QEMU `ati-vga` device (hw/display/ati.c/ati_regs.h/ati_2d.c)
+ * -- both independent sources agree on every offset here byte-for-byte.
+ * Semantics (which combined register triggers a blit on write, the
+ * DP_GUI_MASTER_CNTL field-aliasing behavior, the HOST_DATA accumulator
+ * protocol) are ported from that same upstream ati_2d.c/ati.c, which is
+ * real production code -- not the abandoned SourceFiles/ATI/qemu clone
+ * (see project memory: that tree was already tried once and its
+ * accelerator never loaded).
+ */
+#define R350_DST_OFFSET              0x1404
+#define R350_DST_PITCH               0x1408
+#define R350_DST_WIDTH               0x140c
+#define R350_DST_HEIGHT              0x1410
+#define R350_SRC_X                   0x1414
+#define R350_SRC_Y                   0x1418
+#define R350_DST_X                   0x141c
+#define R350_DST_Y                   0x1420
+#define R350_SRC_PITCH_OFFSET        0x1428
+#define R350_DST_PITCH_OFFSET        0x142c
+#define R350_SRC_Y_X                 0x1434
+#define R350_DST_Y_X                 0x1438
+#define R350_DST_HEIGHT_WIDTH        0x143c
+#define R350_DP_GUI_MASTER_CNTL      0x146c
+/*
+ * GUI_MASTER_CNTL bit 31: the packet carries the brush pattern and
+ * origin inline, rather than the driver having pre-loaded the
+ * BRUSH_DATA registers. Mac OS sets it on every patterned PAINT.
+ */
+#define R350_GMC_LD_BRUSH_Y_X        0x80000000
+#define R350_BRUSH_Y_X               0x1474
+#define R350_BRUSH_DATA0             0x1480   /* .. BRUSH_DATA63 at 0x157c */
+#define R350_BRUSH_DATA63            0x157c
+#define R350_DP_BRUSH_BKGD_CLR       0x1478
+#define R350_DP_BRUSH_FRGD_CLR       0x147c
+#define R350_DST_WIDTH_X             0x1588
+#define R350_SRC_X_Y                 0x1590
+#define R350_DST_X_Y                 0x1594
+#define R350_DST_WIDTH_HEIGHT        0x1598
+#define R350_DST_HEIGHT_Y            0x15a0
+#define R350_SRC_OFFSET              0x15ac
+#define R350_SRC_PITCH               0x15b0
+/*
+ * Colour compare: a per-pixel test that suppresses the write. Mac OS
+ * uses it to repaint a text field's background without disturbing the
+ * glyphs already in it, so leaving it unimplemented erased the text.
+ */
+#define R350_CLR_CMP_CNTL            0x15c0
+#define R350_CLR_CMP_CLR_SRC         0x15c4
+#define R350_CLR_CMP_CLR_DST         0x15c8
+#define R350_CLR_CMP_MASK            0x15cc
+#define R350_CLR_CMP_FN_MASK         0x00000007
+#define R350_CLR_CMP_FN_FALSE        0
+#define R350_CLR_CMP_FN_TRUE         1
+#define R350_CLR_CMP_FN_NOT_EQUAL    4
+#define R350_CLR_CMP_FN_EQUAL        5
+#define R350_CLR_CMP_SRC_SOURCE      0x01000000
+/*
+ * The 2D engine's byte-swap control for data it bus-masters out of host
+ * memory. Same four codes as every other swapper on this chip
+ * (TX_OFFSET.ENDIAN_SWAP, RB3D_COLORPITCH.COLORENDIAN, SURFACEn_INFO):
+ * 0 none, 1 16-bit, 2 32-bit, 3 half-dword.
+ *
+ * Neither AMD register reference we have covers the 2D block, so the
+ * name is established from the driver instead: Mac OS X's
+ * ATIRadeon9700.kext emits this register in
+ * write_2dblit_cmds_for_copy_buffer_using_DMA() carrying the same
+ * bpp-keyed code (8/16/32bpp -> 0/1/2) that set_display_mode_and_vram()
+ * feeds to SURFACE_CNTL and SURFACEn_INFO. A capture of one Chess.app
+ * session agrees exactly: of 1613 BITBLTs, the 23 eight-bit ones and
+ * the 136 that page in OpenGL textures carry 0, and the 1454 that page
+ * in CoreGraphics ARGB surfaces carry 2.
+ */
+#define R350_GUI_HOST_SWAP_CNTL      0x15d4
+/*
+ * The same codes for a blit whose DESTINATION is host memory (a surface
+ * page-out). Mac OS X 10.5's display-mode switch: 4 of 4 page-out
+ * BITBLTs write 2 here and 0 to 0x15d4, 167 of 167 page-ins write 0 here.
+ */
+#define R350_GUI_HOST_DST_SWAP_CNTL  0x15d0
+#define R350_GUI_HOST_SWAP_MASK      0x00000003
+/*
+ * ...and the OTHER end of the same job: the byte-swap control for data
+ * the CPU PUSHES through HOST_DATA0, which is a different path with its
+ * own register. Same four codes.
+ *
+ * The two are not interchangeable and reading the wrong one is the bug
+ * this constant exists to close. GUI_HOST_SWAP_CNTL is written by the
+ * driver's DMA blit emitter (its own function name says so, above) and
+ * describes a buffer the ENGINE reads; RBBM_GUICNTL.HOST_DATA_SWAP is
+ * written immediately before a host-data blit and describes the dwords
+ * the CPU is about to write. Censused over one Mac OS X 10.5 System
+ * Preferences repaint (`texdata-residue2-2026-08-27/adjacency.py` over
+ * leopard-syspref-pm4-2026-08-27.log.gz), the separation is total:
+ * 22 of 22 RBBM_GUICNTL writes are the instruction immediately before a
+ * host-data DP_GUI_MASTER_CNTL and every one carries 2, while 45 of 45
+ * GUI_HOST_SWAP_CNTL writes precede a bus-master blit and alternate
+ * 0 (32 of them) and 2 (13). Neither register ever precedes the other's
+ * operation. Reading the DMA register on the host-data path therefore
+ * picked up whatever the last surface page-in happened to leave there,
+ * which is why 429 of 1335 glyph flushes were unswapped at random and
+ * only some of System Preferences' headers came out as words.
+ */
+#define R350_RBBM_GUICNTL            0x172c
+#define R350_HOST_DATA_SWAP_MASK     0x00000003
+#define R350_DP_SRC_FRGD_CLR         0x15d8
+#define R350_DP_SRC_BKGD_CLR         0x15dc
+#define R350_SC_LEFT                 0x1640
+#define R350_SC_RIGHT                0x1644
+#define R350_SC_TOP                  0x1648
+#define R350_SC_BOTTOM               0x164c
+#define R350_SRC_SC_RIGHT            0x1654
+#define R350_SRC_SC_BOTTOM           0x165c
+#define R350_DP_CNTL                 0x16c0
+#define R350_DP_DATATYPE             0x16c4
+#define R350_DP_MIX                  0x16c8
+#define R350_DP_WRITE_MASK           0x16cc
+#define R350_DEFAULT_OFFSET          0x16e0
+#define R350_DEFAULT_PITCH           0x16e4
+#define R350_DEFAULT_SC_BOTTOM_RIGHT 0x16e8
+#define R350_SC_TOP_LEFT             0x16ec
+#define R350_SC_BOTTOM_RIGHT         0x16f0
+#define R350_SRC_SC_BOTTOM_RIGHT     0x16f4
+/*
+ * GUI context ("_C") registers, RRG-G04500-C: write-only aliases of the
+ * corresponding base registers. XFree86's r128 accel and Mac OS X's
+ * driver program per-operation state through these (the OS X driver's
+ * full-screen presentation batches use ONLY this block for GMC/scissor,
+ * so dropping them executes those blits with stale rop/datatype).
+ */
+#define R350_DST_PITCH_OFFSET_C      0x1c80
+#define R350_DP_GUI_MASTER_CNTL_C    0x1c84
+#define R350_SC_TOP_LEFT_C           0x1c88
+#define R350_SC_BOTTOM_RIGHT_C       0x1c8c
+#define R350_CONSTANT_COLOR_C        0x1d34
+#define R350_PLANE_3D_MASK_C         0x1d44
+#define R350_HOST_DATA0              0x17c0
+#define R350_HOST_DATA1              0x17c4
+#define R350_HOST_DATA2              0x17c8
+#define R350_HOST_DATA3              0x17cc
+#define R350_HOST_DATA4              0x17d0
+#define R350_HOST_DATA5              0x17d4
+#define R350_HOST_DATA6              0x17d8
+#define R350_HOST_DATA7              0x17dc
+#define R350_HOST_DATA_LAST          0x17e0
+
+#define R350_ATI_HOST_DATA_ACC_BITS  128
+
+#define R350_DP_DST_DATATYPE         0x0000000f
+#define R350_DP_BRUSH_DATATYPE       0x00000f00
+#define R350_DP_BRUSH_DATATYPE_SHIFT 8
+/*
+ * Brush (pattern) types, DP_DATATYPE bits 11:8 -- the same codes
+ * GUI_MASTER_CNTL carries in bits 7:4. The "_LA" ("leave alone")
+ * variants are transparent: where the pattern bit is 0 the destination
+ * is not touched at all. Mac OS draws its drag-selection marquee as one
+ * big DSTINVERT rectangle stamped through an 8x8 MONO_FG_LA brush, so
+ * treating every brush as solid inverted the WHOLE rectangle instead of
+ * a dotted outline -- leaving olive-green (inverted desktop purple)
+ * blocks behind on screen.
+ */
+#define R350_BRUSH_8X8_MONO_FG_BG    0
+#define R350_BRUSH_8X8_MONO_FG_LA    1
+#define R350_BRUSH_1X8_MONO_FG_BG    4
+#define R350_BRUSH_1X8_MONO_FG_LA    5
+#define R350_BRUSH_32X1_MONO_FG_BG   6
+#define R350_BRUSH_32X1_MONO_FG_LA   7
+#define R350_BRUSH_32X32_MONO_FG_BG  8
+#define R350_BRUSH_32X32_MONO_FG_LA  9
+#define R350_BRUSH_8X8_COLOR         10
+#define R350_BRUSH_1X8_COLOR         12
+#define R350_BRUSH_SOLID_COLOR       13
+#define R350_BRUSH_NONE              15
+#define R350_DP_SRC_DATATYPE         0x00030000
+#define R350_DP_ROP3                 0x00ff0000
+#define R350_DP_SRC_SOURCE           0x00000700
+#define R350_DP_SRC_HOST             0x00000300
+#define R350_DP_SRC_HOST_BYTEALIGN   0x00000400
+#define R350_DP_BYTE_PIX_ORDER       0x40000000
+/*
+ * "Host data is big endian" -- the chip byte-swaps every pixel the host
+ * feeds it through the HOST_DATA registers or a HOSTDATA_BLT payload,
+ * by pixel size. A big-endian driver that byte-swaps its COMMAND dwords
+ * in software (so the little-endian command fetch reads them right) can
+ * then ship bitmap payload verbatim and let the chip convert it.
+ * Confirmed against xf86-video-r128's r128_reg.h.
+ */
+#define R350_HOST_BIG_ENDIAN_EN      0x20000000
+/*
+ * The fields DP_GUI_MASTER_CNTL aliases into DP_DATATYPE. Everything
+ * outside this mask -- HOST_BIG_ENDIAN_EN above, in particular -- has no
+ * counterpart in GUI_MASTER_CNTL and must survive a write to it.
+ */
+#define R350_DP_DATATYPE_GMC_ALIAS   (R350_DP_DST_DATATYPE | \
+                                      R350_DP_BRUSH_DATATYPE | \
+                                      R350_DP_SRC_DATATYPE | \
+                                      R350_DP_BYTE_PIX_ORDER)
+#define R350_SRC_MONO_FRGD_BKGD      0x00000000
+#define R350_SRC_MONO_FRGD           0x00010000
+#define R350_SRC_COLOR                0x00030000
+#define R350_DST_X_LEFT_TO_RIGHT     0x00000001
+#define R350_DST_Y_TOP_TO_BOTTOM     0x00000002
+#define R350_GMC_SRC_PITCH_OFFSET_CNTL 0x00000001
+#define R350_GMC_DST_PITCH_OFFSET_CNTL 0x00000002
+#define R350_GMC_SRC_CLIPPING        0x00000004
+#define R350_GMC_DST_CLIPPING        0x00000008
+#define R350_GMC_ROP3_MASK           0x00ff0000
+#define R350_ROP3_BLACKNESS          0x00000000
+#define R350_ROP3_SRCCOPY            0x00cc0000
+#define R350_ROP3_PATCOPY            0x00f00000
+#define R350_ROP3_WHITENESS          0x00ff0000
+
+/*
+ * GUI bus mastering (RRG-G04500-C 3.34 "GUI Bus Mastering Registers" is
+ * a stub in the manual itself -- literally "<No description>" with no
+ * register table, confirmed against the actual PDF page, not a text
+ * extraction gap). Only BM_QUEUE_FREE_STATUS (0xA14), BM_ABORT (0xA88)
+ * and the BM_CHUNK_0_VAL name (revision-history mention only) are
+ * documented anywhere in it, and this smoke test doesn't touch any of
+ * them. BM_GUI_TABLE's offset and the descriptor format are
+ * reverse-engineered from a live capture of the real OEM Mac FCode's
+ * post-CRTC-bringup bus-master smoke test (2026-08-02): it writes an 8
+ * byte sentinel to system RAM, points a one-entry descriptor table at
+ * it via this register, then reads back GUI_SCRATCH_REG0/1 expecting
+ * the sentinel to have landed there -- see ati_r350_bm_gui_run().
+ */
+#define R350_BM_GUI_TABLE            0x0a50
+#define R350_BM_CHUNK_0_VAL          0x0a18
+
+/* PCI config space read-only mirror */
+#define R350_CFG_MIRROR_BASE         0x0f00
+#define R350_CFG_MIRROR_END          0x0fff
+
+/* GEN_INT_CNTL / GEN_INT_STATUS (status bits ack by writing 1) */
+#define R350_CRTC_VBLANK_INT         (1 << 0)
+#define R350_CRTC_VLINE_INT          (1 << 1)
+#define R350_CRTC_VSYNC_INT          (1 << 2)
+#define R350_SNAPSHOT_INT            (1 << 3)
+#define R350_FP_DETECT_INT           (1 << 10)
+#define R350_BUSMASTER_EOL_INT       (1 << 16)
+#define R350_I2C_INT                 (1 << 17)
+#define R350_MPP_GP_INT              (1 << 18)
+#define R350_GUI_IDLE_INT            (1 << 19)
+#define R350_VIPH_INT                (1 << 24)
+/*
+ * The software interrupt, which is how the driver learns that work it
+ * submitted has finished: it enables SW_INT in GEN_INT_CNTL, the
+ * command stream raises the interrupt by writing SW_INT_FIRE to
+ * GEN_INT_STATUS, and the handler acknowledges by writing SW_INT back.
+ *
+ * Mac OS X's driver sleeps on this. With it unimplemented the ring
+ * drains correctly and nothing looks wrong from the device's side --
+ * read pointer equal to write pointer, no unimplemented commands --
+ * while the guest waits forever for a completion signal that never
+ * arrives, at low CPU with a dead user interface.
+ */
+#define R350_SW_INT                  (1 << 25)   /* status: pending/ack */
+#define R350_SW_INT_FIRE             (1 << 26)   /* status: write to raise */
+#define R350_GEN_INT_ACK_MASK        (R350_CRTC_VBLANK_INT | \
+                                      R350_CRTC_VLINE_INT | \
+                                      R350_CRTC_VSYNC_INT | \
+                                      R350_SNAPSHOT_INT | \
+                                      R350_FP_DETECT_INT | \
+                                      R350_BUSMASTER_EOL_INT | \
+                                      R350_I2C_INT | R350_MPP_GP_INT | \
+                                      R350_GUI_IDLE_INT | R350_VIPH_INT | \
+                                      R350_SW_INT)
+
+/* CRTC_GEN_CNTL */
+#define R350_CRTC_DBL_SCAN_EN        (1 << 0)
+#define R350_CRTC_INTERLACE_EN       (1 << 1)
+#define R350_CRTC_C_SYNC_EN          (1 << 4)
+#define R350_CRTC_PIX_WIDTH_SHIFT    8
+#define R350_CRTC_PIX_WIDTH_MASK     7
+#define R350_PIX_WIDTH_4BPP          1
+#define R350_PIX_WIDTH_8BPP          2
+#define R350_PIX_WIDTH_15BPP         3
+#define R350_PIX_WIDTH_16BPP         4
+#define R350_PIX_WIDTH_24BPP         5
+#define R350_PIX_WIDTH_32BPP         6
+#define R350_CRTC_CUR_EN             (1 << 16)
+/*
+ * CUR_MODE selects the hardware cursor's pixel format. The Radeon ndrv in
+ * the retail 9800 ROM writes 1 for a cursor converted from a 2-bit source
+ * and 3 for one converted from a 32-bit ARGB source (static RE of its
+ * cscSetHardwareCursor path, code 0x2ad8); both store 32 bits per pixel.
+ * Mode 0 is the classic packed AND/XOR bitmap the FCode console uses.
+ */
+#define R350_CRTC_CUR_MODE_SHIFT     20
+#define R350_CRTC_CUR_MODE_MASK      7
+#define R350_CUR_MODE_MONO           0  /* 2bpp AND/XOR, CUR_CLR0/1 colours */
+#define R350_CUR_MODE_ARGB_CODED     1  /* 32bpp, transparent/invert codes */
+#define R350_CUR_MODE_ARGB_ALPHA     3  /* 32bpp, per-pixel alpha */
+#define R350_CRTC_EXT_DISP_EN        (1 << 24)
+#define R350_CRTC_EN                 (1 << 25)
+#define R350_CRTC_DISP_REQ_EN_B      (1 << 26)
+
+/* CRTC_EXT_CNTL */
+#define R350_VGA_ATI_LINEAR          (1 << 3)
+#define R350_VGA_XCRT_CNT_EN         (1 << 6)
+#define R350_CRTC_HSYNC_DIS          (1 << 8)
+#define R350_CRTC_VSYNC_DIS          (1 << 9)
+#define R350_CRTC_DISPLAY_DIS        (1 << 10)
+#define R350_CRTC_SYNC_TRISTATE      (1 << 11)
+#define R350_DFIFO_EXTSENSE          (1 << 21)  /* default 1 */
+
+/* CRTC_STATUS */
+#define R350_CRTC_VBLANK_CUR         (1 << 0)
+#define R350_CRTC_VBLANK_SAVE        (1 << 1)  /* write 1 clears */
+#define R350_CRTC_VLINE_SYNC         (1 << 2)
+#define R350_CRTC_FRAME_ODD          (1 << 3)
+#define R350_FIX_VSYNC_TIMING        (1u << 31) /* default 1 */
+
+/* DAC_CNTL */
+#define R350_DAC_RANGE_CNTL_MASK     3          /* default 2 (PS2 level) */
+#define R350_DAC_BLANKING            (1 << 2)
+#define R350_DAC_CMP_EN              (1 << 3)   /* default 1 */
+#define R350_DAC_CMP_OUTPUT          (1 << 7)   /* RO: comparator/monitor sense */
+#define R350_DAC_8BIT_EN             (1 << 8)
+#define R350_DAC_MASK_SHIFT          24
+#define R350_DAC_MASK_DEFAULT        0xffu
+
+/* CRTC timing field extraction */
+#define R350_CRTC_H_TOTAL_MASK       0x1ff      /* [8:0], chars */
+#define R350_CRTC_H_DISP_SHIFT       16         /* [23:16], chars - 1 */
+#define R350_CRTC_H_DISP_MASK        0xff
+#define R350_CRTC_V_TOTAL_MASK       0x7ff      /* [10:0], lines */
+#define R350_CRTC_V_DISP_SHIFT       16         /* [26:16], lines - 1 */
+#define R350_CRTC_V_DISP_MASK        0x7ff
+#define R350_CRTC_OFFSET_MASK        0x01fffff8 /* [24:0], bits 2:0 wired 0 */
+#define R350_CRTC_OFFSET_LOCK        (1u << 31)
+#define R350_CRTC_PITCH_MASK         0x3ff      /* [9:0], pixels * 8 */
+
+/* CLOCK_CNTL_INDEX */
+#define R350_PLL_ADDR_MASK           0x3f /* Radeon: 64 PLL registers */
+#define R350_PLL_WR_EN               (1 << 7)
+#define R350_PPLL_DIV_SEL_SHIFT      8
+#define R350_PPLL_DIV_SEL_MASK       3
+
+/* PLL register indices */
+#define R350_PLL_CLK_PIN_CNTL        0x01
+#define R350_PLL_PPLL_CNTL           0x02
+#define R350_PLL_PPLL_REF_DIV        0x03
+#define R350_PLL_PPLL_DIV_0          0x04
+#define R350_PLL_PPLL_DIV_1          0x05
+#define R350_PLL_PPLL_DIV_2          0x06
+#define R350_PLL_PPLL_DIV_3          0x07
+#define R350_PLL_VCLK_ECP_CNTL       0x08
+#define R350_PLL_HTOTAL_CNTL         0x09
+#define R350_PLL_X_MPLL_REF_FB_DIV   0x0a
+#define R350_PLL_XPLL_CNTL           0x0b
+#define R350_PLL_XDLL_CNTL           0x0c
+#define R350_PLL_XCLK_CNTL           0x0d
+#define R350_PLL_MPLL_CNTL           0x0e
+#define R350_PLL_MCLK_CNTL           0x0f
+/*
+ * PPLL_REF_DIV and PPLL_DIV_0..3 all carry the atomic-update handshake
+ * in bit 15: writing 1 (ATOMIC_UPDATE_W) requests the PLL update,
+ * reading (ATOMIC_UPDATE_R) polls for completion -- real hardware
+ * clears it when the new dividers have taken effect; we emulate an
+ * instant PLL, so reads always see it clear.
+ */
+#define R350_PPLL_ATOMIC_UPDATE      (1 << 15)
+
+/* CONFIG_CNTL */
+#define R350_APER_0_ENDIAN_MASK      3          /* [1:0] */
+#define R350_APER_1_ENDIAN_SHIFT     2          /* [3:2] */
+#define R350_APER_ENDIAN_LE          0
+#define R350_APER_ENDIAN_BE16        1
+#define R350_APER_ENDIAN_BE32        2
+#define R350_APER_REG_ENDIAN         (1 << 4)
+#define R350_CFG_VGA_RAM_EN          (1 << 8)
+#define R350_CFG_VGA_IO_DIS          (1 << 9)
+
+/* CONFIG_XSTRAP (read-only strap reflections) */
+#define R350_XSTRAP_ADDIN_CARD       (1 << 13)
+
+/* GUI_STAT */
+#define R350_GUI_FIFOCNT_MASK        0xfff      /* [11:0], default 0x40 free */
+#define R350_GUI_ACTIVE              (1u << 31)
+
+/* I2C_CNTL_0 (undocumented; XFree86 r128_reg.h layout) */
+#define R350_I2C_DONE                (1 << 0)
+#define R350_I2C_NACK                (1 << 1)
+#define R350_I2C_HALT                (1 << 2)
+#define R350_I2C_SOFT_RST            (1 << 5)
+#define R350_I2C_DRIVE_EN            (1 << 6)
+#define R350_I2C_DRIVE_SEL           (1 << 7)
+#define R350_I2C_START               (1 << 8)
+#define R350_I2C_STOP                (1 << 9)
+#define R350_I2C_RECEIVE             (1 << 10)
+#define R350_I2C_ABORT               (1 << 11)
+#define R350_I2C_GO                  (1 << 12)
+/* I2C_CNTL_1 */
+#define R350_I2C_DATA_COUNT_SHIFT    0
+#define R350_I2C_DATA_COUNT_MASK     0xff
+#define R350_I2C_ADDR_SHIFT          8
+#define R350_I2C_ADDR_MASK           0xff
+#define R350_I2C_SEL                 (1 << 16)
+#define R350_I2C_EN                  (1 << 17)
+#define R350_I2C_TIME_LIMIT_SHIFT    24
+
+
+/*
+ * CNTL_SCALING (packet-3 opcode 0x96): the scaled blit Mac OS uses for
+ * video on this card, the counterpart of the mach64's scaler pipe. A
+ * 16-dword packet; the layout below was established from a live capture
+ * of QuickTime playback and cross-checked against the mach64, which
+ * drives the same movie through its own scaler with identical
+ * parameters (the X/Y DDA increments are literally the same values).
+ *
+ *   [0]  GUI_MASTER_CNTL         [3]  SC_TOP_LEFT
+ *   [4]  SC_BOTTOM_RIGHT         [8]  source datatype
+ *   [9]  source offset (bytes)   [10] source pitch, in 8-pixel units
+ *   [12] X increment             [13] Y increment
+ *   [14] DST_X_Y   (X high)      [15] DST_HEIGHT_WIDTH (height high)
+ *
+ * Self-consistency check that pins four of those at once: the scissors
+ * in [3]/[4] exactly bound the rectangle that [14] and [15] describe.
+ */
+#define R350_PM4_OPCODE_SCALING       0x96
+#define R350_SCALE_PKT_DWORDS         16
+#define R350_SCALE_PKT_GMC            0
+#define R350_SCALE_PKT_SRC_PITCH_OFF  1
+#define R350_SCALE_PKT_DST_PITCH_OFF  2
+#define R350_SCALE_PKT_SC_TL          3
+#define R350_SCALE_PKT_SC_BR          4
+#define R350_SCALE_PKT_DATATYPE       8
+#define R350_SCALE_PKT_OFFSET         9
+#define R350_SCALE_PKT_PITCH          10
+#define R350_SCALE_PKT_X_INC          12
+#define R350_SCALE_PKT_Y_INC          13
+#define R350_SCALE_PKT_DST_X_Y        14
+#define R350_SCALE_PKT_DST_H_W        15
+
+/*
+ * Scaler source datatypes. The two 4:2:2 codes are named inconsistently
+ * between the tables in xf86-video-r128's own header, so trust the
+ * behaviour instead: the mach64 uses code 12 for this same movie and
+ * renders correctly as UYVY ('2vuy', the classic Mac 4:2:2 layout).
+ */
+/*
+ * PITCH_OFFSET packing, as Linux's r128 driver builds it:
+ * (pitch << 21) | (offset >> 5), pitch counting 8-pixel units. Verified
+ * against the captured packet, where the source form decodes to pitch
+ * 192 and offset 0x1fda000 -- the same offset the packet also carries
+ * separately, and the same pitch.
+ */
+#define R350_PITCH_OFFSET_PITCH_SHIFT 21
+#define R350_PITCH_OFFSET_OFF_MASK    0x001fffff
+#define R350_PITCH_OFFSET_OFF_SHIFT   5
+
+/*
+ * Blit directions also have a second, differently packed home. Leaving
+ * it undecoded left the direction stale, so an overlapping copy with a
+ * vertical component duplicated rows -- visible as repeated fragments
+ * when a window is dragged anything other than exactly horizontally.
+ */
+#define R350_DP_CNTL_XDIR_YDIR_YMAJOR 0x16d0
+#define R350_DST_Y_DIR_TOP_TO_BOTTOM  0x00008000
+#define R350_DST_X_DIR_LEFT_TO_RIGHT  0x80000000
+
+/*
+ * The same scaler, programmed through its own registers instead of a
+ * CNTL_SCALING packet. Mac OS X's ATI driver draws the pointer this way
+ * whenever the shape does not fit the two-colour hardware cursor (the
+ * I-beam, with its alpha halo): IOGraphics' "cursor in VRAM" callout
+ * hands the driver a 32-bit ARGB sprite, and the driver save-unders with
+ * BITBLT_MULTI, then blends the sprite in with an alpha-blended scale
+ * of it -- SRC_ALPHA / INV_SRC_ALPHA from MISC_3D_STATE_CNTL_REG, the
+ * scale function selected there too (bits 9:8), GMC_3D_FCN_EN in
+ * DP_GUI_MASTER_CNTL_C, and SCALE_DST_HEIGHT_WIDTH as the kick (the last
+ * register written, as for the mach64's scaler). Captured live from
+ * OS X 10.3 on 2026-08-18. Bit layouts as in xf86-video-r128's
+ * r128_reg.h; the RRG lists these registers but documents no fields.
+ */
+#define R350_SCALE_SRC_HEIGHT_WIDTH   0x1994
+#define R350_SCALE_OFFSET_0           0x1998
+#define R350_SCALE_PITCH              0x199c
+#define R350_SCALE_X_INC              0x19a0
+#define R350_SCALE_Y_INC              0x19a4
+#define R350_SCALE_HACC               0x19a8
+#define R350_SCALE_VACC               0x19ac
+#define R350_SCALE_DST_X_Y            0x19b0
+#define R350_SCALE_DST_HEIGHT_WIDTH   0x19b4
+#define R350_SCALE_3D_CNTL            0x1a00
+#define R350_PRIM_TEXTURE_COMBINE_CNTL 0x1a08
+#define R350_SCALE_3D_DATATYPE        0x1a20
+#define R350_TEX_CNTL                 0x1800
+#define R350_TEX_CNTL_C               0x1c9c
+#define R350_MISC_3D_STATE_CNTL_REG   0x1ca0
+#define R350_PRIM_TEX_CNTL_C          0x1cb0
+#define R350_MISC_SCALE_3D_FCN_SHIFT  8       /* 0 noop, 1 scale, 2 texmap */
+#define R350_MISC_SCALE_3D_FCN_MASK   0x3
+#define R350_MISC_SCALE_3D_SCALE      1
+#define R350_ALPHA_BLEND_SRC_SHIFT    16
+#define R350_ALPHA_BLEND_DST_SHIFT    20
+#define R350_ALPHA_BLEND_MASK         0xf
+#define R350_ALPHA_BLEND_ZERO         0
+#define R350_ALPHA_BLEND_ONE          1
+#define R350_ALPHA_BLEND_SRCCOLOR     2
+#define R350_ALPHA_BLEND_INVSRCCOLOR  3
+#define R350_ALPHA_BLEND_SRCALPHA     4
+#define R350_ALPHA_BLEND_INVSRCALPHA  5
+#define R350_ALPHA_BLEND_DSTALPHA     6
+#define R350_ALPHA_BLEND_INVDSTALPHA  7
+#define R350_ALPHA_BLEND_DSTCOLOR     8
+#define R350_ALPHA_BLEND_INVDSTCOLOR  9
+#define R350_ALPHA_BLEND_SAT          10
+#define R350_GMC_3D_FCN_EN            (1u << 28)
+
+#define R350_SCALE_DT_ARGB1555        3
+#define R350_SCALE_DT_RGB565          4
+#define R350_SCALE_DT_ARGB8888        6
+#define R350_SCALE_DT_Y8              8
+#define R350_SCALE_DT_YUYV422         11
+#define R350_SCALE_DT_UYVY422         12
+#define R350_SCALE_DT_AYUV444         14
+
+
+/* ---------------------------------------------------------------- */
+/*
+ * Radeon (R3xx) additions -- offsets and bits from the Linux radeon DRM
+ * radeon_reg.h / r300_reg.h and the X.org radeon driver.
+ */
+#define R350_GPIO_VGA_DDC            0x0060
+#define R350_GPIO_DVI_DDC            0x0064
+#define R350_PALETTE_30_DATA         0x00b8
+#define R350_MC_FB_LOCATION          0x0148
+#define R350_MC_AGP_LOCATION         0x014c
+#define R350_AIC_CNTL                0x01d0
+#define R350_PCIGART_TRANSLATE_EN    (1u << 0)
+#define R350_AIC_LO_ADDR             0x01dc
+#define R350_AIC_HI_ADDR             0x01e0
+/* PCI GART page table bus address; LE32 entries, one bus page each */
+#define R350_AIC_PT_BASE_R300        0x0ab0
+#define R350_MC_IND_INDEX            0x01f8
+#define R350_MC_IND_DATA             0x01fc
+#define R350_DISPLAY_BASE_ADDR       0x023c
+#define R350_CRTC2_GEN_CNTL          0x03f8
+#define R350_CP_RB_BASE              0x0700
+#define R350_CP_RB_CNTL              0x0704
+#define R350_CP_RB_RPTR_ADDR         0x070c
+#define R350_CP_RB_RPTR              0x0710
+#define R350_CP_RB_WPTR              0x0714
+#define R350_CP_RB_WPTR_DELAY        0x0718
+#define R350_CP_RB_RPTR_WR           0x071c
+#define R350_CP_IB_BASE              0x0738
+#define R350_CP_IB_BUFSZ             0x073c
+#define R350_CP_CSQ_CNTL             0x0740
+#define R350_CP_CSQ_MODE             0x0744
+#define R350_SCRATCH_UMSK            0x0770
+#define R350_SCRATCH_ADDR            0x0774
+#define R350_CP_STAT                 0x07c0
+#define R350_CP_ME_CNTL              0x07d0
+#define R350_CP_CSQ_ADDR             0x07f0
+#define R350_CP_CSQ_DATA             0x07f4
+#define R350_CP_CSQ_STAT             0x07f8
+#define R350_SURFACE_CNTL            0x0b00
+#define R350_SURFACE0_LOWER_BOUND    0x0b04
+#define R350_SURFACE0_UPPER_BOUND    0x0b08
+#define R350_SURFACE0_INFO           0x0b0c
+#define R350_SURFACE_STRIDE          0x10
+#define R350_SURFACE7_INFO           0x0b7c
+#define R350_RBBM_STATUS             0x0e40
+#define R350_SCRATCH_REG_BASE        0x15e0
+#define R350_SCRATCH_REG_LAST        0x15f4
+#define R350_ISYNC_CNTL              0x1724
+#define R350_RB3D_ZCACHE_CTLSTAT     0x3254
+#define R350_RB3D_DSTCACHE_CTLSTAT   0x325c
+#define R350_RB2D_DSTCACHE_CTLSTAT   0x342c
+/* MM_INDEX: bit 31 routes MM_DATA to the frame buffer aperture */
+#define R350_MM_APER                 (1u << 31)
+/* SURFACE_CNTL / SURFACEn_INFO byte swappers */
+#define R350_NONSURF_AP0_SWP_16BPP   (1u << 20)
+#define R350_NONSURF_AP0_SWP_32BPP   (1u << 21)
+#define R350_NONSURF_AP1_SWP_16BPP   (1u << 22)
+#define R350_NONSURF_AP1_SWP_32BPP   (1u << 23)
+/* CP_RB_CNTL */
+#define R350_RB_BUFSZ_MASK           0x3f       /* log2(ring size in qwords) */
+#define R350_BUF_SWAP_MASK           (3u << 16)
+#define R350_BUF_SWAP_32BIT          (2u << 16)
+#define R350_RB_NO_UPDATE            (1u << 27)
+#define R350_RB_RPTR_WR_ENA          (1u << 31)
+/* CP_RB_RPTR_ADDR */
+#define R350_RB_RPTR_SWAP_MASK       3u
+/* RBBM_STATUS */
+#define R350_RBBM_FIFOCNT_MASK       0x7f
+#define R350_RBBM_ACTIVE             (1u << 31)
+/* MEM_CNTL: R300_MEM_NUM_CHANNELS: 0 = 64-bit, 1 = 128-bit, 2 = 256-bit */
+#define R350_MEM_NUM_CHANNELS_256    2
+/* P2PLL (CRTC2 pixel PLL) indices, same ATOMIC_UPDATE handshake as PPLL */
+#define R350_PLL_P2PLL_REF_DIV       0x2b
+#define R350_PLL_P2PLL_DIV_0         0x2c
+
+#endif /* ATI_R350_REGS_H */
+
+/* R300 3D engine (used by OS X's accelerator for all its blits) */
+#define R300_PM4_OPCODE_NOP3          0x10
+/*
+ * Clears of the compression side-structures: the Z mask, the
+ * hierarchical-Z buffer and the colour compression mask. This model
+ * stores colour and depth uncompressed, so the structures they reset
+ * do not exist here and discarding the packets is the whole of the
+ * correct behaviour -- but they are named rather than left to the
+ * unknown-opcode arm so they do not show up as gaps. Chess.app clears
+ * CMASK twice per new game.
+ */
+#define R300_PM4_OPCODE_CLEAR_ZMASK   0x32
+#define R300_PM4_OPCODE_CLEAR_HIZ     0x37
+#define R300_PM4_OPCODE_CLEAR_CMASK   0x38
+#define R300_PM4_OPCODE_LOAD_VBPNTR   0x2f
+#define R300_PM4_OPCODE_INDX_BUFFER   0x33
+#define R300_PM4_OPCODE_DRAW_VBUF_2   0x34
+#define R300_PM4_OPCODE_DRAW_IMMD_2   0x35
+#define R300_PM4_OPCODE_DRAW_INDX_2   0x36
+/* VAP_VF_CNTL.INDEX_SIZE: DRAW_INDX_2 indices are 32 bits, not 16 */
+#define R300_VF_CNTL_INDEX_SIZE_32    (1u << 11)
+/*
+ * Viewport Transform Engine control. The scale and the offset are
+ * enabled per component and independently (R3xx 3D register reference,
+ * VAP:VAP_VTE_CNTL) -- a guest that hands the engine coordinates
+ * already in screen units turns the offset off and leaves the scale at
+ * 1.0, and applying SE_VPORT_?OFFSET anyway displaces the whole draw.
+ * Bits 8-10 VTX_XY_FMT, VTX_Z_FMT and VTX_W0_FMT say which divides the
+ * setup engine still owes: the usual 3D draw sets W0_FMT alone, and
+ * pre-transformed vertices come with all three clear (w is 1/w).
+ */
+#define R300_VAP_VTE_CNTL             0x20b0
+#define R300_VTE_VPORT_X_SCALE_ENA    0x00000001
+#define R300_VTE_VPORT_X_OFFSET_ENA   0x00000002
+#define R300_VTE_VPORT_Y_SCALE_ENA    0x00000004
+#define R300_VTE_VPORT_Y_OFFSET_ENA   0x00000008
+#define R300_VTE_VPORT_Z_SCALE_ENA    0x00000010
+#define R300_VTE_VPORT_Z_OFFSET_ENA   0x00000020
+#define R300_VTE_VTX_XY_FMT           0x00000100
+#define R300_VTE_VTX_Z_FMT            0x00000200
+#define R300_VTE_VTX_W0_FMT           0x00000400
+#define R300_VAP_VTX_SIZE             0x20b4
+/*
+ * View-volume clipping (R3xx 3D register reference, VAP_CNTL, VAP_CLIP_CNTL
+ * and VAP_GB_*). DX_CLIP_SPACE_DEF picks 0 < z < w over -w < z < w. The
+ * guard band registers are clip-space distances in units of w, 1.0 meaning
+ * no guard band: x and y are clipped at +-CLIP_ADJ * w, and a primitive
+ * wholly beyond +-DISC_ADJ * w is discarded.
+ */
+#define R300_VAP_CNTL                 0x2080
+#define R300_VAP_DX_CLIP_SPACE_DEF    0x00400000
+#define R300_VAP_CLIP_CNTL            0x221c
+#define R300_VAP_UCP_ENA_MASK         0x0000003f
+#define R300_VAP_CLIP_DISABLE         0x00010000
+#define R300_VAP_UCP_CULL_ONLY_ENA    0x00020000
+#define R300_VAP_GB_VERT_CLIP_ADJ     0x2220
+#define R300_VAP_GB_VERT_DISC_ADJ     0x2224
+#define R300_VAP_GB_HORZ_CLIP_ADJ     0x2228
+#define R300_VAP_GB_HORZ_DISC_ADJ     0x222c
+#define R300_TX_ENABLE                0x4104
+#define R300_TX_FORMAT0_0             0x4480
+#define R300_TX_FORMAT1_0             0x44c0
+#define R300_TX_FORMAT2_0             0x4500
+/*
+ * TX_FORMAT0 bit 31 says whether TX_FORMAT2 carries the row pitch at
+ * all. With it clear the pitch register is not in use and the rows are
+ * as wide as the texture, whatever TX_FORMAT2 happens to hold -- and
+ * what it holds is then stale: Chess.app leaves 16383 in it while
+ * sampling a 128-pixel-wide texture, which taken literally puts every
+ * row 64KB apart and samples each one from unrelated memory. That is
+ * the horizontal banding its window renders as.
+ */
+#define R300_TX_PITCH_EN              (1u << 31)
+/*
+ * TX_FORMAT1 carries the texel format in [4:0] and, above it, a
+ * four-entry selector that says which of the format's own components
+ * feeds each of A, R, G and B. The components are numbered right to
+ * left, so for the 8_8_8_8 format X is the least significant byte of
+ * the texel and W the most. Mac OS X's window tiles select
+ * (W,Z,Y,X) = plain ARGB8888, but Chess.app's board texture selects
+ * (W,X,Y,Z) -- the same bytes with red and blue exchanged.
+ */
+#define R300_TX_FORMAT1_CODE_MASK     0x1f
+/* TXFORMAT codes this model decodes; the rest are counted as a gap */
+#define R300_TX_FMT_8                 0x00    /* one 8-bit component */
+#define R300_TX_FMT_8_8               0x03    /* two: X low byte, Y high */
+#define R300_TX_FMT_5_6_5             0x06    /* X[4:0] Y[10:5] Z[15:11] */
+#define R300_TX_FMT_4_4_4_4           0x0a    /* four 4-bit, X the low nibble */
+#define R300_TX_FMT_1_5_5_5           0x0b    /* X[4:0] Y[9:5] Z[14:10] W[15] */
+#define R300_TX_FMT_8_8_8_8           0x0c    /* four, X the low byte */
+#define R300_TX_FMT_16_16_16_16       0x0e    /* four 16-bit, X the low half */
+#define R300_TX_FMT_16F_16F_16F_16F   0x1a    /* four S10E5 halves, likewise */
+#define R300_TX_FMT_DXT1              0x0f    /* S3TC 4x4 blocks, 8 bytes */
+#define R300_TX_FMT_DXT3              0x10    /* 16 bytes, explicit alpha */
+#define R300_TX_FMT_DXT5              0x11    /* 16 bytes, interpolated alpha */
+#define R300_TX_FMT_VYUY422           0x14    /* Y0 U Y1 V, Y0 the low byte */
+#define R300_TX_FMT_YVYU422           0x15    /* U Y0 V Y1, U the low byte */
+#define R300_TX_FORMAT1_SEL_SHIFT     9       /* A, then R, G, B */
+#define R300_TX_FORMAT1_SEL_MASK      0x7
+#define R300_TX_SEL_X                 0
+#define R300_TX_SEL_W                 3
+#define R300_TX_SEL_ZERO              4
+#define R300_TX_SEL_ONE               5
+/* TX_FORMAT1 YUV_TO_RGB: 0 off, 1 with clamp, 2 without; SWAP_YUV */
+#define R300_TX_FORMAT1_YUV_SHIFT     22
+#define R300_TX_FORMAT1_YUV_MASK      0x3
+#define R300_TX_FORMAT1_SWAP_YUV      (1u << 24)
+#define R300_TX_FORMAT1_COORD_SHIFT   25      /* TEX_COORD_TYPE */
+#define R300_TX_OFFSET_0              0x4540
+#define R300_TXO_ENDIAN_MASK          0x3     /* ENDIAN_SWAP [1:0] */
+#define R300_TXO_MACRO_TILE           (1u << 2)
+#define R300_TXO_MICRO_TILE_SHIFT     3       /* [4:3], 2 = square (16bpp) */
+/* TX_FORMAT0: NUM_LEVELS [29:26], the index of the smallest level */
+#define R300_TX_NUM_LEVELS_SHIFT      26
+#define R300_TX_NUM_LEVELS_MASK       0xf
+/*
+ * TX_FILTER0: clamp modes S/T/R in [8:0], MAG_FILTER [10:9], MIN_FILTER
+ * [12:11] (1 point, 2 linear, 3 anisotropic), MIP_FILTER [14:13] (0
+ * none, 1 point, 2 linear), MAX_MIP_LEVEL [20:17] and MAX_ANISO [23:21]
+ * (0 = 1:1 ... 4 = 16:1).
+ */
+#define R300_TX_MAG_SHIFT             9
+#define R300_TX_MIN_SHIFT             11
+#define R300_TX_MIP_SHIFT             13
+#define R300_TX_MAX_MIP_SHIFT         17
+#define R300_TX_ANISO_SHIFT           21
+#define R300_TX_FILTER_POINT          1
+#define R300_TX_FILTER_LINEAR         2
+#define R300_TX_FILTER_ANISO          3
+/* TX_FILTER1: LOD_BIAS s4.5 in [12:3]; MACRO_SWITCH selects the RV350 rule */
+#define R300_TX_FILTER1_0             0x4440
+#define R300_TX_LOD_BIAS_SHIFT        3
+#define R300_TX_LOD_BIAS_MASK         0x3ff
+#define R300_TX_MACRO_SWITCH          (1u << 22)
+#define R300_TX_BORDER_COLOR_0        0x45c0
+/*
+ * Colour and alpha blend control. The two registers share the factor
+ * and combine fields; only CBLEND carries the enables. Mac OS X sets
+ * SEPARATE_ALPHA on every blended draw, so ABLEND -- not CBLEND --
+ * decides what lands in the destination's alpha byte.
+ */
+#define R300_RB3D_BLENDCNTL           0x4e04
+#define R300_RB3D_ABLENDCNTL          0x4e08
+#define R300_BLEND_ENABLE             (1u << 0)
+#define R300_BLEND_SEPARATE_ALPHA     (1u << 1)
+#define R300_BLEND_READ_ENABLE        (1u << 2)
+#define R300_BLEND_DISCARD_SHIFT      3     /* [5:3], see the enum below */
+#define R300_BLEND_COMB_FCN_SHIFT     12    /* [14:12] add/sub/min/max */
+#define R300_BLEND_SRC_SHIFT          16    /* [21:16] 6-bit factor code */
+#define R300_BLEND_DST_SHIFT          24    /* [29:24] */
+#define R300_BLEND_FACTOR_MASK        0x3f
+/* constant operand for factor codes 43-46 */
+#define R300_RB3D_BLEND_COLOR         0x4e10
+/*
+ * RB3D_COLOR_CHANNEL_MASK: one write-enable per destination channel,
+ * blue in bit 0 through alpha in bit 3. The colour buffer discards the
+ * quad outright when every channel is masked off. Chess draws each
+ * piece twice -- once with the alpha channel masked (0x7) and once
+ * whole -- and masks colour off completely (0x0) for its depth-only
+ * passes, so ignoring this register both loses the destination alpha
+ * and paints depth passes as if they were content.
+ */
+#define R300_RB3D_COLOR_CHANNEL_MASK  0x4e0c
+#define R300_COLORMASK_BLUE           (1u << 0)
+#define R300_COLORMASK_GREEN          (1u << 1)
+#define R300_COLORMASK_RED            (1u << 2)
+#define R300_COLORMASK_ALPHA          (1u << 3)
+#define R300_RB3D_COLOROFFSET0        0x4e28
+#define R300_RB3D_COLORPITCH0         0x4e38
+#define R300_COLORENDIAN_SHIFT        19
+#define R300_COLORFORMAT_SHIFT        21
+#define R300_COLORFORMAT_MASK         0xf
+#define R300_COLORFORMAT_ARGB1555     3
+#define R300_COLORFORMAT_RGB565       4
+#define R300_COLORFORMAT_ARGB8888     6
+#define R300_COLORFORMAT_ARGB32323232 7
+#define R300_COLORFORMAT_I8           9
+#define R300_COLORFORMAT_ARGB16161616 10
+#define R300_COLORFORMAT_VYUY         11
+#define R300_COLORFORMAT_YVYU         12
+#define R300_COLORFORMAT_UV88         13
+#define R300_COLORFORMAT_ARGB4444     15
+/*
+ * Anti-aliasing resolve. With AARESOLVE_MODE set the colour buffer is
+ * the SOURCE of the draw, not its destination: the render backend
+ * filters the samples it already holds and writes the result to
+ * AARESOLVE_OFFSET, whose pitch is counted in PAIRS of pixels
+ * (AARESOLVE_PITCH is field [13:1]). A draw covering the viewport is
+ * how the resolve is kicked off. Chess ends every frame with one, and
+ * taking it for an ordinary draw painted the fragment colour over the
+ * whole scene it had just rendered.
+ */
+#define R300_RB3D_AARESOLVE_OFFSET    0x4e80
+#define R300_RB3D_AARESOLVE_PITCH     0x4e84
+#define R300_RB3D_AARESOLVE_CTL       0x4e88
+#define R300_AARESOLVE_MODE           (1u << 0)
+#define R300_GB_AA_CONFIG             0x4020
+#define R300_AA_ENABLE                (1u << 0)
+/*
+ * Z buffer. DEPTHPITCH is in pixels, field [13:2] in units of four;
+ * bit 16 macro-tiles the surface in 2 KB blocks and [18:17] micro-tiles
+ * each 32-byte line. DEPTHFORMAT 0 is 16-bit Z, 2 is 24-bit Z over
+ * 8-bit stencil.
+ */
+#define R300_ZB_CNTL                  0x4f00
+#define R300_ZB_STENCIL_ENABLE        (1u << 0)
+#define R300_ZB_Z_ENABLE              (1u << 1)
+#define R300_ZB_ZWRITEENABLE          (1u << 2)
+#define R300_ZB_STENCIL_FRONT_BACK    (1u << 4)
+/*
+ * ZSTENCILCNTL: ZFUNC [2:0], then front STENCILFUNC [5:3], STENCILFAIL
+ * [8:6], ZPASS [11:9], ZFAIL [14:12], and the same four for back faces
+ * from bit 15. Functions use the ZFUNC encoding with the reference as
+ * the incoming value; ops are KEEP ZERO REPLACE INCR DECR INVERT
+ * INCR_WRAP DECR_WRAP.
+ */
+#define R300_ZB_ZSTENCILCNTL          0x4f04
+#define R300_ZB_STENCILREFMASK        0x4f08
+#define R300_ZB_FORMAT                0x4f10
+#define R300_ZB_FORMAT_16             0
+#define R300_ZB_FORMAT_24_8           2
+#define R300_ZB_DEPTHOFFSET           0x4f20
+#define R300_ZB_DEPTHPITCH            0x4f24
+#define R300_ZB_MACROTILE             (1u << 16)
+#define R300_ZB_MICROTILE_SHIFT       17
+#define R300_ZB_DEPTHENDIAN_SHIFT     19    /* none, word, dword, half */
+#define R300_ZB_DEPTHCLEARVALUE       0x4f28
+#define R300_ZB_ZMASK_PITCH           0x4f34
+/*
+ * The occlusion counter. Writing ZB_ZPASS_DATA sets the count of samples
+ * that passed the depth and stencil test; writing a dword address to
+ * ZB_ZPASS_ADDR makes each pipe SU_REG_DEST selects store its count
+ * there, in the Z buffer's DEPTHENDIAN byte order. SU_REG_DEST bit 0
+ * selects pipe 0; its reset value 0xf selects every pipe.
+ */
+#define R300_SU_REG_DEST              0x42c8
+#define R300_SU_REG_DEST_P0           (1u << 0)
+#define R300_ZB_ZPASS_DATA            0x4f58
+#define R300_ZB_ZPASS_ADDR            0x4f5c
+/* SU_CULL_MODE: cull front, cull back, front face clockwise */
+#define R300_RE_CULL_CNTL             0x42b8
+/*
+ * The universal shader's control words and its six instruction banks.
+ * The banks are RAM holding many programs at once; US_CONFIG says how
+ * many indirection levels are live, US_CODE_ADDR_n where each level's
+ * ALU and texture segments start and how long they are, and
+ * US_CODE_OFFSET a relocation added to both starts so the guest can
+ * rewrite the store without a pipeline flush. Resolving all four is
+ * what turns "a hundred instruction slots have been written" into the
+ * two instructions a given draw actually is.
+ */
+#define R300_US_CONFIG                0x4600
+#define R300_US_PIXSIZE               0x4604
+#define R300_US_CODE_OFFSET           0x4608
+#define R300_US_CODE_ADDR_0           0x4610
+#define R300_US_TEX_INST_0            0x4620
+#define R300_US_OUT_FMT_0             0x46a4
+#define R300_US_OUT_C0_SEL_SHIFT      8     /* 0 A, 1 R, 2 G, 3 B */
+#define R300_US_ALU_RGB_ADDR_0        0x46c0
+#define R300_US_ALU_ALPHA_ADDR_0      0x47c0
+#define R300_US_ALU_RGB_INST_0        0x48c0
+#define R300_US_ALU_ALPHA_INST_0      0x49c0
+/*
+ * The rasterizer's interpolator routing: RS_INST_n says which frame
+ * register each interpolated quantity is dropped into and RS_IP_n where
+ * in the vertex stage's output packet it comes from. Chess.app's board
+ * is the only thing in the corpus that issues two of them -- the second
+ * carries the specular colour its fragment program adds.
+ */
+#define R300_RS_COUNT                 0x4300
+#define R300_RS_INST_COUNT            0x4304
+#define R300_RS_IP_0                  0x4310
+#define R300_RS_INST_0                0x4330
+/*
+ * US_ALU_CONST, four dwords per vector in R, G, B, A order, stored as
+ * 24-bit floats (IEEE with the low mantissa byte dropped). Vector 0 is
+ * what the driver's solid-fill shader hands the desktop backdrop, which
+ * is why it also carries the name the model has used for it all along.
+ */
+#define R300_PFS_PARAM_0_X            0x4c00
+#define R300_GA_POINT_S0              0x4200
+#define R300_GA_POINT_T0              0x4204
+#define R300_GA_POINT_S1              0x4208
+#define R300_GA_POINT_T1              0x420c
+#define R300_RE_POINTSIZE             0x421c
+/*
+ * Bound vertex arrays. The block is not the flat table the names
+ * suggest: each PAIR of arrays takes three registers -- one packed
+ * count/stride word covering both of them, then one address each --
+ * so arrays 2 and 3 are described by 0x20d0/0x20d4/0x20d8 and not by
+ * a continuation of the first pair's addresses. VTX_NUM_ARRAYS says
+ * how many are bound; Mac OS X's compositor binds two, Chess.app's
+ * board binds three (position, normal, texture coordinate).
+ */
+#define R300_VAP_VTX_AOS_CNT          0x20c0
+#define R300_VAP_VTX_NUM_ARRAYS_MASK  0x1f
+#define R300_VAP_VTX_AOS_ATTR(pair)   (0x20c4 + (pair) * 0xc)
+#define R300_VAP_VTX_AOS_ADDR(n)      (0x20c8 + ((n) >> 1) * 0xc + \
+                                       ((n) & 1) * 4)
+#define R300_VAP_AOS_COUNT_MASK       0x7f    /* dwords per vertex */
+#define R300_VAP_AOS_STRIDE_SHIFT     8
+#define R300_VAP_AOS_STRIDE_MASK      0x7f    /* dwords to the next vertex */
+#define R300_VAP_AOS_ODD_SHIFT        16      /* the pair's second array */
+/*
+ * How many of them this model fetches: all sixteen the hardware allows,
+ * one vertex program input register per array.
+ */
+#define R300_AOS_MAX                  16
+/* dwords of one fetched vertex: sixteen elements of up to four */
+#define R300_VTX_DWORDS_MAX           64
+#define R300_VAP_PVS_UPLOAD_ADDRESS   0x2200
+/*
+ * UPLOAD_ADDRESS is a vector index into the vertex shader's storage:
+ * below this the vectors are program instructions, from here up they are
+ * the constant file, four dwords to a vector.
+ */
+#define R300_PVS_CONST_START          0x200
+/*
+ * Past the constants, the clip state (R5xx acceleration guide 7.4.10,
+ * "R300 1024"): user clip planes 0-5, then the point sprite viewport
+ * scale and texture corners. Auto-increment wraps from the seventh
+ * vector back to the first.
+ */
+#define R300_PVS_UCP_START            0x400
+#define R300_PVS_CLIP_WRAP            7
+#define R300_VAP_PVS_UPLOAD_DATA      0x2208
+/*
+ * Which instruction slots the program in force occupies (FIRST [9:0],
+ * LAST [29:20]) and where its constants begin (CONST_BASE_OFFSET [7:0],
+ * MAX_CONST_ADDR [23:16]). Both files are RAM the guest overwrites in
+ * place, so these -- not how much has ever been uploaded -- are what say
+ * which of their contents belong to the current program.
+ */
+#define R300_VAP_PVS_CODE_CNTL_0      0x22d0
+#define R300_VAP_PVS_CONST_CNTL       0x22d4
+/*
+ * What the vertex stage emits: bit 0 the position, bits 1-4 the colours.
+ * The outputs are packed in that order, so out[1] is the first colour
+ * whenever a position is emitted -- which is how a program's lighting
+ * result is found without decoding the rasterizer's interpolator routing.
+ */
+#define R300_VAP_OUTPUT_VTX_FMT_0     0x2090
+#define R300_VAP_OUTPUT_VTX_FMT_1     0x2094
+#define R300_VAP_CNTL_STATUS          0x2140
+#define R300_VAP_VC_SWAP              0x00000003
+#define R300_VAP_VC_SWAP_16BIT        1
+#define R300_VAP_VC_SWAP_32BIT        2
+#define R300_VAP_VC_SWAP_HDW          3
+#define R300_VAP_PVS_BYPASS           0x00000100
+/*
+ * VAP_PROG_STREAM_CNTL_[0-7] -- the programmable stream control words.
+ * Two stream ELEMENTS to a register, low half first, and the walk stops
+ * at the element whose LAST_VEC is set. DST_VEC_LOC is the vertex
+ * program INPUT REGISTER the element is written to, which is not always
+ * the element's own index: Mac OS X 10.5's compositor sends a two-element
+ * vertex whose second element lands in in[2].
+ *
+ * Field positions are R5xx_Accel.txt's, read directly (DATA_TYPE 3:0,
+ * SKIP_DWORDS 7:4, DST_VEC_LOC 12:8, LAST_VEC 13, SIGNED 14,
+ * NORMALIZE 15, and the same six sixteen bits higher for element 1).
+ */
+#define R300_VAP_PROG_STREAM_CNTL_0   0x2150
+#define R300_PSC_DATA_TYPE_MASK       0xf
+#define R300_PSC_SKIP_DWORDS_SHIFT    4
+#define R300_PSC_SKIP_DWORDS_MASK     0xf
+#define R300_PSC_DST_VEC_LOC_SHIFT    8
+#define R300_PSC_DST_VEC_LOC_MASK     0x1f
+#define R300_PSC_LAST_VEC             (1u << 13)
+#define R300_PSC_SIGNED               (1u << 14)
+#define R300_PSC_NORMALIZE            (1u << 15)
+
+/*
+ * DATA_TYPE, the format one stream element arrives in
+ * (R3xx_3D_Registers.pdf VAP_PROG_STREAM_CNTL_[0-7], and identically in
+ * R5xx_Acceleration_v1.5 which additionally documents codes 10-12;
+ * Mesa's src/gallium/drivers/r300/r300_reg.h names all thirteen the
+ * same way). The starred types -- everything from BYTE to VECTOR_3_EET
+ * -- are FIXED point and take their range from SIGNED and NORMALIZE.
+ *
+ * BYTE and D3DCOLOR differ in exactly one thing, the lane the X
+ * component comes out of: BYTE takes X from bits 7:0, D3DCOLOR from
+ * bits 23:16 (i.e. it swaps X and Z, which is what makes a D3D
+ * 0xAARRGGBB word read as r,g,b,a).
+ */
+#define R300_PSC_TYPE_FLOAT_1         0
+#define R300_PSC_TYPE_FLOAT_2         1
+#define R300_PSC_TYPE_FLOAT_3         2
+#define R300_PSC_TYPE_FLOAT_4         3
+#define R300_PSC_TYPE_BYTE            4
+#define R300_PSC_TYPE_D3DCOLOR        5
+#define R300_PSC_TYPE_SHORT_2         6
+#define R300_PSC_TYPE_SHORT_4         7
+#define R300_PSC_TYPE_VECTOR_3_TTT    8
+#define R300_PSC_TYPE_VECTOR_3_EET    9
+#define R300_PSC_TYPE_FLOAT_8         10
+#define R300_PSC_TYPE_FLT16_2         11
+#define R300_PSC_TYPE_FLT16_4         12
+
+/*
+ * VAP_PSC_SGN_NORM_CNTL -- for SIGNED and NORMALIZE together, which of
+ * the three ways of mapping a two's-complement fixed value onto
+ * -1.0..1.0 the element uses. Two bits per element, sixteen elements.
+ */
+#define R300_VAP_PSC_SGN_NORM_CNTL    0x21dc
+#define R300_PSC_SGN_NORM_ZERO        0
+#define R300_PSC_SGN_NORM_ZERO_CLAMP  1
+#define R300_PSC_SGN_NORM_NO_ZERO     2
+
+/*
+ * VAP_PROG_STREAM_CNTL_EXT_[0-7] -- the same two-elements-per-register
+ * walk as VAP_PROG_STREAM_CNTL, carrying each element's component
+ * SWIZZLE and its four-bit write enable. The select codes are
+ * 0-3 = X,Y,Z,W of the fetched element and 4,5 = the constants 0.0 and
+ * 1.0; 6 and 7 are reserved. A component whose write-enable bit is
+ * clear keeps the input register's (0,0,0,1) default.
+ *
+ * Mac OS X 10.5 programs W,Z,Y,X here for the one-dword colour its
+ * compositor sends, which is how a big-endian guest's R,G,B,A word
+ * survives the vertex fetcher's little-endian byte lanes.
+ */
+#define R300_VAP_PROG_STREAM_CNTL_EXT_0 0x21e0
+#define R300_PSC_SWIZZLE_SHIFT        3
+#define R300_PSC_SWIZZLE_MASK         0x7
+#define R300_PSC_SWIZZLE_FP_ZERO      4
+#define R300_PSC_SWIZZLE_FP_ONE       5
+#define R300_PSC_WRITE_ENA_SHIFT      12
+#define R300_PSC_WRITE_ENA_MASK       0xf
+#define R300_SE_VPORT_XSCALE          0x1d98
+#define R300_SC_SCISSOR0              0x43e0
+#define R300_SC_SCISSOR1              0x43e4
+#define R300_SCISSOR_OFFSET           1440
+#define R300_FG_ALPHA_FUNC            0x4bd4
+#define R300_RE_CLIPRECT_TL_0         0x43b0
+#define R300_RE_CLIPRECT_CNTL         0x43d0
+#define R300_TX_FILTER0_0             0x4400

@@ -1,0 +1,323 @@
+/*
+ * ATI R300/R350 programmable vertex shader (PVS) -- instruction encoding
+ * and interpreter.
+ *
+ * Deliberately free of any device state: everything it needs arrives as
+ * plain arrays, so the same code that runs inside the model can be driven
+ * from a host test harness against programs lifted out of a capture.
+ *
+ * Field names and opcode semantics are transcribed from the R5xx
+ * Acceleration guide (chapter 7.5, "Vertex Shader"), whose PVS description
+ * covers R300 as well; the register addresses are R3xx.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef ATI_R350_PVS_H
+#define ATI_R350_PVS_H
+
+/* program RAM: 256 instruction slots of four dwords, 256 constant vectors */
+#define R300_PVS_CODE_SLOTS           256
+#define R300_PVS_CONST_SLOTS          256
+/* user clip planes, point sprite scale and corners */
+#define R300_PVS_CLIP_VECS            8
+
+#define R300_PVS_IN_REGS              16
+#define R300_PVS_OUT_REGS             16
+#define R300_PVS_TMP_REGS             32
+#define R300_PVS_ATMP_REGS            4
+
+/* the address register: four signed integers, clamped to -256..255 */
+#define R300_PVS_ADDR_MIN             (-256)
+#define R300_PVS_ADDR_MAX             255
+
+/* word 0: opcode and destination operand */
+#define R300_PVS_DST_OPCODE_MASK      0x3f
+#define R300_PVS_DST_MATH_INST        (1u << 6)
+#define R300_PVS_DST_MACRO_INST       (1u << 7)
+#define R300_PVS_DST_REG_TYPE_SHIFT   8
+#define R300_PVS_DST_REG_TYPE_MASK    0xf
+#define R300_PVS_DST_ADDR_MODE_1      (1u << 12)
+#define R300_PVS_DST_OFFSET_SHIFT     13
+#define R300_PVS_DST_OFFSET_MASK      0x7f
+#define R300_PVS_DST_WE_SHIFT         20      /* four write-enable bits */
+#define R300_PVS_DST_WE_MASK          0xf
+#define R300_PVS_DST_VE_SAT           (1u << 24)
+#define R300_PVS_DST_ME_SAT           (1u << 25)
+#define R300_PVS_DST_PRED_ENABLE      (1u << 26)
+#define R300_PVS_DST_DUAL_MATH_OP     (1u << 28)
+#define R300_PVS_DST_ADDR_SEL_SHIFT   29
+#define R300_PVS_DST_ADDR_SEL_MASK    0x3
+#define R300_PVS_DST_ADDR_MODE_0      (1u << 31)
+
+/* words 1-3: source operands */
+#define R300_PVS_SRC_REG_TYPE_MASK    0x3
+#define R300_PVS_SRC_ABS_XYZW         (1u << 3)
+#define R300_PVS_SRC_ADDR_MODE_0      (1u << 4)
+#define R300_PVS_SRC_OFFSET_SHIFT     5
+#define R300_PVS_SRC_OFFSET_MASK      0xff
+#define R300_PVS_SRC_SWIZZLE_SHIFT    13      /* four 3-bit selectors */
+#define R300_PVS_SRC_SWIZZLE_MASK     0x7
+#define R300_PVS_SRC_MODIFIER_SHIFT   25      /* four per-channel negates */
+#define R300_PVS_SRC_ADDR_SEL_SHIFT   29
+#define R300_PVS_SRC_ADDR_SEL_MASK    0x3
+#define R300_PVS_SRC_ADDR_MODE_1      (1u << 31)
+
+/*
+ * ADDR_MODE, from MODE_1 (msb) and MODE_0 (lsb) of an operand: absolute,
+ * relative to the address-register component ADDR_SEL names, or relative
+ * to the loop index (R5xx flow control, not modelled).
+ */
+#define R300_PVS_ADDR_ABSOLUTE        0
+#define R300_PVS_ADDR_RELATIVE_A0     1
+
+/*
+ * Word 3 when R300_PVS_DST_DUAL_MATH_OP is set: it stops being a third
+ * source operand and describes a math-engine instruction issued alongside
+ * the vector one, reading two swizzled components of a single vector and
+ * writing one channel of the alternate temporary file.
+ */
+#define R300_PVS_DUAL_OPCODE_MSB      (1u << 2)
+#define R300_PVS_DUAL_DST_OFF_SHIFT   19
+#define R300_PVS_DUAL_DST_OFF_MASK    0x3
+#define R300_PVS_DUAL_OPCODE_SHIFT    21
+#define R300_PVS_DUAL_OPCODE_MASK     0xf
+#define R300_PVS_DUAL_WE_SEL_SHIFT    27
+#define R300_PVS_DUAL_WE_SEL_MASK     0x3
+
+/* swizzle selectors */
+#define R300_PVS_SRC_SELECT_FORCE_0   4
+#define R300_PVS_SRC_SELECT_FORCE_1   5
+
+/* destination register files */
+#define R300_PVS_DST_REG_TEMPORARY    0
+#define R300_PVS_DST_REG_A0           1
+#define R300_PVS_DST_REG_OUT          2
+#define R300_PVS_DST_REG_OUT_REPL_X   3
+#define R300_PVS_DST_REG_ALT_TEMP     4
+#define R300_PVS_DST_REG_INPUT        5
+
+/* source register files */
+#define R300_PVS_SRC_REG_TEMPORARY    0
+#define R300_PVS_SRC_REG_INPUT        1
+#define R300_PVS_SRC_REG_CONSTANT     2
+#define R300_PVS_SRC_REG_ALT_TEMP     3
+
+/* vector-engine opcodes */
+#define R300_VE_NO_OP                 0
+#define R300_VE_DOT_PRODUCT           1
+#define R300_VE_MULTIPLY              2
+#define R300_VE_ADD                   3
+#define R300_VE_MULTIPLY_ADD          4
+#define R300_VE_DISTANCE_VECTOR       5
+#define R300_VE_FRACTION              6
+#define R300_VE_MAXIMUM               7
+#define R300_VE_MINIMUM               8
+#define R300_VE_SET_GREATER_THAN_EQUAL 9
+#define R300_VE_SET_LESS_THAN         10
+#define R300_VE_MULTIPLYX2_ADD        11
+#define R300_VE_MULTIPLY_CLAMP        12
+#define R300_VE_FLT2FIX_DX            13
+#define R300_VE_FLT2FIX_DX_RND        14
+
+/* math-engine opcodes (one scalar per source, always its w channel) */
+#define R300_ME_NO_OP                 0
+#define R300_ME_EXP_BASE2_DX          1
+#define R300_ME_LOG_BASE2_DX          2
+#define R300_ME_LIGHT_COEFF_DX        4
+#define R300_ME_POWER_FUNC_FF         5
+#define R300_ME_RECIP_DX              6
+#define R300_ME_RECIP_FF              7
+#define R300_ME_RECIP_SQRT_DX         8
+#define R300_ME_RECIP_SQRT_FF         9
+#define R300_ME_MULTIPLY              10
+#define R300_ME_EXP_BASE2_FULL_DX     11
+#define R300_ME_LOG_BASE2_FULL_DX     12
+
+/*
+ * A program as the control registers describe it, plus what a static
+ * scan of its instructions found. Holds no copy of the RAM: `code` and
+ * `cnst` point at the caller's, which is what the guest has uploaded.
+ */
+typedef struct R300PvsProgram {
+    const uint32_t *code;       /* four dwords per instruction slot */
+    const uint32_t *cnst;       /* four dwords per constant vector */
+    unsigned code_slots, const_slots;
+    unsigned first, last;       /* inclusive instruction range */
+    unsigned cbase;             /* PVS_CONST_BASE_OFFSET, in vectors */
+    unsigned cmax;              /* PVS_MAX_CONST_ADDR */
+    bool bounded;               /* honour cmax (the register was written) */
+    bool valid;                 /* the whole range has really been uploaded */
+    /*
+     * The program computes out[0] as the four dot products of input 0
+     * against constants cbase+0..3 and nothing else that this model
+     * consumes -- i.e. it is the 4x4 matrix the fixed path already
+     * applies, and running it per vertex would only spend time.
+     */
+    /*
+     * Note that a program which COMPUTES a texture-coordinate output --
+     * out_mask set, out_src -1 -- keeps this only while every one of
+     * those outputs is the four dot products r300_pvs_texmat() resolves.
+     * The fast path can apply such a matrix without running the program
+     * and cannot apply anything else, so a program that computes its
+     * coordinate some other way loses the fast path rather than losing
+     * the coordinate.
+     */
+    bool plain_matrix;
+    /* out[n] is a straight copy of in[out_src[n]], or -1 if it is not */
+    int8_t out_src[R300_PVS_OUT_REGS];
+    uint32_t out_mask;          /* outputs the program writes at all */
+} R300PvsProgram;
+
+/*
+ * The transform a computed texture-coordinate output applies: the four
+ * dot products of one input register against four consecutive constants,
+ * with the constant file already resolved.
+ */
+typedef struct R300PvsTexMat {
+    unsigned in;                /* the input register it transforms */
+    float m[4][4];              /* row r is the constant it dots with */
+} R300PvsTexMat;
+
+/* opcodes met that this interpreter does not implement */
+typedef struct R300PvsGaps {
+    uint8_t vec_op, math_op, dst_file, addr_mode;
+    bool has_vec_op, has_math_op, has_dst_file, has_addr_mode;
+} R300PvsGaps;
+
+typedef struct R300PvsRegs {
+    float in[R300_PVS_IN_REGS][4];
+    float out[R300_PVS_OUT_REGS][4];
+    float tmp[R300_PVS_TMP_REGS][4];
+    float atmp[R300_PVS_ATMP_REGS][4];
+    int32_t a0[4];              /* the address register, A0.xyzw */
+    uint32_t out_written;       /* bit per output register actually written */
+} R300PvsRegs;
+
+/*
+ * Where the vertex stage's outputs land. VAP_OUTPUT_VTX_FMT_0 bit 0 says
+ * the position is emitted and bits 1-4 which of the four colours are, and
+ * the outputs are packed in that order, so the first colour follows the
+ * position and the texture coordinates follow the colours.
+ */
+void r300_pvs_out_layout(uint32_t fmt0, unsigned *first_color,
+                         unsigned *ncolor, unsigned *first_texcoord);
+
+void r300_pvs_analyse(R300PvsProgram *p, const uint32_t *code,
+                      const uint32_t *slot_valid, unsigned code_slots,
+                      const uint32_t *cnst, unsigned const_slots,
+                      uint32_t code_cntl, uint32_t const_cntl,
+                      unsigned first_texcoord);
+
+/*
+ * Does the program COMPUTE this output rather than forward it or leave
+ * it alone? For a texture-coordinate output that is the difference
+ * between a coordinate the vertex carries and one only the program
+ * knows -- which is also what says a draw is textured however narrow
+ * its vertex is.
+ */
+static inline bool r300_pvs_computes(const R300PvsProgram *p, unsigned out)
+{
+    return p->valid && out < R300_PVS_OUT_REGS &&
+           (p->out_mask & (1u << out)) && p->out_src[out] < 0;
+}
+
+/*
+ * Resolve the matrix a computed texture-coordinate output applies, so a
+ * caller that keeps the plain-matrix fast path can still evaluate the
+ * coordinate. Returns false for an output that is absent, forwarded, or
+ * computed by anything other than four whole dot-product rows -- and
+ * r300_pvs_analyse() has already refused `plain_matrix` for that last
+ * case, so a fast-path caller never meets one.
+ */
+bool r300_pvs_texmat(const R300PvsProgram *p, unsigned out,
+                     R300PvsTexMat *tm);
+
+/*
+ * Run the program over the inputs already in `r`, leaving the outputs
+ * there. `gaps` accumulates opcodes met and not implemented; pass NULL
+ * to ignore them.
+ */
+void r300_pvs_run(const R300PvsProgram *p, R300PvsRegs *r, R300PvsGaps *gaps);
+
+/*
+ * The same program with its operands decoded once, for running over
+ * every vertex of a draw: r300_pvs_compile() when the draw is set up,
+ * r300_pvs_exec() per vertex. It computes what r300_pvs_run() does and
+ * is valid only while the program and its constant file are unchanged,
+ * i.e. for one draw.
+ */
+enum {
+    R300_PVS_CSRC_IN,
+    R300_PVS_CSRC_CONST,
+    R300_PVS_CSRC_ATMP,
+    R300_PVS_CSRC_TMP,
+    R300_PVS_CSRC_RAW,          /* addressing mode: read from `dw` */
+};
+
+typedef struct R300PvsCSrc {
+    uint8_t file;
+    uint8_t idx;
+    uint8_t sel[4];
+    uint8_t neg;                /* a bit per channel */
+    bool abs;
+    bool plain;                 /* .xyzw, no abs, no negate: a copy */
+    uint32_t dw;
+    float kv[4];                /* a constant operand, finished */
+} R300PvsCSrc;
+
+typedef struct R300PvsCIns {
+    const uint32_t *w;          /* the instruction's four dwords */
+    bool dual;
+    R300PvsCSrc a, b, c;
+} R300PvsCIns;
+
+typedef struct R300PvsCompiled {
+    const R300PvsProgram *p;
+    unsigned n;
+    R300PvsCIns ins[R300_PVS_CODE_SLOTS];
+} R300PvsCompiled;
+
+void r300_pvs_compile(const R300PvsProgram *p, R300PvsCompiled *cp);
+void r300_pvs_exec(const R300PvsCompiled *cp, R300PvsRegs *r,
+                   R300PvsGaps *gaps);
+
+/* one constant vector as the program addresses it, cmax applied */
+void r300_pvs_const(const R300PvsProgram *p, unsigned off, float v[4]);
+
+/*
+ * What a translated program needs from whoever runs it, and -- when the
+ * translation was refused -- which construct refused it.
+ */
+typedef struct R300PvsGlsl {
+    unsigned nconst;            /* PVSK[] entries the shader indexes */
+    uint32_t in_mask;           /* PVSA[] registers it reads */
+    uint32_t out_mask;          /* PVSo[] registers it writes */
+    R300PvsGaps gaps;           /* why it was refused, if it was */
+} R300PvsGlsl;
+
+/*
+ * Translate the program to a GLSL 3.30 function
+ *
+ *     void pvs_main();
+ *
+ * reading `uniform vec4 PVSA[16]` (the input registers) and
+ * `uniform vec4 PVSK[n]` (the constant file, PVS_CONST_BASE_OFFSET and
+ * PVS_MAX_CONST_ADDR already applied, so PVSK[k] is what
+ * r300_pvs_const(p, k, ...) returns), and writing `vec4 PVSo[16]`. The
+ * caller declares all three and calls pvs_main() from its own main().
+ * A program that addresses the constant file relative to the address
+ * register makes `n` every constant it can legally reach.
+ *
+ * Returns false, without writing a usable shader, for any construct the
+ * interpreter would report as a gap -- so a program the translator cannot
+ * express is one the caller falls back on rather than renders wrong.
+ * `info` may be NULL.
+ */
+bool r300_pvs_glsl(const R300PvsProgram *p, char *buf, size_t cap,
+                   R300PvsGlsl *info);
+
+/* fill `k[n][4]` with the constant file the translated shader expects */
+void r300_pvs_glsl_consts(const R300PvsProgram *p, float *k, unsigned n);
+
+#endif /* ATI_R350_PVS_H */
