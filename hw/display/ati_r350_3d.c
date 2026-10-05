@@ -156,7 +156,8 @@ typedef struct R300DrawState {
     uint32_t dst_off;       /* VRAM byte offset of the colour buffer */
     uint32_t dst_pitch;     /* bytes per scanline */
     unsigned cb_fmt;        /* RB3D_COLORPITCH0 COLORFORMAT */
-    unsigned cb_bpp;        /* bytes per colour buffer pixel: 1, 2 or 4 */
+    unsigned cb_bpp;        /* bytes per colour buffer pixel: 1, 2, 4, 8 */
+    bool cb_fp16;           /* 8: S10E5 halves (US_OUT_FMT C4_16_FP) */
     unsigned cb_sel;        /* I8: bit position of the stored channel */
     uint32_t wmask;         /* RB3D_COLOR_CHANNEL_MASK as an ARGB byte mask */
     bool resolve;           /* colour buffer in AA-resolve mode */
@@ -472,6 +473,28 @@ static inline uint32_t r300_texel_16x4(uint32_t lo, uint32_t hi)
     return r300_pack_xyzw(lo >> 8, lo >> 24, hi >> 8, hi >> 24);
 }
 
+/* TX_FMT_16F_16F_16F_16F (code 0x1a): the same layout, S10E5 halves */
+static inline unsigned r300_h2c8(uint16_t h)
+{
+    unsigned e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    float f;
+
+    if (h & 0x8000) {
+        return 0;
+    }
+    if (e == 0x1f) {
+        return m ? 0 : 255;
+    }
+    f = e ? ldexpf((float)(m | 0x400), (int)e - 25) : ldexpf((float)m, -24);
+    return f >= 1.0f ? 255 : (unsigned)(f * 255.0f + 0.5f);
+}
+
+static inline uint32_t r300_texel_16fx4(uint32_t lo, uint32_t hi)
+{
+    return r300_pack_xyzw(r300_h2c8(lo), r300_h2c8(lo >> 16),
+                          r300_h2c8(hi), r300_h2c8(hi >> 16));
+}
+
 static inline bool r300_tex_yuv422(unsigned code)
 {
     return code == R300_TX_FMT_VYUY422 || code == R300_TX_FMT_YVYU422;
@@ -547,7 +570,7 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
                             unsigned unit, uint32_t addr)
 {
     const R300TexUnit *u = &d->tex[unit];
-    uint32_t off;
+    uint32_t off, lo, hi;
 
     if (u->bpp == 8) {
         /* single-component format: the byte is component X */
@@ -619,12 +642,15 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
             if (off + 8 > ATI_R350_VRAM_SIZE) {
                 return 0;
             }
-            return r300_texel_16x4(ati_r350_vram_ld32(s, off),
-                                   ati_r350_vram_ld32(s, off + 4));
+            lo = ati_r350_vram_ld32(s, off);
+            hi = ati_r350_vram_ld32(s, off + 4);
+        } else {
+            lo = r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes);
+            hi = r300_lane_xor32(r300_tex_bus32(s, unit, addr + 4),
+                                 u->lanes);
         }
-        return r300_texel_16x4(
-            r300_lane_xor32(r300_tex_bus32(s, unit, addr), u->lanes),
-            r300_lane_xor32(r300_tex_bus32(s, unit, addr + 4), u->lanes));
+        return u->code == R300_TX_FMT_16F_16F_16F_16F
+               ? r300_texel_16fx4(lo, hi) : r300_texel_16x4(lo, hi);
     }
     if (ati_r350_mc_to_vram(s, addr, &off)) {
         if (off + 4 > ATI_R350_VRAM_SIZE) {
@@ -1051,10 +1077,142 @@ static bool r300_cb_modelled(unsigned fmt)
     case R300_COLORFORMAT_RGB565:
     case R300_COLORFORMAT_ARGB4444:
     case R300_COLORFORMAT_ARGB8888:
+    case R300_COLORFORMAT_ARGB16161616:
         return true;
     default:
         return false;
     }
+}
+
+/*
+ * ARGB16161616: one 64-bit pixel, B in the low half of the first dword
+ * and A in the high half of the second, as ARGB8888 orders its bytes and
+ * as TX_FMT_16_16_16_16 reads them back. The shader's output format
+ * picks the encoding: C4_16_FP stores S10E5 halves, anything else
+ * unsigned 16-bit fractions.
+ */
+static uint16_t r300_f2h(float f)
+{
+    uint32_t u, sign, e, m, v, rem, half, sh;
+
+    memcpy(&u, &f, sizeof(u));
+    sign = (u >> 16) & 0x8000;
+    e = (u >> 23) & 0xff;
+    m = u & 0x7fffff;
+    if (e == 0xff) {
+        return sign | 0x7c00 | (m ? 0x200 : 0);
+    }
+    if (e > 142) {
+        return sign | 0x7c00;
+    }
+    if (e < 113) {
+        /* a half subnormal, or zero */
+        if (e < 102) {
+            return sign;
+        }
+        m |= 0x800000;
+        sh = 126 - e;
+        v = m >> sh;
+        rem = m & ((1u << sh) - 1);
+        half = 1u << (sh - 1);
+    } else {
+        v = ((e - 112) << 10) | (m >> 13);
+        rem = m & 0x1fff;
+        half = 0x1000;
+    }
+    /* to nearest, ties to even; a carry moves into the exponent */
+    if (rem > half || (rem == half && (v & 1))) {
+        v++;
+    }
+    return sign | v;
+}
+
+static float r300_h2f(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t e = (h >> 10) & 0x1f, m = h & 0x3ff, u;
+    float f;
+
+    if (e == 0) {
+        f = ldexpf((float)m, -24);
+        return sign ? -f : f;
+    }
+    if (e == 0x1f) {
+        u = sign | 0x7f800000 | (m << 13);
+    } else {
+        u = sign | ((e + 112) << 23) | (m << 13);
+    }
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static uint16_t r300_cb_enc16(const R300DrawState *d, float v)
+{
+    if (d->cb_fp16) {
+        return r300_f2h(v);
+    }
+    return (uint16_t)(MIN(MAX(v, 0.0f), 1.0f) * 65535.0f + 0.5f);
+}
+
+static float r300_cb_dec16(const R300DrawState *d, uint16_t v)
+{
+    return d->cb_fp16 ? r300_h2f(v) : v / 65535.0f;
+}
+
+static uint32_t r300_cb_ld32(ATIR350State *s, const R300DrawState *d,
+                             uint32_t addr)
+{
+    unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+
+    return (uint32_t)d->cb[addr ^ xr] |
+           ((uint32_t)d->cb[(addr + 1) ^ xr] << 8) |
+           ((uint32_t)d->cb[(addr + 2) ^ xr] << 16) |
+           ((uint32_t)d->cb[(addr + 3) ^ xr] << 24);
+}
+
+static void r300_cb_st32(ATIR350State *s, const R300DrawState *d,
+                         uint32_t addr, uint32_t v)
+{
+    unsigned xr = d->cb_host ? d->cb_xr : ati_r350_vram_xor(s, addr);
+
+    d->cb[addr ^ xr] = v & 0xff;
+    d->cb[(addr + 1) ^ xr] = (v >> 8) & 0xff;
+    d->cb[(addr + 2) ^ xr] = (v >> 16) & 0xff;
+    d->cb[(addr + 3) ^ xr] = (v >> 24) & 0xff;
+}
+
+/* argb[] = A, R, G, B */
+static void r300_read_dst64(ATIR350State *s, const R300DrawState *d,
+                            uint32_t addr, float *argb)
+{
+    uint32_t lo = r300_cb_ld32(s, d, addr), hi = r300_cb_ld32(s, d, addr + 4);
+
+    argb[0] = r300_cb_dec16(d, hi >> 16);
+    argb[1] = r300_cb_dec16(d, hi & 0xffff);
+    argb[2] = r300_cb_dec16(d, lo >> 16);
+    argb[3] = r300_cb_dec16(d, lo & 0xffff);
+}
+
+static void r300_write_dst64(ATIR350State *s, const R300DrawState *d,
+                             uint32_t addr, const float *argb)
+{
+    uint32_t lo = r300_cb_ld32(s, d, addr), hi = r300_cb_ld32(s, d, addr + 4);
+    uint16_t a = hi >> 16, r = hi & 0xffff, g = lo >> 16, b = lo & 0xffff;
+
+    if (d->wmask & 0xff000000u) {
+        a = r300_cb_enc16(d, argb[0]);
+    }
+    if (d->wmask & 0x00ff0000u) {
+        r = r300_cb_enc16(d, argb[1]);
+    }
+    if (d->wmask & 0x0000ff00u) {
+        g = r300_cb_enc16(d, argb[2]);
+    }
+    if (d->wmask & 0x000000ffu) {
+        b = r300_cb_enc16(d, argb[3]);
+    }
+    r300_cb_st32(s, d, addr, (uint32_t)g << 16 | b);
+    r300_cb_st32(s, d, addr + 4, (uint32_t)a << 16 | r);
 }
 
 /*
@@ -2066,7 +2224,14 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                                (uint32_t)x * d->cb_bpp;
 
                 if (src + d->cb_bpp <= ATI_R350_VRAM_SIZE) {
-                    r300_write_dst(s, d, addr, r300_read_dst(s, d, src));
+                    if (d->cb_bpp == 8) {
+                        float px[4];
+
+                        r300_read_dst64(s, d, src, px);
+                        r300_write_dst64(s, d, addr, px);
+                    } else {
+                        r300_write_dst(s, d, addr, r300_read_dst(s, d, src));
+                    }
                 }
                 continue;
             }
@@ -2325,12 +2490,28 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                  * the destination at all; the destination terms then
                  * see zero rather than whatever is in memory.
                  */
-                uint32_t dst = d->blend_read ? r300_read_dst(s, d, addr) : 0;
-                float dr = ((dst >> 16) & 0xff) / 255.0f;
-                float dg = ((dst >> 8) & 0xff) / 255.0f;
-                float db = (dst & 0xff) / 255.0f;
-                float da = ((dst >> 24) & 0xff) / 255.0f;
+                float dr, dg, db, da;
                 float nr, ng, nb;
+
+                if (d->cb_bpp == 8) {
+                    float px[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+                    if (d->blend_read) {
+                        r300_read_dst64(s, d, addr, px);
+                    }
+                    da = px[0];
+                    dr = px[1];
+                    dg = px[2];
+                    db = px[3];
+                } else {
+                    uint32_t dst = d->blend_read ? r300_read_dst(s, d, addr)
+                                                 : 0;
+
+                    dr = ((dst >> 16) & 0xff) / 255.0f;
+                    dg = ((dst >> 8) & 0xff) / 255.0f;
+                    db = (dst & 0xff) / 255.0f;
+                    da = ((dst >> 24) & 0xff) / 255.0f;
+                }
 
                 nr = r300_blend_comb(d->comb_fcn,
                         cr * r300_blend_f(d->src_factor, cr, ca, dr, da,
@@ -2355,6 +2536,12 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 cr = nr;
                 cg = ng;
                 cb = nb;
+            }
+            if (d->cb_bpp == 8) {
+                float px[4] = { ca, cr, cg, cb };
+
+                r300_write_dst64(s, d, addr, px);
+                continue;
             }
             out = ((uint32_t)(MIN(MAX(ca, 0.0f), 1.0f) * 255.0f) << 24) |
                   ((uint32_t)(MIN(MAX(cr, 0.0f), 1.0f) * 255.0f) << 16) |
@@ -4068,6 +4255,7 @@ static void r300_tex_setup(ATIR350State *s, R300DrawState *d, unsigned unit)
                  (txfmt1 & R300_TX_FORMAT1_SWAP_YUV ? 4 : 0);
         break;
     case R300_TX_FMT_16_16_16_16:
+    case R300_TX_FMT_16F_16F_16F_16F:
         u->bpp = 64;
         break;
     case R300_TX_FMT_8_8_8_8:
@@ -4284,6 +4472,8 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->cb_sel = sel_shift[(s->regs[R300_US_OUT_FMT_0 >> 2] >>
                                R300_US_OUT_C0_SEL_SHIFT) & 3];
     }
+    d->cb_fp16 = (s->regs[R300_US_OUT_FMT_0 >> 2] & R300_US_OUT_FMT_MASK) ==
+                 R300_US_OUT_FMT_C4_16_FP;
     d->dst_pitch = (colorpitch & 0x3fff) * d->cb_bpp;
     if (!d->dst_pitch) {
         return false;

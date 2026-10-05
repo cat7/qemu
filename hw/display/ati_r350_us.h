@@ -181,6 +181,8 @@
 #define R300_US_OUT_FMT_MASK         0x1f
 #define R300_US_OUT_FMT_C4_8         0
 #define R300_US_OUT_FMT_C4_10        1
+#define R300_US_OUT_FMT_C4_16        5
+#define R300_US_OUT_FMT_C4_16_FP     18
 #define R300_US_OUT_SEL_SHIFT(n)     (8 + (n) * 2)
 #define R300_US_OUT_SEL_MASK         0x3
 #define R300_US_OUT_SEL_ALPHA        0
