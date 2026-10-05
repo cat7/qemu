@@ -2225,10 +2225,10 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
 
                 if (src + d->cb_bpp <= ATI_R350_VRAM_SIZE) {
                     if (d->cb_bpp == 8) {
-                        float px[4];
+                        float c64[4];
 
-                        r300_read_dst64(s, d, src, px);
-                        r300_write_dst64(s, d, addr, px);
+                        r300_read_dst64(s, d, src, c64);
+                        r300_write_dst64(s, d, addr, c64);
                     } else {
                         r300_write_dst(s, d, addr, r300_read_dst(s, d, src));
                     }
@@ -2494,15 +2494,15 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 float nr, ng, nb;
 
                 if (d->cb_bpp == 8) {
-                    float px[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    float c64[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
                     if (d->blend_read) {
-                        r300_read_dst64(s, d, addr, px);
+                        r300_read_dst64(s, d, addr, c64);
                     }
-                    da = px[0];
-                    dr = px[1];
-                    dg = px[2];
-                    db = px[3];
+                    da = c64[0];
+                    dr = c64[1];
+                    dg = c64[2];
+                    db = c64[3];
                 } else {
                     uint32_t dst = d->blend_read ? r300_read_dst(s, d, addr)
                                                  : 0;
@@ -2538,9 +2538,9 @@ static void r300_raster_tri(ATIR350State *s, const R300DrawState *d,
                 cb = nb;
             }
             if (d->cb_bpp == 8) {
-                float px[4] = { ca, cr, cg, cb };
+                float c64[4] = { ca, cr, cg, cb };
 
-                r300_write_dst64(s, d, addr, px);
+                r300_write_dst64(s, d, addr, c64);
                 continue;
             }
             out = ((uint32_t)(MIN(MAX(ca, 0.0f), 1.0f) * 255.0f) << 24) |
