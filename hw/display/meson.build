@@ -73,13 +73,19 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
 # (see the win32 leg's comment in ati_r350_gl.c). Elsewhere the file
 # compiles to a stub that reports there is no backend.
 r350_gl_deps = []
+r350_gl_files = []
 if host_os == 'darwin'
   r350_gl_deps += dependency('appleframeworks', modules: 'OpenGL')
+  # ati_r350_mtl.m is the same interface drawn through Metal ("gl-api"),
+  # ati_r350_gpu.c dispatches between the two.
+  r350_gl_deps += dependency('appleframeworks',
+                             modules: ['Metal', 'Foundation'])
+  r350_gl_files += files('ati_r350_gpu.c', 'ati_r350_mtl.m')
 elif host_os == 'windows'
   r350_gl_deps += [cc.find_library('opengl32'), cc.find_library('gdi32'),
                    cc.find_library('user32')]
 endif
-system_ss.add(when: 'CONFIG_ATI_R350', if_true: [files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c', 'ati_r350_pvs_glsl.c', 'ati_r350_us.c', 'ati_r350_us_glsl.c', 'ati_r350_gl.c'), r350_gl_deps])
+system_ss.add(when: 'CONFIG_ATI_R350', if_true: [files('ati_r350.c', 'ati_r350_2d.c', 'ati_r350_3d.c', 'ati_r350_dbg.c', 'ati_r350_pvs.c', 'ati_r350_pvs_glsl.c', 'ati_r350_us.c', 'ati_r350_us_glsl.c', 'ati_r350_gl.c'), r350_gl_files, r350_gl_deps])
 
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])

@@ -72,7 +72,12 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef CONFIG_DARWIN
+#define R350_GPU_IMPL_OGL 1
+#include "ati_r350_gpu.h"
+#else
 #include "ati_r350_gl.h"
+#endif
 #include <float.h>
 #include <math.h>
 #include "ati_r350_us.h"

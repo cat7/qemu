@@ -304,6 +304,10 @@ typedef struct R350GlCtx R350GlCtx;
 #define R350_GL_MAXWORKERS 8
 
 R350GlCtx *ati_r350_gl_open(const char **err, unsigned workers);
+#if defined(CONFIG_DARWIN) && !defined(R350_GPU_P)
+/* the same interface drawn through Metal; NULL with `err` set when absent */
+R350GlCtx *ati_r350_gl_open_metal(const char **err, unsigned workers);
+#endif
 void ati_r350_gl_close(R350GlCtx *g);
 
 /*

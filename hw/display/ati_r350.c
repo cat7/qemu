@@ -5154,7 +5154,22 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                        R350_GL_MAXWORKERS);
             return;
         }
-        s->gl_ctx = ati_r350_gl_open(&why, s->gl_async ? s->gl_workers : 0);
+        if (!s->gl_api || !s->gl_api[0] || !strcmp(s->gl_api, "gl")) {
+            s->gl_ctx = ati_r350_gl_open(&why,
+                                         s->gl_async ? s->gl_workers : 0);
+        } else if (!strcmp(s->gl_api, "metal")) {
+#ifdef CONFIG_DARWIN
+            s->gl_ctx = ati_r350_gl_open_metal(&why, s->gl_async
+                                               ? s->gl_workers : 0);
+#else
+            error_setg(errp, "gl-api=metal is only available on macOS");
+            return;
+#endif
+        } else {
+            error_setg(errp, "gl-api must be gl or metal (got \"%s\")",
+                       s->gl_api);
+            return;
+        }
         if (!s->gl_ctx) {
             error_setg(errp, "gl=%s: %s", s->gl_path, why);
             return;
@@ -5436,6 +5451,7 @@ static const Property ati_r350_properties[] = {
      * "on", or "verify". See ati_r350_gl.h.
      */
     DEFINE_PROP_STRING("gl", ATIR350State, gl_path),
+    DEFINE_PROP_STRING("gl-api", ATIR350State, gl_api),
     /*
      * Diagnostic only (milestone M4): translate each vertex program the
      * guest uploads to GLSL and count whether the translator could
