@@ -72,32 +72,47 @@
  *   (25+8C)..(36+8C)  triangle vertex 0/1/2 SECOND colours
  *   (37+8C)           1.0f / signed area again
  *   (38+8C)..(40+8C)  triangle vertex 0/1/2 1/w
+ *   (41+8C)..(43+8C)  triangle vertex 0/1/2 Z, screen-linear
+ *   (44+8C)           unused
  *
  * The second colour is the one a fragment program can add to the
  * modulated texel -- Chess.app's specular term -- and it is carried at
  * the corners like the first so the fragment stage interpolates it with
  * the same weights.
  */
-#define R350_GL_VSTRIDE (41 + 8 * R350_GL_TEXCOORDS)
+#define R350_GL_VSTRIDE (45 + 8 * R350_GL_TEXCOORDS)
 
 /*
- * How many uploaded textures the backend keeps, plus one: slot
+ * How many uploaded textures the backend can keep, plus one: slot
  * R350_GL_TEXSLOTS is a scratch the caller uses for a texture it is not
  * tracking, and it is uploaded every time. See R350GlReq.tex_slot.
+ * The device uses as many of these as its gl-texcache-slots property
+ * says and bounds their total size (R300_GL_TEXCACHE_BYTES).
  *
- * MEASURED, not guessed: at 8 a live Flurry session reported 620 of its
- * 2546 decodes as entries the LRU had evicted -- the second largest
- * miss class after the ones a writer killed. The device-side cache
- * bounds each entry at R300_GL_TEXCACHE_MAX texels, so this many slots
- * is a bounded worst case rather than an open-ended allocation.
+ * At 8 a Flurry session reported 620 of its 2546 decodes as LRU
+ * evictions; at 32 a Quake III timedemo reported 133004 of 134782.
  */
-#define R350_GL_TEXSLOTS 32
+#define R350_GL_TEXSLOTS 256
 
 /* US_ALU_CONST vectors a translated fragment program may name */
 #define R350_GL_USK 32
 
 /* rectangles the texture-barrier bookkeeping keeps apart */
 #define R350_GL_WRITTEN 32
+
+/*
+ * The depth and stencil test of one draw, as r300_zb_pixel() defines it.
+ * `mode` 0 leaves both tests off; 1 is 24-bit Z above 8 stencil bits, 2
+ * is 16-bit Z without stencil. Compare functions and stencil operations
+ * are the ZB_ZSTENCILCNTL codes; index 0 is the front face, 1 the back.
+ */
+typedef struct R350GlZ {
+    int mode;
+    int test, func, write;
+    int stencil;
+    int sfunc[2], sfail[2], szfail[2], szpass[2];
+    int sref, smask, swmask;
+} R350GlZ;
 
 typedef struct R350GlReq {
     /*
@@ -165,6 +180,11 @@ typedef struct R350GlReq {
      */
     int levels[R350_GL_TEXUNITS];
     int filt[R350_GL_TEXUNITS][11];
+    /*
+     * A cube map: each level of `tex` is its six faces (+X -X +Y -Y +Z
+     * -Z) stacked, w x 6h, and the general form's fetch picks the face.
+     */
+    int cube[R350_GL_TEXUNITS];
     uint8_t border[R350_GL_TEXUNITS][4];
     uint32_t textured;
 
@@ -246,6 +266,32 @@ typedef struct R350GlReq {
     float tcinv[R350_GL_TCSETS][2];
     uint32_t tc_raw;
     int lod_any;
+
+    /*
+     * The depth and stencil test, against the resident depth buffer.
+     * `zonly` is a pass with every colour channel masked: it runs no
+     * fragment program and no alpha test, as r300_raster_tri() does not.
+     * `zout`, for gl=verify, receives the drawn rectangle's Z words.
+     */
+    R350GlZ z;
+    int zonly;
+    uint32_t *zout;
+    /*
+     * DISCARD_SRC_PIXELS on a draw that writes Z: the device skips only
+     * the colour write, after the depth and stencil test. A discarded
+     * fragment then writes the destination back unchanged instead of
+     * being killed, so the draw reads its destination as a blend does.
+     */
+    int dkeep;
+    /*
+     * Occlusion counting. `zq` adds the samples this draw passes -- the
+     * fragments that survive the program, the alpha test and the depth
+     * and stencil test -- to the backend's running count; see
+     * ati_r350_gl_zq_mark(). `zq_out`, for gl=verify, receives this
+     * draw's own count instead, read back at once.
+     */
+    int zq;
+    uint32_t *zq_out;
 } R350GlReq;
 
 typedef struct R350GlCtx R350GlCtx;
@@ -255,8 +301,19 @@ typedef struct R350GlCtx R350GlCtx;
  * string on failure -- a host without a usable GL context is a
  * configuration fact to report, not an abort.
  */
-R350GlCtx *ati_r350_gl_open(const char **err);
+R350GlCtx *ati_r350_gl_open(const char **err, bool async);
 void ati_r350_gl_close(R350GlCtx *g);
+
+/*
+ * Whether a draw with this fragment program, blend variant and colour
+ * write mask would find its host pipeline built: 1 yes, 0 not yet (a
+ * worker thread is building it; the caller draws in software meanwhile),
+ * -1 the program will not link. See "THE PROGRAM WORKER".
+ */
+int ati_r350_gl_prog_ready(R350GlCtx *g, uint64_t key, bool add,
+                           const char *glsl, uint32_t wmask);
+void ati_r350_gl_worker_stats(R350GlCtx *g, uint64_t *warms, uint64_t *failed,
+                              uint64_t *waits, unsigned *inflight);
 
 /*
  * Size the resident render target to at least w x h. Returns false if
@@ -281,11 +338,42 @@ bool ati_r350_gl_fetch(R350GlCtx *g, int x0, int y0, int w, int h,
                        uint8_t *base, unsigned pitch, unsigned xr);
 
 /*
+ * The resident DEPTH buffer, the size of the colour target, attached
+ * beside it. A word is a pixel's Z as r300_zb_pixel() reads it: (z24 <<
+ * 8) | stencil for `mode` 1, the 16-bit Z for `mode` 2. The caller does
+ * the tiling and the swapper. depth() is false when the host gave no
+ * depth buffer; the others then refuse.
+ */
+bool ati_r350_gl_depth(R350GlCtx *g);
+bool ati_r350_gl_zseed(R350GlCtx *g, int x0, int y0, int w, int h,
+                       const uint32_t *z, int mode);
+bool ati_r350_gl_zfetch(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t *z, int mode);
+bool ati_r350_gl_zclear(R350GlCtx *g, int x0, int y0, int w, int h,
+                        uint32_t z, int mode);
+
+/*
  * Render one request into the resident target. Returns false if the
  * backend could not run it, in which case the target is unchanged and
  * the caller must fall back.
  */
 bool ati_r350_gl_draw(R350GlCtx *g, const R350GlReq *req);
+
+/*
+ * The running occlusion count. The samples of counted draws are summed by
+ * host occlusion queries issued in submission order. mark() closes the
+ * queries over everything submitted so far and returns a TICKET, the
+ * number of queries issued. sum() gives the samples of every counted
+ * draw before `ticket`: with `wait` it waits for the GPU, without it it
+ * returns false while the GPU has not finished them. Tickets are summed
+ * in non-decreasing order; one below the last summed is refused.
+ */
+uint64_t ati_r350_gl_zq_mark(R350GlCtx *g);
+bool ati_r350_gl_zq_sum(R350GlCtx *g, uint64_t ticket, bool wait,
+                        uint64_t *sum);
+
+/* release the storage of a cached texture slot; the slot reads as empty */
+void ati_r350_gl_tex_forget(R350GlCtx *g, unsigned slot);
 
 /* a one-line description of the backend actually in use, for `qom-get gl` */
 const char *ati_r350_gl_describe(R350GlCtx *g);

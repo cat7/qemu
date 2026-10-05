@@ -113,10 +113,15 @@ typedef enum ATIR350GapKind {
     R350_GAP_ZB_FORMAT,      /* ZB_FORMAT depth format not modelled */
     R350_GAP_CB_FORMAT,      /* COLORFORMAT the rasteriser cannot store */
     R350_GAP_VS_ADDR_MODE,   /* PVS operand addressing mode not modelled */
+    R350_GAP_UCP,            /* VAP_CLIP_CNTL user clip planes enabled */
+    R350_GAP_ZPASS,          /* occlusion counter use not modelled */
     R350_GAP_MAX
 } ATIR350GapKind;
 
 #define R350_GAP_SLOTS 256
+
+/* dumps of the occlusion counter waiting for the GPU's count */
+#define R350_ZQ_PEND 16
 
 /*
  * How the "gl" property is set: whether the host-GPU backend renders a
@@ -151,6 +156,8 @@ typedef enum ATIR350GlFallback {
     R350_GLF_FSPROG,        /* fragment program the translator refused */
     R350_GLF_CBFMT,         /* 16bpp or GART colour buffer */
     R350_GLF_ZTEST,         /* depth or stencil test */
+    R350_GLF_ZPASS,         /* counted by an occlusion query, gl-zpass=off */
+    R350_GLF_PROGWAIT,      /* the program worker still has the program */
     R350_GLF_MAX
 } ATIR350GlFallback;
 
@@ -176,6 +183,19 @@ typedef enum ATIR350GlRel {
     R350_GLR_FENCE,         /* a scratch or read pointer write, threaded CP */
     R350_GLR_MAX
 } ATIR350GlRel;
+
+/* why the GPU's copy of the depth buffer was given up */
+typedef enum ATIR350GlZDrop {
+    R350_GLZD_PARK,         /* could not be kept across a release */
+    R350_GLZD_STALE,        /* kept, then VRAM under it changed */
+    R350_GLZD_OTHER,        /* another depth buffer, or drawn into */
+    R350_GLZD_SOFT,         /* the software path wrote Z */
+    R350_GLZD_WRITER,       /* 2D engine, CP or MM_DATA wrote its range */
+    R350_GLZD_GUARD,        /* the guest CPU touched it */
+    R350_GLZD_RESET,        /* reset, backend failure, target grown */
+    R350_GLZD_VERIFY,       /* gl=verify */
+    R350_GLZD_MAX
+} ATIR350GlZDrop;
 
 /*
  * WHICH 2D path ended the residency. R350_GLR_2D above lumps three
@@ -230,13 +250,19 @@ typedef enum ATIR350GlTexLife {
 #define R300_GL_PASS_MAX    128
 
 /*
- * How many decoded textures are kept, and the largest one kept. Eight
- * entries of at most a megabyte of RGBA each: enough for a compositor
- * frame's window tiles, and bounded so a guest cannot make the device
- * allocate without limit.
+ * The decoded-texture cache: at most R300_GL_TEXCACHE entries (the
+ * gl-texcache-slots property picks how many are used), each at most
+ * R300_GL_TEXCACHE_MAX texels per face. With more than the classic 32
+ * slots, lookups go through a hash on the decode key and the decoded
+ * bytes are bounded by R300_GL_TEXCACHE_BYTES, least recently used
+ * first, so a guest cannot make the device allocate without limit.
  */
-#define R300_GL_TEXCACHE     R350_GL_TEXSLOTS
-#define R300_GL_TEXCACHE_MAX (256 * 1024)
+#define R300_GL_TEXCACHE       R350_GL_TEXSLOTS
+#define R300_GL_TEXCACHE_OLD   32
+#define R300_GL_TEXCACHE_MAX   (256 * 1024)
+#define R300_GL_TEXCACHE_BYTES (128u << 20)
+#define R300_GL_TEXHASH        512
+#define R300_GL_TEXNIL         0xffff
 
 /*
  * The guard on a cached entry (see r300_gl_tex_current()) walks the
@@ -712,6 +738,8 @@ struct ATIR350State {
      * flush count that went down.
      */
     uint64_t gl_nowork;
+    /* view-volume clipping: draws cut, triangles cut, primitives dropped */
+    uint64_t clip_draws, clip_tris, clip_drop, clip_ucp;
     /* gl=verify: the per-pixel agreement between the two paths */
     uint64_t gl_v_px, gl_v_hist[4];     /* delta 0, 1, 2-4, above 4 */
     uint64_t gl_v_draws, gl_v_bad;      /* draws compared / with delta > 1 */
@@ -766,6 +794,73 @@ struct ATIR350State {
     uint64_t gl_rel_2d[R350_GL2D_MAX];
     uint64_t gl_rel_2d_px[R350_GL2D_MAX];
     /*
+     * The GL-owned DEPTH buffer. The rules are at "GL-OWNED DEPTH BUFFER"
+     * in ati_r350_3d.c. `gl_zres` says the GPU holds a copy of the Z
+     * buffer described by gl_z_*, good inside the seeded rectangle and
+     * newer than VRAM inside the drawn one; `gl_zpark` that the copy
+     * outlived a release and must be checked against the dirty bitmap
+     * before it is used again; `gl_ztaint` that VRAM under it was written
+     * while it was resident, so it may not be kept.
+     */
+    bool gl_depth;              /* "gl-depth": depth-tested draws on the GPU */
+    bool gl_zres, gl_zpark, gl_ztaint;
+    uint64_t gl_zepoch;
+    uint32_t gl_z_off, gl_z_pitch;
+    bool gl_z_macro, gl_z_micro, gl_z_aa, gl_z_z16;
+    int gl_zvx0, gl_zvy0, gl_zvx1, gl_zvy1;     /* seeded */
+    int gl_zdx0, gl_zdy0, gl_zdx1, gl_zdy1;     /* drawn: GPU is NEWER */
+    uint32_t *gl_zstage, *gl_zbefore, *gl_zgpu;
+    size_t gl_zstage_n, gl_zv_n;
+    uint64_t gl_zdrawn, gl_zflushes, gl_zflush_px, gl_zseed_px;
+    uint64_t gl_zclears, gl_zkept, gl_zstale, gl_zdropped;
+    uint64_t gl_zdrop_why[R350_GLZD_MAX];
+    /*
+     * "gl-depth-resident": the copy stays on the GPU across releases and
+     * goes back to VRAM only when something reads it. The guest CPU's
+     * accesses are trapped by the DEPTH GUARD, a window over the
+     * aperture at [zg_lo, zg_hi) laid over the Z buffer's pages; zg_zlo
+     * and zg_zhi are the Z bytes inside it. Changed with the BQL and the
+     * engine both held. See "GL-OWNED DEPTH BUFFER".
+     */
+    bool gl_zlazy;
+    bool zg_ready, zg_on;
+    MemoryRegion zg_io, zg_win;
+    uint32_t zg_lo, zg_hi, zg_zlo, zg_zhi;
+    uint64_t gl_zlazy_rel, gl_zg_arms, gl_zg_traps, gl_zg_back;
+    uint64_t gl_zclr_px;        /* cleared on the GPU only */
+    /* gl=verify over the depth buffer, classed as the colour is */
+    uint64_t gl_vz_draws, gl_vz_px, gl_vz_diff, gl_vz_cover_px, gl_vz_cover;
+    /*
+     * The occlusion counter (ZB_ZPASS_DATA, ZB_ZPASS_ADDR); the rules
+     * are at "ZPASS COUNTER" in ati_r350_3d.c. Engine state, except
+     * zq_draw, which the raster threads add to.
+     */
+    bool gl_zpass;              /* "gl-zpass": count queried draws on the GPU */
+    bool gl_async;              /* "gl-async-compile": worker thread */
+    bool zq_on;                 /* reset since the last dump: counting */
+    bool zq_late;               /* drawn uncounted since the last dump */
+    bool zq_gl;                 /* GL counted a draw since the reset */
+    /* a 3D_CLEAR_ZMASK held for the first draw on its buffer */
+    bool zclr_pend;
+    uint32_t zclr_first, zclr_n, zclr_zoff, zclr_zp, zclr_clr;
+    uint32_t zclr_zfmt, zclr_bw, zclr_smp;
+    uint32_t zq_base;           /* the value ZB_ZPASS_DATA was given */
+    uint64_t zq_sw;             /* software samples since the reset */
+    uint64_t zq_draw;           /* the current draw's software samples */
+    uint64_t zq_t0;             /* backend ticket at the reset */
+    bool zq_cv;                 /* zq_cp is the backend's sum at zq_ct */
+    uint64_t zq_ct, zq_cp;
+    struct {
+        uint32_t addr, part;    /* where, and base + software samples */
+        unsigned swap;          /* ZB_DEPTHPITCH DEPTHENDIAN */
+        uint64_t t0, t;         /* backend tickets: reset, dump */
+    } zq_pend[R350_ZQ_PEND];
+    unsigned zq_npend;
+    uint64_t zq_resets, zq_dumps, zq_deferred, zq_gldraws, zq_swdraws;
+    uint64_t zq_offdraws, zq_reads;
+    /* gl=verify: each draw counted both ways */
+    uint64_t zq_v_draws, zq_v_bad, zq_v_sw, zq_v_gl;
+    /*
      * Decoded textures, keyed on everything the decode depends on.
      *
      * An entry is valid while the VRAM range it was decoded from is
@@ -781,6 +876,7 @@ struct ATIR350State {
         unsigned sel[4];
         int w, h;
         unsigned nlev;              /* mip levels decoded, one after another */
+        bool cube;                  /* each level six faces tall */
         uint32_t lay;               /* offset of the last of them */
         uint8_t *rgba;
         size_t sz;
@@ -789,7 +885,16 @@ struct ATIR350State {
         unsigned npg;               /* host pages the range spans */
         bool live;                  /* the decoded bytes are current */
         bool up;                    /* ... and the backend has them too */
+        uint16_t hb;                /* hash bucket, or R300_GL_TEXNIL */
+        uint16_t hnext;             /* next entry in that bucket */
     } gl_tex[R300_GL_TEXCACHE];
+    uint32_t gl_tex_slots;      /* "gl-texcache-slots" */
+    unsigned gl_tex_n;          /* entries in use */
+    bool gl_tex_hashed;         /* hash lookup and byte bound */
+    uint16_t gl_tex_bucket[R300_GL_TEXHASH];
+    size_t gl_tex_bytes;        /* decoded bytes held */
+    uint64_t gl_tex_pin;        /* entries used after this are this draw's */
+    uint64_t gl_tex_trim;       /* live entries dropped for the byte bound */
     uint64_t gl_tex_seq, gl_tex_hit, gl_tex_miss;
     uint64_t gl_tex_stale;      /* entries the dirty guard killed */
     /*
@@ -886,6 +991,8 @@ struct ATIR350State {
     uint32_t pvs_upload_cnt;
     uint32_t pvs_const[R300_PVS_CONST_SLOTS * 4];
     uint32_t pvs_const_dwords;
+    /* user clip planes and point sprite state, R300_PVS_UCP_START on */
+    uint32_t pvs_clip[R300_PVS_CLIP_VECS * 4];
     uint32_t pvs_code[R300_PVS_CODE_SLOTS * 4];
     uint32_t pvs_code_slot_valid[R300_PVS_CODE_SLOTS / 32];
     /* dwords ever uploaded to the code region: is there a program at all */
@@ -969,6 +1076,13 @@ struct ATIR350State {
     bool us_glsl_ok;
     uint64_t us_glsl_key;
     uint64_t us_glsl_ok_n, us_glsl_refused_n;
+    /*
+     * A `gl_simple` program in the general form, for a draw that needs
+     * its fetch inside the shader (a cube map); made on demand for the
+     * program `us_glsl_gen_for` names, keyed by `us_glsl_gen_key`.
+     */
+    char us_glsl_gen[64 * 1024];
+    uint64_t us_glsl_gen_for, us_glsl_gen_key;
     float us_konst_flat[R300_US_CONSTS * 4];
 
     /*
@@ -1040,6 +1154,18 @@ const char *ati_r350_gl_rel_name(ATIR350GlRel why);
 const char *ati_r350_gl_2d_path_name(ATIR350Gl2dPath path);
 
 /*
+ * The occlusion counter; see "ZPASS COUNTER" in ati_r350_3d.c. Called
+ * by the thread that has the engine: the ZB_ZPASS_DATA and ZB_ZPASS_ADDR
+ * writes, a ZB_ZPASS_DATA read, the guest-visible points where pending
+ * dumps must have landed (settle), and reset.
+ */
+void ati_r350_zpass_reset(ATIR350State *s, uint32_t val);
+void ati_r350_zpass_dump(ATIR350State *s, uint32_t addr);
+uint32_t ati_r350_zpass_read(ATIR350State *s);
+void ati_r350_zpass_settle(ATIR350State *s);
+void ati_r350_zpass_drop(ATIR350State *s);
+
+/*
  * The display refresh has just snapshotted and CLEARED the VGA dirty
  * bitmap, which is the one thing the decoded-texture cache reads to
  * know whether the guest CPU wrote over a texture. Hand the pages it
@@ -1059,6 +1185,18 @@ void ati_r350_gl_epoch_apply(ATIR350State *s);
  * code whose bits these are.
  */
 bool ati_r350_gl_admit(ATIR350State *s, uint32_t off, uint32_t len);
+
+/*
+ * The depth guard (see "GL-OWNED DEPTH BUFFER" in ati_r350_3d.c).
+ * ati_r350_zguard_arm() lays it over [lo, hi), page aligned, taking the
+ * BQL if the caller does not hold it; the engine must be this thread's.
+ * ati_r350_gl_zguard() is the trap's half in the draw code: the guest
+ * CPU is about to access [off, off+len), the engine is held, and it
+ * returns true when the guard has nothing left to watch.
+ */
+bool ati_r350_zguard_arm(ATIR350State *s, uint32_t lo, uint32_t hi,
+                         uint32_t zlo, uint32_t zhi);
+bool ati_r350_gl_zguard(ATIR350State *s, uint32_t off, unsigned len);
 
 bool ati_r350_on_engine(void);
 /* ati_r350_vram_xor() on this thread uses `memo` from now on */
@@ -1080,7 +1218,7 @@ void ati_r350_gl_leave(ATIR350State *s, bool claimed);
 static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
                                      uint32_t len)
 {
-    if (unlikely(s->gl_res)) {
+    if (unlikely(s->gl_res || s->gl_zres)) {
         ati_r350_gl_sync(s, off, len);
     }
 }
@@ -1089,7 +1227,7 @@ static inline void ati_r350_gl_touch(ATIR350State *s, uint32_t off,
 static inline void ati_r350_gl_dirty(ATIR350State *s, uint32_t off,
                                      uint32_t len)
 {
-    if (unlikely(s->gl_res || s->gl_tex_any)) {
+    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres)) {
         ati_r350_gl_wrote(s, off, len);
     }
 }

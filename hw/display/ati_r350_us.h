@@ -181,6 +181,8 @@
 #define R300_US_OUT_FMT_MASK         0x1f
 #define R300_US_OUT_FMT_C4_8         0
 #define R300_US_OUT_FMT_C4_10        1
+#define R300_US_OUT_FMT_C4_16        5
+#define R300_US_OUT_FMT_C4_16_FP     18
 #define R300_US_OUT_SEL_SHIFT(n)     (8 + (n) * 2)
 #define R300_US_OUT_SEL_MASK         0x3
 #define R300_US_OUT_SEL_ALPHA        0
@@ -556,5 +558,247 @@ static inline void r300_us_run_fast(const R300UsProgram *p,
  * `p->expressible` refuses.
  */
 bool r300_us_glsl(const R300UsProgram *p, char *buf, size_t cap);
+
+/* the general form for any program, `gl_simple` or not */
+bool r300_us_glsl_general(const R300UsProgram *p, char *buf, size_t cap);
+
+/*
+ * S3TC, TX_FORMAT1 TXFORMAT 0x0f/0x10/0x11 (Mesa r300_reg.h
+ * R300_TX_FORMAT_DXT1/3/5). A block is 4x4 texels, 8 bytes for DXT1 and
+ * 16 for DXT3/5, read as a byte stream in ascending address order with
+ * multi-byte fields little-endian.
+ *
+ * Output texels are packed X = blue, Y = green, Z = red, W = alpha, one
+ * byte each from the low lane: the component numbering of the 5_6_5
+ * endpoint words (X in bits 4:0).
+ */
+static inline unsigned r300_dxt_block_bytes(unsigned dxt)
+{
+    return dxt == 1 ? 8 : 16;
+}
+
+static inline void r300_dxt_565(uint32_t c, uint32_t rgb[3])
+{
+    uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+
+    rgb[0] = (r << 3) | (r >> 2);
+    rgb[1] = (g << 2) | (g >> 4);
+    rgb[2] = (b << 3) | (b >> 2);
+}
+
+static inline void r300_dxt_decode(unsigned dxt, const uint8_t *b,
+                                   uint32_t out[16])
+{
+    const uint8_t *cb = dxt == 1 ? b : b + 8;
+    uint32_t c0 = cb[0] | (cb[1] << 8), c1 = cb[2] | (cb[3] << 8);
+    uint32_t idx = cb[4] | (cb[5] << 8) | (cb[6] << 16) |
+                   ((uint32_t)cb[7] << 24);
+    uint32_t pal[4][3], pa[4] = { 255, 255, 255, 255 }, apal[8];
+    uint64_t abits = 0;
+    unsigned k, t;
+
+    r300_dxt_565(c0, pal[0]);
+    r300_dxt_565(c1, pal[1]);
+    for (k = 0; k < 3; k++) {
+        if (dxt != 1 || c0 > c1) {
+            pal[2][k] = (2 * pal[0][k] + pal[1][k]) / 3;
+            pal[3][k] = (pal[0][k] + 2 * pal[1][k]) / 3;
+        } else {
+            pal[2][k] = (pal[0][k] + pal[1][k]) / 2;
+            pal[3][k] = 0;
+        }
+    }
+    if (dxt == 1 && c0 <= c1) {
+        pa[3] = 0;
+    }
+    if (dxt == 5) {
+        uint32_t a0 = b[0], a1 = b[1];
+
+        for (k = 0; k < 6; k++) {
+            abits |= (uint64_t)b[2 + k] << (8 * k);
+        }
+        apal[0] = a0;
+        apal[1] = a1;
+        for (k = 2; k < 8; k++) {
+            if (a0 > a1) {
+                apal[k] = ((8 - k) * a0 + (k - 1) * a1) / 7;
+            } else if (k < 6) {
+                apal[k] = ((6 - k) * a0 + (k - 1) * a1) / 5;
+            } else {
+                apal[k] = k == 6 ? 0 : 255;
+            }
+        }
+    }
+    for (t = 0; t < 16; t++) {
+        uint32_t a;
+
+        k = (idx >> (2 * t)) & 3;
+        if (dxt == 1) {
+            a = pa[k];
+        } else if (dxt == 3) {
+            a = ((b[t >> 1] >> ((t & 1) * 4)) & 15) * 17;
+        } else {
+            a = apal[(abits >> (3 * t)) & 7];
+        }
+        out[t] = pal[k][2] | (pal[k][1] << 8) | (pal[k][0] << 16) | (a << 24);
+    }
+}
+
+/*
+ * Cube-map face selection (OpenGL 1.3 table 3.19; faces +X -X +Y -Y +Z
+ * -Z are 0..5, stored in that order per level, R5xx acceleration guide
+ * 4.6). The major axis names the face; sc, tc and ma are components
+ * `is`, `it` and `im` of the direction times `ss`, `st` and `sm`.
+ */
+typedef struct R300CubeSel {
+    unsigned face;
+    unsigned is, it, im;
+    float ss, st, sm;
+} R300CubeSel;
+
+static inline R300CubeSel r300_cube_sel(const float v[3])
+{
+    float ax = v[0] < 0.0f ? -v[0] : v[0];
+    float ay = v[1] < 0.0f ? -v[1] : v[1];
+    float az = v[2] < 0.0f ? -v[2] : v[2];
+    R300CubeSel c;
+    bool p;
+
+    if (ax >= ay && ax >= az) {
+        p = v[0] >= 0.0f;
+        c.face = p ? 0 : 1;
+        c.im = 0;
+        c.is = 2;
+        c.it = 1;
+        c.ss = p ? -1.0f : 1.0f;
+        c.st = -1.0f;
+    } else if (ay >= az) {
+        p = v[1] >= 0.0f;
+        c.face = p ? 2 : 3;
+        c.im = 1;
+        c.is = 0;
+        c.it = 2;
+        c.ss = 1.0f;
+        c.st = p ? 1.0f : -1.0f;
+    } else {
+        p = v[2] >= 0.0f;
+        c.face = p ? 4 : 5;
+        c.im = 2;
+        c.is = 0;
+        c.it = 1;
+        c.ss = p ? 1.0f : -1.0f;
+        c.st = -1.0f;
+    }
+    c.sm = p ? 1.0f : -1.0f;
+    return c;
+}
+
+/*
+ * The face coordinates in that face's level-0 texels, and their screen
+ * derivatives from those of the direction (dv[c][0] = d/dx, dv[c][1] =
+ * d/dy, or NULL). One operation per statement, mirrored by the GLSL
+ * below.
+ */
+static inline unsigned r300_cube_coord(const float v[3], const float dv[3][2],
+                                       int w, int h, float *fs, float *ft,
+                                       float der[4])
+{
+    R300CubeSel c = r300_cube_sel(v);
+    float ma = c.sm * v[c.im];
+    float sc = c.ss * v[c.is];
+    float tc = c.st * v[c.it];
+    float qs = 0.0f, qt = 0.0f, hs, ht, fw = (float)w, fh = (float)h;
+    unsigned k;
+
+    for (k = 0; k < 4; k++) {
+        der[k] = 0.0f;
+    }
+    if (ma > 0.0f) {
+        qs = sc / ma;
+        qt = tc / ma;
+    }
+    hs = qs * 0.5f;
+    hs = hs + 0.5f;
+    *fs = hs * fw;
+    ht = qt * 0.5f;
+    ht = ht + 0.5f;
+    *ft = ht * fh;
+    if (dv && ma > 0.0f) {
+        for (k = 0; k < 2; k++) {
+            float dm = c.sm * dv[c.im][k];
+            float ds = c.ss * dv[c.is][k];
+            float dt = c.st * dv[c.it][k];
+            float e = qs * dm;
+
+            e = ds - e;
+            e = e / ma;
+            e = e * 0.5f;
+            der[k * 2] = e * fw;
+            e = qt * dm;
+            e = dt - e;
+            e = e / ma;
+            e = e * 0.5f;
+            der[k * 2 + 1] = e * fh;
+        }
+    }
+    return c.face;
+}
+
+/* r300_cube_coord() in GLSL: returns the face, `fd` = (fs, ft) */
+#define R300_CUBE_GLSL \
+"int cube_coord(vec3 v, vec3 dx, vec3 dy, bool lod, int w, int h,\n" \
+"               out vec2 fd, out vec4 der)\n" \
+"{\n" \
+"    vec3 a = abs(v);\n" \
+"    int face, im, is, it;\n" \
+"    float ss, st, sm;\n" \
+"    bool p;\n" \
+"    if (a.x >= a.y && a.x >= a.z) {\n" \
+"        p = v.x >= 0.0; face = p ? 0 : 1; im = 0; is = 2; it = 1;\n" \
+"        ss = p ? -1.0 : 1.0; st = -1.0;\n" \
+"    } else if (a.y >= a.z) {\n" \
+"        p = v.y >= 0.0; face = p ? 2 : 3; im = 1; is = 0; it = 2;\n" \
+"        ss = 1.0; st = p ? 1.0 : -1.0;\n" \
+"    } else {\n" \
+"        p = v.z >= 0.0; face = p ? 4 : 5; im = 2; is = 0; it = 1;\n" \
+"        ss = p ? 1.0 : -1.0; st = -1.0;\n" \
+"    }\n" \
+"    sm = p ? 1.0 : -1.0;\n" \
+"    precise float ma = sm * v[im];\n" \
+"    precise float sc = ss * v[is];\n" \
+"    precise float tc = st * v[it];\n" \
+"    precise float qs = 0.0, qt = 0.0;\n" \
+"    precise float fw = float(w), fh = float(h);\n" \
+"    if (ma > 0.0) { qs = sc / ma; qt = tc / ma; }\n" \
+"    precise float hs = qs * 0.5;\n" \
+"    hs = hs + 0.5;\n" \
+"    precise float ht = qt * 0.5;\n" \
+"    ht = ht + 0.5;\n" \
+"    precise float os = hs * fw;\n" \
+"    precise float ot = ht * fh;\n" \
+"    fd = vec2(os, ot);\n" \
+"    der = vec4(0.0);\n" \
+"    if (lod && ma > 0.0) {\n" \
+"        for (int k = 0; k < 2; k++) {\n" \
+"            vec3 g = k == 0 ? dx : dy;\n" \
+"            precise float dm = sm * g[im];\n" \
+"            precise float ds = ss * g[is];\n" \
+"            precise float dt = st * g[it];\n" \
+"            precise float e = qs * dm;\n" \
+"            e = ds - e;\n" \
+"            e = e / ma;\n" \
+"            e = e * 0.5;\n" \
+"            precise float es = e * fw;\n" \
+"            e = qt * dm;\n" \
+"            e = dt - e;\n" \
+"            e = e / ma;\n" \
+"            e = e * 0.5;\n" \
+"            precise float et = e * fh;\n" \
+"            if (k == 0) { der.x = es; der.y = et; }\n" \
+"            else { der.z = es; der.w = et; }\n" \
+"        }\n" \
+"    }\n" \
+"    return face;\n" \
+"}\n"
 
 #endif /* ATI_R350_US_H */

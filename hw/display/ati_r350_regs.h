@@ -975,6 +975,23 @@
 #define R300_VTE_VTX_Z_FMT            0x00000200
 #define R300_VTE_VTX_W0_FMT           0x00000400
 #define R300_VAP_VTX_SIZE             0x20b4
+/*
+ * View-volume clipping (R3xx 3D register reference, VAP_CNTL, VAP_CLIP_CNTL
+ * and VAP_GB_*). DX_CLIP_SPACE_DEF picks 0 < z < w over -w < z < w. The
+ * guard band registers are clip-space distances in units of w, 1.0 meaning
+ * no guard band: x and y are clipped at +-CLIP_ADJ * w, and a primitive
+ * wholly beyond +-DISC_ADJ * w is discarded.
+ */
+#define R300_VAP_CNTL                 0x2080
+#define R300_VAP_DX_CLIP_SPACE_DEF    0x00400000
+#define R300_VAP_CLIP_CNTL            0x221c
+#define R300_VAP_UCP_ENA_MASK         0x0000003f
+#define R300_VAP_CLIP_DISABLE         0x00010000
+#define R300_VAP_UCP_CULL_ONLY_ENA    0x00020000
+#define R300_VAP_GB_VERT_CLIP_ADJ     0x2220
+#define R300_VAP_GB_VERT_DISC_ADJ     0x2224
+#define R300_VAP_GB_HORZ_CLIP_ADJ     0x2228
+#define R300_VAP_GB_HORZ_DISC_ADJ     0x222c
 #define R300_TX_ENABLE                0x4104
 #define R300_TX_FORMAT0_0             0x4480
 #define R300_TX_FORMAT1_0             0x44c0
@@ -1007,6 +1024,10 @@
 #define R300_TX_FMT_1_5_5_5           0x0b    /* X[4:0] Y[9:5] Z[14:10] W[15] */
 #define R300_TX_FMT_8_8_8_8           0x0c    /* four, X the low byte */
 #define R300_TX_FMT_16_16_16_16       0x0e    /* four 16-bit, X the low half */
+#define R300_TX_FMT_16F_16F_16F_16F   0x1a    /* four S10E5 halves, likewise */
+#define R300_TX_FMT_DXT1              0x0f    /* S3TC 4x4 blocks, 8 bytes */
+#define R300_TX_FMT_DXT3              0x10    /* 16 bytes, explicit alpha */
+#define R300_TX_FMT_DXT5              0x11    /* 16 bytes, interpolated alpha */
 #define R300_TX_FMT_VYUY422           0x14    /* Y0 U Y1 V, Y0 the low byte */
 #define R300_TX_FMT_YVYU422           0x15    /* U Y0 V Y1, U the low byte */
 #define R300_TX_FORMAT1_SEL_SHIFT     9       /* A, then R, G, B */
@@ -1019,6 +1040,7 @@
 #define R300_TX_FORMAT1_YUV_SHIFT     22
 #define R300_TX_FORMAT1_YUV_MASK      0x3
 #define R300_TX_FORMAT1_SWAP_YUV      (1u << 24)
+#define R300_TX_FORMAT1_COORD_SHIFT   25      /* TEX_COORD_TYPE */
 #define R300_TX_OFFSET_0              0x4540
 #define R300_TXO_ENDIAN_MASK          0x3     /* ENDIAN_SWAP [1:0] */
 #define R300_TXO_MACRO_TILE           (1u << 2)
@@ -1136,8 +1158,20 @@
 #define R300_ZB_DEPTHPITCH            0x4f24
 #define R300_ZB_MACROTILE             (1u << 16)
 #define R300_ZB_MICROTILE_SHIFT       17
+#define R300_ZB_DEPTHENDIAN_SHIFT     19    /* none, word, dword, half */
 #define R300_ZB_DEPTHCLEARVALUE       0x4f28
 #define R300_ZB_ZMASK_PITCH           0x4f34
+/*
+ * The occlusion counter. Writing ZB_ZPASS_DATA sets the count of samples
+ * that passed the depth and stencil test; writing a dword address to
+ * ZB_ZPASS_ADDR makes each pipe SU_REG_DEST selects store its count
+ * there, in the Z buffer's DEPTHENDIAN byte order. SU_REG_DEST bit 0
+ * selects pipe 0; its reset value 0xf selects every pipe.
+ */
+#define R300_SU_REG_DEST              0x42c8
+#define R300_SU_REG_DEST_P0           (1u << 0)
+#define R300_ZB_ZPASS_DATA            0x4f58
+#define R300_ZB_ZPASS_ADDR            0x4f5c
 /* SU_CULL_MODE: cull front, cull back, front face clockwise */
 #define R300_RE_CULL_CNTL             0x42b8
 /*
@@ -1216,6 +1250,14 @@
  * the constant file, four dwords to a vector.
  */
 #define R300_PVS_CONST_START          0x200
+/*
+ * Past the constants, the clip state (R5xx acceleration guide 7.4.10,
+ * "R300 1024"): user clip planes 0-5, then the point sprite viewport
+ * scale and texture corners. Auto-increment wraps from the seventh
+ * vector back to the first.
+ */
+#define R300_PVS_UCP_START            0x400
+#define R300_PVS_CLIP_WRAP            7
 #define R300_VAP_PVS_UPLOAD_DATA      0x2208
 /*
  * Which instruction slots the program in force occupies (FIRST [9:0],

@@ -19,6 +19,8 @@
 /* program RAM: 256 instruction slots of four dwords, 256 constant vectors */
 #define R300_PVS_CODE_SLOTS           256
 #define R300_PVS_CONST_SLOTS          256
+/* user clip planes, point sprite scale and corners */
+#define R300_PVS_CLIP_VECS            8
 
 #define R300_PVS_IN_REGS              16
 #define R300_PVS_OUT_REGS             16

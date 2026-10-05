@@ -772,7 +772,8 @@ void r300_us_analyse(R300UsProgram *p,
         unsigned fmt = us_out_fmt0 & R300_US_OUT_FMT_MASK;
         unsigned k;
 
-        if (fmt != R300_US_OUT_FMT_C4_8 && fmt != R300_US_OUT_FMT_C4_10) {
+        if (fmt != R300_US_OUT_FMT_C4_8 && fmt != R300_US_OUT_FMT_C4_10 &&
+            fmt != R300_US_OUT_FMT_C4_16 && fmt != R300_US_OUT_FMT_C4_16_FP) {
             us_gap_out_fmt(&p->gaps, fmt);
             p->expressible = false;
         }
