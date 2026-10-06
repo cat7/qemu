@@ -166,9 +166,9 @@ static void ati_r350_maybe_capture_mode(ATIR350State *s)
 
 /*
  * All drawing converts through an allocated 32bpp surface. VRAM bytes
- * are decoded CHIP-NATIVE LITTLE-ENDIAN: with the aperture-1 byte
- * swapper actually modeled (see ati_r350_aper1_ops), a big-endian
- * Mac guest's pixels land in VRAM in the chip's own layout, exactly
+ * are decoded CHIP-NATIVE LITTLE-ENDIAN: the aperture byte swapper
+ * (see ati_r350_swap_ops) puts a big-endian Mac guest's pixels into
+ * VRAM in the chip's own layout, exactly
  * as on real hardware (verified live against Mac OS 9's lavender
  * desktop: bytes 9c 63 63 00 = LE B,G,R,X -- decoding them big-endian
  * was what tinted the desktop olive-green once the swapper existed;
@@ -176,16 +176,14 @@ static void ati_r350_maybe_capture_mode(ATIR350State *s)
  * missing swapper and the wrong decode cancelled out).
  */
 /*
- * SURFACE_CNTL byte swappers. On real silicon a big-endian CPU store
- * through the aperture is byte-swapped on its way into VRAM (16- or
- * 32-bit wide, per the NONSURF_AP0_SWP bits, or per surface for the
- * eight SURFACEn ranges), so that the chip's little-endian consumers --
- * CRTC, 2D engine, CP -- see little-endian data. VRAM here is a plain
- * RAM region (stores land unswapped, for speed), so the swap is applied
- * on the consumer side instead: every reader/writer of VRAM bytes XORs
- * the byte address with the lane mask returned here, which is exactly
- * how the hardware's swapper is built (byte-lane steering). Mode 1 =
- * 16-bit swap = XOR 1, mode 3 = 32-bit swap = XOR 3.
+ * SURFACE_CNTL byte swappers. They sit on the host side of the frame
+ * buffer aperture: a big-endian CPU access through the aperture is
+ * byte-lane steered on its way to and from VRAM (16- or 32-bit wide, per
+ * the NONSURF_AP0_SWP bits, or per surface for the eight SURFACEn
+ * ranges), so VRAM holds chip-native little-endian data whatever the
+ * swap mode was at the time. The engines, the CP and the CRTC see VRAM
+ * unswapped. Mode 1 = 16-bit swap = byte-lane XOR 1, mode 3 = 32-bit
+ * swap = XOR 3.
  */
 static unsigned ati_r350_swap_bits(uint32_t info)
 {
@@ -194,8 +192,8 @@ static unsigned ati_r350_swap_bits(uint32_t info)
 }
 
 /*
- * Walk the surfaces for `off` and, with the answer, the range of
- * offsets that provably share it.
+ * Walk the surfaces for aperture offset `off` and, with the answer, the
+ * range of offsets that provably share it.
  *
  * The surface that wins is the first one containing `off`, so the
  * answer holds across that surface's own bounds -- minus whatever an
@@ -204,6 +202,10 @@ static unsigned ati_r350_swap_bits(uint32_t info)
  * lies on. Surfaces after the winner cannot change anything inside the
  * winner's bounds, so the walk stops there. With no surface at all the
  * range is bounded only by the surfaces that were stepped over.
+ *
+ * The bounds are aperture offsets, not card addresses (Mac OS 9's ndrv
+ * declares its frame buffer as SURFACE7 = 0x10000..0x13bfff while
+ * MC_FB_LOCATION puts it at card address 0x90010000).
  */
 static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off,
                                   ATIR350SwapMemo *m)
@@ -240,80 +242,135 @@ static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off,
     m->valid = true;
 }
 
-/* the memo ati_r350_vram_xor() uses on this thread; NULL = the display's */
-static __thread ATIR350SwapMemo *ati_r350_thread_memo;
-
-void ati_r350_swap_memo_bind(ATIR350SwapMemo *memo)
+/* the aperture's byte-lane xor at `off`; called with the BQL */
+unsigned ati_r350_aper_xor(ATIR350State *s, uint32_t off)
 {
-    ati_r350_thread_memo = memo;
-}
+    ATIR350SwapMemo *m = &s->swap;
 
-unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off)
-{
-    /*
-     * The surfaces' bounds are FRAME-BUFFER APERTURE OFFSETS, not card
-     * addresses: the swapper sits on the host-access side of the
-     * aperture. Observed live under Mac OS 9: the ndrv declares its
-     * 640x480x32 frame buffer as SURFACE7 = 0x10000..0x13bfff while
-     * DISPLAY_BASE_ADDR / MC_FB_LOCATION put the same buffer at card
-     * address 0x90010000 -- comparing against the card address matched
-     * nothing, so no swap was applied and white came out yellow.
-     *
-     * The walk itself is memoised, one memo per thread that resolves:
-     * the display, the command processor and each raster worker run
-     * concurrently. The answer is identical either way.
-     */
-    ATIR350SwapMemo *m = ati_r350_thread_memo;
-    uint32_t gen = qatomic_read(&s->swap_gen);
-
-    if (!m) {
-        m = &s->swap;
-    }
-    if (!m->valid || m->gen != gen || off < m->lo || off > m->hi) {
+    if (!m->valid || off < m->lo || off > m->hi) {
         ati_r350_swap_resolve(s, off, m);
-        m->gen = gen;
     }
     return m->val;
 }
 
-unsigned ati_r350_vram_xor_range(ATIR350State *s, uint32_t off,
-                                 uint32_t *lo, uint32_t *hi)
+/*
+ * Lay the swapping window over every aperture range whose swap mode is
+ * not zero, leaving the rest a plain RAM mapping. Called with the BQL
+ * whenever a surface register changes.
+ */
+static void ati_r350_aper_remap(ATIR350State *s)
 {
     ATIR350SwapMemo m;
+    uint64_t off = 0;
+    unsigned n = 0, i;
+    uint32_t lo[ATI_R350_SWAP_WINS], len[ATI_R350_SWAP_WINS];
 
-    ati_r350_swap_resolve(s, off, &m);
-    *lo = m.lo;
-    *hi = m.hi;
-    return m.val;
-}
+    s->swap.valid = false;
+    while (off < ATI_R350_VRAM_SIZE) {
+        uint64_t end;
 
-/* the lane xor for every byte of [off, off + len); false if it varies */
-bool ati_r350_vram_xor_span(ATIR350State *s, uint32_t off, uint32_t len,
-                            unsigned *xr)
-{
-    ATIR350SwapMemo m;
-
-    ati_r350_swap_resolve(s, off, &m);
-    if ((uint64_t)off + (len ? len : 1) - 1 > m.hi) {
-        return false;
+        ati_r350_swap_resolve(s, off, &m);
+        end = MIN((uint64_t)m.hi + 1, ATI_R350_VRAM_SIZE);
+        if (m.val) {
+            if (n && (uint64_t)lo[n - 1] + len[n - 1] == off) {
+                len[n - 1] += end - off;
+            } else if (n < ATI_R350_SWAP_WINS) {
+                lo[n] = off;
+                len[n] = end - off;
+                n++;
+            }
+        }
+        off = end;
     }
-    *xr = m.val;
-    return true;
+    memory_region_transaction_begin();
+    for (i = 0; i < ATI_R350_SWAP_WINS; i++) {
+        MemoryRegion *w = &s->swap_win[i];
+
+        memory_region_set_enabled(w, false);
+        if (i < n) {
+            memory_region_set_alias_offset(w, lo[i]);
+            memory_region_set_size(w, len[i]);
+            memory_region_set_address(w, lo[i]);
+            memory_region_set_enabled(w, true);
+        }
+    }
+    memory_region_transaction_commit();
 }
+
+/* a big-endian host access of `size` bytes at aperture offset `off` */
+static uint64_t ati_r350_aper_ld(ATIR350State *s, uint32_t off,
+                                 unsigned size)
+{
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    unsigned xr = ati_r350_aper_xor(s, off), i;
+    uint64_t val = 0;
+
+    if (off + size > ATI_R350_VRAM_SIZE) {
+        return 0;
+    }
+    if (size == 4 && !(off & 3) && xr == 3) {
+        return ldl_le_p(vram + off);
+    }
+    for (i = 0; i < size; i++) {
+        val = (val << 8) | vram[(off + i) ^ xr];
+    }
+    return val;
+}
+
+static void ati_r350_aper_st(ATIR350State *s, uint32_t off, uint64_t data,
+                             unsigned size)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    unsigned xr = ati_r350_aper_xor(s, off), i;
+
+    if (off + size > ATI_R350_VRAM_SIZE) {
+        return;
+    }
+    if (size == 4 && !(off & 3) && xr == 3) {
+        stl_le_p(vram + off, data);
+    } else {
+        for (i = 0; i < size; i++) {
+            vram[(off + size - 1 - i) ^ xr] = data >> (8 * i);
+        }
+    }
+    memory_region_set_dirty(&s->vram, off & ~3u, ((off + size + 3) & ~3u) -
+                            (off & ~3u));
+}
+
+static uint64_t ati_r350_swap_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return ati_r350_aper_ld(opaque, addr, size);
+}
+
+static void ati_r350_swap_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
+{
+    ati_r350_aper_st(opaque, addr, data, size);
+}
+
+static const MemoryRegionOps ati_r350_swap_ops = {
+    .read = ati_r350_swap_read,
+    .write = ati_r350_swap_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
 
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off)
 {
-    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    unsigned xr;
-
     if (off + 4 > ATI_R350_VRAM_SIZE) {
         return 0;
     }
-    xr = ati_r350_vram_xor(s, off);
-    return (uint32_t)vram[off ^ xr] |
-           ((uint32_t)vram[(off + 1) ^ xr] << 8) |
-           ((uint32_t)vram[(off + 2) ^ xr] << 16) |
-           ((uint32_t)vram[(off + 3) ^ xr] << 24);
+    return ldl_le_p((const uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+                    off);
 }
 
 static uint32_t *ati_r350_draw_row(const ATIR350DispJob *j, int y)
@@ -327,14 +384,13 @@ static void ati_r350_draw_8bpp(const ATIR350DispJob *j)
     const ATIR350Mode *mode = &j->mode;
     const uint8_t *src = j->vram + mode->fb_offset;
     const uint8_t (*pal)[3] = j->pal;
-    unsigned xr = j->xr;
     uint32_t *dst;
     int x, y;
 
     for (y = 0; y < mode->height; y++) {
         dst = ati_r350_draw_row(j, y);
         for (x = 0; x < mode->width; x++) {
-            uint8_t idx = src[x ^ xr];
+            uint8_t idx = src[x];
             dst[x] = 0xff000000u |
                      ((uint32_t)pal[idx][0] << 16) |
                      ((uint32_t)pal[idx][1] << 8) |
@@ -377,7 +433,6 @@ static void ati_r350_draw_16bpp(const ATIR350DispJob *j, bool rgb565)
     const ATIR350Mode *mode = &j->mode;
     const uint8_t *src = j->vram + mode->fb_offset;
     const uint8_t (*pal)[3] = j->pal;
-    unsigned xr = j->xr;
     bool lut = !ati_r350_palette_identity(pal);
     uint32_t *dst;
     int x, y;
@@ -385,8 +440,8 @@ static void ati_r350_draw_16bpp(const ATIR350DispJob *j, bool rgb565)
     for (y = 0; y < mode->height; y++) {
         dst = ati_r350_draw_row(j, y);
         for (x = 0; x < mode->width; x++) {
-            uint16_t pixel = ((uint16_t)src[(2 * x + 1) ^ xr] << 8) |
-                             src[(2 * x) ^ xr];
+            uint16_t pixel = ((uint16_t)src[2 * x + 1] << 8) |
+                             src[2 * x];
             uint8_t r, g, b;
 
             if (rgb565) {
@@ -419,7 +474,6 @@ static void ati_r350_draw_32bpp(const ATIR350DispJob *j)
     const ATIR350Mode *mode = &j->mode;
     const uint8_t *src = j->vram + mode->fb_offset;
     const uint8_t (*pal)[3] = j->pal;
-    unsigned xr = j->xr;
     uint32_t *dst;
     int x, y;
 
@@ -435,9 +489,9 @@ static void ati_r350_draw_32bpp(const ATIR350DispJob *j)
              * only becomes the Aqua blue through the LUT).
              */
             dst[x] = 0xff000000u |
-                     ((uint32_t)pal[src[(4 * x + 2) ^ xr]][0] << 16) |
-                     ((uint32_t)pal[src[(4 * x + 1) ^ xr]][1] << 8) |
-                     pal[src[(4 * x) ^ xr]][2];
+                     ((uint32_t)pal[src[4 * x + 2]][0] << 16) |
+                     ((uint32_t)pal[src[4 * x + 1]][1] << 8) |
+                     pal[src[4 * x]][2];
         }
         src += mode->pitch;
     }
@@ -448,7 +502,6 @@ static void ati_r350_draw_24bpp(const ATIR350DispJob *j)
     const ATIR350Mode *mode = &j->mode;
     const uint8_t *src = j->vram + mode->fb_offset;
     const uint8_t (*pal)[3] = j->pal;
-    unsigned xr = j->xr;
     uint32_t *dst;
     int x, y;
 
@@ -458,9 +511,9 @@ static void ati_r350_draw_24bpp(const ATIR350DispJob *j)
             /* chip-native little-endian: B,G,R in VRAM; palette RAM
              * doubles as the per-channel gamma LUT, as in 32bpp */
             dst[x] = 0xff000000u |
-                     ((uint32_t)pal[src[(3 * x + 2) ^ xr]][0] << 16) |
-                     ((uint32_t)pal[src[(3 * x + 1) ^ xr]][1] << 8) |
-                     pal[src[(3 * x) ^ xr]][2];
+                     ((uint32_t)pal[src[3 * x + 2]][0] << 16) |
+                     ((uint32_t)pal[src[3 * x + 1]][1] << 8) |
+                     pal[src[3 * x]][2];
         }
         src += mode->pitch;
     }
@@ -1073,7 +1126,6 @@ static void ati_r350_disp_post(ATIR350State *s, const ATIR350Mode *mode)
     j->mode = *mode;
     j->ds = qemu_console_surface(s->con);
     j->vram = memory_region_get_ram_ptr(&s->vram);
-    j->xr = s->draw_xr;
     memcpy(j->palette, s->palette, sizeof(j->palette));
     j->pal = (const uint8_t (*)[3])j->palette;
     qemu_mutex_lock(&s->disp_lock);
@@ -1108,7 +1160,6 @@ static bool ati_r350_update_async(ATIR350State *s)
     }
     s->force_redraw = false;
     ati_r350_vram_peek(s, &mode);
-    s->draw_xr = (int)ati_r350_vram_xor(s, mode.fb_offset);
     ati_r350_disp_post(s, &mode);
     return false;
 }
@@ -1226,11 +1277,9 @@ static bool ati_r350_update_display(void *opaque)
     }
     s->force_redraw = false;
     ati_r350_vram_peek(s, &mode);
-    s->draw_xr = (int)ati_r350_vram_xor(s, mode.fb_offset);
     j.mode = mode;
     j.ds = qemu_console_surface(s->con);
     j.vram = memory_region_get_ram_ptr(&s->vram);
-    j.xr = s->draw_xr;
     j.pal = (const uint8_t (*)[3])s->palette;
     ati_r350_draw(&j);
     ati_r350_cursor_apply(s);
@@ -2379,8 +2428,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
     case R350_SURFACE_CNTL:
     case R350_SURFACE0_LOWER_BOUND ... R350_SURFACE7_INFO:
         s->regs[base >> 2] = val;
-        /* the memoised walks are now stale */
-        qatomic_set(&s->swap_gen, s->swap_gen + 1);
+        ati_r350_aper_remap(s);
         s->force_redraw = true;
         trace_ati_r350_surface(ati_r350_reg_name(base), val);
         break;
@@ -3902,7 +3950,6 @@ static __thread bool ati_r350_engine_ctx;
  */
 static __thread unsigned ati_r350_claim_depth;
 static __thread bool ati_r350_claim_kick;
-static __thread ATIR350SwapMemo *ati_r350_claim_memo;
 
 bool ati_r350_on_engine(void)
 {
@@ -3987,8 +4034,6 @@ static void ati_r350_engine_take(ATIR350State *s)
     s->engine_claims++;
     qatomic_store_release(&s->engine_busy, true);
     ati_r350_claim_depth = 1;
-    ati_r350_claim_memo = ati_r350_thread_memo;
-    ati_r350_thread_memo = &s->cswap;
 }
 
 /*
@@ -4060,7 +4105,6 @@ static void ati_r350_engine_unclaim(ATIR350State *s, bool kick)
     }
     kick |= ati_r350_claim_kick;
     ati_r350_claim_kick = false;
-    ati_r350_thread_memo = ati_r350_claim_memo;
     qemu_mutex_lock(&s->engine_lock);
     s->engine_claimed = false;
     if (kick) {
@@ -4159,7 +4203,6 @@ static void *ati_r350_engine_thread(void *opaque)
 
     rcu_register_thread();
     ati_r350_engine_ctx = true;
-    ati_r350_swap_memo_bind(&s->eswap);
     ati_r350_gl_hold(true);
     qemu_mutex_lock(&s->engine_lock);
     for (;;) {
@@ -4424,25 +4467,16 @@ static const MemoryRegionOps ati_r350_mmio_ops = {
 
 /*
  * Diagnostic window over part of aperture 0 (see the fillwatch fields).
- * Aperture 0 applies no endian swap, so this has to behave exactly like
- * the RAM alias it replaces: on a big-endian guest a store's most
- * significant byte lands at the lowest address, which is what writing
- * lane i as byte (size-1-i) of a DEVICE_BIG_ENDIAN access does.
+ * It has to behave exactly like the aperture it replaces, swapper
+ * included.
  */
 static uint64_t ati_r350_fillwatch_read(void *opaque, hwaddr addr,
                                            unsigned size)
 {
     ATIR350State *s = opaque;
-    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t base = s->fillwatch_off + (uint32_t)addr;
-    uint64_t val = 0;
-    unsigned i;
+    uint64_t val = ati_r350_aper_ld(s, base, size);
 
-    for (i = 0; i < size; i++) {
-        if (base + i < ATI_R350_VRAM_SIZE) {
-            val |= (uint64_t)vram[base + i] << (8 * (size - 1 - i));
-        }
-    }
     trace_ati_r350_fillwatch_rd(base, size, val);
     return val;
 }
@@ -4451,16 +4485,9 @@ static void ati_r350_fillwatch_write(void *opaque, hwaddr addr,
                                         uint64_t data, unsigned size)
 {
     ATIR350State *s = opaque;
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t base = s->fillwatch_off + (uint32_t)addr;
-    unsigned i;
 
-    for (i = 0; i < size; i++) {
-        if (base + i < ATI_R350_VRAM_SIZE) {
-            vram[base + i] = (data >> (8 * (size - 1 - i))) & 0xff;
-        }
-    }
-    memory_region_set_dirty(&s->vram, base & ~7ull, 8);
+    ati_r350_aper_st(s, base, data, size);
 
     /*
      * Coalesce. A strided fill writes each row as one contiguous run and
@@ -4571,35 +4598,24 @@ static uint64_t ati_r350_zguard_read(void *opaque, hwaddr addr,
                                      unsigned size)
 {
     ATIR350State *s = opaque;
-    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    uint64_t val = 0;
-    unsigned i;
 
     if (addr + size > ATI_R350_VRAM_SIZE) {
         return 0;
     }
     ati_r350_zguard_hit(s, addr, size);
-    for (i = 0; i < size; i++) {
-        val |= (uint64_t)vram[addr + i] << (8 * (size - 1 - i));
-    }
-    return val;
+    return ati_r350_aper_ld(s, addr, size);
 }
 
 static void ati_r350_zguard_write(void *opaque, hwaddr addr,
                                   uint64_t data, unsigned size)
 {
     ATIR350State *s = opaque;
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    unsigned i;
 
     if (addr + size > ATI_R350_VRAM_SIZE) {
         return;
     }
     ati_r350_zguard_hit(s, addr, size);
-    for (i = 0; i < size; i++) {
-        vram[addr + i] = (data >> (8 * (size - 1 - i))) & 0xff;
-    }
-    memory_region_set_dirty(&s->vram, addr, size);
+    ati_r350_aper_st(s, addr, data, size);
 }
 
 static const MemoryRegionOps ati_r350_zguard_ops = {
@@ -4640,8 +4656,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     memset(s->plls, 0, sizeof(s->plls));
     ati_r350_palette_reset(s);
     /* the surface registers just went */
-    qatomic_set(&s->swap_gen, s->swap_gen + 1);
-    s->draw_xr = -1;                /* nothing has been drawn with any */
+    ati_r350_aper_remap(s);
     s->dac_wr_index = 0;
     s->dac_rd_index = 0;
     s->i2c_offset = 0;
@@ -4788,7 +4803,7 @@ static void ati_r350_cursor_apply(ATIR350State *s)
     const uint8_t *src;
     uint32_t sum = 0;
     QEMUCursor *c;
-    unsigned row, px, xr;
+    unsigned row, px;
     int x, y;
 
     if (!s->con) {
@@ -4826,7 +4841,6 @@ static void ati_r350_cursor_apply(ATIR350State *s)
     /* the sprite could be sitting inside a target the GPU still holds */
     ati_r350_gl_touch(s, vram_off, (uint32_t)image_bytes);
     src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) + vram_off;
-    xr = ati_r350_vram_xor(s, vram_off);
 
     /*
      * CUR_HORZ_OFF says which column of the map is drawn at CUR_HORZ_POSN,
@@ -4858,7 +4872,7 @@ static void ati_r350_cursor_apply(ATIR350State *s)
      */
     sum = 0x811c9dc5u ^ vram_off;
     for (row = 0; row < image_bytes; row++) {
-        sum = (sum ^ src[row ^ xr]) * 0x01000193u;
+        sum = (sum ^ src[row]) * 0x01000193u;
     }
     sum ^= clr0 ^ clr1 ^ (uint32_t)horz_off ^ ((uint32_t)vert_off << 8) ^
            ((uint32_t)cur_mode << 16);
@@ -4896,8 +4910,7 @@ static void ati_r350_cursor_apply(ATIR350State *s)
 
         for (row = 0; row < R350_CUR_HEIGHT; row++) {
             for (byte = 0; byte < 8; byte++) {
-                and_ones += ctpop8(src[(row * R350_CUR_ROW_BYTES + byte)
-                                       ^ xr]);
+                and_ones += ctpop8(src[row * R350_CUR_ROW_BYTES + byte]);
             }
         }
         if (and_ones < R350_CUR_WIDTH * R350_CUR_HEIGHT / 8) {
@@ -4947,8 +4960,8 @@ static void ati_r350_cursor_apply(ATIR350State *s)
             } else {
                 const uint8_t *line = src + row * row_bytes;
                 unsigned bit = 7 - (px & 7);
-                unsigned and_bit = (line[(px >> 3) ^ xr] >> bit) & 1;
-                unsigned xor_bit = (line[(8 + (px >> 3)) ^ xr] >> bit) & 1;
+                unsigned and_bit = (line[px >> 3] >> bit) & 1;
+                unsigned xor_bit = (line[8 + (px >> 3)] >> bit) & 1;
 
                 if (!and_bit) {
                     val = xor_bit ? clr1 : clr0;
@@ -4974,8 +4987,8 @@ static void ati_r350_cursor_apply(ATIR350State *s)
             unsigned i;
 
             for (i = 0; i < 8; i++) {
-                hi = (hi << 8) | src[(row * 16 + i) ^ xr];
-                lo = (lo << 8) | src[(row * 16 + 8 + i) ^ xr];
+                hi = (hi << 8) | src[row * 16 + i];
+                lo = (lo << 8) | src[row * 16 + 8 + i];
             }
             trace_ati_r350_cursor_dump(offs, row * 16, hi, lo);
         }
@@ -5077,9 +5090,8 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
 
     /*
      * BAR0: the 128MB linear frame-buffer aperture, all of it VRAM. The
-     * Radeon's big-endian support is the SURFACE_CNTL byte swappers,
-     * honoured by every consumer of VRAM bytes (ati_r350_vram_xor())
-     * rather than by trapping CPU stores.
+     * ranges a SURFACE_CNTL byte swapper covers are overlaid with a
+     * swapping window (ati_r350_aper_remap()); the rest maps the RAM.
      */
     memory_region_init(&s->aper, obj, "ati-r350-aper",
                        ATI_R350_APER_SIZE);
@@ -5095,6 +5107,14 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
      */
     memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
     memory_region_add_subregion(&s->aper, 0, &s->vram);
+    memory_region_init_io(&s->swap_io, obj, &ati_r350_swap_ops, s,
+                          "ati-r350-aper-swap", ATI_R350_VRAM_SIZE);
+    for (int i = 0; i < ATI_R350_SWAP_WINS; i++) {
+        memory_region_init_alias(&s->swap_win[i], obj, "ati-r350-swap-win",
+                                 &s->swap_io, 0, ATI_R350_VRAM_SIZE);
+        memory_region_set_enabled(&s->swap_win[i], false);
+        memory_region_add_subregion_overlap(&s->aper, 0, &s->swap_win[i], 1);
+    }
     /*
      * Optional diagnostic overlay on aperture 0 (see the fillwatch fields
      * in the header). Higher priority than the RAM alias underneath, so
@@ -5107,7 +5127,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                               &ati_r350_fillwatch_ops, s,
                               "ati-r350-fillwatch", s->fillwatch_size);
         memory_region_add_subregion_overlap(&s->aper, s->fillwatch_off,
-                                            &s->vram_watch, 1);
+                                            &s->vram_watch, 3);
     }
 
     /*
@@ -5434,11 +5454,18 @@ static int ati_r350_pre_save(void *opaque)
     return 0;
 }
 
+static int ati_r350_post_load(void *opaque, int version_id)
+{
+    ati_r350_aper_remap(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ati_r350 = {
     .name = "ati-radeon9800",
     .version_id = 1,
     .minimum_version_id = 1,
     .pre_save = ati_r350_pre_save,
+    .post_load = ati_r350_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, ATIR350State),
         VMSTATE_UINT32_ARRAY(regs, ATIR350State, ATI_R350_NUM_REGS),
@@ -6076,8 +6103,8 @@ static char *ati_r350_get_scanout(Object *obj, Error **errp)
         "crtc: %ux%u bpp=%u pitch=%u fb_offset=0x%x valid_seen=%d\n"
         "crtc_offset_reg: 0x%x  crtc_pitch_reg: 0x%x  display_dis: %d\n"
         "auto_fb: valid=%d %ux%u bpp=%u fb_offset=0x%x\n"
-        "swapper: xr now %u for fb_offset (SURFACE_CNTL=0x%08x), "
-        "xr at last redraw %d, force_redraw=%d\n"
+        "aperture swap at fb_offset: xor %u (SURFACE_CNTL=0x%08x), "
+        "force_redraw=%d\n"
         "activity: %d/%d blocks live, longest run %d blocks at 0x%x\n"
         "async display: %s, frames %" PRIu64 ", deferred ticks %" PRIu64,
         s->auto_fb_overriding ? "activity heuristic (CRTC overridden)"
@@ -6090,8 +6117,8 @@ static char *ati_r350_get_scanout(Object *obj, Error **errp)
         (s->regs[R350_CRTC_EXT_CNTL >> 2] & R350_CRTC_DISPLAY_DIS) != 0,
         s->auto_fb_valid, s->auto_fb_mode.width, s->auto_fb_mode.height,
         s->auto_fb_mode.bpp, s->auto_fb_mode.fb_offset,
-        ati_r350_vram_xor(s, s->mode.fb_offset),
-        s->regs[R350_SURFACE_CNTL >> 2], s->draw_xr, s->force_redraw,
+        ati_r350_aper_xor(s, s->mode.fb_offset),
+        s->regs[R350_SURFACE_CNTL >> 2], s->force_redraw,
         active, nblocks, best,
         best_start < 0 ? 0 : best_start * ATI_R350_FB_SCAN_BLOCK,
         s->disp_on ? "on" : "off", s->disp_frames, s->disp_deferred);

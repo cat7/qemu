@@ -216,27 +216,19 @@ typedef struct R300DrawState {
     uint32_t cb_card;
     unsigned cb_xr;
     bool cb_host;
-    /*
-     * The aperture lane xor at the VRAM colour and Z buffers, resolved
-     * once per draw: `cb_sv` holds for offsets in [cb_slo, cb_shi],
-     * `zb_sv` for [zb_slo, zb_shi]. An empty range resolves per access.
-     */
-    unsigned cb_sv, zb_sv;
-    uint32_t cb_slo, cb_shi, zb_slo, zb_shi;
     /* d->vs with its operands decoded, for the per-vertex loop; or NULL */
     const R300PvsCompiled *vsc;
     /* count the samples passing the depth test, zq_spp to a pixel */
     bool zq;
     unsigned zq_spp;
     /*
-     * A texture unit's whole mip chain as one contiguous, uniformly
-     * swapped VRAM range, when it is one: a texel is then read straight
-     * from it instead of through the memory controller and the swapper.
+     * A texture unit's whole mip chain as one contiguous VRAM range,
+     * when it is one: a texel is then read straight from it instead of
+     * through the memory controller.
      */
     struct {
         bool ok;
         uint32_t off, len;
-        unsigned xr;
     } tvx[R300_TEX_UNITS];
 } R300DrawState;
 
@@ -324,7 +316,6 @@ typedef struct R300RasterWorker {
     QemuThread thread;
     QemuSemaphore start;
     uint32_t job;               /* the job it was last woken for */
-    ATIR350SwapMemo memo;
 } R300RasterWorker;
 
 /* a batch is flushed at this many triangles even inside its packet */
@@ -584,16 +575,6 @@ static inline uint32_t r300_lane_xor32(uint32_t v, unsigned x)
     }
 }
 
-/* a VRAM dword with the swapper already resolved */
-static inline uint32_t r300_ld32x(const R300DrawState *d, uint32_t addr,
-                                  unsigned xr)
-{
-    return (uint32_t)d->vram[addr ^ xr] |
-           ((uint32_t)d->vram[(addr + 1) ^ xr] << 8) |
-           ((uint32_t)d->vram[(addr + 2) ^ xr] << 16) |
-           ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
-}
-
 /* the texel at card address `addr`, in the unit's format */
 static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
                             unsigned unit, uint32_t addr)
@@ -603,15 +584,13 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
 
     if (d->tvx[unit].ok && addr - u->off < d->tvx[unit].len) {
         /* the resolved chain: the bytes the paths below would read */
-        unsigned x = d->tvx[unit].xr;
         uint32_t o = d->tvx[unit].off + (addr - u->off);
 
         switch (u->bpp) {
         case 8:
-            return d->vram[o ^ (x & 3)];
+            return d->vram[o];
         case 16: {
-            uint32_t v = (uint32_t)d->vram[o ^ x] |
-                         ((uint32_t)d->vram[(o + 1) ^ x] << 8);
+            uint32_t v = lduw_le_p(d->vram + o);
 
             switch (u->code) {
             case R300_TX_FMT_1_5_5_5:
@@ -625,12 +604,12 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
             }
         }
         case 64:
-            lo = r300_ld32x(d, o, x);
-            hi = r300_ld32x(d, o + 4, x);
+            lo = ldl_le_p(d->vram + o);
+            hi = ldl_le_p(d->vram + o + 4);
             return u->code == R300_TX_FMT_16F_16F_16F_16F
                    ? r300_texel_16fx4(lo, hi) : r300_texel_16x4(lo, hi);
         default:
-            return r300_ld32x(d, o, x);
+            return ldl_le_p(d->vram + o);
         }
     }
     if (u->bpp == 8) {
@@ -641,8 +620,7 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
             if (off + 1 > ATI_R350_VRAM_SIZE) {
                 return 0;
             }
-            a = ((uint8_t *)memory_region_get_ram_ptr(&s->vram))
-                [off ^ (ati_r350_vram_xor(s, off) & 3)];
+            a = ((uint8_t *)memory_region_get_ram_ptr(&s->vram))[off];
         } else {
             a = (r300_tex_bus32(s, unit, addr & ~3u) >>
                  (((addr ^ u->lanes) & 3) * 8)) & 0xff;
@@ -652,18 +630,14 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
     if (u->bpp == 16) {
         /*
          * One 16-bit unit per texel, assembled from its two bytes in
-         * ascending address order. The byte lanes go through the same
-         * aperture swapper as every other VRAM read -- a 32-bit swapper
-         * reverses the lanes of a halfword just as it does for the 2D
-         * engine's 16bpp path. TX_FMT_8_8 is then already in the packed
-         * shape (X the low byte, Y the high one); TX_FMT_1_5_5_5 has to
-         * have its components spread into their own lanes.
+         * ascending address order. TX_FMT_8_8 is then already in the
+         * packed shape (X the low byte, Y the high one); TX_FMT_1_5_5_5
+         * has to have its components spread into their own lanes.
          */
-        unsigned xr;
         uint32_t v;
 
         if (r300_tex_yuv422(u->code)) {
-            /* the pair's dword, through the same swapper */
+            /* the pair's dword */
             if (!ati_r350_mc_to_vram(s, addr & ~3u, &off)) {
                 v = r300_lane_xor32(r300_tex_bus32(s, unit, addr & ~3u),
                                     u->lanes);
@@ -678,9 +652,7 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
         } else if (off + 2 > ATI_R350_VRAM_SIZE) {
             return 0;
         } else {
-            xr = ati_r350_vram_xor(s, off);
-            v = (uint32_t)d->vram[off ^ xr] |
-                ((uint32_t)d->vram[(off + 1) ^ xr] << 8);
+            v = lduw_le_p(d->vram + off);
         }
         switch (u->code) {
         case R300_TX_FMT_1_5_5_5:
@@ -724,8 +696,8 @@ static uint32_t r300_tex_at(ATIR350State *s, const R300DrawState *d,
 }
 
 /*
- * One S3TC block, its dwords read as a 32bpp texel's are: through the
- * aperture swapper in VRAM, through the TX_OFFSET swap over the bus.
+ * One S3TC block, its dwords read as a 32bpp texel's are: straight from
+ * VRAM, through the TX_OFFSET swap over the bus.
  */
 static void r300_dxt_block(ATIR350State *s, const R300DrawState *d,
                            unsigned unit, uint32_t a, uint32_t out[16])
@@ -1089,20 +1061,15 @@ static float r300_texel_chan(const R300TexUnit *u, uint32_t texel,
 }
 
 /*
- * A VRAM dword through the aperture swapper, from the pointer the draw
- * already holds. ati_r350_vram_ld32() resolves the RAM pointer on every
+ * A VRAM dword, from the pointer the draw already holds.
+ * ati_r350_vram_ld32() resolves the RAM pointer on every
  * call, which is real work to repeat for each of the two or three
  * fetches a single pixel can make.
  */
 static inline uint32_t r300_ld32(ATIR350State *s, const R300DrawState *d,
                                  uint32_t addr)
 {
-    unsigned xr = ati_r350_vram_xor(s, addr);
-
-    return (uint32_t)d->vram[addr ^ xr] |
-           ((uint32_t)d->vram[(addr + 1) ^ xr] << 8) |
-           ((uint32_t)d->vram[(addr + 2) ^ xr] << 16) |
-           ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
+    return ldl_le_p(d->vram + addr);
 }
 
 /* bytes per colour buffer pixel, 0 for a reserved COLORFORMAT */
@@ -1224,23 +1191,7 @@ static float r300_cb_dec16(const R300DrawState *d, uint16_t v)
 static inline unsigned r300_cb_xor(ATIR350State *s, const R300DrawState *d,
                                    uint32_t addr)
 {
-    if (d->cb_host) {
-        return d->cb_xr;
-    }
-    if (addr >= d->cb_slo && addr <= d->cb_shi) {
-        return d->cb_sv;
-    }
-    return ati_r350_vram_xor(s, addr);
-}
-
-/* ... and the Z buffer's */
-static inline unsigned r300_zb_xor(ATIR350State *s, const R300DrawState *d,
-                                   uint32_t addr)
-{
-    if (addr >= d->zb_slo && addr <= d->zb_shi) {
-        return d->zb_sv;
-    }
-    return ati_r350_vram_xor(s, addr);
+    return d->cb_host ? d->cb_xr : 0;
 }
 
 static uint32_t r300_cb_ld32(ATIR350State *s, const R300DrawState *d,
@@ -1394,15 +1345,6 @@ static void r300_write_dst(ATIR350State *s, const R300DrawState *d,
     d->cb[(addr + 3) ^ xr] = (argb >> 24) & 0xff;
 }
 
-static void r300_st32x(const R300DrawState *d, uint32_t addr, uint32_t val,
-                       unsigned xr)
-{
-    d->vram[(addr + 0) ^ xr] = val & 0xff;
-    d->vram[(addr + 1) ^ xr] = (val >> 8) & 0xff;
-    d->vram[(addr + 2) ^ xr] = (val >> 16) & 0xff;
-    d->vram[(addr + 3) ^ xr] = (val >> 24) & 0xff;
-}
-
 /*
  * Z buffer addressing. The guest reads the depth buffer back through
  * the aperture (Chess.app picks a square that way), so the layout is
@@ -1496,7 +1438,6 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
     uint32_t addr = r300_zb_addr(s, x, y, 0);
     uint32_t old, znew, zold, sold, snew, val;
     bool zpass, spass = true;
-    unsigned xr;
 
     if (s->zb.z16) {
         /*
@@ -1508,24 +1449,18 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
         if (addr + 2 > ATI_R350_VRAM_SIZE) {
             return true;
         }
-        xr = r300_zb_xor(s, d, addr);
-        zold = d->vram[addr ^ xr] | (uint32_t)d->vram[(addr + 1) ^ xr] << 8;
+        zold = lduw_le_p(d->vram + addr);
         znew = (uint32_t)(MIN(MAX(zf, 0.0f), 1.0f) * 65535.0f);
         zpass = !s->zb.z_test || r300_zs_cmp(s->zb.zsc & 7, znew, zold);
         if (zpass && s->zb.z_wr && znew != zold) {
-            d->vram[addr ^ xr] = znew & 0xff;
-            d->vram[(addr + 1) ^ xr] = znew >> 8;
+            stw_le_p(d->vram + addr, znew);
         }
         return zpass;
     }
     if (addr + 4 > ATI_R350_VRAM_SIZE) {
         return true;
     }
-    xr = r300_zb_xor(s, d, addr);
-    old = (uint32_t)d->vram[addr ^ xr] |
-          ((uint32_t)d->vram[(addr + 1) ^ xr] << 8) |
-          ((uint32_t)d->vram[(addr + 2) ^ xr] << 16) |
-          ((uint32_t)d->vram[(addr + 3) ^ xr] << 24);
+    old = ldl_le_p(d->vram + addr);
     zold = old >> 8;
     sold = old & 0xff;
     snew = sold;
@@ -1547,11 +1482,11 @@ static bool r300_zb_pixel(ATIR350State *s, const R300DrawState *d,
     }
     if (znew != zold || snew != sold) {
         val = (znew << 8) | snew;
-        r300_st32x(d, addr, val, xr);
+        stl_le_p(d->vram + addr, val);
         if (s->zb.aa) {
             addr = r300_zb_addr(s, x, y, 1);
             if (addr + 4 <= ATI_R350_VRAM_SIZE) {
-                r300_st32x(d, addr, val, r300_zb_xor(s, d, addr));
+                stl_le_p(d->vram + addr, val);
             }
         }
     }
@@ -1598,24 +1533,6 @@ static void r300_zclear_run(ATIR350State *s, const R300ZClear *c,
     uint32_t i, off;
     unsigned x, y, k;
     int keep[4];
-    /*
-     * The swapper over the range last resolved, and the cleared word as
-     * it is stored under each lane xor: a 24-bit sample is then one
-     * aligned store, with one surface walk per range instead of one per
-     * sample.
-     */
-    uint32_t xlo = 1, xhi = 0, word[4];
-    unsigned xr = 0;
-
-    for (k = 0; k < 4; k++) {
-        uint8_t b[4];
-        unsigned j;
-
-        for (j = 0; j < 4; j++) {
-            b[j ^ k] = clr >> (j * 8);
-        }
-        memcpy(&word[k], b, 4);
-    }
     if (!bw || !((zp >> 2) & 0xfff) ||
         (c->zfmt != R300_ZB_FORMAT_24_8 && c->zfmt != R300_ZB_FORMAT_16) ||
         !ati_r350_mc_to_vram(s, c->zoff, &off)) {
@@ -1649,11 +1566,7 @@ static void r300_zclear_run(ATIR350State *s, const R300ZClear *c,
                     if (a + 2 > ATI_R350_VRAM_SIZE) {
                         continue;
                     }
-                    if (a < xlo || a > xhi) {
-                        xr = ati_r350_vram_xor_range(s, a, &xlo, &xhi);
-                    }
-                    vram[a ^ xr] = clr & 0xff;
-                    vram[(a + 1) ^ xr] = (clr >> 8) & 0xff;
+                    stw_le_p(vram + a, clr);
                     continue;
                 }
                 for (k = 0; k < smp; k++) {
@@ -1662,17 +1575,7 @@ static void r300_zclear_run(ATIR350State *s, const R300ZClear *c,
                     if (a + 4 > ATI_R350_VRAM_SIZE) {
                         continue;
                     }
-                    if (a < xlo || a > xhi) {
-                        xr = ati_r350_vram_xor_range(s, a, &xlo, &xhi);
-                    }
-                    if (!(a & 3)) {
-                        memcpy(vram + a, &word[xr], 4);
-                        continue;
-                    }
-                    vram[(a + 0) ^ xr] = clr & 0xff;
-                    vram[(a + 1) ^ xr] = (clr >> 8) & 0xff;
-                    vram[(a + 2) ^ xr] = (clr >> 16) & 0xff;
-                    vram[(a + 3) ^ xr] = (clr >> 24) & 0xff;
+                    stl_le_p(vram + a, clr);
                 }
             }
         }
@@ -5089,11 +4992,6 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
      */
     trace_ati_r350_3d_cb(d->dst_off, d->dst_pitch, d->wmask, d->resolve,
                          d->res_off, d->res_pitch);
-    /*
-     * The swapper over the colour and Z buffers, resolved here once
-     * instead of for every pixel. The surface registers cannot change
-     * before the draw is done.
-     */
     {
         unsigned tu;
 
@@ -5107,9 +5005,7 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
                 ati_r350_mc_to_vram(s, u->off, &o0) &&
                 ati_r350_mc_to_vram(s, u->off + u->chain - 1, &o1) &&
                 o1 == o0 + u->chain - 1 &&
-                (uint64_t)o0 + u->chain + 8 <= ATI_R350_VRAM_SIZE &&
-                ati_r350_vram_xor_span(s, o0, u->chain + 8,
-                                       &d->tvx[tu].xr)) {
+                (uint64_t)o0 + u->chain + 8 <= ATI_R350_VRAM_SIZE) {
                 d->tvx[tu].ok = true;
                 d->tvx[tu].off = o0;
                 d->tvx[tu].len = u->chain;
@@ -5123,17 +5019,6 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         }
         r300_pvs_compile(&d->vs, s->pvs_cc);
         d->vsc = s->pvs_cc;
-    }
-    d->cb_slo = d->zb_slo = 1;
-    d->cb_shi = d->zb_shi = 0;
-    d->cb_sv = d->zb_sv = 0;
-    if (!d->cb_host) {
-        d->cb_sv = ati_r350_vram_xor_range(s, d->dst_off, &d->cb_slo,
-                                           &d->cb_shi);
-    }
-    if (s->zb.z_en) {
-        d->zb_sv = ati_r350_vram_xor_range(s, s->zb.off, &d->zb_slo,
-                                           &d->zb_shi);
     }
     return true;
 }
@@ -5193,7 +5078,6 @@ static void *r300_raster_thread(void *opaque)
 
     /* stripes resolve VRAM and mark it dirty inside RCU read sections */
     rcu_register_thread();
-    ati_r350_swap_memo_bind(&w->memo);
     for (;;) {
         qemu_sem_wait(&w->start);
         if (qatomic_read(&q->quit)) {
@@ -5754,30 +5638,6 @@ static uint32_t r300_cap_hash(const uint8_t *p, uint32_t len)
 }
 
 /*
- * A record carries one swapper xor per region, so a region the swapper
- * does not treat uniformly cannot be represented and its draw is skipped
- * rather than recorded wrong. Surface descriptors cover contiguous
- * multi-page ranges, so a stride well under a page settles it.
- */
-static bool r300_cap_xor(ATIR350State *s, uint32_t off, uint32_t len,
-                         unsigned *xr)
-{
-    unsigned v = ati_r350_vram_xor(s, off);
-    uint32_t i;
-
-    for (i = 256; i < len; i += 256) {
-        if (ati_r350_vram_xor(s, off + i) != v) {
-            return false;
-        }
-    }
-    if (len && ati_r350_vram_xor(s, off + len - 1) != v) {
-        return false;
-    }
-    *xr = v;
-    return true;
-}
-
-/*
  * Where this draw can write: the pixels whose centres the primitive's
  * own bounding box holds, within R300_CAP_EPS, then clipped exactly the
  * way r300_raster_tri() clips its scan. A rectangle list adds the fourth
@@ -5935,10 +5795,7 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
      */
     if (d->resolve || d->cb_bpp != 4 || d->cb_host ||
         !r300_cap_rect(s, d, vb, nvtx, prim, &x0, &y0, &x1, &y1, NULL) ||
-        (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0) > s->cap_max_px ||
-        !r300_cap_xor(s, d->dst_off + (uint32_t)y0 * d->dst_pitch,
-                      (uint32_t)(y1 - 1 - y0) * d->dst_pitch +
-                      (uint32_t)x1 * 4, &dxr)) {
+        (uint32_t)(x1 - x0) * (uint32_t)(y1 - y0) > s->cap_max_px) {
         s->cap_skipped++;
         r300_raster_prims(s, d, vb, nvtx, prim);
         return;
@@ -5960,8 +5817,7 @@ static void r300_cap_draw(ATIR350State *s, R300DrawState *d,
         len = tu->pitch * (uint32_t)tu->h;
         if (!len || !ati_r350_mc_to_vram(s, tu->off, &off) ||
             !ati_r350_mc_to_vram(s, tu->off + len - 1, &last) ||
-            last != off + len - 1 ||
-            !r300_cap_xor(s, off, len, &h.tex[u].xor)) {
+            last != off + len - 1) {
             s->cap_skipped++;
             r300_raster_prims(s, d, vb, nvtx, prim);
             return;
@@ -6208,7 +6064,7 @@ static void r300_gl_discard(ATIR350State *s)
  * beside the colour target (ati_r350_gl_zseed() and friends). It is a
  * copy of the Z buffer r300_zb_pixel() works on, one word per pixel as
  * that function reads it -- (z24 << 8) | stencil from sample 0 at
- * r300_zaddr() under the swapper, or the linear 16-bit Z -- and the
+ * r300_zaddr(), or the linear 16-bit Z -- and the
  * backend never sees the tiling.
  *
  * RESIDENT. While a draw uses it the copy follows the colour target's
@@ -6302,15 +6158,13 @@ static bool r300_gl_zload(ATIR350State *s, const uint8_t *vram,
                           unsigned x, unsigned y, uint32_t *v)
 {
     uint32_t a;
-    unsigned xr;
 
     if (s->gl_z_z16) {
         a = s->gl_z_off + ((uint32_t)y * s->gl_z_pitch + x) * 2;
         if (a + 2 > ATI_R350_VRAM_SIZE) {
             return false;
         }
-        xr = ati_r350_vram_xor(s, a);
-        *v = vram[a ^ xr] | (uint32_t)vram[(a + 1) ^ xr] << 8;
+        *v = lduw_le_p(vram + a);
         return true;
     }
     a = r300_zaddr(s->gl_z_off, s->gl_z_pitch, s->gl_z_macro, s->gl_z_micro,
@@ -6318,25 +6172,20 @@ static bool r300_gl_zload(ATIR350State *s, const uint8_t *vram,
     if (a + 4 > ATI_R350_VRAM_SIZE) {
         return false;
     }
-    xr = ati_r350_vram_xor(s, a);
-    *v = (uint32_t)vram[a ^ xr] | (uint32_t)vram[(a + 1) ^ xr] << 8 |
-         (uint32_t)vram[(a + 2) ^ xr] << 16 |
-         (uint32_t)vram[(a + 3) ^ xr] << 24;
+    *v = ldl_le_p(vram + a);
     return true;
 }
 
 static void r300_gl_zstore(ATIR350State *s, uint8_t *vram,
                            unsigned x, unsigned y, uint32_t v)
 {
-    unsigned k, xr;
+    unsigned k;
     uint32_t a;
 
     if (s->gl_z_z16) {
         a = s->gl_z_off + ((uint32_t)y * s->gl_z_pitch + x) * 2;
         if (a + 2 <= ATI_R350_VRAM_SIZE) {
-            xr = ati_r350_vram_xor(s, a);
-            vram[a ^ xr] = v & 0xff;
-            vram[(a + 1) ^ xr] = (v >> 8) & 0xff;
+            stw_le_p(vram + a, v);
         }
         return;
     }
@@ -6346,11 +6195,7 @@ static void r300_gl_zstore(ATIR350State *s, uint8_t *vram,
         if (a + 4 > ATI_R350_VRAM_SIZE) {
             continue;
         }
-        xr = ati_r350_vram_xor(s, a);
-        vram[(a + 0) ^ xr] = v & 0xff;
-        vram[(a + 1) ^ xr] = (v >> 8) & 0xff;
-        vram[(a + 2) ^ xr] = (v >> 16) & 0xff;
-        vram[(a + 3) ^ xr] = (v >> 24) & 0xff;
+        stl_le_p(vram + a, v);
     }
 }
 
@@ -8125,8 +7970,8 @@ static void r300_gl_rd_rect(const R300DrawState *d, unsigned xr,
 
 /*
  * The texture, decoded by the device's OWN r300_sample_tex() and
- * r300_texel_chan(): format decode, bytes per texel, the aperture
- * swapper and the four-way TX_FORMAT1 component select all included.
+ * r300_texel_chan(): format decode, bytes per texel and the four-way
+ * TX_FORMAT1 component select all included.
  * Both paths therefore share the sampler exactly, and what gl=verify
  * measures is the rasterization, not the texture unit.
  *
@@ -8450,8 +8295,7 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
         !u->pitch || !len ||
         !ati_r350_mc_to_vram(s, u->off, &off) ||
         (uint64_t)off + len > ATI_R350_VRAM_SIZE ||
-        r300_gl_pages(s, off, len) > R300_GL_DIRTY_PAGES ||
-        !r300_cap_xor(s, off, len, &xr)) {
+        r300_gl_pages(s, off, len) > R300_GL_DIRTY_PAGES) {
         s->gl_tex_miss++;
         r300_gl_decode_tex(s, d, unit, s->gl_texbuf);
         return s->gl_texbuf;
@@ -9032,11 +8876,6 @@ static R300GlOutcome r300_gl_prims(ATIR350State *s, R300DrawState *d,
     if ((uint64_t)d->dst_off + (uint64_t)y1 * d->dst_pitch +
         (uint64_t)x1 * 4 > ATI_R350_VRAM_SIZE) {
         return r300_gl_fallback(s, R350_GLF_VRAMEND, prim, nvtx);
-    }
-    if (!r300_cap_xor(s, d->dst_off + (uint32_t)y0 * d->dst_pitch,
-                      (uint32_t)(y1 - 1 - y0) * d->dst_pitch +
-                      (uint32_t)x1 * 4, &xr)) {
-        return r300_gl_fallback(s, R350_GLF_XOR, prim, nvtx);
     }
     for (i = 0; i < R300_TEX_UNITS; i++) {
         size_t n;
@@ -10081,11 +9920,10 @@ void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n)
  * 3 = half-dword). A big-endian host uses it to leave vertex arrays in
  * memory in its native order.
  *
- * It only has to be applied on the way out of system memory here. VRAM
- * in this model stores what the CPU wrote and folds the frame-buffer
- * aperture's byte swapper into every VRAM reader instead
- * (ati_r350_vram_xor), so a VRAM-resident array has already been put
- * right by the time the fetch returns and swapping again would undo it.
+ * It only has to be applied on the way out of system memory here. A
+ * VRAM-resident array was put into chip-native order by the frame
+ * buffer aperture's byte swapper when the CPU wrote it, and swapping
+ * again would undo it.
  */
 static uint32_t r300_vc_swap(uint32_t val, unsigned mode)
 {
@@ -10217,15 +10055,13 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
         uint32_t *arr[R300_AOS_MAX] = { NULL };
         size_t span[R300_AOS_MAX], total = 0;
         /*
-         * A VRAM array that is one contiguous, uniformly swapped range is
-         * read straight out of VRAM: one coherency touch and one swapper
-         * lookup for the array instead of a memory-controller walk, a
-         * touch and a lookup per dword.
+         * A VRAM array that is one contiguous range is read straight out
+         * of VRAM: one coherency touch for the array instead of a
+         * memory-controller walk and a touch per dword.
          */
         const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
         bool vp[R300_AOS_MAX] = { false };
         uint32_t voff[R300_AOS_MAX] = { 0 };
-        unsigned vxr[R300_AOS_MAX] = { 0 };
         R300TexSrc ts[R300_TEXCOORDS];
         uint32_t dw[R300_VTX_DWORDS_MAX];
 
@@ -10247,9 +10083,7 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                     ati_r350_mc_to_vram(s, addr[a] +
                                         (uint32_t)(span[a] - 1) * 4, &end) &&
                     end == off + (uint32_t)(span[a] - 1) * 4 &&
-                    (uint64_t)off + span[a] * 4 <= ATI_R350_VRAM_SIZE &&
-                    ati_r350_vram_xor_span(s, off, (uint32_t)span[a] * 4,
-                                           &vxr[a])) {
+                    (uint64_t)off + span[a] * 4 <= ATI_R350_VRAM_SIZE) {
                     ati_r350_gl_touch(s, off, (uint32_t)span[a] * 4);
                     vp[a] = true;
                     voff[a] = off;
@@ -10286,12 +10120,8 @@ static void r300_draw_aos(ATIR350State *s, uint32_t vf, const uint16_t *idx)
                     if (vp[a]) {
                         /* VRAM: the VC swap never applies there */
                         uint32_t o = voff[a] + (vi * stride[a] + c) * 4;
-                        unsigned x = vxr[a];
 
-                        dw[n++] = (uint32_t)vram[o ^ x] |
-                                  (uint32_t)vram[(o + 1) ^ x] << 8 |
-                                  (uint32_t)vram[(o + 2) ^ x] << 16 |
-                                  (uint32_t)vram[(o + 3) ^ x] << 24;
+                        dw[n++] = ldl_le_p(vram + o);
                         continue;
                     }
                     card = addr[a] + (vi * stride[a] + c) * 4;
