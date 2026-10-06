@@ -8262,6 +8262,38 @@ static void r300_gl_tex_trim(ATIR350State *s)
 }
 
 /*
+ * Claim the dirty bits over [off, off + len) for a new entry. Clearing
+ * them would also erase a store another live entry has not yet been
+ * checked against, so every entry on a page with a bit set is dropped
+ * first.
+ */
+static bool r300_gl_admit(ATIR350State *s, uint32_t off, uint32_t len)
+{
+    uint64_t pg = qemu_target_page_size();
+    uint64_t lo = off & ~(pg - 1);
+    uint64_t hi = MIN(((uint64_t)off + len + pg - 1) & ~(pg - 1),
+                      (uint64_t)ATI_R350_VRAM_SIZE);
+    ram_addr_t base = memory_region_get_ram_addr(&s->vram);
+    uint64_t a;
+    unsigned k;
+
+    for (a = lo; a < hi; a += pg) {
+        if (!physical_memory_get_dirty_flag(base + a, DIRTY_MEMORY_VGA)) {
+            continue;
+        }
+        for (k = 0; k < s->gl_tex_n; k++) {
+            if (s->gl_tex[k].live && s->gl_tex[k].off < a + pg &&
+                (uint64_t)s->gl_tex[k].off + s->gl_tex[k].len > a) {
+                s->gl_tex[k].live = false;
+                s->gl_tex[k].up = false;
+                s->gl_tex_stale++;
+            }
+        }
+    }
+    return ati_r350_gl_admit(s, off, len);
+}
+
+/*
  * The decoded texture for this draw: from the cache when the same bytes
  * were decoded the same way and have not been written since, and decoded
  * into the least recently used entry otherwise. A texture that does not
@@ -8279,7 +8311,8 @@ static const uint8_t *r300_gl_texture(ATIR350State *s, const R300DrawState *d,
 {
     const R300TexUnit *u = &d->tex[unit];
     uint32_t off, len;
-    unsigned k, victim = 0, xr = 0, hb = R300_GL_TEXNIL;
+    unsigned k, victim = 0, xr = 0, hb = R300_GL_TEXNIL, npg;
+    bool live;
     size_t need = u->ltexels * 4;
 
     *slot = R350_GL_TEXSLOTS;           /* the scratch: uploaded every time */
@@ -8373,6 +8406,20 @@ decode:
         s->gl_tex_bytes += need - s->gl_tex[victim].sz;
         s->gl_tex[victim].sz = need;
     }
+    /*
+     * ADMISSION: only a range whose every page reads clean can be
+     * guarded, because a bit already set cannot afterwards be told from
+     * one set later. It is decided before the decode, so that a store
+     * landing during the decode sets a bit the guard then sees. An
+     * entry that fails is used for this draw and then dropped, and the
+     * next decode after a refresh admits it.
+     */
+    s->gl_tex_evict += s->gl_tex[victim].live;
+    s->gl_tex[victim].live = false;
+    npg = r300_gl_pages(s, off, len);
+    live = s->gl_texlife != R350_TEXLIFE_DIRTY ||
+           !r300_gl_range_dirty(s, off, npg) ||
+           r300_gl_admit(s, off, len);
     r300_gl_decode_tex(s, d, unit, s->gl_tex[victim].rgba);
     s->gl_tex[victim].off = off;
     s->gl_tex[victim].len = len;
@@ -8391,18 +8438,8 @@ decode:
     s->gl_tex[victim].lay = u->loff[u->nlev - 1] - u->off;
     s->gl_tex[victim].used = ++s->gl_tex_seq;
     s->gl_tex[victim].epoch = s->gl_epoch;
-    s->gl_tex[victim].npg = r300_gl_pages(s, off, len);
-    /*
-     * ADMISSION: only a range whose every page reads clean can be
-     * guarded, because a bit already set cannot afterwards be told from
-     * one set later. An entry that fails here is used for this draw and
-     * then dropped, and the next decode after a refresh admits it.
-     */
-    s->gl_tex_evict += s->gl_tex[victim].live;
-    s->gl_tex[victim].live = s->gl_texlife != R350_TEXLIFE_DIRTY ||
-                             !r300_gl_range_dirty(s, off,
-                                                  s->gl_tex[victim].npg) ||
-                             ati_r350_gl_admit(s, off, len);
+    s->gl_tex[victim].npg = npg;
+    s->gl_tex[victim].live = live;
     s->gl_tex_noadmit += !s->gl_tex[victim].live;
     s->gl_tex[victim].up = true;
     s->gl_tex_any |= s->gl_tex[victim].live;
