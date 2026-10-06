@@ -89,7 +89,7 @@ static int ati_r350_bpp_from_dp_datatype(ATIR350State *s)
 
 /*
  * One of this chip's four-code byte-swap fields as a byte-lane XOR, in
- * the same encoding ati_r350_vram_xor() returns: 32-bit swap reverses
+ * the same encoding ati_r350_aper_xor() returns: 32-bit swap reverses
  * all four lanes, 16-bit swap reverses each pair, half-dword swaps the
  * two halves.
  */
@@ -134,7 +134,6 @@ static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
-    unsigned xr;
 
     if (x < 0 || y < 0) {
         return 0;
@@ -162,7 +161,7 @@ static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
          *     compositor's TX_FORMAT component select declares.
          *
          * Modelled the same way as every other swapper on this chip: as
-         * an XOR on the byte lane, exactly like ati_r350_vram_xor().
+         * an XOR on the byte lane, exactly like ati_r350_aper_xor().
          * Hard-coding the 32-bit swap here was right for CoreGraphics
          * and wrong for the GL driver -- it is why Chess.app's wood
          * board came out red with green and blue exchanged. The 8bpp
@@ -197,19 +196,15 @@ static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
             return 0;
         }
     }
-    xr = ati_r350_vram_xor(s, addr);
     switch (bpp) {
     case 8:
-        return vram[addr ^ xr];
+        return vram[addr];
     case 16:
-        return vram[addr ^ xr] | ((uint32_t)vram[(addr + 1) ^ xr] << 8);
+        return lduw_le_p(vram + addr);
     case 24:
-        return ((uint32_t)vram[(addr + 2) ^ xr] << 16) |
-               ((uint32_t)vram[(addr + 1) ^ xr] << 8) | vram[addr ^ xr];
+        return ((uint32_t)vram[addr + 2] << 16) | lduw_le_p(vram + addr);
     case 32:
-        return vram[addr ^ xr] | ((uint32_t)vram[(addr + 1) ^ xr] << 8) |
-               ((uint32_t)vram[(addr + 2) ^ xr] << 16) |
-               ((uint32_t)vram[(addr + 3) ^ xr] << 24);
+        return ldl_le_p(vram + addr);
     default:
         return 0;
     }
@@ -221,7 +216,6 @@ static void ati_r350_2d_write_pixel(ATIR350State *s, uint32_t offset,
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
-    unsigned xr;
 
     if (x < 0 || y < 0) {
         return;
@@ -250,19 +244,18 @@ static void ati_r350_2d_write_pixel(ATIR350State *s, uint32_t offset,
     if (addr >= 0xd000 && addr < 0xe000) {
         trace_ati_r350_pixwatch(addr, color, bpp);
     }
-    xr = ati_r350_vram_xor(s, addr);
     switch (bpp) {
     case 32:
-        vram[(addr + 3) ^ xr] = (color >> 24) & 0xff;
+        vram[addr + 3] = (color >> 24) & 0xff;
         /* fall through */
     case 24:
-        vram[(addr + 2) ^ xr] = (color >> 16) & 0xff;
+        vram[addr + 2] = (color >> 16) & 0xff;
         /* fall through */
     case 16:
-        vram[(addr + 1) ^ xr] = (color >> 8) & 0xff;
+        vram[addr + 1] = (color >> 8) & 0xff;
         /* fall through */
     case 8:
-        vram[addr ^ xr] = color & 0xff;
+        vram[addr] = color & 0xff;
         break;
     default:
         break;
@@ -467,12 +460,11 @@ static bool ati_r350_2d_page_in_row(ATIR350State *s, uint32_t src_stride,
         for (k = 0; k < m; k++) {
             uint32_t dw = buf[k];
             uint32_t a = (uint32_t)dst + (i + k) * 4;
-            unsigned xr = ati_r350_vram_xor(s, a);
 
-            vram[a ^ xr] = (dw >> ((0 ^ sxr) * 8)) & 0xff;
-            vram[(a + 1) ^ xr] = (dw >> ((1 ^ sxr) * 8)) & 0xff;
-            vram[(a + 2) ^ xr] = (dw >> ((2 ^ sxr) * 8)) & 0xff;
-            vram[(a + 3) ^ xr] = (dw >> ((3 ^ sxr) * 8)) & 0xff;
+            vram[a] = (dw >> ((0 ^ sxr) * 8)) & 0xff;
+            vram[a + 1] = (dw >> ((1 ^ sxr) * 8)) & 0xff;
+            vram[a + 2] = (dw >> ((2 ^ sxr) * 8)) & 0xff;
+            vram[a + 3] = (dw >> ((3 ^ sxr) * 8)) & 0xff;
         }
     }
     memory_region_set_dirty(&s->vram, dst & ~7ull,

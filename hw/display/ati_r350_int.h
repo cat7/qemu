@@ -70,6 +70,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIR350State, ATI_R350)
  * Quartz Extreme needs >= 16MB, Quartz 2D Extreme >= 64MB.
  */
 #define ATI_R350_VRAM_SIZE   (128 * 1024 * 1024)
+/* live swapped ranges: eight surfaces and the gaps around them */
+#define ATI_R350_SWAP_WINS   17
 #define ATI_R350_MMIO_SIZE   (64 * 1024)
 #define ATI_R350_IO_SIZE     256
 #define ATI_R350_NUM_REGS    (ATI_R350_MMIO_SIZE / 4)
@@ -288,17 +290,12 @@ typedef struct ATIR350PM4Parser {
 } ATIR350PM4Parser;
 
 /*
- * Memo for ati_r350_vram_xor(). Resolving the swapper means walking
- * eight surface descriptors, three registers each, and the software
- * rasterizer asks two or three times for every pixel it touches -- which
- * is why the surface walk sat second and third in a profile of a stalled
- * guest. `lo`..`hi` is the offset range over which the walk provably
- * cannot give a different answer than `val`, so a hit costs two
- * comparisons. A memo belongs to one thread.
+ * Memo for ati_r350_aper_xor(): `lo`..`hi` is the aperture offset range
+ * over which the surface walk provably cannot give a different answer
+ * than `val`, so a hit costs two comparisons.
  */
 typedef struct ATIR350SwapMemo {
     uint32_t lo, hi;
-    uint32_t gen;               /* the device's swap_gen it was resolved at */
     unsigned val;
     bool valid;
 } ATIR350SwapMemo;
@@ -320,7 +317,6 @@ typedef struct ATIR350DispJob {
     ATIR350Mode mode;
     struct DisplaySurface *ds;
     const uint8_t *vram;
-    unsigned xr;
     const uint8_t (*pal)[3];    /* palette, or the device's own */
     uint8_t palette[256][3];
 } ATIR350DispJob;
@@ -345,14 +341,10 @@ struct ATIR350State {
 
     uint32_t regs[ATI_R350_NUM_REGS];
     uint32_t plls[ATI_R350_NUM_PLLS];
-    /*
-     * Memos for ati_r350_vram_xor(): the display's, and the command
-     * processor thread's. Raster workers keep their own. Any write to a
-     * surface register bumps `swap_gen`, which stales all of them.
-     */
+    /* the aperture swapper: memo, and windows over swapped ranges */
     ATIR350SwapMemo swap;
-    ATIR350SwapMemo eswap;
-    uint32_t swap_gen;
+    MemoryRegion swap_io;
+    MemoryRegion swap_win[ATI_R350_SWAP_WINS];
     /*
      * Command processor thread. A CPU write of CP_RB_WPTR records the
      * pointer and wakes it; see "COMMAND PROCESSOR THREAD" in ati_r350.c.
@@ -378,7 +370,6 @@ struct ATIR350State {
     bool lockless;              /* in effect: needs the engine thread */
     bool engine_claimed;
     QemuCond engine_claim_cond;
-    ATIR350SwapMemo cswap;      /* the claimant's ati_r350_vram_xor() memo */
     uint64_t engine_claims, engine_claim_waits, engine_claim_wait_us;
     uint64_t engine_claim_busy;
     /* the decoded-texture cache, held by the draw path */
@@ -706,7 +697,6 @@ struct ATIR350State {
     char *cap_path;
     FILE *cap_fp;
     bool cap_arm;               /* record at all: a settable QOM property */
-    int draw_xr;                /* swapper xor the LAST redraw used */
     uint32_t cap_max;           /* records to take before closing the file */
     uint32_t cap_max_px;        /* skip a draw whose rectangle exceeds this */
     uint32_t cap_index;         /* records written so far */
@@ -1202,8 +1192,6 @@ bool ati_r350_zguard_arm(ATIR350State *s, uint32_t lo, uint32_t hi,
 bool ati_r350_gl_zguard(ATIR350State *s, uint32_t off, unsigned len);
 
 bool ati_r350_on_engine(void);
-/* ati_r350_vram_xor() on this thread uses `memo` from now on */
-void ati_r350_swap_memo_bind(ATIR350SwapMemo *memo);
 void ati_r350_engine_wait(ATIR350State *s);
 
 /*
@@ -1279,21 +1267,13 @@ bool ati_r350_host_data_flush(ATIR350State *s);
  */
 void ati_r350_host_cursor(int x, int y, bool on);
 /*
- * Byte-lane XOR that turns a raw VRAM byte offset into the byte a
- * little-endian consumer (CRTC, 2D engine, CP) sees there, given the
- * SURFACE_CNTL / SURFACEn swappers in force at that address: 0 = no
- * swap, 1 = 16-bit swap, 3 = 32-bit swap. See ati_r350_vram_xor().
+ * Byte-lane XOR the SURFACE_CNTL / SURFACEn swappers apply to a host
+ * access at frame-buffer aperture offset `off`: 0 = no swap, 1 = 16-bit
+ * swap, 3 = 32-bit swap. VRAM itself is chip-native; nothing but the
+ * aperture swaps.
  */
-unsigned ati_r350_vram_xor(ATIR350State *s, uint32_t off);
-/*
- * The same lane XOR, and the inclusive offset range [*lo, *hi] around
- * `off` over which ati_r350_vram_xor() returns it while the surface
- * registers stay as they are.
- */
-unsigned ati_r350_vram_xor_range(ATIR350State *s, uint32_t off,
-                                 uint32_t *lo, uint32_t *hi);
-bool ati_r350_vram_xor_span(ATIR350State *s, uint32_t off, uint32_t len,
-                            unsigned *xr);
+unsigned ati_r350_aper_xor(ATIR350State *s, uint32_t off);
+/* a chip-native little-endian VRAM dword */
 uint32_t ati_r350_vram_ld32(ATIR350State *s, uint32_t off);
 
 #endif /* ATI_R350_INT_H */
