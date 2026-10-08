@@ -779,6 +779,11 @@ struct BlockDriver {
     int coroutine_fn GRAPH_RDLOCK_PTR (*bdrv_co_ioctl)(
         BlockDriverState *bs, unsigned long int req, void *buf);
 
+    /* CD media: track layout and raw 2352-byte sectors by LBA */
+    int GRAPH_RDLOCK_PTR (*bdrv_get_cd_toc)(BlockDriverState *bs, CDToc *toc);
+    int coroutine_fn GRAPH_RDLOCK_PTR (*bdrv_co_cd_read_raw)(
+        BlockDriverState *bs, int64_t lba, int nb_sectors, QEMUIOVector *qiov);
+
     /*
      * Returns 0 for completed check, -errno for internal errors.
      * The check results are stored in result.

@@ -26,6 +26,7 @@
 
 #include "qapi/qapi-types-block-core.h"
 #include "qemu/queue.h"
+#include "block/cdrom.h"
 
 /*
  * co_wrapper{*}: Function specifiers used by block-coroutine-wrapper.py
