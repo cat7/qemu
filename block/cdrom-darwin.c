@@ -25,6 +25,7 @@
 #define IMAGE_PREFIX        "image:"
 #define IMAGE_DEVICE_CLASS  "IOHDIXHDDriveOutKernel"
 #define RELEASE_TIMEOUT_MS  3000
+#define DA_TIMEOUT_MS       5000
 
 typedef struct WatchEvent {
     HostCDEvent ev;
@@ -48,6 +49,7 @@ struct HostCDWatch {
     bool want_release;
     QemuSemaphore released;
     char eject_bsd[32];
+    QemuSemaphore da_done;      /* unmount at start / mount at the end */
 
     DASessionRef session;
     dispatch_queue_t queue;
@@ -271,10 +273,48 @@ static void watch_bh(void *opaque)
 static void unmount_done(DADiskRef disk, DADissenterRef dissenter,
                          void *context)
 {
+    HostCDWatch *w = context;
+
     if (dissenter) {
         warn_report("host_cdrom: could not unmount %s (0x%x)",
                     DADiskGetBSDName(disk), DADissenterGetStatus(dissenter));
     }
+    /* the disc cannot be opened while a volume of it is mounted */
+    watch_post(w, HOST_CD_MEDIUM_IN, DADiskGetBSDName(disk));
+}
+
+static void unmount_sync_done(DADiskRef disk, DADissenterRef dissenter,
+                              void *context)
+{
+    HostCDWatch *w = context;
+
+    if (dissenter) {
+        warn_report("host_cdrom: could not unmount %s (0x%x)",
+                    DADiskGetBSDName(disk), DADissenterGetStatus(dissenter));
+    }
+    qemu_sem_post(&w->da_done);
+}
+
+static void do_unmount_sync(void *opaque)
+{
+    HostCDWatch *w = opaque;
+    DADiskRef disk = DADiskCreateFromBSDName(kCFAllocatorDefault, w->session,
+                                             w->bsd);
+
+    if (!disk) {
+        qemu_sem_post(&w->da_done);
+        return;
+    }
+    DADiskUnmount(disk, kDADiskUnmountOptionWhole, unmount_sync_done, w);
+    CFRelease(disk);
+}
+
+static void mount_done(DADiskRef disk, DADissenterRef dissenter,
+                       void *context)
+{
+    HostCDWatch *w = context;
+
+    qemu_sem_post(&w->da_done);
 }
 
 static void disk_appeared(DADiskRef disk, void *context)
@@ -290,7 +330,6 @@ static void disk_appeared(DADiskRef disk, void *context)
     w->held = true;
     qemu_mutex_unlock(&w->lock);
     DADiskUnmount(disk, kDADiskUnmountOptionWhole, unmount_done, w);
-    watch_post(w, HOST_CD_MEDIUM_IN, name);
 }
 
 static void disk_disappeared(DADiskRef disk, void *context)
@@ -382,10 +421,18 @@ static void do_teardown(void *opaque)
         DADiskRef disk = DADiskCreateFromBSDName(kCFAllocatorDefault,
                                                  w->session, w->bsd);
         if (disk) {
-            DADiskMount(disk, NULL, kDADiskMountOptionWhole, NULL, NULL);
+            DADiskMount(disk, NULL, kDADiskMountOptionWhole, mount_done, w);
             CFRelease(disk);
+            return;
         }
     }
+    qemu_sem_post(&w->da_done);
+}
+
+static void do_detach(void *opaque)
+{
+    HostCDWatch *w = opaque;
+
     DASessionSetDispatchQueue(w->session, NULL);
 }
 
@@ -422,6 +469,7 @@ HostCDWatch *host_cd_watch_new(const char *id, HostCDWatchFn *fn,
     w->bh = qemu_bh_new(watch_bh, w);
     qemu_mutex_init(&w->lock);
     qemu_sem_init(&w->released, 0);
+    qemu_sem_init(&w->da_done, 0);
     g_queue_init(&w->events);
     pstrcpy(w->bsd, sizeof(w->bsd), bsd);
 
@@ -449,6 +497,9 @@ void host_cd_watch_free(HostCDWatch *w)
         return;
     }
     dispatch_sync_f(w->queue, w, do_teardown);
+    /* the disc goes back to the host before the session ends */
+    qemu_sem_timedwait(&w->da_done, DA_TIMEOUT_MS);
+    dispatch_sync_f(w->queue, w, do_detach);
     CFRelease(w->session);
     dispatch_release(w->queue);
     qemu_bh_delete(w->bh);
@@ -456,6 +507,7 @@ void host_cd_watch_free(HostCDWatch *w)
         g_free(e);
     }
     qemu_sem_destroy(&w->released);
+    qemu_sem_destroy(&w->da_done);
     qemu_mutex_destroy(&w->lock);
     g_free(w->id);
     g_free(w->image);
@@ -488,4 +540,13 @@ void host_cd_watch_present(HostCDWatch *w, char *bsd, size_t bsd_len)
     qemu_mutex_lock(&w->lock);
     pstrcpy(bsd, bsd_len, w->bsd);
     qemu_mutex_unlock(&w->lock);
+}
+
+void host_cd_watch_unmount(HostCDWatch *w)
+{
+    if (!w->bsd[0]) {
+        return;
+    }
+    dispatch_async_f(w->queue, w, do_unmount_sync);
+    qemu_sem_timedwait(&w->da_done, DA_TIMEOUT_MS);
 }
