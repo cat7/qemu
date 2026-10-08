@@ -56,4 +56,15 @@ static inline int cd_toc_find(const CDToc *toc, uint32_t lba)
     return -1;
 }
 
+/*
+ * Build @toc from a full TOC (MMC READ TOC format 2) of @len bytes,
+ * header included. Returns 0 or -EINVAL.
+ */
+int cd_toc_parse_full(const uint8_t *buf, int len, CDToc *toc);
+
+bool cd_toc_has_audio(const CDToc *toc);
+
+/* Sync pattern and MSF header of a raw data sector; @mode is 1 or 2. */
+void cd_raw_header(uint8_t *buf, uint32_t lba, int mode);
+
 #endif
