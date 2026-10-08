@@ -184,7 +184,8 @@ static QTestState *start(const char *extra)
 {
     QTestState *qts;
 
-    qts = qtest_initf("-M mac99 -nodefaults "
+    /* A G4 CPU keeps the Uni-North layout under ppc64 too */
+    qts = qtest_initf("-M mac99 -cpu 7447a -nodefaults "
                       "-drive if=none,id=cd,file=%s,format=cue,media=cdrom "
                       "-device ide-cd,drive=cd,bus=ide.1,unit=0%s",
                       img.cue, extra ? extra : "");
