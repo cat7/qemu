@@ -71,6 +71,75 @@ static inline int media_is_cd(IDEState *s)
     return (media_present(s) && s->nb_sectors <= CD_MAX_SECTORS);
 }
 
+/* The medium has a backend-reported track layout. */
+static inline bool media_has_toc(IDEState *s)
+{
+    return media_present(s) && s->cd_toc;
+}
+
+/* The drive reports CD-DA play and read capabilities. */
+static bool atapi_audio_capable(IDEState *s)
+{
+    return s->cd_toc || ide_cd_audio_has_output(s);
+}
+
+static const uint8_t cd_audio_page_default[16] = {
+    MODE_PAGE_AUDIO_CTL, 14, 0x04, 0, 0, 0, 0, 0,
+    0x01, 0xff, 0x02, 0xff, 0, 0, 0, 0,
+};
+
+void ide_atapi_reset(IDEState *s)
+{
+    ide_cd_audio_stop(s);
+    memcpy(s->cd_audio_page, cd_audio_page_default,
+           sizeof(s->cd_audio_page));
+    s->cd_raw_read = false;
+    s->atapi_out_end = NULL;
+}
+
+void ide_atapi_media_changed(IDEState *s, bool load)
+{
+    CDToc toc;
+
+    ide_cd_audio_stop(s);
+    g_free(s->cd_toc);
+    s->cd_toc = NULL;
+    if (load && blk_get_cd_toc(s->blk, &toc) == 0 && toc.nb_tracks > 0) {
+        s->cd_toc = g_memdup2(&toc, sizeof(toc));
+    }
+}
+
+static const CDTrack *cd_track_at(IDEState *s, uint32_t lba, int *num)
+{
+    int i = cd_toc_find(s->cd_toc, lba);
+
+    if (i < 0) {
+        return NULL;
+    }
+    if (num) {
+        *num = s->cd_toc->first + i;
+    }
+    return &s->cd_toc->tracks[i];
+}
+
+/* All sectors of [lba, lba + n) have track mode @mode. */
+static bool cd_range_mode(IDEState *s, uint32_t lba, uint32_t n, int *mode)
+{
+    const CDToc *toc = s->cd_toc;
+    int i = cd_toc_find(toc, lba);
+
+    if (i < 0) {
+        return false;
+    }
+    *mode = toc->tracks[i].mode;
+    for (; i < toc->nb_tracks && toc->tracks[i].index0 < lba + n; i++) {
+        if (toc->tracks[i].mode != *mode) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void cd_data_to_raw(uint8_t *buf, int lba)
 {
     /* sync bytes */
@@ -86,6 +155,224 @@ static void cd_data_to_raw(uint8_t *buf, int lba)
     buf += 2048;
     /* XXX: ECC not computed */
     memset(buf, 0, 288);
+}
+
+/* READ CD main channel selection (CDB byte 9) */
+#define RCD_SYNC        0x80
+#define RCD_SUBHEADER   0x40
+#define RCD_HEADER      0x20
+#define RCD_USER        0x10
+#define RCD_EDC         0x08
+#define RCD_C2          0x06
+#define RCD_MAIN        0xf8
+
+/* READ CD expected sector type (CDB byte 1) */
+enum {
+    RCD_TYPE_ANY,
+    RCD_TYPE_CDDA,
+    RCD_TYPE_MODE1,
+    RCD_TYPE_MODE2,
+    RCD_TYPE_FORM1,
+    RCD_TYPE_FORM2,
+};
+
+/* Sector layouts */
+enum {
+    CD_KIND_CDDA,
+    CD_KIND_MODE1,
+    CD_KIND_MODE2,
+    CD_KIND_FORM1,
+    CD_KIND_FORM2,
+};
+
+/* Main channel fields of each sector layout, in order: start and end. */
+static const struct {
+    uint8_t field;
+    uint16_t range[5][2];
+} cd_fields[] = {
+    { RCD_SYNC,      { {0, 0}, {0, 12}, {0, 12}, {0, 12}, {0, 12} } },
+    { RCD_HEADER,    { {0, 0}, {12, 16}, {12, 16}, {12, 16}, {12, 16} } },
+    { RCD_SUBHEADER, { {0, 0}, {16, 16}, {16, 16}, {16, 24}, {16, 24} } },
+    { RCD_USER,      { {0, 2352}, {16, 2064}, {16, 2352}, {24, 2072},
+                       {24, 2348} } },
+    { RCD_EDC,       { {0, 0}, {2064, 2352}, {2352, 2352}, {2072, 2352},
+                       {2348, 2352} } },
+};
+
+/* Bytes returned per sector of layout @kind, or -1 if invalid. */
+static int cd_sector_bytes(int kind, uint8_t fields, uint8_t subch)
+{
+    int i, n = 0;
+
+    if (kind == CD_KIND_CDDA) {
+        n = (fields & RCD_MAIN) ? CD_RAW_SECTOR_SIZE : 0;
+    } else {
+        for (i = 0; i < ARRAY_SIZE(cd_fields); i++) {
+            if (fields & cd_fields[i].field) {
+                n += cd_fields[i].range[kind][1] - cd_fields[i].range[kind][0];
+            }
+        }
+    }
+    switch (fields & RCD_C2) {
+    case 0x02:
+        n += 294;
+        break;
+    case 0x04:
+        n += 296;
+        break;
+    case 0x06:
+        return -1;
+    }
+    switch (subch) {
+    case 0:
+        break;
+    case 2:
+        n += 16;
+        break;
+    default:
+        return -1;
+    }
+    return n;
+}
+
+static uint8_t to_bcd(int v)
+{
+    return ((v / 10) << 4) | (v % 10);
+}
+
+/* Formatted Q sub-channel for @lba */
+static void cd_subchannel_q(IDEState *s, uint32_t lba, uint8_t *q)
+{
+    int num = 1;
+    const CDTrack *t = cd_track_at(s, lba, &num);
+    uint32_t a = lba + 150;
+    int32_t rel;
+
+    memset(q, 0, 16);
+    if (!t) {
+        return;
+    }
+    rel = (int32_t)lba - (int32_t)t->start;
+    if (rel < 0) {
+        rel = -rel;
+    }
+    q[0] = 0x10 | t->control;
+    q[1] = to_bcd(num);
+    q[2] = lba < t->start ? 0 : 1;
+    q[3] = to_bcd(rel / 75 / 60);
+    q[4] = to_bcd((rel / 75) % 60);
+    q[5] = to_bcd(rel % 75);
+    q[7] = to_bcd(a / 75 / 60);
+    q[8] = to_bcd((a / 75) % 60);
+    q[9] = to_bcd(a % 75);
+}
+
+static int cd_sector_kind(IDEState *s, uint32_t lba, const uint8_t *raw)
+{
+    const CDTrack *t = cd_track_at(s, lba, NULL);
+
+    if (!t || t->mode == CD_TRACK_AUDIO) {
+        return CD_KIND_CDDA;
+    }
+    if (t->mode == CD_TRACK_MODE1) {
+        return CD_KIND_MODE1;
+    }
+    switch (s->cd_read_type) {
+    case RCD_TYPE_MODE2:
+        return CD_KIND_MODE2;
+    case RCD_TYPE_FORM1:
+        return CD_KIND_FORM1;
+    case RCD_TYPE_FORM2:
+        return CD_KIND_FORM2;
+    default:
+        return raw && (raw[18] & 0x20) ? CD_KIND_FORM2 : CD_KIND_FORM1;
+    }
+}
+
+/* Build the READ CD answer for one raw sector. */
+static void cd_format_sector(IDEState *s, uint32_t lba, const uint8_t *raw,
+                             uint8_t *out)
+{
+    int kind = cd_sector_kind(s, lba, raw);
+    uint8_t fields = s->cd_read_fields;
+    uint8_t *p = out;
+    int i;
+
+    if (kind == CD_KIND_CDDA) {
+        if (fields & RCD_MAIN) {
+            memcpy(p, raw, CD_RAW_SECTOR_SIZE);
+            p += CD_RAW_SECTOR_SIZE;
+        }
+    } else {
+        for (i = 0; i < ARRAY_SIZE(cd_fields); i++) {
+            int a = cd_fields[i].range[kind][0];
+            int b = cd_fields[i].range[kind][1];
+
+            if (fields & cd_fields[i].field) {
+                memcpy(p, raw + a, b - a);
+                p += b - a;
+            }
+        }
+    }
+    switch (fields & RCD_C2) {
+    case 0x02:
+        memset(p, 0, 294);
+        p += 294;
+        break;
+    case 0x04:
+        memset(p, 0, 296);
+        p += 296;
+        break;
+    }
+    if (s->cd_read_subch == 2) {
+        cd_subchannel_q(s, lba, p);
+        p += 16;
+    }
+    /* sectors of a run share one size; pad or cut a stray layout */
+    if (p - out < s->cd_sector_size) {
+        memset(p, 0, s->cd_sector_size - (p - out));
+    }
+}
+
+static void cd_read_formatted_cb(void *opaque, int ret)
+{
+    IDEState *s = opaque;
+    uint8_t tmp[CD_RAW_SECTOR_SIZE + 296 + 16];
+    int i;
+
+    if (ret >= 0) {
+        for (i = 0; i < s->cd_raw_n; i++) {
+            cd_format_sector(s, s->cd_raw_lba + i,
+                             s->cd_raw_buf + i * CD_RAW_SECTOR_SIZE, tmp);
+            memcpy(s->io_buffer + i * s->cd_sector_size, tmp,
+                   s->cd_sector_size);
+        }
+    }
+    s->cd_raw_cb(s->cd_raw_opaque, ret);
+}
+
+/*
+ * Read @nb_sectors raw sectors from @lba and format them for READ CD into
+ * s->io_buffer, cd_sector_size bytes each.
+ */
+BlockAIOCB *ide_atapi_read_formatted(IDEState *s, int lba, int nb_sectors,
+                                     BlockCompletionFunc *cb, void *opaque)
+{
+    assert(nb_sectors > 0 && nb_sectors <= CD_RAW_MAX_SECTORS);
+    assert(nb_sectors * s->cd_sector_size <= s->io_buffer_total_len);
+
+    if (!s->cd_raw_buf) {
+        s->cd_raw_buf = blk_blockalign(s->blk,
+                                       CD_RAW_MAX_SECTORS * CD_RAW_SECTOR_SIZE);
+    }
+    s->cd_raw_lba = lba;
+    s->cd_raw_n = nb_sectors;
+    s->cd_raw_cb = cb;
+    s->cd_raw_opaque = opaque;
+    qemu_iovec_init_buf(&s->cd_raw_qiov, s->cd_raw_buf,
+                        nb_sectors * CD_RAW_SECTOR_SIZE);
+    return ide_buffered_cd_read_raw(s, lba, &s->cd_raw_qiov, nb_sectors,
+                                    cd_read_formatted_cb, s);
 }
 
 static void cd_read_sector_cb(void *opaque, int ret)
@@ -107,7 +394,7 @@ static void cd_read_sector_cb(void *opaque, int ret)
 
     block_acct_done(blk_get_stats(s->blk), &s->acct);
 
-    if (s->cd_sector_size == 2352) {
+    if (!s->cd_raw_read && s->cd_sector_size == 2352) {
         /* unpack back-to-front so a sector never clobbers an unmoved one */
         for (i = nsec - 1; i >= 0; i--) {
             memmove(s->io_buffer + i * 2352 + 16, s->io_buffer + i * 2048,
@@ -145,6 +432,15 @@ static int cd_read_sector(IDEState *s)
     int et = s->elementary_transfer_size;
     int skip = s->io_buffer_index;
     int nsec = DIV_ROUND_UP(skip + et, s->cd_sector_size);
+
+    if (s->cd_raw_read) {
+        trace_cd_read_sector(s->lba);
+        block_acct_start(blk_get_stats(s->blk), &s->acct,
+                         nsec * CD_RAW_SECTOR_SIZE, BLOCK_ACCT_READ);
+        ide_atapi_read_formatted(s, s->lba, nsec, cd_read_sector_cb, s);
+        s->status |= BUSY_STAT;
+        return 0;
+    }
 
     if (s->cd_sector_size != 2048 && s->cd_sector_size != 2352) {
         block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_READ);
@@ -236,6 +532,14 @@ void ide_atapi_cmd_reply_end(IDEState *s)
             }
             size = byte_count_limit;
         }
+        if (s->cd_raw_read) {
+            int max = CD_RAW_MAX_SECTORS * s->cd_sector_size -
+                      s->io_buffer_index;
+
+            if (size > max) {
+                size = max & ~1;
+            }
+        }
         s->elementary_transfer_size = size;
         ret = cd_read_sector(s);
         if (ret < 0) {
@@ -308,6 +612,45 @@ static void ide_atapi_cmd_reply(IDEState *s, int size, int max_size)
     }
 }
 
+static void ide_atapi_cmd_write_dma_cb(void *opaque, int ret)
+{
+    IDEState *s = opaque;
+    EndTransferFunc *end = s->atapi_out_end;
+
+    s->atapi_out_end = NULL;
+    s->io_buffer_index = 0;
+    if (ret < 0 || s->bus->dma->ops->rw_buf(s->bus->dma, 0) == 0) {
+        ide_set_inactive(s, false);
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                            ASC_PARAMETER_LIST_LENGTH_ERROR);
+        return;
+    }
+    ide_set_inactive(s, false);
+    end(s);
+}
+
+static void ide_atapi_data_out(IDEState *s, int len, EndTransferFunc *end)
+{
+    s->lba = -1;
+    s->packet_transfer_size = len;
+    s->elementary_transfer_size = 0;
+    s->io_buffer_index = 0;
+    s->io_buffer_size = len;
+
+    if (s->atapi_dma) {
+        s->atapi_out_end = end;
+        s->status = READY_STAT | SEEK_STAT | DRQ_STAT;
+        ide_start_dma(s, ide_atapi_cmd_write_dma_cb);
+    } else {
+        s->status = READY_STAT | SEEK_STAT;
+        s->nsector = s->nsector & ~7;   /* data to the device */
+        s->lcyl = len & 0xff;
+        s->hcyl = len >> 8;
+        ide_transfer_start(s, s->io_buffer, len, end);
+        ide_bus_set_irq(s->bus);
+    }
+}
+
 /* start a CD-ROM read command */
 static void ide_atapi_cmd_read_pio(IDEState *s, int lba, int nb_sectors,
                                    int sector_size)
@@ -357,7 +700,9 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
          * the reply data.
          */
         if (s->lba != -1) {
-            if (s->cd_sector_size == 2352) {
+            if (s->cd_raw_read) {
+                n = s->io_buffer_size / s->cd_sector_size;
+            } else if (s->cd_sector_size == 2352) {
                 n = 1;
                 cd_data_to_raw(s->io_buffer, s->lba);
             } else {
@@ -378,7 +723,16 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
     }
 
     s->io_buffer_index = 0;
-    if (s->cd_sector_size == 2352) {
+    if (s->cd_raw_read) {
+        n = MIN(s->packet_transfer_size / s->cd_sector_size,
+                CD_RAW_MAX_SECTORS);
+        s->io_buffer_size = n * s->cd_sector_size;
+        trace_ide_atapi_cmd_read_dma_cb_aio(s, s->lba, n);
+        s->bus->dma->aiocb = ide_atapi_read_formatted(s, s->lba, n,
+                                                      ide_atapi_cmd_read_dma_cb,
+                                                      s);
+        return;
+    } else if (s->cd_sector_size == 2352) {
         n = 1;
         s->io_buffer_size = s->cd_sector_size;
         data_offset = 16;
@@ -854,6 +1208,30 @@ static int atapi_feature(IDEState *s, uint16_t feature, uint8_t *p,
         *current = true;
         return 8;
 
+    case 0x001e: /* CD Read */
+        if (!s->cd_toc) {
+            return 0;
+        }
+        stw_be_p(p, 0x001e);
+        p[2] = (2 << 2) | media_is_cd(s);
+        p[3] = 4;
+        p[4] = p[5] = p[6] = p[7] = 0;
+        *current = media_is_cd(s);
+        return 8;
+
+    case 0x0103: /* CD External Audio Play */
+        if (!atapi_audio_capable(s)) {
+            return 0;
+        }
+        stw_be_p(p, 0x0103);
+        p[2] = media_is_cd(s);
+        p[3] = 4;
+        p[4] = 0x03;    /* separate channel mute, separate volume */
+        p[5] = 0;
+        stw_be_p(p + 6, 256);
+        *current = media_is_cd(s);
+        return 8;
+
     case 0x0010: /* Random Readable */
         stw_be_p(p, 0x0010);
         p[2] = 0x03;
@@ -872,7 +1250,9 @@ static int atapi_feature(IDEState *s, uint16_t feature, uint8_t *p,
 
 static void cmd_get_configuration(IDEState *s, uint8_t *buf)
 {
-    static const uint16_t features[] = { 0x0000, 0x0001, 0x0003, 0x0010 };
+    static const uint16_t features[] = {
+        0x0000, 0x0001, 0x0003, 0x0010, 0x001e, 0x0103,
+    };
     uint16_t start = lduw_be_p(buf + 2);
     int rt = buf[1] & 0x03;
     int max_len = lduw_be_p(buf + 7);
@@ -925,8 +1305,11 @@ static void cmd_get_configuration(IDEState *s, uint8_t *buf)
     ide_atapi_cmd_reply(s, len, max_len);
 }
 
-/* Write mode page @code at @p and return its length, or 0 if unknown. */
-static int atapi_mode_page(IDEState *s, int code, uint8_t *p)
+/*
+ * Write mode page @code at @p and return its length, or 0 if unknown.
+ * @action is the page control field: current, changeable or default.
+ */
+static int atapi_mode_page(IDEState *s, int code, int action, uint8_t *p)
 {
     switch (code) {
     case MODE_PAGE_R_W_ERROR: /* error recovery */
@@ -941,6 +1324,24 @@ static int atapi_mode_page(IDEState *s, int code, uint8_t *p)
         memset(p, 0, 16);
         p[0] = MODE_PAGE_AUDIO_CTL;
         p[1] = 14;
+        if (!atapi_audio_capable(s)) {
+            return 16;
+        }
+        switch (action) {
+        case 1:
+            p[2] = 0x02;    /* SOTC */
+            p[8] = 0x0f;
+            p[9] = 0xff;
+            p[10] = 0x0f;
+            p[11] = 0xff;
+            break;
+        case 2:
+            memcpy(p, cd_audio_page_default, 16);
+            break;
+        default:
+            memcpy(p, s->cd_audio_page, 16);
+            break;
+        }
         return 16;
 
     case MODE_PAGE_CAPABILITIES:
@@ -963,6 +1364,11 @@ static int atapi_mode_page(IDEState *s, int code, uint8_t *p)
         stw_be_p(&p[8], 704);  /* 4x read speed */
         p[10] = 0;             /* Two volume levels */
         p[11] = 2;
+        if (atapi_audio_capable(s)) {
+            p[5] |= 0x03;      /* CD-DA commands, stream accurate */
+            p[7] |= 0x03;      /* separate volume and channel mute */
+            stw_be_p(&p[10], 256);
+        }
         stw_be_p(&p[12], 512); /* 512k buffer */
         stw_be_p(&p[14], 704); /* 4x read speed current */
         return 22;
@@ -1013,10 +1419,11 @@ static void atapi_mode_sense(IDEState *s, uint8_t *buf, bool ten)
     memset(buf, 0, head);
     if (code == 0x3f) {
         for (i = 0; i < ARRAY_SIZE(all_pages); i++) {
-            page += atapi_mode_page(s, all_pages[i], buf + head + page);
+            page += atapi_mode_page(s, all_pages[i], action,
+                                    buf + head + page);
         }
     } else {
-        page = atapi_mode_page(s, code, buf + head);
+        page = atapi_mode_page(s, code, action, buf + head);
     }
     if (page == 0) {
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
@@ -1024,11 +1431,13 @@ static void atapi_mode_sense(IDEState *s, uint8_t *buf, bool ten)
     }
 
     if (action == 1) {
-        /* Changeable values: no parameter is changeable. */
+        /* Changeable values: only the audio control page has any. */
         for (i = 0; i < page;) {
             int len = buf[head + i + 1] + 2;
 
-            memset(buf + head + i + 2, 0, len - 2);
+            if ((buf[head + i] & 0x3f) != MODE_PAGE_AUDIO_CTL) {
+                memset(buf + head + i + 2, 0, len - 2);
+            }
             i += len;
         }
     }
@@ -1051,6 +1460,84 @@ static void cmd_mode_sense(IDEState *s, uint8_t *buf)
 static void cmd_mode_sense_6(IDEState *s, uint8_t *buf)
 {
     atapi_mode_sense(s, buf, false);
+}
+
+/* Receive @len bytes of parameter data into io_buffer, then call @end. */
+static void ide_atapi_data_out(IDEState *s, int len, EndTransferFunc *end);
+
+static void atapi_mode_select_end(IDEState *s, bool ten)
+{
+    uint8_t *buf = s->io_buffer;
+    int len = s->packet_transfer_size;
+    int head = ten ? 8 : 4;
+    int p;
+
+    if (len < head) {
+        goto bad_param;
+    }
+    p = head + (ten ? lduw_be_p(buf + 6) : buf[3]);
+    while (p + 2 <= len) {
+        int code = buf[p] & 0x3f;
+        int plen = buf[p + 1] + 2;
+
+        if (p + plen > len) {
+            goto bad_param;
+        }
+        if (code == MODE_PAGE_AUDIO_CTL) {
+            if (plen < 16) {
+                goto bad_param;
+            }
+            s->cd_audio_page[2] = (s->cd_audio_page[2] & ~0x02) |
+                                  (buf[p + 2] & 0x02);
+            s->cd_audio_page[8] = buf[p + 8] & 0x0f;
+            s->cd_audio_page[9] = buf[p + 9];
+            s->cd_audio_page[10] = buf[p + 10] & 0x0f;
+            s->cd_audio_page[11] = buf[p + 11];
+        }
+        p += plen;
+    }
+    ide_atapi_cmd_ok(s);
+    return;
+
+bad_param:
+    ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_PARAMETER_LIST);
+}
+
+void ide_atapi_mode_select6_end(IDEState *s)
+{
+    atapi_mode_select_end(s, false);
+}
+
+void ide_atapi_mode_select10_end(IDEState *s)
+{
+    atapi_mode_select_end(s, true);
+}
+
+static void atapi_mode_select(IDEState *s, uint8_t *buf, bool ten)
+{
+    int len = ten ? lduw_be_p(buf + 7) : buf[4];
+
+    if (len == 0) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    if (len > 512) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                            ASC_PARAMETER_LIST_LENGTH_ERROR);
+        return;
+    }
+    ide_atapi_data_out(s, len, ten ? ide_atapi_mode_select10_end
+                                   : ide_atapi_mode_select6_end);
+}
+
+static void cmd_mode_select(IDEState *s, uint8_t *buf)
+{
+    atapi_mode_select(s, buf, true);
+}
+
+static void cmd_mode_select_6(IDEState *s, uint8_t *buf)
+{
+    atapi_mode_select(s, buf, false);
 }
 
 static void cmd_test_unit_ready(IDEState *s, uint8_t *buf)
@@ -1090,7 +1577,81 @@ static void cmd_read(IDEState *s, uint8_t* buf)
         return;
     }
 
+    if (media_has_toc(s)) {
+        int mode;
+
+        if (!cd_range_mode(s, lba, nb_sectors, &mode) ||
+            mode == CD_TRACK_AUDIO) {
+            ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                                ASC_ILLEGAL_MODE_FOR_THIS_TRACK);
+            return;
+        }
+    }
+
     ide_atapi_cmd_read(s, lba, nb_sectors, 2048);
+}
+
+/* READ CD of a medium with a track layout */
+static void cmd_read_cd_toc(IDEState *s, uint8_t *buf, uint32_t lba,
+                            uint32_t nb_sectors)
+{
+    int type = (buf[1] >> 2) & 7;
+    uint8_t fields = buf[9] & 0xfe;
+    uint8_t subch = buf[10] & 7;
+    int mode, kind, size;
+
+    if (!cd_range_mode(s, lba, nb_sectors, &mode)) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                            ASC_ILLEGAL_MODE_FOR_THIS_TRACK);
+        return;
+    }
+    switch (type) {
+    case RCD_TYPE_ANY:
+        break;
+    case RCD_TYPE_CDDA:
+        if (mode != CD_TRACK_AUDIO) {
+            goto bad_mode;
+        }
+        break;
+    case RCD_TYPE_MODE1:
+        if (mode != CD_TRACK_MODE1) {
+            goto bad_mode;
+        }
+        break;
+    case RCD_TYPE_MODE2:
+    case RCD_TYPE_FORM1:
+    case RCD_TYPE_FORM2:
+        if (mode != CD_TRACK_MODE2) {
+            goto bad_mode;
+        }
+        break;
+    default:
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+
+    s->cd_read_type = type;
+    s->cd_read_fields = fields;
+    s->cd_read_subch = subch;
+    kind = cd_sector_kind(s, lba, NULL);
+    size = cd_sector_bytes(kind, fields, subch);
+    if (size < 0) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+    if (size == 0) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    if (!validate_bcl(s)) {
+        return;
+    }
+    s->cd_raw_read = true;
+    ide_atapi_cmd_read(s, lba, nb_sectors, size);
+    return;
+
+bad_mode:
+    ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_ILLEGAL_MODE_FOR_THIS_TRACK);
 }
 
 static void cmd_read_cd(IDEState *s, uint8_t* buf)
@@ -1109,6 +1670,11 @@ static void cmd_read_cd(IDEState *s, uint8_t* buf)
     lba = ldl_be_p(buf + 2);
     if (lba >= total_sectors || lba + nb_sectors - 1 >= total_sectors) {
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
+        return;
+    }
+
+    if (media_has_toc(s)) {
+        cmd_read_cd_toc(s, buf, lba, nb_sectors);
         return;
     }
 
@@ -1140,6 +1706,30 @@ static void cmd_read_cd(IDEState *s, uint8_t* buf)
     }
 }
 
+static int msf_to_lba(const uint8_t *msf)
+{
+    return (msf[0] * 60 + msf[1]) * 75 + msf[2] - 150;
+}
+
+static void cmd_read_cd_msf(IDEState *s, uint8_t *buf)
+{
+    int start = msf_to_lba(buf + 3);
+    int end = msf_to_lba(buf + 6);
+    uint32_t n;
+
+    if (start < 0 || end < start) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+    n = end - start;
+    /* rewrite as READ CD */
+    stl_be_p(buf + 2, start);
+    buf[6] = n >> 16;
+    buf[7] = n >> 8;
+    buf[8] = n;
+    cmd_read_cd(s, buf);
+}
+
 static void cmd_seek(IDEState *s, uint8_t* buf)
 {
     unsigned int lba;
@@ -1151,6 +1741,7 @@ static void cmd_seek(IDEState *s, uint8_t* buf)
         return;
     }
 
+    ide_cd_audio_stop(s);
     ide_atapi_cmd_ok(s);
 }
 
@@ -1165,6 +1756,10 @@ static void cmd_start_stop_unit(IDEState *s, uint8_t* buf)
         /* eject/load only happens for power condition == 0 */
         ide_atapi_cmd_ok(s);
         return;
+    }
+
+    if (!start) {
+        ide_cd_audio_stop(s);
     }
 
     if (loej) {
@@ -1198,6 +1793,102 @@ static void cmd_mechanism_status(IDEState *s, uint8_t* buf)
     ide_atapi_cmd_reply(s, 8, max_len);
 }
 
+static uint8_t *cd_toc_addr(uint8_t *q, uint32_t lba, bool msf)
+{
+    if (msf) {
+        q[0] = 0;
+        lba_to_msf(q + 1, lba);
+    } else {
+        stl_be_p(q, lba);
+    }
+    return q + 4;
+}
+
+static uint8_t *cd_full_toc_entry(uint8_t *q, uint8_t control, uint8_t point,
+                                  uint8_t pmin, uint8_t psec, uint8_t pframe)
+{
+    *q++ = 1;                   /* session */
+    *q++ = 0x10 | control;      /* ADR 1 */
+    *q++ = 0;                   /* TNO */
+    *q++ = point;
+    *q++ = 0;
+    *q++ = 0;
+    *q++ = 0;
+    *q++ = 0;
+    *q++ = pmin;
+    *q++ = psec;
+    *q++ = pframe;
+    return q;
+}
+
+static int cd_read_toc(IDEState *s, int format, bool msf, int start,
+                       uint8_t *buf)
+{
+    const CDToc *toc = s->cd_toc;
+    int last = toc->first + toc->nb_tracks - 1;
+    const CDTrack *lt = &toc->tracks[toc->nb_tracks - 1];
+    uint8_t *q = buf + 4;
+    uint8_t m[3];
+    bool xa = false;
+    int i, len;
+
+    switch (format) {
+    case 0:
+        if (start > last && start != 0xaa) {
+            return -1;
+        }
+        buf[2] = toc->first;
+        buf[3] = last;
+        for (i = 0; i < toc->nb_tracks; i++) {
+            if (toc->first + i < start) {
+                continue;
+            }
+            *q++ = 0;
+            *q++ = 0x10 | toc->tracks[i].control;
+            *q++ = toc->first + i;
+            *q++ = 0;
+            q = cd_toc_addr(q, toc->tracks[i].start, msf);
+        }
+        *q++ = 0;
+        *q++ = 0x10 | lt->control;
+        *q++ = 0xaa;
+        *q++ = 0;
+        q = cd_toc_addr(q, toc->leadout, msf);
+        break;
+    case 1:
+        buf[2] = 1;
+        buf[3] = 1;
+        *q++ = 0;
+        *q++ = 0x10 | toc->tracks[0].control;
+        *q++ = toc->first;
+        *q++ = 0;
+        q = cd_toc_addr(q, toc->tracks[0].start, msf);
+        break;
+    case 2:
+        for (i = 0; i < toc->nb_tracks; i++) {
+            xa |= toc->tracks[i].mode == CD_TRACK_MODE2;
+        }
+        buf[2] = 1;
+        buf[3] = 1;
+        q = cd_full_toc_entry(q, toc->tracks[0].control, 0xa0,
+                              toc->first, xa ? 0x20 : 0x00, 0);
+        q = cd_full_toc_entry(q, lt->control, 0xa1, last, 0, 0);
+        lba_to_msf(m, toc->leadout);
+        q = cd_full_toc_entry(q, lt->control, 0xa2, m[0], m[1], m[2]);
+        for (i = 0; i < toc->nb_tracks; i++) {
+            lba_to_msf(m, toc->tracks[i].start);
+            q = cd_full_toc_entry(q, toc->tracks[i].control, toc->first + i,
+                                  m[0], m[1], m[2]);
+        }
+        break;
+    default:
+        return -1;
+    }
+    len = q - buf;
+    stw_be_p(buf, len - 2);
+    return len;
+}
+
 static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
 {
     int format, msf, start_track, len;
@@ -1208,6 +1899,18 @@ static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
     format = buf[9] >> 6;
     msf = (buf[1] >> 1) & 1;
     start_track = buf[6];
+
+    if (media_has_toc(s)) {
+        if (buf[2] & 0x0f) {
+            format = buf[2] & 0x0f;
+        }
+        len = cd_read_toc(s, format, msf, start_track, buf);
+        if (len < 0) {
+            goto error_cmd;
+        }
+        ide_atapi_cmd_reply(s, len, max_len);
+        return;
+    }
 
     switch(format) {
     case 0:
@@ -1266,6 +1969,11 @@ static void cmd_read_disc_information(IDEState *s, uint8_t* buf)
     buf[4] = 1;   /* # of sessions */
     buf[5] = 1;   /* first track of last session */
     buf[6] = 1;   /* last track of last session */
+    if (media_has_toc(s)) {
+        buf[3] = s->cd_toc->first;
+        buf[5] = s->cd_toc->first;
+        buf[6] = s->cd_toc->first + s->cd_toc->nb_tracks - 1;
+    }
     buf[7] = 0x20; /* unrestricted use */
     buf[8] = 0x00; /* CD-ROM or DVD-ROM */
     /* 9-10-11: most significant byte corresponding bytes 4-5-6 */
@@ -1331,6 +2039,150 @@ static void cmd_read_dvd_structure(IDEState *s, uint8_t* buf)
     }
 }
 
+static void cmd_read_subchannel(IDEState *s, uint8_t *buf)
+{
+    int max_len = lduw_be_p(buf + 7);
+    bool msf = buf[1] & 2;
+    bool subq = buf[2] & 0x40;
+    int format = buf[3];
+    uint32_t pos = ide_cd_audio_position(s);
+    const CDTrack *t;
+    int num = 1, len = 4;
+
+    if (subq && (format < 1 || format > 3)) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+
+    memset(buf, 0, 24);
+    buf[1] = ide_cd_audio_status(s);
+    if (subq) {
+        buf[4] = format;
+        switch (format) {
+        case 1: /* current position */
+            t = s->cd_toc ? cd_track_at(s, pos, &num) : NULL;
+            buf[5] = 0x10 | (t ? t->control : CD_CTRL_DATA);
+            buf[6] = num;
+            buf[7] = t && pos < t->start ? 0 : 1;
+            cd_toc_addr(buf + 8, pos, msf);
+            if (msf) {
+                uint32_t rel = t ? abs((int32_t)(pos - t->start)) : pos;
+
+                buf[12] = 0;
+                buf[13] = rel / 75 / 60;
+                buf[14] = (rel / 75) % 60;
+                buf[15] = rel % 75;
+            } else {
+                stl_be_p(buf + 12, t ? pos - t->start : pos);
+            }
+            len = 16;
+            break;
+        case 3: /* ISRC */
+            buf[5] = 0x10 | (s->cd_toc && buf[6] ? 0 : CD_CTRL_DATA);
+            /* fall through */
+        case 2: /* media catalog number: none */
+            len = 24;
+            break;
+        }
+        stw_be_p(buf + 2, len - 4);
+    }
+    ide_atapi_cmd_reply(s, len, max_len);
+}
+
+/* Start audio play of [start, end) */
+static void atapi_play(IDEState *s, uint32_t start, uint32_t end)
+{
+    const CDTrack *t;
+    int mode;
+
+    if (end == start) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    if (end < start) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+    if (!media_has_toc(s) || start >= s->cd_toc->leadout) {
+        if (media_has_toc(s)) {
+            ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
+        } else {
+            ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                                ASC_ILLEGAL_MODE_FOR_THIS_TRACK);
+        }
+        return;
+    }
+    if (end > s->cd_toc->leadout) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
+        return;
+    }
+    t = cd_track_at(s, start, NULL);
+    if (s->cd_audio_page[2] & 0x02) { /* SOTC */
+        end = MIN(end, t->end);
+    }
+    if (!cd_range_mode(s, start, end - start, &mode) ||
+        mode != CD_TRACK_AUDIO) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                            ASC_ILLEGAL_MODE_FOR_THIS_TRACK);
+        return;
+    }
+    ide_cd_audio_play(s, start, end);
+    ide_atapi_cmd_ok(s);
+}
+
+static void cmd_play_audio(IDEState *s, uint8_t *buf)
+{
+    uint32_t lba = ldl_be_p(buf + 2);
+    uint32_t len;
+
+    if (buf[0] == GPCMD_PLAY_AUDIO_10) {
+        len = lduw_be_p(buf + 7);
+    } else {
+        len = ldl_be_p(buf + 6);
+    }
+    if (lba == 0xffffffff) {
+        lba = ide_cd_audio_position(s);
+    }
+    if (len == 0) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    atapi_play(s, lba, (uint64_t)lba + len > UINT32_MAX ? UINT32_MAX
+                                                         : lba + len);
+}
+
+static void cmd_play_audio_msf(IDEState *s, uint8_t *buf)
+{
+    int start, end;
+
+    if (buf[3] == 0xff && buf[4] == 0xff && buf[5] == 0xff) {
+        start = ide_cd_audio_position(s);
+    } else {
+        start = msf_to_lba(buf + 3);
+    }
+    end = msf_to_lba(buf + 6);
+    if (start < 0 || end < 0) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+    atapi_play(s, start, end);
+}
+
+static void cmd_pause_resume(IDEState *s, uint8_t *buf)
+{
+    if (!ide_cd_audio_pause(s, !(buf[8] & 1))) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_COMMAND_SEQUENCE_ERROR);
+        return;
+    }
+    ide_atapi_cmd_ok(s);
+}
+
+static void cmd_stop_play_scan(IDEState *s, uint8_t *buf)
+{
+    ide_cd_audio_stop(s);
+    ide_atapi_cmd_ok(s);
+}
+
 static void cmd_set_speed(IDEState *s, uint8_t* buf)
 {
     ide_atapi_cmd_ok(s);
@@ -1374,19 +2226,28 @@ static const struct AtapiCmd {
     [ 0x00 ] = { cmd_test_unit_ready,               CHECK_READY | NONDATA },
     [ 0x03 ] = { cmd_request_sense,                 ALLOW_UA },
     [ 0x12 ] = { cmd_inquiry,                       ALLOW_UA },
+    [ 0x15 ] = { cmd_mode_select_6,                 0 },
     [ 0x1a ] = { cmd_mode_sense_6,                  0 },
     [ 0x1b ] = { cmd_start_stop_unit,               NONDATA }, /* [1] */
     [ 0x1e ] = { cmd_prevent_allow_medium_removal,  NONDATA },
     [ 0x25 ] = { cmd_read_cdvd_capacity,            CHECK_READY },
     [ 0x28 ] = { cmd_read, /* (10) */               CHECK_READY },
     [ 0x2b ] = { cmd_seek,                          CHECK_READY | NONDATA },
+    [ 0x42 ] = { cmd_read_subchannel,               CHECK_READY },
     [ 0x43 ] = { cmd_read_toc_pma_atip,             CHECK_READY },
+    [ 0x45 ] = { cmd_play_audio, /* (10) */         CHECK_READY | NONDATA },
+    [ 0x47 ] = { cmd_play_audio_msf,                CHECK_READY | NONDATA },
+    [ 0x4b ] = { cmd_pause_resume,                  CHECK_READY | NONDATA },
+    [ 0x4e ] = { cmd_stop_play_scan,                CHECK_READY | NONDATA },
     [ 0x46 ] = { cmd_get_configuration,             ALLOW_UA },
     [ 0x4a ] = { cmd_get_event_status_notification, ALLOW_UA },
     [ 0x51 ] = { cmd_read_disc_information,         CHECK_READY },
+    [ 0x55 ] = { cmd_mode_select, /* (10) */        0 },
     [ 0x5a ] = { cmd_mode_sense, /* (10) */         0 },
+    [ 0xa5 ] = { cmd_play_audio, /* (12) */         CHECK_READY | NONDATA },
     [ 0xa8 ] = { cmd_read, /* (12) */               CHECK_READY },
     [ 0xad ] = { cmd_read_dvd_structure,            CHECK_READY },
+    [ 0xb9 ] = { cmd_read_cd_msf,                   CHECK_READY | CONDDATA },
     [ 0xbb ] = { cmd_set_speed,                     NONDATA },
     [ 0xbd ] = { cmd_mechanism_status,              0 },
     [ 0xbe ] = { cmd_read_cd,                       CHECK_READY | CONDDATA },
@@ -1457,6 +2318,7 @@ void ide_atapi_cmd(IDEState *s)
 
     /* Execute the command */
     if (cmd->handler) {
+        s->cd_raw_read = false;
         cmd->handler(s, buf);
         return;
     }
