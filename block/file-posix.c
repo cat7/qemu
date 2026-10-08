@@ -4765,11 +4765,6 @@ static int cdrom_probe_device(const char *filename)
     return prio;
 }
 
-static uint32_t cdrom_msf_to_lba(const uint8_t *msf)
-{
-    return (msf[0] * 60 + msf[1]) * 75 + msf[2] - 150;
-}
-
 /* Build the layout from the full TOC (MMC READ TOC format 2). */
 static int cdrom_read_toc(int fd, CDToc *toc)
 {
@@ -4780,62 +4775,11 @@ static int cdrom_read_toc(int fd, CDToc *toc)
         .bufferLength = sizeof(buf),
         .buffer = buf,
     };
-    uint8_t disc_type = 0;
-    uint32_t leadout = 0;
-    int len, i, first = 0, last = 0;
-    CDTrack tracks[CD_MAX_TRACKS + 1] = { 0 };
-    bool seen[CD_MAX_TRACKS + 1] = { false };
 
     if (ioctl(fd, DKIOCCDREADTOC, &req) < 0) {
         return -errno;
     }
-    len = MIN(lduw_be_p(buf) + 2, req.bufferLength);
-    for (i = 4; i + 11 <= len; i += 11) {
-        const uint8_t *d = buf + i;
-        uint8_t adr = d[1] >> 4, point = d[3];
-
-        if (adr != 1) {
-            continue;
-        }
-        if (point == 0xa0 && d[0] == 1) {
-            disc_type = d[9];
-        } else if (point == 0xa2) {
-            leadout = cdrom_msf_to_lba(d + 8);
-        } else if (point >= 1 && point <= CD_MAX_TRACKS) {
-            tracks[point].control = d[1] & 0x0f;
-            tracks[point].start = cdrom_msf_to_lba(d + 8);
-            seen[point] = true;
-            first = first ? MIN(first, point) : point;
-            last = MAX(last, point);
-        }
-    }
-    if (!first || !leadout) {
-        return -EINVAL;
-    }
-
-    memset(toc, 0, sizeof(*toc));
-    toc->first = first;
-    toc->leadout = leadout;
-    for (i = first; i <= last; i++) {
-        CDTrack *t = &toc->tracks[toc->nb_tracks];
-
-        if (!seen[i]) {
-            return -EINVAL;
-        }
-        *t = tracks[i];
-        t->index0 = toc->nb_tracks ? t->start : 0;
-        if (!(t->control & CD_CTRL_DATA)) {
-            t->mode = CD_TRACK_AUDIO;
-        } else {
-            t->mode = disc_type == 0x20 ? CD_TRACK_MODE2 : CD_TRACK_MODE1;
-        }
-        if (toc->nb_tracks) {
-            toc->tracks[toc->nb_tracks - 1].end = t->start;
-        }
-        toc->nb_tracks++;
-    }
-    toc->tracks[toc->nb_tracks - 1].end = leadout;
-    return 0;
+    return cd_toc_parse_full(buf, req.bufferLength, toc);
 }
 
 static void cdrom_load_toc(BlockDriverState *bs)

@@ -9,6 +9,7 @@ block_ss.add(files(
   'blkverify.c',
   'block-backend.c',
   'block-copy.c',
+  'cdrom.c',
   'commit.c',
   'copy-before-write.c',
   'copy-on-read.c',
