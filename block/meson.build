@@ -14,6 +14,7 @@ block_ss.add(files(
   'copy-on-read.c',
   'create.c',
   'crypto.c',
+  'cue.c',
   'dirty-bitmap.c',
   'filter-compress.c',
   'graph-lock.c',
