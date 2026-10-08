@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
+#include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "block/block-io.h"
 #include "block/block_int.h"
@@ -56,7 +57,7 @@
 #include <IOKit/storage/IOMediaBSDClient.h>
 #include <IOKit/storage/IOMedia.h>
 #include <IOKit/storage/IOCDMedia.h>
-//#include <IOKit/storage/IOCDTypes.h>
+#include <IOKit/storage/IOCDMediaBSDClient.h>
 #include <IOKit/storage/IODVDMedia.h>
 #include <CoreFoundation/CoreFoundation.h>
 #endif
@@ -190,6 +191,12 @@ typedef struct BDRVRawState {
     } stats;
 
     PRManager *pr_mgr;
+
+#if defined(__APPLE__) && defined(__MACH__)
+    /* CD medium: track layout; user data is read per sector type */
+    CDToc *cd_toc;
+    bool cd_cooked;
+#endif
 } BDRVRawState;
 
 typedef struct BDRVRawReopenState {
@@ -4725,6 +4732,392 @@ static BlockDriver bdrv_host_cdrom = {
 };
 #endif /* __FreeBSD__ */
 
+#if defined(__APPLE__) && defined(__MACH__)
+/*
+ * CD media through IOCDMedia: the whole-disc node reads audio sectors only
+ * with DKIOCCDREAD, and a disc with audio tracks has 2352-byte blocks.
+ */
+
+static void cdrom_parse_filename(const char *filename, QDict *options,
+                                 Error **errp)
+{
+    bdrv_parse_filename_strip_prefix(filename, "host_cdrom:", options);
+}
+
+static int cdrom_probe_device(const char *filename)
+{
+    uint16_t speed;
+    int fd, prio = 0;
+
+    if (strstart(filename, "/dev/cdrom", NULL)) {
+        return 100;
+    }
+    if (!strstart(filename, "/dev/disk", NULL) &&
+        !strstart(filename, "/dev/rdisk", NULL)) {
+        return 0;
+    }
+    fd = qemu_open(filename, O_RDONLY | O_NONBLOCK, NULL);
+    if (fd < 0) {
+        return 0;
+    }
+    if (ioctl(fd, DKIOCCDGETSPEED, &speed) == 0) {
+        prio = 100;
+    }
+    qemu_close(fd);
+    return prio;
+}
+
+static uint32_t cdrom_msf_to_lba(const uint8_t *msf)
+{
+    return (msf[0] * 60 + msf[1]) * 75 + msf[2] - 150;
+}
+
+/* Build the layout from the full TOC (MMC READ TOC format 2). */
+static int cdrom_read_toc(int fd, CDToc *toc)
+{
+    uint8_t buf[4 + 128 * 11];
+    dk_cd_read_toc_t req = {
+        .format = kCDTOCFormatTOC,
+        .formatAsTime = 1,
+        .bufferLength = sizeof(buf),
+        .buffer = buf,
+    };
+    uint8_t disc_type = 0;
+    uint32_t leadout = 0;
+    int len, i, first = 0, last = 0;
+    CDTrack tracks[CD_MAX_TRACKS + 1] = { 0 };
+    bool seen[CD_MAX_TRACKS + 1] = { false };
+
+    if (ioctl(fd, DKIOCCDREADTOC, &req) < 0) {
+        return -errno;
+    }
+    len = MIN(lduw_be_p(buf) + 2, req.bufferLength);
+    for (i = 4; i + 11 <= len; i += 11) {
+        const uint8_t *d = buf + i;
+        uint8_t adr = d[1] >> 4, point = d[3];
+
+        if (adr != 1) {
+            continue;
+        }
+        if (point == 0xa0 && d[0] == 1) {
+            disc_type = d[9];
+        } else if (point == 0xa2) {
+            leadout = cdrom_msf_to_lba(d + 8);
+        } else if (point >= 1 && point <= CD_MAX_TRACKS) {
+            tracks[point].control = d[1] & 0x0f;
+            tracks[point].start = cdrom_msf_to_lba(d + 8);
+            seen[point] = true;
+            first = first ? MIN(first, point) : point;
+            last = MAX(last, point);
+        }
+    }
+    if (!first || !leadout) {
+        return -EINVAL;
+    }
+
+    memset(toc, 0, sizeof(*toc));
+    toc->first = first;
+    toc->leadout = leadout;
+    for (i = first; i <= last; i++) {
+        CDTrack *t = &toc->tracks[toc->nb_tracks];
+
+        if (!seen[i]) {
+            return -EINVAL;
+        }
+        *t = tracks[i];
+        t->index0 = toc->nb_tracks ? t->start : 0;
+        if (!(t->control & CD_CTRL_DATA)) {
+            t->mode = CD_TRACK_AUDIO;
+        } else {
+            t->mode = disc_type == 0x20 ? CD_TRACK_MODE2 : CD_TRACK_MODE1;
+        }
+        if (toc->nb_tracks) {
+            toc->tracks[toc->nb_tracks - 1].end = t->start;
+        }
+        toc->nb_tracks++;
+    }
+    toc->tracks[toc->nb_tracks - 1].end = leadout;
+    return 0;
+}
+
+static void cdrom_load_toc(BlockDriverState *bs)
+{
+    BDRVRawState *s = bs->opaque;
+    CDToc toc;
+    uint32_t bsize = 0;
+    int i;
+
+    g_free(s->cd_toc);
+    s->cd_toc = NULL;
+    s->cd_cooked = false;
+    if (s->fd < 0 || cdrom_read_toc(s->fd, &toc) < 0) {
+        return;
+    }
+    s->cd_toc = g_memdup2(&toc, sizeof(toc));
+    ioctl(s->fd, DKIOCGETBLOCKSIZE, &bsize);
+    s->cd_cooked = bsize != CD_DATA_SECTOR_SIZE;
+    for (i = 0; i < toc.nb_tracks; i++) {
+        s->cd_cooked |= toc.tracks[i].mode == CD_TRACK_AUDIO;
+    }
+}
+
+static int cdrom_open(BlockDriverState *bs, QDict *options, int flags,
+                      Error **errp)
+{
+    BDRVRawState *s = bs->opaque;
+    const char *filename = qdict_get_str(options, "filename");
+    char bsd_path[MAXPATHLEN] = "";
+    int ret;
+
+    if (strcmp(filename, "/dev/cdrom") == 0) {
+        io_iterator_t it = 0;
+        char *type = FindEjectableOpticalMedia(&it);
+        kern_return_t kr = type ? GetBSDPath(it, bsd_path, sizeof(bsd_path),
+                                             flags) : KERN_FAILURE;
+
+        g_free(type);
+        if (it) {
+            IOObjectRelease(it);
+        }
+        if (kr != KERN_SUCCESS || !bsd_path[0]) {
+            error_setg(errp, "No disc found in an optical drive");
+            return -ENOMEDIUM;
+        }
+        qdict_put_str(options, "filename", bsd_path);
+    }
+
+    ret = hdev_open(bs, options, flags, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    s->type = FTYPE_CD;
+    s->force_alignment = true;
+    cdrom_load_toc(bs);
+    return 0;
+}
+
+static void cdrom_close(BlockDriverState *bs)
+{
+    BDRVRawState *s = bs->opaque;
+
+    g_free(s->cd_toc);
+    s->cd_toc = NULL;
+    raw_close(bs);
+}
+
+static void cdrom_refresh_limits(BlockDriverState *bs, Error **errp)
+{
+    BDRVRawState *s = bs->opaque;
+
+    bs->bl.has_variable_length = true;
+    if (s->cd_cooked) {
+        s->needs_alignment = false;
+        s->buf_align = 1;
+        bs->bl.request_alignment = CD_DATA_SECTOR_SIZE;
+        bs->bl.min_mem_alignment = 1;
+        bs->bl.opt_mem_alignment = qemu_real_host_page_size();
+        return;
+    }
+    raw_refresh_limits(bs, errp);
+}
+
+typedef struct CDReadData {
+    int fd;
+    dk_cd_read_t req;
+} CDReadData;
+
+static int handle_cd_read(void *opaque)
+{
+    CDReadData *d = opaque;
+    uint32_t len = d->req.bufferLength;
+
+    if (ioctl(d->fd, DKIOCCDREAD, &d->req) < 0) {
+        return -errno;
+    }
+    return d->req.bufferLength == len ? 0 : -EIO;
+}
+
+/*
+ * Read @n sectors of track mode @mode from @lba: user data (@user) or the
+ * whole 2352-byte sector.
+ */
+static int coroutine_fn cdrom_read_sectors(BlockDriverState *bs, uint32_t lba,
+                                           uint32_t n, int mode, bool user,
+                                           uint8_t *buf)
+{
+    BDRVRawState *s = bs->opaque;
+    CDReadData d = { .fd = s->fd };
+    uint32_t size;
+
+    if (mode == CD_TRACK_AUDIO) {
+        d.req.sectorArea = kCDSectorAreaUser;
+        d.req.sectorType = kCDSectorTypeCDDA;
+        size = CD_RAW_SECTOR_SIZE;
+    } else if (user) {
+        d.req.sectorArea = kCDSectorAreaUser;
+        d.req.sectorType = mode == CD_TRACK_MODE1 ? kCDSectorTypeMode1
+                                                  : kCDSectorTypeMode2Form1;
+        size = CD_DATA_SECTOR_SIZE;
+    } else {
+        d.req.sectorArea = kCDSectorAreaSync | kCDSectorAreaHeader |
+                           kCDSectorAreaSubHeader | kCDSectorAreaUser |
+                           kCDSectorAreaAuxiliary;
+        d.req.sectorType = mode == CD_TRACK_MODE1 ? kCDSectorTypeMode1
+                                                  : kCDSectorTypeMode2;
+        size = CD_RAW_SECTOR_SIZE;
+    }
+    d.req.offset = (uint64_t)lba * size;
+    d.req.bufferLength = n * size;
+    d.req.buffer = buf;
+    return raw_thread_pool_submit(handle_cd_read, &d);
+}
+
+/* Read [lba, lba + nb) split at track mode changes. */
+static int coroutine_fn cdrom_read_runs(BlockDriverState *bs, uint32_t lba,
+                                        uint32_t nb, bool user,
+                                        QEMUIOVector *qiov)
+{
+    BDRVRawState *s = bs->opaque;
+    uint32_t osize = user ? CD_DATA_SECTOR_SIZE : CD_RAW_SECTOR_SIZE;
+    uint32_t chunk = 32;
+    uint8_t *buf = qemu_try_blockalign(bs, chunk * CD_RAW_SECTOR_SIZE);
+    size_t done = 0;
+    int ret = 0;
+
+    if (!buf) {
+        return -ENOMEM;
+    }
+    while (nb > 0) {
+        int i = cd_toc_find(s->cd_toc, lba);
+        uint32_t n = MIN(nb, chunk);
+
+        if (i < 0) {
+            memset(buf, 0, n * osize);
+        } else {
+            const CDTrack *t = &s->cd_toc->tracks[i];
+
+            n = MIN(n, t->end - lba);
+            if (user && t->mode == CD_TRACK_AUDIO) {
+                memset(buf, 0, n * osize);
+            } else {
+                ret = cdrom_read_sectors(bs, lba, n, t->mode, user, buf);
+                if (ret < 0) {
+                    break;
+                }
+            }
+        }
+        qemu_iovec_from_buf(qiov, done, buf, n * osize);
+        done += n * osize;
+        lba += n;
+        nb -= n;
+    }
+    qemu_vfree(buf);
+    return ret;
+}
+
+static int coroutine_fn cdrom_co_preadv(BlockDriverState *bs, int64_t offset,
+                                        int64_t bytes, QEMUIOVector *qiov,
+                                        BdrvRequestFlags flags)
+{
+    BDRVRawState *s = bs->opaque;
+
+    if (!s->cd_cooked) {
+        return raw_co_preadv(bs, offset, bytes, qiov, flags);
+    }
+    assert(QEMU_IS_ALIGNED(offset | bytes, CD_DATA_SECTOR_SIZE));
+    return cdrom_read_runs(bs, offset / CD_DATA_SECTOR_SIZE,
+                           bytes / CD_DATA_SECTOR_SIZE, true, qiov);
+}
+
+static int coroutine_fn cdrom_co_cd_read_raw(BlockDriverState *bs,
+                                             int64_t lba, int nb_sectors,
+                                             QEMUIOVector *qiov)
+{
+    BDRVRawState *s = bs->opaque;
+
+    if (!s->cd_toc) {
+        return -ENOTSUP;
+    }
+    if (lba + nb_sectors > s->cd_toc->leadout) {
+        return -EINVAL;
+    }
+    return cdrom_read_runs(bs, lba, nb_sectors, false, qiov);
+}
+
+static int cdrom_get_cd_toc(BlockDriverState *bs, CDToc *toc)
+{
+    BDRVRawState *s = bs->opaque;
+
+    if (!s->cd_toc) {
+        return -ENOTSUP;
+    }
+    *toc = *s->cd_toc;
+    return 0;
+}
+
+static int64_t coroutine_fn cdrom_co_getlength(BlockDriverState *bs)
+{
+    BDRVRawState *s = bs->opaque;
+
+    if (s->cd_cooked) {
+        return (int64_t)s->cd_toc->leadout * CD_DATA_SECTOR_SIZE;
+    }
+    return raw_getlength(bs);
+}
+
+static bool coroutine_fn cdrom_co_is_inserted(BlockDriverState *bs)
+{
+    BDRVRawState *s = bs->opaque;
+    uint64_t count = 0;
+
+    return s->fd >= 0 && ioctl(s->fd, DKIOCGETBLOCKCOUNT, &count) == 0 &&
+           count > 0;
+}
+
+static void coroutine_fn cdrom_co_eject(BlockDriverState *bs, bool eject_flag)
+{
+    BDRVRawState *s = bs->opaque;
+
+    if (eject_flag && s->fd >= 0 && ioctl(s->fd, DKIOCEJECT) < 0) {
+        warn_report("host_cdrom: eject failed: %s", strerror(errno));
+    }
+}
+
+static BlockDriver bdrv_host_cdrom = {
+    .format_name            = "host_cdrom",
+    .protocol_name          = "host_cdrom",
+    .instance_size          = sizeof(BDRVRawState),
+    .bdrv_needs_filename    = true,
+    .bdrv_probe_device      = cdrom_probe_device,
+    .bdrv_parse_filename    = cdrom_parse_filename,
+    .bdrv_open              = cdrom_open,
+    .bdrv_close             = cdrom_close,
+    .bdrv_reopen_prepare    = raw_reopen_prepare,
+    .bdrv_reopen_commit     = raw_reopen_commit,
+    .bdrv_reopen_abort      = raw_reopen_abort,
+    .bdrv_co_create_opts    = bdrv_co_create_opts_simple,
+    .create_opts            = &bdrv_create_opts_simple,
+    .mutable_opts           = mutable_opts,
+    .bdrv_co_invalidate_cache = raw_co_invalidate_cache,
+
+    .bdrv_co_preadv         = cdrom_co_preadv,
+    .bdrv_co_pwritev        = raw_co_pwritev,
+    .bdrv_co_flush_to_disk  = raw_co_flush_to_disk,
+    .bdrv_refresh_limits    = cdrom_refresh_limits,
+
+    .bdrv_co_getlength                  = cdrom_co_getlength,
+    .bdrv_co_get_allocated_file_size    = raw_co_get_allocated_file_size,
+
+    /* removable device support */
+    .bdrv_co_is_inserted    = cdrom_co_is_inserted,
+    .bdrv_co_eject          = cdrom_co_eject,
+
+    /* CD media */
+    .bdrv_get_cd_toc        = cdrom_get_cd_toc,
+    .bdrv_co_cd_read_raw    = cdrom_co_cd_read_raw,
+};
+#endif /* __APPLE__ */
+
 #endif /* HAVE_HOST_BLOCK_DEVICE */
 
 static void bdrv_file_init(void)
@@ -4740,6 +5133,9 @@ static void bdrv_file_init(void)
     bdrv_register(&bdrv_host_cdrom);
 #endif
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    bdrv_register(&bdrv_host_cdrom);
+#endif
+#if defined(__APPLE__) && defined(__MACH__)
     bdrv_register(&bdrv_host_cdrom);
 #endif
 #endif /* HAVE_HOST_BLOCK_DEVICE */
