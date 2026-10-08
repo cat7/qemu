@@ -1458,9 +1458,6 @@ static void cmd_mode_sense_6(IDEState *s, uint8_t *buf)
     atapi_mode_sense(s, buf, false);
 }
 
-/* Receive @len bytes of parameter data into io_buffer, then call @end. */
-static void ide_atapi_data_out(IDEState *s, int len, EndTransferFunc *end);
-
 static void atapi_mode_select_end(IDEState *s, bool ten)
 {
     uint8_t *buf = s->io_buffer;
