@@ -569,24 +569,6 @@ static const CueExtent *cue_find(BDRVCueState *s, uint32_t lba)
     return NULL;
 }
 
-static uint8_t to_bcd(int v)
-{
-    return ((v / 10) << 4) | (v % 10);
-}
-
-static void cue_raw_header(uint8_t *buf, uint32_t lba, int mode)
-{
-    uint32_t a = lba + 150;
-
-    buf[0] = 0x00;
-    memset(buf + 1, 0xff, 10);
-    buf[11] = 0x00;
-    buf[12] = to_bcd(a / 75 / 60);
-    buf[13] = to_bcd((a / 75) % 60);
-    buf[14] = to_bcd(a % 75);
-    buf[15] = mode;
-}
-
 /*
  * Read @n sectors of extent @e starting at @lba as raw 2352-byte sectors
  * (@raw) or as 2048-byte user data into @out.
@@ -602,7 +584,7 @@ cue_read_extent(BDRVCueState *s, const CueExtent *e, uint32_t lba, int n,
         memset(out, 0, n * osize);
         if (raw && e->mode != CD_TRACK_AUDIO) {
             for (i = 0; i < n; i++) {
-                cue_raw_header(out + i * osize, lba + i,
+                cd_raw_header(out + i * osize, lba + i,
                                e->mode == CD_TRACK_MODE1 ? 1 : 2);
             }
         }
@@ -636,11 +618,11 @@ cue_read_extent(BDRVCueState *s, const CueExtent *e, uint32_t lba, int n,
                 memcpy(dst, src, CD_RAW_SECTOR_SIZE);
                 break;
             case 2336:
-                cue_raw_header(dst, lba + i, 2);
+                cd_raw_header(dst, lba + i, 2);
                 memcpy(dst + 16, src, 2336);
                 break;
             default:
-                cue_raw_header(dst, lba + i, 1);
+                cd_raw_header(dst, lba + i, 1);
                 memcpy(dst + 16, src, CD_DATA_SECTOR_SIZE);
                 memset(dst + 16 + CD_DATA_SECTOR_SIZE, 0, 288);
                 break;
