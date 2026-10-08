@@ -1801,6 +1801,54 @@ BlockAIOCB *blk_aio_ioctl(BlockBackend *blk, unsigned long int req, void *buf,
     return blk_aio_prwv(blk, req, 0, buf, blk_aio_ioctl_entry, 0, cb, opaque);
 }
 
+int blk_get_cd_toc(BlockBackend *blk, CDToc *toc)
+{
+    GLOBAL_STATE_CODE();
+
+    if (!blk_is_available(blk)) {
+        return -ENOMEDIUM;
+    }
+
+    GRAPH_RDLOCK_GUARD_MAINLOOP();
+    return bdrv_get_cd_toc(blk_bs(blk), toc);
+}
+
+/* To be called between exactly one pair of blk_inc/dec_in_flight() */
+static int coroutine_fn
+blk_co_do_cd_read_raw(BlockBackend *blk, int64_t lba, int nb_sectors,
+                      QEMUIOVector *qiov)
+{
+    IO_CODE();
+
+    blk_wait_while_drained(blk, 0);
+    GRAPH_RDLOCK_GUARD();
+
+    if (!blk_co_is_available(blk)) {
+        return -ENOMEDIUM;
+    }
+    return bdrv_co_cd_read_raw(blk_bs(blk), lba, nb_sectors, qiov);
+}
+
+static void coroutine_fn blk_aio_cd_read_raw_entry(void *opaque)
+{
+    BlkAioEmAIOCB *acb = opaque;
+    BlkRwCo *rwco = &acb->rwco;
+
+    rwco->ret = blk_co_do_cd_read_raw(rwco->blk, rwco->offset,
+                                      acb->bytes / CD_RAW_SECTOR_SIZE,
+                                      rwco->iobuf);
+    blk_aio_complete(acb);
+}
+
+BlockAIOCB *blk_aio_cd_read_raw(BlockBackend *blk, int64_t lba, int nb_sectors,
+                                QEMUIOVector *qiov,
+                                BlockCompletionFunc *cb, void *opaque)
+{
+    IO_CODE();
+    return blk_aio_prwv(blk, lba, (int64_t)nb_sectors * CD_RAW_SECTOR_SIZE,
+                        qiov, blk_aio_cd_read_raw_entry, 0, cb, opaque);
+}
+
 /* To be called between exactly one pair of blk_inc/dec_in_flight() */
 static int coroutine_fn
 blk_co_do_pdiscard(BlockBackend *blk, int64_t offset, int64_t bytes,
