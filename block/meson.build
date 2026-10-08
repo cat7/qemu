@@ -94,6 +94,9 @@ if host_os == 'windows'
   block_ss.add(files('file-win32.c', 'win32-aio.c'))
 else
   block_ss.add(files('file-posix.c'), coref, iokit)
+  if host_os == 'darwin' and iokit.found() and diskarb.found()
+    block_ss.add(files('cdrom-darwin.c'), coref, iokit, diskarb)
+  endif
 endif
 block_ss.add(when: libiscsi, if_true: files('iscsi-opts.c'))
 if host_os == 'linux'
