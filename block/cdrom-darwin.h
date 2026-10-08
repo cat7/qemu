@@ -35,5 +35,7 @@ void host_cd_watch_released(HostCDWatch *w);
 void host_cd_watch_eject(HostCDWatch *w, const char *bsd);
 /* The disc of the drive, as last seen (empty if none). */
 void host_cd_watch_present(HostCDWatch *w, char *bsd, size_t bsd_len);
+/* Unmount the disc present now; returns when done. */
+void host_cd_watch_unmount(HostCDWatch *w);
 
 #endif
