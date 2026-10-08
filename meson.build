@@ -823,6 +823,7 @@ socket = []
 version_res = []
 coref = []
 iokit = []
+diskarb = not_found
 pvg = not_found
 emulator_link_args = []
 midl = not_found
@@ -848,6 +849,8 @@ if host_os == 'windows'
 elif host_os == 'darwin'
   coref = dependency('appleframeworks', modules: 'CoreFoundation')
   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
+  diskarb = dependency('appleframeworks', modules: 'DiskArbitration',
+                       required: false)
   host_dsosuf = '.dylib'
   pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
                    required: get_option('pvg'))
@@ -2567,6 +2570,9 @@ config_host_data.set('QEMU_VERSION_MICRO', meson.project_version().split('.')[2]
 
 config_host_data.set_quoted('CONFIG_HOST_DSOSUF', host_dsosuf)
 config_host_data.set('HAVE_HOST_BLOCK_DEVICE', have_host_block_device)
+config_host_data.set('CONFIG_HOST_CDROM_WATCH',
+                     host_os == 'darwin' and have_host_block_device and
+                     diskarb.found())
 
 have_coroutine_pool = get_option('coroutine_pool')
 if get_option('debug_stack_usage') and have_coroutine_pool
