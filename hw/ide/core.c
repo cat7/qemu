@@ -2486,6 +2486,10 @@ uint32_t ide_data_readw(void *opaque, uint32_t addr)
         }
 
         ret = *p++;
+    } else if (p + 1 == s->data_end) {
+        /* Odd byte count: the last word carries one byte. */
+        ret = cpu_to_le16(*p);
+        p++;
     } else {
         if (p + 2 > s->data_end) {
             return 0;
