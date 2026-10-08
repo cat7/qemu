@@ -709,6 +709,35 @@ BlockAIOCB *ide_buffered_readv(IDEState *s, int64_t sector_num,
     return aioreq;
 }
 
+BlockAIOCB *ide_buffered_cd_read_raw(IDEState *s, int64_t lba,
+                                     QEMUIOVector *iov, int nb_sectors,
+                                     BlockCompletionFunc *cb, void *opaque)
+{
+    BlockAIOCB *aioreq;
+    IDEBufferedRequest *req;
+    int c = 0;
+
+    QLIST_FOREACH(req, &s->buffered_requests, list) {
+        c++;
+    }
+    if (c > MAX_BUFFERED_REQS) {
+        return blk_abort_aio_request(s->blk, cb, opaque, -EIO);
+    }
+
+    req = g_new0(IDEBufferedRequest, 1);
+    req->original_qiov = iov;
+    req->original_cb = cb;
+    req->original_opaque = opaque;
+    qemu_iovec_init_buf(&req->qiov, blk_blockalign(s->blk, iov->size),
+                        iov->size);
+
+    aioreq = blk_aio_cd_read_raw(s->blk, lba, nb_sectors, &req->qiov,
+                                 ide_buffered_readv_cb, req);
+
+    QLIST_INSERT_HEAD(&s->buffered_requests, req, list);
+    return aioreq;
+}
+
 /**
  * Cancel all pending DMA requests.
  * Any buffered DMA requests are instantly canceled,
@@ -1199,6 +1228,7 @@ static void ide_cd_change_cb(void *opaque, bool load, Error **errp)
     s->tray_open = !load;
     blk_get_geometry(s->blk, &nb_sectors);
     s->nb_sectors = nb_sectors;
+    ide_atapi_media_changed(s, load);
 
     /*
      * First indicate to the guest that a CD has been removed.  That's
@@ -1396,6 +1426,9 @@ static void ide_reset(IDEState *s)
     s->atapi_dma = 0;
     s->tray_locked = 0;
     s->tray_open = 0;
+    if (s->drive_kind == IDE_CD) {
+        ide_atapi_reset(s);
+    }
     /* ATA DMA state */
     s->io_buffer_size = 0;
     s->req_nb_sectors = 0;
@@ -2399,7 +2432,9 @@ void ide_ctrl_write(void *opaque, uint32_t addr, uint32_t val)
 static bool ide_is_pio_out(IDEState *s)
 {
     if (s->end_transfer_func == ide_sector_write ||
-        s->end_transfer_func == ide_atapi_cmd) {
+        s->end_transfer_func == ide_atapi_cmd ||
+        s->end_transfer_func == ide_atapi_mode_select6_end ||
+        s->end_transfer_func == ide_atapi_mode_select10_end) {
         return false;
     } else if (s->end_transfer_func == ide_sector_read ||
                s->end_transfer_func == ide_transfer_stop ||
@@ -2642,6 +2677,8 @@ int ide_init_drive(IDEState *s, IDEDevice *dev, IDEDriveKind kind, Error **errp)
     s->smart_selftest_count = 0;
     if (kind == IDE_CD) {
         blk_set_dev_ops(s->blk, &ide_cd_block_ops, s);
+        ide_cd_audio_init(s, dev->audio_be);
+        ide_atapi_media_changed(s, blk_is_inserted(s->blk));
     } else {
         if (!blk_is_inserted(s->blk)) {
             error_setg(errp, "Device needs media, but drive is empty");
@@ -2852,6 +2889,8 @@ static EndTransferFunc* transfer_end_table[] = {
         ide_atapi_cmd_reply_end,
         ide_atapi_cmd,
         ide_dummy_transfer_stop,
+        ide_atapi_mode_select6_end,
+        ide_atapi_mode_select10_end,
 };
 
 static int transfer_end_table_idx(EndTransferFunc *fn)

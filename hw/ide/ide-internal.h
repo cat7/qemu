@@ -296,6 +296,10 @@
 #define ASC_SAVING_PARAMETERS_NOT_SUPPORTED  0x39
 #define ASC_DATA_PHASE_ERROR                 0x4b
 #define ASC_MEDIA_REMOVAL_PREVENTED          0x53
+#define ASC_PARAMETER_LIST_LENGTH_ERROR      0x1a
+#define ASC_INV_FIELD_IN_PARAMETER_LIST      0x26
+#define ASC_COMMAND_SEQUENCE_ERROR           0x2c
+#define ASC_ILLEGAL_MODE_FOR_THIS_TRACK      0x64
 
 #define CFA_NO_ERROR            0x00
 #define CFA_MISC_ERROR          0x09
@@ -442,6 +446,32 @@ void ide_cancel_dma_sync(IDEState *s);
 /* hw/ide/atapi.c */
 void ide_atapi_cmd(IDEState *s);
 void ide_atapi_cmd_reply_end(IDEState *s);
+void ide_atapi_mode_select6_end(IDEState *s);
+void ide_atapi_mode_select10_end(IDEState *s);
+void ide_atapi_media_changed(IDEState *s, bool load);
+/* Most sectors one formatted READ CD read covers */
+#define CD_RAW_MAX_SECTORS 24
+void ide_atapi_reset(IDEState *s);
+BlockAIOCB *ide_atapi_read_formatted(IDEState *s, int lba, int nb_sectors,
+                                     BlockCompletionFunc *cb, void *opaque);
+BlockAIOCB *ide_buffered_cd_read_raw(IDEState *s, int64_t lba,
+                                     QEMUIOVector *iov, int nb_sectors,
+                                     BlockCompletionFunc *cb, void *opaque);
+
+/* CD audio play through the drive's analog output */
+#define CD_AUDIO_STATUS_PLAYING   0x11
+#define CD_AUDIO_STATUS_PAUSED    0x12
+#define CD_AUDIO_STATUS_COMPLETED 0x13
+#define CD_AUDIO_STATUS_ERROR     0x14
+#define CD_AUDIO_STATUS_NONE      0x15
+
+void ide_cd_audio_init(IDEState *s, struct AudioBackend *be);
+void ide_cd_audio_play(IDEState *s, uint32_t start, uint32_t end);
+bool ide_cd_audio_pause(IDEState *s, bool pause);
+void ide_cd_audio_stop(IDEState *s);
+uint32_t ide_cd_audio_position(IDEState *s);
+uint8_t ide_cd_audio_status(IDEState *s);
+bool ide_cd_audio_has_output(IDEState *s);
 
 int ide_handle_rw_error(IDEState *s, int error, int op);
 
