@@ -60,6 +60,9 @@
 #include <IOKit/storage/IOCDMediaBSDClient.h>
 #include <IOKit/storage/IODVDMedia.h>
 #include <CoreFoundation/CoreFoundation.h>
+#ifdef CONFIG_HOST_CDROM_WATCH
+#include "cdrom-darwin.h"
+#endif
 #endif
 
 #ifdef __sun__
@@ -196,6 +199,11 @@ typedef struct BDRVRawState {
     /* CD medium: track layout; user data is read per sector type */
     CDToc *cd_toc;
     bool cd_cooked;
+#ifdef CONFIG_HOST_CDROM_WATCH
+    /* drive mode: the drive, and the disc open in fd */
+    HostCDWatch *cd_watch;
+    char cd_bsd[32];
+#endif
 #endif
 } BDRVRawState;
 
@@ -4803,13 +4811,192 @@ static void cdrom_load_toc(BlockDriverState *bs)
     }
 }
 
+static bool cdrom_tracks_drive(BDRVRawState *s)
+{
+#ifdef CONFIG_HOST_CDROM_WATCH
+    return s->cd_watch;
+#else
+    return false;
+#endif
+}
+
+#ifdef CONFIG_HOST_CDROM_WATCH
+/*
+ * Drive mode: the node follows the discs of one drive. The descriptor is
+ * -1 while there is no disc.
+ */
+static void cdrom_drop_medium(BDRVRawState *s)
+{
+    qemu_close(s->fd);
+    s->fd = -1;
+    s->cd_bsd[0] = '\0';
+    g_free(s->cd_toc);
+    s->cd_toc = NULL;
+    s->cd_cooked = false;
+}
+
+static void cdrom_medium_out(BlockDriverState *bs, bool notify)
+{
+    BDRVRawState *s = bs->opaque;
+
+    if (s->fd < 0) {
+        return;
+    }
+    bdrv_drained_begin(bs);
+    cdrom_drop_medium(s);
+    bdrv_drained_end(bs);
+    if (notify) {
+        GRAPH_RDLOCK_GUARD_MAINLOOP();
+        bdrv_media_changed(bs, false);
+    }
+}
+
+static int cdrom_medium_in(BlockDriverState *bs, const char *bsd,
+                           bool notify, Error **errp)
+{
+    BDRVRawState *s = bs->opaque;
+    g_autofree char *path = NULL;
+    int fd;
+
+    if (s->fd >= 0) {
+        if (!strcmp(s->cd_bsd, bsd)) {
+            return 0;
+        }
+        cdrom_medium_out(bs, notify);
+    }
+    path = g_strdup_printf("%s%s%s", _PATH_DEV,
+                           (bs->open_flags & BDRV_O_NOCACHE) ? "r" : "", bsd);
+    fd = qemu_open(path, s->open_flags, errp);
+    if (fd < 0) {
+        int ret = -errno;
+
+        if (ret == -EACCES) {
+            error_append_hint(errp, "Reading a disc may need root.\n");
+        }
+        return ret;
+    }
+    bdrv_drained_begin(bs);
+    s->fd = fd;
+    pstrcpy(s->cd_bsd, sizeof(s->cd_bsd), bsd);
+    cdrom_load_toc(bs);
+    bdrv_drained_end(bs);
+    if (notify) {
+        GRAPH_RDLOCK_GUARD_MAINLOOP();
+        bdrv_media_changed(bs, true);
+    }
+    return 0;
+}
+
+static void cdrom_watch_event(void *opaque, HostCDEvent ev, const char *bsd)
+{
+    BlockDriverState *bs = opaque;
+    BDRVRawState *s = bs->opaque;
+    Error *err = NULL;
+
+    switch (ev) {
+    case HOST_CD_MEDIUM_IN:
+        if (cdrom_medium_in(bs, bsd, true, &err) < 0) {
+            error_report_err(err);
+        }
+        break;
+    case HOST_CD_MEDIUM_OUT:
+        if (!strcmp(s->cd_bsd, bsd)) {
+            cdrom_medium_out(bs, true);
+        }
+        break;
+    case HOST_CD_EJECT_REQUEST:
+        cdrom_medium_out(bs, true);
+        host_cd_watch_released(s->cd_watch);
+        break;
+    }
+}
+
+static void cdrom_drive_eject(BlockDriverState *bs, bool eject_flag)
+{
+    BDRVRawState *s = bs->opaque;
+    char bsd[sizeof(s->cd_bsd)];
+    Error *err = NULL;
+
+    if (eject_flag) {
+        /* the device already reports an open tray */
+        pstrcpy(bsd, sizeof(bsd), s->cd_bsd);
+        if (s->fd >= 0) {
+            cdrom_drop_medium(s);
+        }
+        if (bsd[0]) {
+            host_cd_watch_eject(s->cd_watch, bsd);
+        }
+        return;
+    }
+    /* a disc the host could not eject is still there */
+    host_cd_watch_present(s->cd_watch, bsd, sizeof(bsd));
+    if (s->fd < 0 && bsd[0] && cdrom_medium_in(bs, bsd, false, &err) < 0) {
+        error_report_err(err);
+    }
+}
+
+static int cdrom_open_drive(BlockDriverState *bs, QDict *options, int flags,
+                            const char *drive, Error **errp)
+{
+    BDRVRawState *s = bs->opaque;
+    char bsd[sizeof(s->cd_bsd)];
+    Error *err = NULL;
+    int ret;
+
+    s->cd_watch = host_cd_watch_new(drive, cdrom_watch_event, bs,
+                                    bsd, sizeof(bsd), errp);
+    if (!s->cd_watch) {
+        return -ENOENT;
+    }
+    /* set up the node on a placeholder; discs come and go below it */
+    qdict_del(options, "drive");
+    qdict_put_str(options, "filename", "/dev/null");
+    qdict_put_str(options, "locking", "off");
+    ret = hdev_open(bs, options, flags, errp);
+    if (ret < 0) {
+        host_cd_watch_free(s->cd_watch);
+        s->cd_watch = NULL;
+        return ret;
+    }
+    qemu_close(s->fd);
+    s->fd = -1;
+    s->type = FTYPE_CD;
+    if (bsd[0] && cdrom_medium_in(bs, bsd, false, &err) < 0) {
+        warn_report_err(err);
+    }
+    return 0;
+}
+#endif /* CONFIG_HOST_CDROM_WATCH */
+
+/*
+ * filename=/dev/diskN reads that disc. drive=<id> or filename=/dev/cdrom
+ * follow the discs of a drive.
+ */
 static int cdrom_open(BlockDriverState *bs, QDict *options, int flags,
                       Error **errp)
 {
     BDRVRawState *s = bs->opaque;
-    const char *filename = qdict_get_str(options, "filename");
+    const char *filename = qdict_get_try_str(options, "filename");
+    const char *drive = qdict_get_try_str(options, "drive");
     char bsd_path[MAXPATHLEN] = "";
     int ret;
+
+#ifdef CONFIG_HOST_CDROM_WATCH
+    if (drive || !g_strcmp0(filename, "/dev/cdrom")) {
+        g_autofree char *id = g_strdup(drive ? drive : "");
+
+        return cdrom_open_drive(bs, options, flags, id, errp);
+    }
+#else
+    if (drive) {
+        error_setg(errp, "host_cdrom: 'drive' is not supported on this host");
+        return -ENOTSUP;
+    }
+#endif
+    if (!filename) {
+        error_setg(errp, "host_cdrom needs 'filename' or 'drive'");
+        return -EINVAL;
+    }
 
     if (strcmp(filename, "/dev/cdrom") == 0) {
         io_iterator_t it = 0;
@@ -4845,6 +5032,20 @@ static void cdrom_close(BlockDriverState *bs)
     g_free(s->cd_toc);
     s->cd_toc = NULL;
     raw_close(bs);
+#ifdef CONFIG_HOST_CDROM_WATCH
+    host_cd_watch_free(s->cd_watch);
+    s->cd_watch = NULL;
+#endif
+}
+
+static int cdrom_reopen_prepare(BDRVReopenState *state,
+                                BlockReopenQueue *queue, Error **errp)
+{
+    if (cdrom_tracks_drive(state->bs->opaque)) {
+        error_setg(errp, "host_cdrom: a drive node cannot be reopened");
+        return -ENOTSUP;
+    }
+    return raw_reopen_prepare(state, queue, errp);
 }
 
 static void cdrom_refresh_limits(BlockDriverState *bs, Error **errp)
@@ -4852,7 +5053,7 @@ static void cdrom_refresh_limits(BlockDriverState *bs, Error **errp)
     BDRVRawState *s = bs->opaque;
 
     bs->bl.has_variable_length = true;
-    if (s->cd_cooked) {
+    if (s->cd_cooked || cdrom_tracks_drive(s)) {
         s->needs_alignment = false;
         s->buf_align = 1;
         bs->bl.request_alignment = CD_DATA_SECTOR_SIZE;
@@ -4963,6 +5164,9 @@ static int coroutine_fn cdrom_co_preadv(BlockDriverState *bs, int64_t offset,
 {
     BDRVRawState *s = bs->opaque;
 
+    if (s->fd < 0) {
+        return -ENOMEDIUM;
+    }
     if (!s->cd_cooked) {
         return raw_co_preadv(bs, offset, bytes, qiov, flags);
     }
@@ -5001,6 +5205,9 @@ static int64_t coroutine_fn cdrom_co_getlength(BlockDriverState *bs)
 {
     BDRVRawState *s = bs->opaque;
 
+    if (s->fd < 0) {
+        return 0;
+    }
     if (s->cd_cooked) {
         return (int64_t)s->cd_toc->leadout * CD_DATA_SECTOR_SIZE;
     }
@@ -5020,21 +5227,38 @@ static void coroutine_fn cdrom_co_eject(BlockDriverState *bs, bool eject_flag)
 {
     BDRVRawState *s = bs->opaque;
 
+#ifdef CONFIG_HOST_CDROM_WATCH
+    if (s->cd_watch) {
+        cdrom_drive_eject(bs, eject_flag);
+        return;
+    }
+#endif
     if (eject_flag && s->fd >= 0 && ioctl(s->fd, DKIOCEJECT) < 0) {
         warn_report("host_cdrom: eject failed: %s", strerror(errno));
     }
+}
+
+static void coroutine_fn cdrom_co_lock_medium(BlockDriverState *bs,
+                                              bool locked)
+{
+#ifdef CONFIG_HOST_CDROM_WATCH
+    BDRVRawState *s = bs->opaque;
+
+    if (s->cd_watch) {
+        host_cd_watch_set_locked(s->cd_watch, locked);
+    }
+#endif
 }
 
 static BlockDriver bdrv_host_cdrom = {
     .format_name            = "host_cdrom",
     .protocol_name          = "host_cdrom",
     .instance_size          = sizeof(BDRVRawState),
-    .bdrv_needs_filename    = true,
     .bdrv_probe_device      = cdrom_probe_device,
     .bdrv_parse_filename    = cdrom_parse_filename,
     .bdrv_open              = cdrom_open,
     .bdrv_close             = cdrom_close,
-    .bdrv_reopen_prepare    = raw_reopen_prepare,
+    .bdrv_reopen_prepare    = cdrom_reopen_prepare,
     .bdrv_reopen_commit     = raw_reopen_commit,
     .bdrv_reopen_abort      = raw_reopen_abort,
     .bdrv_co_create_opts    = bdrv_co_create_opts_simple,
@@ -5053,6 +5277,7 @@ static BlockDriver bdrv_host_cdrom = {
     /* removable device support */
     .bdrv_co_is_inserted    = cdrom_co_is_inserted,
     .bdrv_co_eject          = cdrom_co_eject,
+    .bdrv_co_lock_medium    = cdrom_co_lock_medium,
 
     /* CD media */
     .bdrv_get_cd_toc        = cdrom_get_cd_toc,
