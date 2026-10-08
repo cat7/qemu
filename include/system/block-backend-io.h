@@ -69,6 +69,11 @@ void blk_aio_cancel_async(BlockAIOCB *acb);
 BlockAIOCB *blk_aio_ioctl(BlockBackend *blk, unsigned long int req, void *buf,
                           BlockCompletionFunc *cb, void *opaque);
 
+int blk_get_cd_toc(BlockBackend *blk, CDToc *toc);
+BlockAIOCB *blk_aio_cd_read_raw(BlockBackend *blk, int64_t lba, int nb_sectors,
+                                QEMUIOVector *qiov,
+                                BlockCompletionFunc *cb, void *opaque);
+
 void blk_inc_in_flight(BlockBackend *blk);
 void blk_dec_in_flight(BlockBackend *blk);
 void coroutine_fn blk_co_start_request(BlockBackend *blk);
