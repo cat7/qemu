@@ -3293,6 +3293,55 @@ out:
     return co.ret;
 }
 
+int bdrv_get_cd_toc(BlockDriverState *bs, CDToc *toc)
+{
+    BlockDriver *drv = bs->drv;
+    BlockDriverState *filtered;
+    IO_CODE();
+    assert_bdrv_graph_readable();
+
+    if (!drv) {
+        return -ENOMEDIUM;
+    }
+    if (drv->bdrv_get_cd_toc) {
+        return drv->bdrv_get_cd_toc(bs, toc);
+    }
+    filtered = drv->is_filter ? bdrv_filter_bs(bs) : NULL;
+    if (filtered) {
+        return bdrv_get_cd_toc(filtered, toc);
+    }
+    return -ENOTSUP;
+}
+
+int coroutine_fn bdrv_co_cd_read_raw(BlockDriverState *bs, int64_t lba,
+                                     int nb_sectors, QEMUIOVector *qiov)
+{
+    BlockDriver *drv = bs->drv;
+    BlockDriverState *filtered;
+    int ret;
+    IO_CODE();
+    assert_bdrv_graph_readable();
+
+    if (!drv) {
+        return -ENOMEDIUM;
+    }
+    if (lba < 0 || nb_sectors < 0 ||
+        qiov->size < (size_t)nb_sectors * CD_RAW_SECTOR_SIZE) {
+        return -EINVAL;
+    }
+
+    bdrv_inc_in_flight(bs);
+    if (drv->bdrv_co_cd_read_raw) {
+        ret = drv->bdrv_co_cd_read_raw(bs, lba, nb_sectors, qiov);
+    } else {
+        filtered = drv->is_filter ? bdrv_filter_bs(bs) : NULL;
+        ret = filtered ? bdrv_co_cd_read_raw(filtered, lba, nb_sectors, qiov)
+                       : -ENOTSUP;
+    }
+    bdrv_dec_in_flight(bs);
+    return ret;
+}
+
 int coroutine_fn bdrv_co_zone_report(BlockDriverState *bs, int64_t offset,
                         unsigned int *nr_zones,
                         BlockZoneDescriptor *zones)
