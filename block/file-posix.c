@@ -4961,6 +4961,9 @@ static int cdrom_open_drive(BlockDriverState *bs, QDict *options, int flags,
     qemu_close(s->fd);
     s->fd = -1;
     s->type = FTYPE_CD;
+    if (bsd[0]) {
+        host_cd_watch_unmount(s->cd_watch);
+    }
     if (bsd[0] && cdrom_medium_in(bs, bsd, false, &err) < 0) {
         warn_report_err(err);
     }
