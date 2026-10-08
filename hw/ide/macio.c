@@ -56,6 +56,46 @@ static const int debug_macio = 0;
 
 #define MACIO_PAGE_SIZE 4096
 
+static void pmac_ide_atapi_transfer_cb(void *opaque, int ret);
+
+/* Copy formatted READ CD sectors read into io_buffer to the guest. */
+static void pmac_ide_atapi_raw_cb(void *opaque, int ret)
+{
+    DBDMA_io *io = opaque;
+    MACIOIDEState *m = io->opaque;
+    IDEState *s = ide_bus_active_if(&m->bus);
+    int skip = s->io_buffer_index % s->cd_sector_size;
+    int len;
+
+    s->bus->dma->aiocb = NULL;
+    if (ret < 0) {
+        pmac_ide_atapi_transfer_cb(io, ret);
+        return;
+    }
+
+    len = MIN(MIN(io->len, s->io_buffer_size),
+              s->cd_raw_n * s->cd_sector_size - skip);
+    dma_memory_write(&address_space_memory, io->addr, s->io_buffer + skip,
+                     len, MEMTXATTRS_UNSPECIFIED);
+    io->addr += len;
+    io->len -= len;
+    s->io_buffer_size -= len;
+    s->io_buffer_index += len;
+    pmac_ide_atapi_transfer_cb(io, 0);
+}
+
+static void pmac_ide_atapi_raw(DBDMA_io *io, IDEState *s)
+{
+    int sz = s->cd_sector_size;
+    int skip = s->io_buffer_index % sz;
+    int len = MIN(io->len, s->io_buffer_size);
+    int n = MIN(DIV_ROUND_UP(skip + len, sz), CD_RAW_MAX_SECTORS);
+
+    s->bus->dma->aiocb =
+        ide_atapi_read_formatted(s, s->lba + s->io_buffer_index / sz, n,
+                                 pmac_ide_atapi_raw_cb, io);
+}
+
 static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
 {
     DBDMA_io *io = opaque;
@@ -90,6 +130,26 @@ static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
 
     if (io->len == 0) {
         MACIO_DPRINTF("End of DMA transfer\n");
+        goto done;
+    }
+
+    if (s->cd_raw_read) {
+        pmac_ide_atapi_raw(io, s);
+        return;
+    }
+
+    if (s->lba == -1 && s->atapi_out_end) {
+        /* ATAPI parameter data from RAM */
+        EndTransferFunc *end = s->atapi_out_end;
+
+        s->atapi_out_end = NULL;
+        s->io_buffer_size = MIN(s->io_buffer_size, io->len);
+        dma_memory_read(&address_space_memory, io->addr, s->io_buffer,
+                        s->io_buffer_size, MEMTXATTRS_UNSPECIFIED);
+        s->packet_transfer_size = s->io_buffer_size;
+        io->len = 0;
+        m->dma_active = false;
+        end(s);
         goto done;
     }
 
