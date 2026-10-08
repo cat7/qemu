@@ -104,6 +104,24 @@ struct IDEState {
     int lba;
     int cd_sector_size;
     int atapi_dma; /* true if dma is requested for the packet cmd */
+    /* CD layout of the medium, NULL unless the backend reports one */
+    struct CDToc *cd_toc;
+    /* READ CD of formatted sectors through the raw sector interface */
+    bool cd_raw_read;
+    uint8_t cd_read_type;
+    uint8_t cd_read_fields;
+    uint8_t cd_read_subch;
+    uint8_t *cd_raw_buf;
+    QEMUIOVector cd_raw_qiov;
+    int cd_raw_lba;
+    int cd_raw_n;
+    BlockCompletionFunc *cd_raw_cb;
+    void *cd_raw_opaque;
+    /* data-out phase of MODE SELECT over DMA */
+    EndTransferFunc *atapi_out_end;
+    /* CD audio control mode page 0x0e */
+    uint8_t cd_audio_page[16];
+    struct IDECDAudio *cd_audio;
     BlockAcctCookie acct;
     BlockAIOCB *pio_aiocb;
     QEMUIOVector qiov;
@@ -165,6 +183,7 @@ struct IDEDevice {
      */
     uint16_t rotation_rate;
     bool win2k_install_hack;
+    struct AudioBackend *audio_be;
 };
 
 typedef struct IDEDrive {
