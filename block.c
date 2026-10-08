@@ -3446,6 +3446,24 @@ bdrv_parent_cb_change_media(BlockDriverState *bs, bool load)
     }
 }
 
+/*
+ * A driver's medium appeared (@load) or went away on its own: tell the
+ * devices above @bs, through the primary children of BDS parents.
+ */
+void GRAPH_RDLOCK bdrv_media_changed(BlockDriverState *bs, bool load)
+{
+    BdrvChild *c;
+    GLOBAL_STATE_CODE();
+
+    QLIST_FOREACH(c, &bs->parents, next_parent) {
+        if (c->klass->change_media) {
+            c->klass->change_media(c, load);
+        } else if (c->klass->parent_is_bds && (c->role & BDRV_CHILD_PRIMARY)) {
+            bdrv_media_changed(c->opaque, load);
+        }
+    }
+}
+
 /* Return true if you can reach parent going through child->inherits_from
  * recursively. If parent or child are NULL, return false */
 static bool bdrv_inherits_from_recursive(BlockDriverState *child,

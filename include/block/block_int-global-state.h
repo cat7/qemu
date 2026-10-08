@@ -250,6 +250,7 @@ void bdrv_default_perms(BlockDriverState *bs, BdrvChild *c,
                         uint64_t *nperm, uint64_t *nshared);
 
 void blk_dev_change_media_cb(BlockBackend *blk, bool load, Error **errp);
+void GRAPH_RDLOCK bdrv_media_changed(BlockDriverState *bs, bool load);
 bool blk_dev_has_removable_media(BlockBackend *blk);
 void blk_dev_eject_request(BlockBackend *blk, bool force);
 bool blk_dev_is_medium_locked(BlockBackend *blk);
