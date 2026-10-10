@@ -174,6 +174,48 @@ static uint32_t openpic_cpu_read_internal(void *opaque, hwaddr addr,
                                           int idx);
 static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
                                        uint32_t val, int idx);
+
+static void openpic_set_irq(void *opaque, int n_IRQ, int level);
+
+/*
+ * More than four CPUs on the KeyLargo/K2 MPIC (emulator-only: real Macs
+ * had at most four). The MPIC has four IPI channels, and Apple's
+ * AppleMPIC uses channel n to signal CPU n: with eight CPUs it puts
+ * channels 4-7 where channel 3's registers would continue, on top of
+ * other registers. The writes it makes there can be told from the real
+ * registers' own, so they are taken as channels 4-7:
+ *
+ *   IPI vector/priority 4-7: 0x10E0 SPVE, 0x10F0 TFRR, 0x1100 timer 0
+ *     count, 0x1110 timer 0 base count (no timer is used on a Mac);
+ *   IPI dispatch 4-7 (per CPU): 0x80 CTPR with 0x10 (a priority is
+ *     0-15), 0x90 WHOAMI and 0xA0 IACK (read-only) with anything,
+ *     0xB0 EOI with 0x80 (AppleMPIC's EOI writes 0).
+ */
+static bool openpic_ipi_alias(OpenPICState *opp)
+{
+    return opp->model == OPENPIC_MODEL_KEYLARGO && opp->nb_cpus > 4;
+}
+
+static int openpic_nb_ipi(OpenPICState *opp)
+{
+    return opp->model == OPENPIC_MODEL_KEYLARGO ? KEYLARGO_MAX_IPI
+                                                : OPENPIC_MAX_IPI;
+}
+
+/* the SPVE slot: an IPI vector/priority write sets mask or priority bits */
+static bool openpic_spve_is_ipi4(OpenPICState *opp, uint64_t val)
+{
+    return openpic_ipi_alias(opp) && (val & ~0xFFULL);
+}
+
+static void openpic_ipi_dispatch(OpenPICState *opp, int ch, uint32_t val)
+{
+    /* we use IDE as mask which CPUs to deliver the IPI to still. */
+    opp->src[opp->irq_ipi0 + ch].destmask |= val;
+    openpic_set_irq(opp, opp->irq_ipi0 + ch, 1);
+    openpic_set_irq(opp, opp->irq_ipi0 + ch, 0);
+}
+
 static void openpic_reset(DeviceState *d);
 
 /*
@@ -633,7 +675,11 @@ static void openpic_gbl_write(void *opaque, hwaddr addr, uint64_t val,
         idx = (addr - 0x10A0) >> 4;
         write_IRQreg_ivpr(opp, opp->irq_ipi0 + idx, val);
         break;
-    case 0x10E0: /* SPVE */
+    case 0x10E0: /* SPVE, or IPI 4's vector/priority */
+        if (openpic_spve_is_ipi4(opp, val)) {
+            write_IRQreg_ivpr(opp, opp->irq_ipi0 + 4, val);
+            break;
+        }
         opp->spve = val & opp->vector_mask;
         break;
     default:
@@ -687,8 +733,9 @@ static uint64_t openpic_gbl_read(void *opaque, hwaddr addr, unsigned len)
             retval = read_IRQreg_ivpr(opp, opp->irq_ipi0 + idx);
         }
         break;
-    case 0x10E0: /* SPVE */
-        retval = opp->spve;
+    case 0x10E0: /* SPVE, or IPI 4's vector/priority */
+        retval = openpic_ipi_alias(opp)
+                 ? read_IRQreg_ivpr(opp, opp->irq_ipi0 + 4) : opp->spve;
         break;
     default:
         break;
@@ -781,6 +828,11 @@ static void openpic_tmr_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     }
 
+    if (openpic_ipi_alias(opp) && addr <= 0x20) {
+        /* TFRR, timer 0 count and base count: IPI 5, 6 and 7 */
+        write_IRQreg_ivpr(opp, opp->irq_ipi0 + 5 + (addr >> 4), val);
+        return;
+    }
     if (addr == 0) {
         /* TFRR */
         opp->tfrr = val;
@@ -822,6 +874,11 @@ static uint64_t openpic_tmr_read(void *opaque, hwaddr addr, unsigned len)
 
     DPRINTF("%s: addr %#" HWADDR_PRIx, __func__, addr + 0x10f0);
     if (addr & 0xF) {
+        goto out;
+    }
+    if (openpic_ipi_alias(opp) && addr <= 0x20) {
+        /* TFRR, timer 0 count and base count: IPI 5, 6 and 7 */
+        retval = read_IRQreg_ivpr(opp, opp->irq_ipi0 + 5 + (addr >> 4));
         goto out;
     }
     if (addr == 0) {
@@ -1014,13 +1071,13 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
     case 0x50:
     case 0x60:
     case 0x70:
-        idx = (addr - 0x40) >> 4;
-        /* we use IDE as mask which CPUs to deliver the IPI to still. */
-        opp->src[opp->irq_ipi0 + idx].destmask |= val;
-        openpic_set_irq(opp, opp->irq_ipi0 + idx, 1);
-        openpic_set_irq(opp, opp->irq_ipi0 + idx, 0);
+        openpic_ipi_dispatch(opp, (addr - 0x40) >> 4, val);
         break;
-    case 0x80: /* CTPR */
+    case 0x80: /* CTPR, or IPI 4's dispatch */
+        if (openpic_ipi_alias(opp) && val == 0x10) {
+            openpic_ipi_dispatch(opp, 4, val);
+            break;
+        }
         dst->ctpr = val & 0x0000000F;
 
         DPRINTF("%s: set CPU %d ctpr to %d, raised %d servicing %d",
@@ -1038,13 +1095,21 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
         }
 
         break;
-    case 0x90: /* WHOAMI */
-        /* Read-only register */
+    case 0x90: /* WHOAMI: read-only; written, IPI 5's dispatch */
+        if (openpic_ipi_alias(opp) && val) {
+            openpic_ipi_dispatch(opp, 5, val);
+        }
         break;
-    case 0xA0: /* IACK */
-        /* Read-only register */
+    case 0xA0: /* IACK: read-only; written, IPI 6's dispatch */
+        if (openpic_ipi_alias(opp) && val) {
+            openpic_ipi_dispatch(opp, 6, val);
+        }
         break;
-    case 0xB0: /* EOI */
+    case 0xB0: /* EOI, or IPI 7's dispatch */
+        if (openpic_ipi_alias(opp) && val == 0x80) {
+            openpic_ipi_dispatch(opp, 7, val);
+            break;
+        }
         DPRINTF("EOI");
         s_IRQ = IRQ_get_next(opp, &dst->servicing);
 
@@ -1117,7 +1182,8 @@ static uint32_t openpic_iack(OpenPICState *opp, IRQDest *dst, int cpu)
     }
 
     /* Timers and IPIs support multicast. */
-    if (((irq >= opp->irq_ipi0) && (irq < (opp->irq_ipi0 + OPENPIC_MAX_IPI))) ||
+    if (((irq >= opp->irq_ipi0) &&
+         (irq < (opp->irq_ipi0 + openpic_nb_ipi(opp)))) ||
         ((irq >= opp->irq_tim0) && (irq < (opp->irq_tim0 + OPENPIC_MAX_TMR)))) {
         DPRINTF("irq is IPI or TMR");
         src->destmask &= ~(1 << cpu);

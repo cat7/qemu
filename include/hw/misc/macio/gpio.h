@@ -32,7 +32,9 @@
 
 /* Offset of the first pin register in the mac-io */
 #define MACIO_GPIO_EXTINT_0     0x58
-#define MACIO_GPIO_MAX_CPUS     4
+#define MACIO_GPIO_MAX_CPUS     8
+/* Pin registers from MACIO_GPIO_EXTINT_0 (0x58) through 0x91 */
+#define MACIO_GPIO_NB_REGS      58
 
 #define TYPE_MACIO_GPIO "macio-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOGPIOState, MACIO_GPIO)
@@ -46,7 +48,7 @@ struct MacIOGPIOState {
     qemu_irq gpio_extirqs[10];
     qemu_irq cpu_reset[MACIO_GPIO_MAX_CPUS];  /* asserted = held in reset */
     uint8_t gpio_levels[8];
-    uint8_t gpio_regs[36]; /* XXX Check count */
+    uint8_t gpio_regs[MACIO_GPIO_NB_REGS];
     uint32_t nb_cpus;
     bool k2;
 };

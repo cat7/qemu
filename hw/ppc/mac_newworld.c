@@ -412,6 +412,12 @@ static void ppc_core99_init(MachineState *machine)
         u3_dart_attach(U3_DART(dart), PCI_HOST_BRIDGE(ht_dev)->bus);
     } else {
         machine_arch = ARCH_MAC99;
+        /* KeyLargo has soft-reset lines for four CPUs only */
+        if (machine->smp.cpus > 4) {
+            error_report("mac99 (G4, KeyLargo) supports at most 4 CPUs; "
+                         "more need the G5 (U3/K2) machine");
+            exit(1);
+        }
         /* Use values found on a real PowerMac */
         /* Uninorth AGP bus */
         uninorth_agp_dev = qdev_new(TYPE_UNI_NORTH_AGP_HOST_BRIDGE);

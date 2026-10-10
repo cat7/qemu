@@ -32,9 +32,14 @@ typedef struct IrqLines { qemu_irq irq[OPENPIC_OUTPUT_NB]; } IrqLines;
                              OPENPIC_MAX_TMR)
 
 /* KeyLargo */
-#define KEYLARGO_MAX_CPU  4
+#define KEYLARGO_MAX_CPU  8
 #define KEYLARGO_MAX_EXT  64
-#define KEYLARGO_MAX_IPI  4
+/*
+ * The MPIC has four IPI channels. Apple's AppleMPIC uses channel n to
+ * signal CPU n, so with more than four CPUs it addresses channels 4-7 at
+ * the registers that follow channel 3's (see openpic_ipi_alias()).
+ */
+#define KEYLARGO_MAX_IPI  8
 #define KEYLARGO_MAX_IRQ  (64 + KEYLARGO_MAX_IPI)
 #define KEYLARGO_MAX_TMR  0
 #define KEYLARGO_IPI_IRQ  (KEYLARGO_MAX_EXT) /* First IPI IRQ */
