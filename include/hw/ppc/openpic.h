@@ -35,11 +35,8 @@ typedef struct IrqLines { qemu_irq irq[OPENPIC_OUTPUT_NB]; } IrqLines;
 #define KEYLARGO_MAX_CPU  4
 #define KEYLARGO_MAX_EXT  64
 #define KEYLARGO_MAX_IPI  4
-#define KEYLARGO_MAX_IRQ  (64 + KEYLARGO_MAX_IPI)
 #define KEYLARGO_MAX_TMR  0
 #define KEYLARGO_IPI_IRQ  (KEYLARGO_MAX_EXT) /* First IPI IRQ */
-/* Timers don't exist but this makes the code happy... */
-#define KEYLARGO_TMR_IRQ  (KEYLARGO_IPI_IRQ + KEYLARGO_MAX_IPI)
 
 typedef struct FslMpicInfo {
     int max_ext;
@@ -162,6 +159,8 @@ struct OpenPICState {
     /* Local registers per output pin */
     IRQDest dst[MAX_CPU];
     uint32_t nb_cpus;
+    bool ipi_alias;             /* KeyLargo model: one IPI per CPU */
+    uint32_t nb_ipi;
     /* Timer registers */
     OpenPICTimer timers[OPENPIC_MAX_TMR];
     uint32_t max_tmr;
