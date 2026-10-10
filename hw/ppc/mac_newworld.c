@@ -439,6 +439,8 @@ static void ppc_core99_init(MachineState *machine)
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
+    qdev_prop_set_bit(pic_dev, "ipi-alias",
+                      machine->smp.cpus > KEYLARGO_MAX_CPU);
     qdev_prop_set_uint32(DEVICE(object_resolve_path_component(macio, "gpio")),
                          "nb-cpus", machine->smp.cpus);
 
@@ -689,8 +691,15 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
     mc->desc = "Mac99 based PowerMac";
     mc->init = ppc_core99_init;
     mc->block_default_type = IF_IDE;
-    /* SMP supported via KeyLargo GPIO-based secondary CPU reset control */
+    /*
+     * The MPIC's FRR NCPU field and AppleMPIC's 32-bit CPU masks limit
+     * the G4 to 32 CPUs; the ppc64 build stays at four.
+     */
+#ifdef TARGET_PPC64
     mc->max_cpus = KEYLARGO_MAX_CPU;
+#else
+    mc->max_cpus = MAX_CPU;
+#endif
     mc->default_boot_order = "cd";
     mc->default_display = "std";
     mc->default_nic = "sungem";

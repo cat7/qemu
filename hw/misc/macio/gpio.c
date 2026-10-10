@@ -40,10 +40,19 @@ enum MacioGPIORegisterBits {
     OUT_ENABLE = 4,
 };
 
-/* Soft-reset registers of CPU0-3 */
-static const uint8_t keylargo_cpu_reset[MACIO_GPIO_MAX_CPUS] = {
-    0x5b, 0x5c, 0x67, 0x68
-};
+/*
+ * Soft-reset register of CPU n. KeyLargo's pins end at 0x7b; CPU4 and up
+ * take one register each from 0x89, past them, the offsets the G5's K2
+ * uses for its CPU4 and up. The guest finds them through the cpu nodes'
+ * soft-reset.
+ */
+static uint8_t macio_gpio_cpu_reset(int n)
+{
+    static const uint8_t keylargo_cpu_reset[] = { 0x5b, 0x5c, 0x67, 0x68 };
+
+    return n < ARRAY_SIZE(keylargo_cpu_reset) ? keylargo_cpu_reset[n]
+                                              : 0x85 + n;
+}
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 {
@@ -117,7 +126,7 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
     }
 
     addr -= 8;
-    if (addr < 36) {
+    if (addr < MACIO_GPIO_NB_REGS) {
         value &= ~IN_DATA;
 
         if (value & OUT_ENABLE) {
@@ -133,7 +142,7 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
          * reset. Pins of absent CPUs carry other functions.
          */
         for (n = 1; n < MIN(s->nb_cpus, MACIO_GPIO_MAX_CPUS); n++) {
-            if (addr == keylargo_cpu_reset[n] - MACIO_GPIO_EXTINT_0) {
+            if (addr == macio_gpio_cpu_reset(n) - MACIO_GPIO_EXTINT_0) {
                 qemu_set_irq(s->cpu_reset[n], (value & OUT_ENABLE) &&
                                               !(value & OUT_DATA));
             }
@@ -152,7 +161,7 @@ static uint64_t macio_gpio_read(void *opaque, hwaddr addr, unsigned size)
     } else {
         addr -= 8;
 
-        if (addr < 36) {
+        if (addr < MACIO_GPIO_NB_REGS) {
             val = s->gpio_regs[addr];
         }
     }
@@ -184,7 +193,7 @@ static void macio_gpio_init(Object *obj)
                              MACIO_GPIO_MAX_CPUS);
 
     memory_region_init_io(&s->gpiomem, OBJECT(s), &macio_gpio_ops, obj,
-                          "gpio", 0x30);
+                          "gpio", 8 + MACIO_GPIO_NB_REGS);
     sysbus_init_mmio(sbd, &s->gpiomem);
 }
 
@@ -194,11 +203,11 @@ static const Property macio_gpio_properties[] = {
 
 static const VMStateDescription vmstate_macio_gpio = {
     .name = "macio_gpio",
-    .version_id = 0,
-    .minimum_version_id = 0,
+    .version_id = 1,
+    .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(gpio_levels, MacIOGPIOState, 8),
-        VMSTATE_UINT8_ARRAY(gpio_regs, MacIOGPIOState, 36),
+        VMSTATE_UINT8_ARRAY(gpio_regs, MacIOGPIOState, MACIO_GPIO_NB_REGS),
         VMSTATE_END_OF_LIST()
     }
 };
