@@ -32,9 +32,9 @@
 
 /* Offset of the first pin register in the mac-io */
 #define MACIO_GPIO_EXTINT_0     0x58
-#define MACIO_GPIO_MAX_CPUS     8
-/* Pin registers from MACIO_GPIO_EXTINT_0 (0x58) through 0x91 */
-#define MACIO_GPIO_NB_REGS      58
+#define MACIO_GPIO_MAX_CPUS     32
+/* Pin registers from MACIO_GPIO_EXTINT_0 (0x58) through 0xa4 */
+#define MACIO_GPIO_NB_REGS      77
 
 #define TYPE_MACIO_GPIO "macio-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOGPIOState, MACIO_GPIO)

@@ -76,7 +76,7 @@ static int get_current_cpu(void);
 #define OPENPIC_SRC_REG_START        0x10000
 #define OPENPIC_SRC_REG_SIZE         (OPENPIC_MAX_SRC * 0x20)
 #define OPENPIC_CPU_REG_START        0x20000
-#define OPENPIC_CPU_REG_SIZE         0x100 + ((MAX_CPU - 1) * 0x1000)
+#define OPENPIC_CPU_REG_SIZE         (MAX_CPU * 0x1000)
 
 static FslMpicInfo fsl_mpic_20 = {
     .max_ext = 12,
@@ -178,34 +178,43 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
 static void openpic_set_irq(void *opaque, int n_IRQ, int level);
 
 /*
- * More than four CPUs on the KeyLargo/K2 MPIC (emulator-only: real Macs
- * had at most four). The MPIC has four IPI channels, and Apple's
- * AppleMPIC uses channel n to signal CPU n: with eight CPUs it puts
- * channels 4-7 where channel 3's registers would continue, on top of
- * other registers. The writes it makes there can be told from the real
- * registers' own, so they are taken as channels 4-7:
+ * KeyLargo/K2 MPIC with an IPI channel per CPU ("ipi-alias"), for more
+ * than four CPUs. Apple's AppleMPIC signals CPU n on channel n and places
+ * channel n's registers past channel 3's, with nothing but the value to
+ * tell them from the registers already there:
  *
- *   IPI vector/priority 4-7: 0x10E0 SPVE, 0x10F0 TFRR, 0x1100 timer 0
- *     count, 0x1110 timer 0 base count (no timer is used on a Mac);
- *   IPI dispatch 4-7 (per CPU): 0x80 CTPR with 0x10 (a priority is
- *     0-15), 0x90 WHOAMI and 0xA0 IACK (read-only) with anything,
- *     0xB0 EOI with 0x80 (AppleMPIC's EOI writes 0).
+ *   vector/priority  0x10A0 + 0x10 * n: 4 is SPVE, 5 TFRR, 6 and up the
+ *                    timers, which this MPIC does not have. SPVE is only
+ *                    written with a vector, a channel always with a
+ *                    priority; reads are the channel's.
+ *   dispatch         0x40 + 0x10 * n in the sender's per-CPU block,
+ *                    written with 1 << n: 4-7 are CTPR (a priority is
+ *                    0-15), WHOAMI and IACK (read-only) and EOI (written
+ *                    with 0).
  */
-static bool openpic_ipi_alias(OpenPICState *opp)
+static int openpic_alias_ivpr(OpenPICState *opp, hwaddr addr)
 {
-    return opp->model == OPENPIC_MODEL_KEYLARGO && opp->nb_cpus > 4;
+    int n;
+
+    if (!opp->ipi_alias || addr < 0x10E0 || (addr & 0xF)) {
+        return -1;
+    }
+    n = (addr - 0x10A0) >> 4;
+    return n < opp->nb_ipi ? n : -1;
 }
 
-static int openpic_nb_ipi(OpenPICState *opp)
+static int openpic_alias_ipidr(OpenPICState *opp, hwaddr addr, uint32_t val)
 {
-    return opp->model == OPENPIC_MODEL_KEYLARGO ? KEYLARGO_MAX_IPI
-                                                : OPENPIC_MAX_IPI;
-}
+    int n;
 
-/* the SPVE slot: an IPI vector/priority write sets mask or priority bits */
-static bool openpic_spve_is_ipi4(OpenPICState *opp, uint64_t val)
-{
-    return openpic_ipi_alias(opp) && (val & ~0xFFULL);
+    if (!opp->ipi_alias || addr < 0x80) {
+        return -1;
+    }
+    n = (addr - 0x40) >> 4;
+    if (n >= opp->nb_ipi || (n < 8 && val != 1U << n)) {
+        return -1;
+    }
+    return n;
 }
 
 static void openpic_ipi_dispatch(OpenPICState *opp, int ch, uint32_t val)
@@ -627,7 +636,7 @@ static void openpic_gbl_write(void *opaque, hwaddr addr, uint64_t val,
 {
     OpenPICState *opp = opaque;
     IRQDest *dst;
-    int idx;
+    int idx, n_IPI;
 
     DPRINTF("%s: addr %#" HWADDR_PRIx " <= %08" PRIx64,
             __func__, addr, val);
@@ -675,9 +684,10 @@ static void openpic_gbl_write(void *opaque, hwaddr addr, uint64_t val,
         idx = (addr - 0x10A0) >> 4;
         write_IRQreg_ivpr(opp, opp->irq_ipi0 + idx, val);
         break;
-    case 0x10E0: /* SPVE, or IPI 4's vector/priority */
-        if (openpic_spve_is_ipi4(opp, val)) {
-            write_IRQreg_ivpr(opp, opp->irq_ipi0 + 4, val);
+    case 0x10E0: /* SPVE */
+        n_IPI = openpic_alias_ivpr(opp, addr);
+        if (n_IPI >= 0 && (val & ~opp->vector_mask)) {
+            write_IRQreg_ivpr(opp, opp->irq_ipi0 + n_IPI, val);
             break;
         }
         opp->spve = val & opp->vector_mask;
@@ -691,6 +701,7 @@ static uint64_t openpic_gbl_read(void *opaque, hwaddr addr, unsigned len)
 {
     OpenPICState *opp = opaque;
     uint32_t retval;
+    int n_IPI;
 
     DPRINTF("%s: addr %#" HWADDR_PRIx, __func__, addr);
     retval = 0xFFFFFFFF;
@@ -733,9 +744,10 @@ static uint64_t openpic_gbl_read(void *opaque, hwaddr addr, unsigned len)
             retval = read_IRQreg_ivpr(opp, opp->irq_ipi0 + idx);
         }
         break;
-    case 0x10E0: /* SPVE, or IPI 4's vector/priority */
-        retval = openpic_ipi_alias(opp)
-                 ? read_IRQreg_ivpr(opp, opp->irq_ipi0 + 4) : opp->spve;
+    case 0x10E0: /* SPVE */
+        n_IPI = openpic_alias_ivpr(opp, addr);
+        retval = n_IPI >= 0 ? read_IRQreg_ivpr(opp, opp->irq_ipi0 + n_IPI)
+                            : opp->spve;
         break;
     default:
         break;
@@ -820,7 +832,7 @@ static void openpic_tmr_write(void *opaque, hwaddr addr, uint64_t val,
                               unsigned len)
 {
     OpenPICState *opp = opaque;
-    int idx;
+    int idx, n_IPI;
 
     DPRINTF("%s: addr %#" HWADDR_PRIx " <= %08" PRIx64,
             __func__, (addr + 0x10f0), val);
@@ -828,9 +840,9 @@ static void openpic_tmr_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     }
 
-    if (openpic_ipi_alias(opp) && addr <= 0x20) {
-        /* TFRR, timer 0 count and base count: IPI 5, 6 and 7 */
-        write_IRQreg_ivpr(opp, opp->irq_ipi0 + 5 + (addr >> 4), val);
+    n_IPI = openpic_alias_ivpr(opp, addr + OPENPIC_TMR_REG_START);
+    if (n_IPI >= 0) {
+        write_IRQreg_ivpr(opp, opp->irq_ipi0 + n_IPI, val);
         return;
     }
     if (addr == 0) {
@@ -870,15 +882,15 @@ static uint64_t openpic_tmr_read(void *opaque, hwaddr addr, unsigned len)
 {
     OpenPICState *opp = opaque;
     uint32_t retval = -1;
-    int idx;
+    int idx, n_IPI;
 
     DPRINTF("%s: addr %#" HWADDR_PRIx, __func__, addr + 0x10f0);
     if (addr & 0xF) {
         goto out;
     }
-    if (openpic_ipi_alias(opp) && addr <= 0x20) {
-        /* TFRR, timer 0 count and base count: IPI 5, 6 and 7 */
-        retval = read_IRQreg_ivpr(opp, opp->irq_ipi0 + 5 + (addr >> 4));
+    n_IPI = openpic_alias_ivpr(opp, addr + OPENPIC_TMR_REG_START);
+    if (n_IPI >= 0) {
+        retval = read_IRQreg_ivpr(opp, opp->irq_ipi0 + n_IPI);
         goto out;
     }
     if (addr == 0) {
@@ -1066,6 +1078,11 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
     }
     dst = &opp->dst[idx];
     addr &= 0xFF0;
+    n_IRQ = openpic_alias_ipidr(opp, addr, val);
+    if (n_IRQ >= 0) {
+        openpic_ipi_dispatch(opp, n_IRQ, val);
+        return;
+    }
     switch (addr) {
     case 0x40: /* IPIDR */
     case 0x50:
@@ -1073,11 +1090,7 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
     case 0x70:
         openpic_ipi_dispatch(opp, (addr - 0x40) >> 4, val);
         break;
-    case 0x80: /* CTPR, or IPI 4's dispatch */
-        if (openpic_ipi_alias(opp) && val == 0x10) {
-            openpic_ipi_dispatch(opp, 4, val);
-            break;
-        }
+    case 0x80: /* CTPR */
         dst->ctpr = val & 0x0000000F;
 
         DPRINTF("%s: set CPU %d ctpr to %d, raised %d servicing %d",
@@ -1095,21 +1108,13 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
         }
 
         break;
-    case 0x90: /* WHOAMI: read-only; written, IPI 5's dispatch */
-        if (openpic_ipi_alias(opp) && val) {
-            openpic_ipi_dispatch(opp, 5, val);
-        }
+    case 0x90: /* WHOAMI */
+        /* Read-only register */
         break;
-    case 0xA0: /* IACK: read-only; written, IPI 6's dispatch */
-        if (openpic_ipi_alias(opp) && val) {
-            openpic_ipi_dispatch(opp, 6, val);
-        }
+    case 0xA0: /* IACK */
+        /* Read-only register */
         break;
-    case 0xB0: /* EOI, or IPI 7's dispatch */
-        if (openpic_ipi_alias(opp) && val == 0x80) {
-            openpic_ipi_dispatch(opp, 7, val);
-            break;
-        }
+    case 0xB0: /* EOI */
         DPRINTF("EOI");
         s_IRQ = IRQ_get_next(opp, &dst->servicing);
 
@@ -1182,8 +1187,7 @@ static uint32_t openpic_iack(OpenPICState *opp, IRQDest *dst, int cpu)
     }
 
     /* Timers and IPIs support multicast. */
-    if (((irq >= opp->irq_ipi0) &&
-         (irq < (opp->irq_ipi0 + openpic_nb_ipi(opp)))) ||
+    if (((irq >= opp->irq_ipi0) && (irq < (opp->irq_ipi0 + opp->nb_ipi))) ||
         ((irq >= opp->irq_tim0) && (irq < (opp->irq_tim0 + OPENPIC_MAX_TMR)))) {
         DPRINTF("irq is IPI or TMR");
         src->destmask &= ~(1 << cpu);
@@ -1434,6 +1438,7 @@ static void fsl_common_init(OpenPICState *opp)
     opp->idr_reset = 1 << 0;
     opp->max_irq = OPENPIC_MAX_IRQ;
 
+    opp->nb_ipi = OPENPIC_MAX_IPI;
     opp->irq_ipi0 = virq;
     virq += OPENPIC_MAX_IPI;
     opp->irq_tim0 = virq;
@@ -1637,6 +1642,10 @@ static void openpic_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "property 'nb_cpus' can be at most %d", MAX_CPU);
         return;
     }
+    if (opp->ipi_alias && opp->model != OPENPIC_MODEL_KEYLARGO) {
+        error_setg(errp, "property 'ipi-alias' needs the KeyLargo model");
+        return;
+    }
 
     switch (opp->model) {
     case OPENPIC_MODEL_FSL_MPIC_20:
@@ -1674,15 +1683,18 @@ static void openpic_realize(DeviceState *dev, Error **errp)
         opp->tfrr_reset = 4160000;
         opp->ivpr_reset = IVPR_MASK_MASK | IVPR_MODE_MASK;
         opp->idr_reset = 0;
-        opp->max_irq = KEYLARGO_MAX_IRQ;
+        opp->nb_ipi = opp->ipi_alias ? MAX(opp->nb_cpus, KEYLARGO_MAX_IPI)
+                                     : KEYLARGO_MAX_IPI;
+        opp->max_irq = KEYLARGO_MAX_EXT + opp->nb_ipi;
         opp->irq_ipi0 = KEYLARGO_IPI_IRQ;
-        opp->irq_tim0 = KEYLARGO_TMR_IRQ;
+        /* Timers don't exist but this makes the code happy... */
+        opp->irq_tim0 = opp->irq_ipi0 + opp->nb_ipi;
         opp->brr1 = -1;
         opp->mpic_mode_mask = GCR_MODE_MIXED;
 
-        if (opp->nb_cpus > KEYLARGO_MAX_CPU) {
-            error_setg(errp, "KeyLargo OpenPIC supports at most %d CPUs",
-                       KEYLARGO_MAX_CPU);
+        if (!opp->ipi_alias && opp->nb_cpus > KEYLARGO_MAX_CPU) {
+            error_setg(errp, "KeyLargo OpenPIC supports at most %d CPUs "
+                       "without ipi-alias", KEYLARGO_MAX_CPU);
             return;
         }
 
@@ -1710,6 +1722,7 @@ static const Property openpic_properties[] = {
     DEFINE_PROP_UINT32("model", OpenPICState, model, OPENPIC_MODEL_FSL_MPIC_20),
     DEFINE_PROP_UINT32("nb_cpus", OpenPICState, nb_cpus, 1),
     DEFINE_PROP_BOOL("big-endian", OpenPICState, big_endian, false),
+    DEFINE_PROP_BOOL("ipi-alias", OpenPICState, ipi_alias, false),
 };
 
 static void openpic_class_init(ObjectClass *oc, const void *data)

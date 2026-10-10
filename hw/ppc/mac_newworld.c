@@ -413,7 +413,7 @@ static void ppc_core99_init(MachineState *machine)
     } else {
         machine_arch = ARCH_MAC99;
         /* KeyLargo has soft-reset lines for four CPUs only */
-        if (machine->smp.cpus > 4) {
+        if (machine->smp.cpus > KEYLARGO_MAX_CPU) {
             error_report("mac99 (G4, KeyLargo) supports at most 4 CPUs; "
                          "more need the G5 (U3/K2) machine");
             exit(1);
@@ -486,6 +486,8 @@ static void ppc_core99_init(MachineState *machine)
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
+    qdev_prop_set_bit(pic_dev, "ipi-alias", machine_arch == ARCH_MAC99_U3 &&
+                      machine->smp.cpus > KEYLARGO_MAX_CPU);
     dev = DEVICE(object_resolve_path_component(macio, "gpio"));
     qdev_prop_set_uint32(dev, "nb-cpus", machine->smp.cpus);
     qdev_prop_set_bit(dev, "k2", machine_arch == ARCH_MAC99_U3);
@@ -542,7 +544,7 @@ static void ppc_core99_init(MachineState *machine)
     }
     g_free(openpic_irqs);
 
-    /* CPU1-3 soft-reset lines */
+    /* Secondary CPUs' soft-reset lines */
     dev = DEVICE(object_resolve_path_component(macio, "gpio"));
     for (i = 1; i < machine->smp.cpus; i++) {
         cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[i], 0);
@@ -860,7 +862,12 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
     mc->desc = "Mac99 based PowerMac";
     mc->init = ppc_core99_init;
     mc->block_default_type = IF_IDE;
+#ifdef TARGET_PPC64
+    /* The G5 (U3/K2) machine; the G4 (KeyLargo) one stops at four */
+    mc->max_cpus = MAX_CPU;
+#else
     mc->max_cpus = KEYLARGO_MAX_CPU;
+#endif
     mc->default_boot_order = "cd";
     mc->default_display = "std";
     mc->default_nic = "sungem";

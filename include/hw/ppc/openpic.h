@@ -32,19 +32,11 @@ typedef struct IrqLines { qemu_irq irq[OPENPIC_OUTPUT_NB]; } IrqLines;
                              OPENPIC_MAX_TMR)
 
 /* KeyLargo */
-#define KEYLARGO_MAX_CPU  8
+#define KEYLARGO_MAX_CPU  4
 #define KEYLARGO_MAX_EXT  64
-/*
- * The MPIC has four IPI channels. Apple's AppleMPIC uses channel n to
- * signal CPU n, so with more than four CPUs it addresses channels 4-7 at
- * the registers that follow channel 3's (see openpic_ipi_alias()).
- */
-#define KEYLARGO_MAX_IPI  8
-#define KEYLARGO_MAX_IRQ  (64 + KEYLARGO_MAX_IPI)
+#define KEYLARGO_MAX_IPI  4
 #define KEYLARGO_MAX_TMR  0
 #define KEYLARGO_IPI_IRQ  (KEYLARGO_MAX_EXT) /* First IPI IRQ */
-/* Timers don't exist but this makes the code happy... */
-#define KEYLARGO_TMR_IRQ  (KEYLARGO_IPI_IRQ + KEYLARGO_MAX_IPI)
 
 typedef struct FslMpicInfo {
     int max_ext;
@@ -168,6 +160,8 @@ struct OpenPICState {
     IRQDest dst[MAX_CPU];
     uint32_t nb_cpus;
     bool big_endian;            /* KeyLargo model: registers big-endian */
+    bool ipi_alias;             /* KeyLargo model: one IPI per CPU */
+    uint32_t nb_ipi;
     /* Timer registers */
     OpenPICTimer timers[OPENPIC_MAX_TMR];
     uint32_t max_tmr;

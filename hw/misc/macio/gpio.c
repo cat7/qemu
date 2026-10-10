@@ -41,16 +41,20 @@ enum MacioGPIORegisterBits {
 };
 
 /*
- * Soft-reset registers of CPU0-7. KeyLargo has four soft-reset lines.
- * On K2, CPU4-7 use the pins the Quad G5 (PowerMac11,2) uses for its
- * CPU0-3; the guest finds them through the cpu nodes' soft-reset.
+ * Soft-reset register of CPU n, 0 for none. KeyLargo has four soft-reset
+ * lines. On K2, CPU0-3 use 0x71-0x74 and CPU4 and up 0x89 onwards, from
+ * the pins the Quad G5 (PowerMac11,2) uses for its CPU0-3; the guest finds
+ * them through the cpu nodes' soft-reset.
  */
-static const uint8_t keylargo_cpu_reset[MACIO_GPIO_MAX_CPUS] = {
-    0x5b, 0x5c, 0x67, 0x68
-};
-static const uint8_t k2_cpu_reset[MACIO_GPIO_MAX_CPUS] = {
-    0x71, 0x72, 0x73, 0x74, 0x89, 0x8a, 0x8b, 0x8c
-};
+static uint8_t macio_gpio_cpu_reset(MacIOGPIOState *s, int n)
+{
+    static const uint8_t keylargo_cpu_reset[] = { 0x5b, 0x5c, 0x67, 0x68 };
+
+    if (!s->k2) {
+        return n < ARRAY_SIZE(keylargo_cpu_reset) ? keylargo_cpu_reset[n] : 0;
+    }
+    return n < 4 ? 0x71 + n : 0x85 + n;
+}
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 {
@@ -113,7 +117,7 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
                              unsigned size)
 {
     MacIOGPIOState *s = opaque;
-    uint8_t ibit;
+    uint8_t ibit, reset;
     int n;
 
     trace_macio_gpio_write(addr, value);
@@ -140,9 +144,8 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
          * reset. Pins of absent CPUs carry other functions.
          */
         for (n = 1; n < MIN(s->nb_cpus, MACIO_GPIO_MAX_CPUS); n++) {
-            const uint8_t *reset = s->k2 ? k2_cpu_reset : keylargo_cpu_reset;
-
-            if (reset[n] && addr == reset[n] - MACIO_GPIO_EXTINT_0) {
+            reset = macio_gpio_cpu_reset(s, n);
+            if (reset && addr == reset - MACIO_GPIO_EXTINT_0) {
                 qemu_set_irq(s->cpu_reset[n], (value & OUT_ENABLE) &&
                                               !(value & OUT_DATA));
             }
