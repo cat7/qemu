@@ -40,6 +40,11 @@ enum MacioGPIORegisterBits {
     OUT_ENABLE = 4,
 };
 
+/* Soft-reset registers of CPU0-3 */
+static const uint8_t keylargo_cpu_reset[MACIO_GPIO_MAX_CPUS] = {
+    0x5b, 0x5c, 0x67, 0x68
+};
+
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 {
     uint8_t new_reg;
@@ -56,13 +61,7 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
         new_reg |= IN_DATA;
     }
 
-    /*
-     * CPU reset lines (GPIO 3, 4, 15, 16) must always propagate, even if the
-     * register value doesn't change, so that repeated assert/deassert
-     * writes from the guest reliably kick the reset IRQ line.
-     */
-    if (gpio != 3 && gpio != 4 && gpio != 15 && gpio != 16 &&
-        new_reg == s->gpio_regs[gpio]) {
+    if (new_reg == s->gpio_regs[gpio]) {
         return;
     }
 
@@ -77,15 +76,7 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 
     switch (gpio) {
     case 1:
-    case 3:
-    case 4:
-    case 15:
-    case 16:
-        /*
-         * Level low: GPIO 1 is the machine's own reset/interrupt line;
-         * GPIO 3/4/15/16 are the KeyLargo CPU0-3 soft-reset lines used to
-         * hold secondary CPUs in reset and release them for SMP.
-         */
+        /* Level low */
         if (!state) {
             trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
@@ -116,6 +107,7 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
 {
     MacIOGPIOState *s = opaque;
     uint8_t ibit;
+    int n;
 
     trace_macio_gpio_write(addr, value);
 
@@ -134,14 +126,17 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
             ibit = s->gpio_regs[addr] & IN_DATA;
         }
 
-        if (addr == (KL_GPIO_RESET_CPU1 - KEYLARGO_GPIO_EXTINT_0)) {
-            macio_set_gpio(s, 4, !(value & OUT_ENABLE) || (ibit != 0));
-        } else if (addr == (KL_GPIO_RESET_CPU2 - KEYLARGO_GPIO_EXTINT_0)) {
-            macio_set_gpio(s, 15, !(value & OUT_ENABLE) || (ibit != 0));
-        } else if (addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
-            macio_set_gpio(s, 16, !(value & OUT_ENABLE) || (ibit != 0));
-        } else {
-            s->gpio_regs[addr] = value | ibit;
+        s->gpio_regs[addr] = value | ibit;
+
+        /*
+         * A secondary CPU's soft-reset line, driven low to hold it in
+         * reset. Pins of absent CPUs carry other functions.
+         */
+        for (n = 1; n < MIN(s->nb_cpus, MACIO_GPIO_MAX_CPUS); n++) {
+            if (addr == keylargo_cpu_reset[n] - MACIO_GPIO_EXTINT_0) {
+                qemu_set_irq(s->cpu_reset[n], (value & OUT_ENABLE) &&
+                                              !(value & OUT_DATA));
+            }
         }
     }
 }
@@ -182,14 +177,20 @@ static void macio_gpio_init(Object *obj)
     MacIOGPIOState *s = MACIO_GPIO(obj);
     int i;
 
-    for (i = 0; i < KEYLARGO_GPIO_EXTINT_CNT; i++) {
+    for (i = 0; i < ARRAY_SIZE(s->gpio_extirqs); i++) {
         sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
     }
+    qdev_init_gpio_out_named(DEVICE(obj), s->cpu_reset, "cpu-reset",
+                             MACIO_GPIO_MAX_CPUS);
 
     memory_region_init_io(&s->gpiomem, OBJECT(s), &macio_gpio_ops, obj,
                           "gpio", 0x30);
     sysbus_init_mmio(sbd, &s->gpiomem);
 }
+
+static const Property macio_gpio_properties[] = {
+    DEFINE_PROP_UINT32("nb-cpus", MacIOGPIOState, nb_cpus, 1),
+};
 
 static const VMStateDescription vmstate_macio_gpio = {
     .name = "macio_gpio",
@@ -208,14 +209,6 @@ static void macio_gpio_reset(DeviceState *dev)
 
     /* GPIO 1 is up by default */
     macio_set_gpio(s, 1, true);
-
-    /*
-     * GPIO 3 (CPU0 soft-reset) is up by default. GPIO 4/15/16 (CPU1-3
-     * soft-reset) are intentionally left low/asserted here: secondary
-     * CPUs stay held in reset until the guest OS deasserts them to
-     * start each one up (see hw/ppc/mac_newworld.c cpu_kick()).
-     */
-    macio_set_gpio(s, 3, true);
 }
 
 static void macio_gpio_nmi(NMIState *n)
@@ -231,6 +224,7 @@ static void macio_gpio_class_init(ObjectClass *oc, const void *data)
 
     device_class_set_legacy_reset(dc, macio_gpio_reset);
     dc->vmsd = &vmstate_macio_gpio;
+    device_class_set_props(dc, macio_gpio_properties);
     nc->raise_nmi = macio_gpio_nmi;
 }
 

@@ -439,6 +439,8 @@ static void ppc_core99_init(MachineState *machine)
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
+    qdev_prop_set_uint32(DEVICE(object_resolve_path_component(macio, "gpio")),
+                         "nb-cpus", machine->smp.cpus);
 
     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
 
@@ -473,23 +475,11 @@ static void ppc_core99_init(MachineState *machine)
     }
     g_free(openpic_irqs);
 
-    /*
-     * Wire the KeyLargo GPIO soft-reset lines for secondary CPUs (1-3) to
-     * cpu_kick(), so the guest OS can release each one from reset to
-     * start it running (see gpio.c GPIO 4/15/16 handling).
-     */
-    s = SYS_BUS_DEVICE(object_resolve_path_component(macio, "gpio"));
-    if (machine->smp.cpus > 1) {
-        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[1], 0);
-        sysbus_connect_irq(s, 4, cpu_kick_irq);
-    }
-    if (machine->smp.cpus > 2) {
-        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[2], 0);
-        sysbus_connect_irq(s, 15, cpu_kick_irq);
-    }
-    if (machine->smp.cpus > 3) {
-        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[3], 0);
-        sysbus_connect_irq(s, 16, cpu_kick_irq);
+    /* Secondary CPUs' soft-reset lines */
+    dev = DEVICE(object_resolve_path_component(macio, "gpio"));
+    for (i = 1; i < machine->smp.cpus; i++) {
+        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[i], 0);
+        qdev_connect_gpio_out_named(dev, "cpu-reset", i, cpu_kick_irq);
     }
     g_free(cpus);
 
