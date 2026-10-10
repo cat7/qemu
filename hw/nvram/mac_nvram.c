@@ -30,6 +30,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "system/block-backend.h"
+#include "block/block_int.h"
 #include "migration/vmstate.h"
 #include "qemu/cutils.h"
 #include "qemu/module.h"
@@ -398,6 +399,116 @@ static bool prom_env_sets(const char *var)
     return false;
 }
 
+#define PANIC_INFO_VAR "aapl,panic-info="
+
+/*
+ * Undo the IODTNVRAM escaping of a data value: 0xff, then a byte whose
+ * low 7 bits count a run of 0x00 (bit 7 clear) or 0xff (bit 7 set).
+ * Returns the length of the result, at most n.
+ */
+static size_t nvram_unescape_data(uint8_t *out, const uint8_t *in, size_t n)
+{
+    size_t i, o = 0;
+    unsigned int run;
+
+    for (i = 0; i < n; i++) {
+        if (in[i] != 0xff) {
+            out[o++] = in[i];
+            continue;
+        }
+        if (++i == n) {
+            break;
+        }
+        for (run = in[i] & 0x7f; run && o < n; run--) {
+            out[o++] = (in[i] & 0x80) ? 0xff : 0x00;
+        }
+    }
+    return o;
+}
+
+/*
+ * Unpack text stored as 7-bit characters, 8 in 7 bytes, most significant
+ * bit first. Returns a g_malloc'd string.
+ */
+static char *nvram_unpack7(const uint8_t *in, size_t n)
+{
+    size_t chars = n * 8 / 7, i;
+    char *out = g_malloc(chars + 1);
+
+    for (i = 0; i < chars; i++) {
+        size_t bit = i * 7, b = bit >> 3, sh = bit & 7;
+        unsigned int v = in[b] << 8 | (b + 1 < n ? in[b + 1] : 0);
+
+        out[i] = (v >> (9 - sh)) & 0x7f;
+    }
+    out[chars] = 0;
+    return out;
+}
+
+static bool nvram_text_ok(const char *t)
+{
+    size_t i, good = 0;
+
+    for (i = 0; t[i]; i++) {
+        good += (t[i] >= 0x20 && t[i] < 0x7f) || t[i] == '\n' ||
+                t[i] == '\r' || t[i] == '\t';
+    }
+    return i >= 8 && good * 10 >= i * 9;
+}
+
+/*
+ * The panic log of an aapl,panic-info value as text: unescaped, then
+ * unpacked from the 7-bit stream after the best-fitting header length
+ * if that reads as text, else a hex dump of the unescaped bytes.
+ */
+static char *nvram_panic_text(const uint8_t *val, size_t n)
+{
+    g_autofree uint8_t *raw = g_malloc(n + 1);
+    size_t len = nvram_unescape_data(raw, val, n), hdr, i;
+    GString *str;
+
+    for (hdr = 0; hdr <= 16 && hdr < len; hdr += 4) {
+        char *t = nvram_unpack7(raw + hdr, len - hdr);
+
+        if (nvram_text_ok(t)) {
+            return t;
+        }
+        g_free(t);
+    }
+    str = g_string_new(NULL);
+    for (i = 0; i < len; i++) {
+        g_string_append_printf(str, "%02x%c", raw[i],
+                               (i & 15) == 15 || i + 1 == len ? '\n' : ' ');
+    }
+    return g_string_free(str, false);
+}
+
+/* Save the panic log in val next to the NVRAM image; its path, or NULL */
+static char *nvram_save_panic(MacIONVRAMState *nvr, const uint8_t *val,
+                              size_t n)
+{
+    g_autofree char *dir = NULL;
+    g_autofree char *text = NULL;
+    const char *name;
+    char *path;
+
+    if (!nvr->blk || !blk_bs(nvr->blk)) {
+        return NULL;
+    }
+    name = blk_bs(nvr->blk)->filename;
+    if (!name[0] || strstart(name, "json:", NULL)) {
+        return NULL;
+    }
+    dir = g_path_get_dirname(name);
+    path = g_build_filename(dir, "last-panic.txt", NULL);
+    text = nvram_panic_text(val, n);
+    if (!g_file_set_contents(path, text, -1, NULL)) {
+        g_free(path);
+        return NULL;
+    }
+    return path;
+}
+
 /*
  * Set the -prom-env variables in the "common" partition of the live bank
  * of a valid Core99 NVRAM, in place of any of the same name.
@@ -405,9 +516,11 @@ static bool prom_env_sets(const char *var)
 void pmac_nvram_core99_set_prom_env(MacIONVRAMState *nvr)
 {
     g_autofree uint8_t *buf = NULL;
+    g_autofree char *panic_path = NULL;
     uint32_t gen_a, gen_b, off, len, size, pos, p, n;
     uint8_t *bank, *vars;
     unsigned int i;
+    bool drop_panic = false;
 
     if (!nb_prom_envs || !pmac_nvram_core99_valid(nvr)) {
         return;
@@ -426,13 +539,17 @@ void pmac_nvram_core99_set_prom_env(MacIONVRAMState *nvr)
     size = len - sizeof(ChrpNvramPartHdr);
     buf = g_malloc0(size);
 
+retry:
+    memset(buf, 0, size);
     pos = 0;
     for (p = 0; p < size && vars[p]; p += n + 1) {
         n = strnlen((const char *)&vars[p], size - p);
         if (n == size - p) {
             break;
         }
-        if (prom_env_sets((const char *)&vars[p])) {
+        if (prom_env_sets((const char *)&vars[p]) ||
+            (drop_panic && strstart((const char *)&vars[p], PANIC_INFO_VAR,
+                                    NULL))) {
             continue;
         }
         if (pos + n + 1 >= size) {
@@ -451,6 +568,14 @@ void pmac_nvram_core99_set_prom_env(MacIONVRAMState *nvr)
     }
 
     memcpy(vars, buf, size);
+    if (drop_panic) {
+        if (panic_path) {
+            warn_report("NVRAM was full: saved the last panic log to %s",
+                        panic_path);
+        } else {
+            warn_report("NVRAM was full: dropped the last panic log");
+        }
+    }
     stl_be_p(&bank[16], adler32(1, &bank[20], MACIO_NVRAM_SIZE - 20));
     if (nvr->blk && blk_pwrite(nvr->blk, bank - nvr->data, MACIO_NVRAM_SIZE,
                                bank, 0) < 0) {
@@ -459,6 +584,26 @@ void pmac_nvram_core99_set_prom_env(MacIONVRAMState *nvr)
     return;
 
 full:
+    if (!drop_panic) {
+        for (p = 0; p < size && vars[p]; p += n + 1) {
+            n = strnlen((const char *)&vars[p], size - p);
+            if (n == size - p) {
+                break;
+            }
+            if (strstart((const char *)&vars[p], PANIC_INFO_VAR, NULL)) {
+                char *path = nvram_save_panic(nvr,
+                    &vars[p + strlen(PANIC_INFO_VAR)],
+                    n - strlen(PANIC_INFO_VAR));
+
+                if (path || !nvr->blk || !blk_bs(nvr->blk)) {
+                    panic_path = path;
+                    drop_panic = true;
+                    goto retry;
+                }
+                break;
+            }
+        }
+    }
     warn_report("NVRAM has no room for the -prom-env variables");
 }
 
