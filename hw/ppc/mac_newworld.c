@@ -997,6 +997,12 @@ static void core99_nvram_graft(MacIONVRAMState *nvr, bool inject_gmac,
                              is_pm34 ? guid : NULL, l2clock);
 }
 
+/* KeyLargo's timebase enable drives the TBEN pin of every 6xx CPU */
+static void mac99_tb_enable(void *opaque, int n, int level)
+{
+    cpu_ppc_tb_enable_all(level);
+}
+
 /* PowerPC Mac99 hardware initialisation */
 static void ppc_core99_init(MachineState *machine)
 {
@@ -1487,6 +1493,10 @@ static void ppc_core99_init(MachineState *machine)
         cpu_probe_irq = qemu_allocate_irq(cpu_probe_wake, pw, 0);
         sysbus_connect_irq(s, KL_GPIO_CPU_PROBE - KEYLARGO_GPIO_EXTINT_0,
                            cpu_probe_irq);
+    }
+    if (machine->smp.cpus > 1 && PPC_INPUT(env) == PPC_FLAGS_INPUT_6xx) {
+        sysbus_connect_irq(s, KL_GPIO_TB_ENABLE - KEYLARGO_GPIO_EXTINT_0,
+                           qemu_allocate_irq(mac99_tb_enable, NULL, 0));
     }
     g_free(cpus);
 

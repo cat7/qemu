@@ -175,6 +175,16 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
 
             s->gpio_regs[addr] = value | ibit;
             macio_set_gpio(s, gpio, !(value & OUT_ENABLE) || (ibit != 0));
+        } else if (s->nb_cpus > 1 &&
+                   addr == (KL_GPIO_TB_ENABLE - KEYLARGO_GPIO_EXTINT_0)) {
+            /*
+             * Driven low, the timebase enable freezes every CPU's time
+             * base; Mac OS 9 holds it low while it copies CPU0's TB into
+             * CPU1. Undriven it is pulled up.
+             */
+            s->gpio_regs[addr] = value | ibit;
+            qemu_set_irq(s->gpio_extirqs[addr], !(value & OUT_ENABLE) ||
+                                                (value & OUT_DATA));
         } else {
             s->gpio_regs[addr] = value | ibit;
         }
@@ -248,6 +258,9 @@ static void macio_gpio_reset(DeviceState *dev)
 
     /* GPIO 1 is up by default */
     macio_set_gpio(s, 1, true);
+
+    /* A reset while the time bases were frozen releases them */
+    qemu_irq_raise(s->gpio_extirqs[KL_GPIO_TB_ENABLE - KEYLARGO_GPIO_EXTINT_0]);
 
     /*
      * GPIO 3 (CPU0 soft-reset) is up by default. GPIO 4/15/16 (CPU1-3

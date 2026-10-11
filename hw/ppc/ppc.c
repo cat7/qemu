@@ -39,8 +39,8 @@
 #include "migration/vmstate.h"
 #include "trace.h"
 
-static void cpu_ppc_tb_stop (CPUPPCState *env);
-static void cpu_ppc_tb_start (CPUPPCState *env);
+static void cpu_ppc_tb_stop(CPUPPCState *env);
+static void cpu_ppc_tb_start(CPUPPCState *env);
 
 void ppc_set_irq(PowerPCCPU *cpu, int irq, int level)
 {
@@ -789,14 +789,13 @@ void cpu_ppc_store_tbu40(CPUPPCState *env, uint64_t value)
     cpu_ppc_store_tb(tb_env, clock, &tb_env->tb_offset, tb);
 }
 
-static void cpu_ppc_tb_stop (CPUPPCState *env)
+static void cpu_ppc_tb_stop_at(CPUPPCState *env, uint64_t vmclk)
 {
     ppc_tb_t *tb_env = env->tb_env;
-    uint64_t tb, atb, vmclk;
+    uint64_t tb, atb;
 
     /* If the time base is already frozen, do nothing */
     if (tb_env->tb_freq != 0) {
-        vmclk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         /* Get the time base */
         tb = cpu_ppc_get_tb(tb_env, vmclk, tb_env->tb_offset);
         /* Get the alternate time base */
@@ -809,14 +808,13 @@ static void cpu_ppc_tb_stop (CPUPPCState *env)
     }
 }
 
-static void cpu_ppc_tb_start (CPUPPCState *env)
+static void cpu_ppc_tb_start_at(CPUPPCState *env, uint64_t vmclk)
 {
     ppc_tb_t *tb_env = env->tb_env;
-    uint64_t tb, atb, vmclk;
+    uint64_t tb, atb;
 
     /* If the time base is not frozen, do nothing */
     if (tb_env->tb_freq == 0) {
-        vmclk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         /* Get the time base from tb_offset */
         tb = tb_env->tb_offset;
         /* Get the alternate time base from atb_offset */
@@ -827,6 +825,35 @@ static void cpu_ppc_tb_start (CPUPPCState *env)
         cpu_ppc_store_tb(tb_env, vmclk, &tb_env->tb_offset, tb);
         /* Store the alternate time base value */
         cpu_ppc_store_tb(tb_env, vmclk, &tb_env->atb_offset, atb);
+    }
+}
+
+static void cpu_ppc_tb_stop(CPUPPCState *env)
+{
+    cpu_ppc_tb_stop_at(env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+static void cpu_ppc_tb_start(CPUPPCState *env)
+{
+    cpu_ppc_tb_start_at(env, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+/*
+ * Freeze or restart the time base of every CPU at one instant, as a board
+ * line wired to all the TBEN pins does.
+ */
+void cpu_ppc_tb_enable_all(bool enable)
+{
+    uint64_t vmclk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        trace_ppc_irq_set_state("time base", enable);
+        if (enable) {
+            cpu_ppc_tb_start_at(cpu_env(cs), vmclk);
+        } else {
+            cpu_ppc_tb_stop_at(cpu_env(cs), vmclk);
+        }
     }
 }
 

@@ -39,6 +39,8 @@
 #define KL_GPIO_RESET_CPU1             (KEYLARGO_GPIO_EXTINT_0 + 0x04)
 #define KL_GPIO_RESET_CPU2             (KEYLARGO_GPIO_EXTINT_0 + 0x0f)
 #define KL_GPIO_RESET_CPU3             (KEYLARGO_GPIO_EXTINT_0 + 0x10)
+/* Timebase enable, wired to the TBEN pin of every CPU */
+#define KL_GPIO_TB_ENABLE              (KEYLARGO_GPIO_EXTINT_0 + 0x1b)
 
 /*
  * Total gpio_regs[] storage: 18 "extint" pins (0x58-0x69) plus 18 "regular"
