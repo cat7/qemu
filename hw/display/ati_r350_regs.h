@@ -952,6 +952,8 @@
 #define R300_PM4_OPCODE_DRAW_VBUF_2   0x34
 #define R300_PM4_OPCODE_DRAW_IMMD_2   0x35
 #define R300_PM4_OPCODE_DRAW_INDX_2   0x36
+/* INDX_BUFFER writes the fetched indices to this port */
+#define R300_VAP_PORT_IDX0            0x2040
 /* VAP_VF_CNTL.INDEX_SIZE: DRAW_INDX_2 indices are 32 bits, not 16 */
 #define R300_VF_CNTL_INDEX_SIZE_32    (1u << 11)
 /*

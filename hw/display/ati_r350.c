@@ -3344,6 +3344,7 @@ static void ati_r350_pm4_parse(ATIR350State *s,
                 p->p3_opcode != R300_PM4_OPCODE_LOAD_VBPNTR &&
                 p->p3_opcode != R300_PM4_OPCODE_DRAW_IMMD_2 &&
                 p->p3_opcode != R300_PM4_OPCODE_DRAW_INDX_2 &&
+                p->p3_opcode != R300_PM4_OPCODE_INDX_BUFFER &&
                 p->p3_opcode != R300_PM4_OPCODE_DRAW_VBUF_2) {
                 trace_ati_r350_pm4_unimp(p->p3_opcode, p->remaining);
                 ati_r350_note_gap(s, R350_GAP_P3_OPCODE, p->p3_opcode);
@@ -3718,6 +3719,17 @@ static void ati_r350_pm4_parse(ATIR350State *s,
                 p->p3_params[p->p3_param_idx] = val;
                 if (p->p3_param_idx == 2) {
                     ati_r350_r300_clear_zmask(s, p->p3_params[0],
+                                              p->p3_params[1], val);
+                }
+            }
+            p->p3_param_idx++;
+            break;
+        case R300_PM4_OPCODE_INDX_BUFFER:
+            /* port register, card address, dword count */
+            if (p->p3_param_idx < 3) {
+                p->p3_params[p->p3_param_idx] = val;
+                if (p->p3_param_idx == 2) {
+                    ati_r350_r300_indx_buffer(s, p->p3_params[0],
                                               p->p3_params[1], val);
                 }
             }
@@ -4690,6 +4702,7 @@ static void ati_r350_reset_hold(Object *obj, ResetType type)
     /* command-stream framing and the host-data accumulator */
     memset(&s->pm4_fifo, 0, sizeof(s->pm4_fifo));
     memset(&s->pm4_ring, 0, sizeof(s->pm4_ring));
+    s->r300_indx_vf = 0;
     s->pm4_ucode_waddr = 0;
     s->pm4_ucode_raddr = 0;
     s->host_data_active = false;
