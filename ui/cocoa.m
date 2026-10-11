@@ -804,7 +804,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (bool) handleEvent:(NSEvent *)event
 {
-    return bool_with_bql(^{
+    return bool_with_bql(^bool {
+        /* Events keep arriving after cocoa_display_cleanup() freed kbd. */
+        if (!kbd) {
+            return false;
+        }
         return [self handleEventLocked:event];
     });
 }
@@ -1212,7 +1216,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void) raiseAllKeys
 {
     with_bql(^{
-        qkbd_state_lift_all_keys(kbd);
+        if (kbd) {
+            qkbd_state_lift_all_keys(kbd);
+        }
     });
 }
 
