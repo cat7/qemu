@@ -1085,6 +1085,8 @@ struct ATIR350State {
      * is lost, like the 2D host-data accumulator above.
      */
     uint32_t r300_immd[16384];
+    /* VAP_VF_CNTL of a 3D_DRAW_INDX_2 waiting for its INDX_BUFFER */
+    uint32_t r300_indx_vf;
 };
 
 
@@ -1227,6 +1229,8 @@ static inline void ati_r350_gl_dirty(ATIR350State *s, uint32_t off,
 void ati_r350_r300_draw_immd(ATIR350State *s, const uint32_t *dw, unsigned n);
 void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf);
 void ati_r350_r300_draw_indx(ATIR350State *s, const uint32_t *dw, unsigned n);
+void ati_r350_r300_indx_buffer(ATIR350State *s, uint32_t port, uint32_t addr,
+                               uint32_t n);
 void ati_r350_r300_clear_zmask(ATIR350State *s, uint32_t first, uint32_t n,
                                uint32_t val);
 void ati_r350_raster_init(ATIR350State *s);

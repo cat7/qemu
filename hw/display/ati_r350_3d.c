@@ -10237,7 +10237,7 @@ void ati_r350_r300_draw_vbuf(ATIR350State *s, uint32_t vf)
  * 3D_DRAW_INDX_2: VAP_VF_CNTL (PRIM_WALK=1, NUM_VERTICES = the index
  * count) followed by the indices into the arrays bound for DRAW_VBUF_2,
  * two 16-bit indices per dword, low half first, or one per dword with
- * VAP_VF_CNTL.INDEX_SIZE set.
+ * VAP_VF_CNTL.INDEX_SIZE set. Without them an INDX_BUFFER follows.
  */
 void ati_r350_r300_draw_indx(ATIR350State *s, const uint32_t *dw, unsigned n)
 {
@@ -10255,6 +10255,10 @@ void ati_r350_r300_draw_indx(ATIR350State *s, const uint32_t *dw, unsigned n)
         trace_ati_r350_3d_skip(vf, 0, n);
         return;
     }
+    if (n == 1) {
+        s->r300_indx_vf = vf;
+        return;
+    }
     if ((idx32 ? nidx : (nidx + 1) / 2) > n - 1) {
         trace_ati_r350_3d_skip(vf, 0, n);
         return;
@@ -10268,4 +10272,32 @@ void ati_r350_r300_draw_indx(ATIR350State *s, const uint32_t *dw, unsigned n)
     trace_ati_r350_3d_indx(vf, nidx, idx[0], nidx > 1 ? idx[1] : 0,
                            nidx > 2 ? idx[2] : 0, nidx > 3 ? idx[3] : 0);
     r300_draw_aos(s, vf, idx);
+}
+
+/*
+ * INDX_BUFFER: the indices of the preceding 3D_DRAW_INDX_2, `n` dwords
+ * the engine fetches from card address `addr` into VAP_PORT_IDX0.
+ */
+void ati_r350_r300_indx_buffer(ATIR350State *s, uint32_t port, uint32_t addr,
+                               uint32_t n)
+{
+    uint32_t vf = s->r300_indx_vf;
+    g_autofree uint32_t *dw = NULL;
+
+    if (trace_event_get_state_backends(TRACE_ATI_R350_3D_INDX_BUF)) {
+        uint64_t target;
+        const char *win = ati_r350_mc_describe(s, addr, &target);
+
+        trace_ati_r350_3d_indx_buf(port, addr, n, win, target);
+    }
+    s->r300_indx_vf = 0;
+    if ((port & 0xffff) != R300_VAP_PORT_IDX0 >> 2 || !vf || !n ||
+        n > 0x10000) {
+        trace_ati_r350_3d_skip(vf, 0, n);
+        return;
+    }
+    dw = g_new(uint32_t, n + 1);
+    dw[0] = vf;
+    ati_r350_mc_read_block(s, addr, dw + 1, n);
+    ati_r350_r300_draw_indx(s, dw, n + 1);
 }
