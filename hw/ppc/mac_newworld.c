@@ -183,6 +183,12 @@ static void cpu_kick(void *opaque, int n, int level)
     qemu_cpu_kick(cs);
 }
 
+/* KeyLargo's timebase enable drives the TBEN pin of every 6xx CPU */
+static void mac99_tb_enable(void *opaque, int n, int level)
+{
+    cpu_ppc_tb_enable_all(level);
+}
+
 /* PowerPC Mac99 hardware initialisation */
 static void ppc_core99_init(MachineState *machine)
 {
@@ -482,6 +488,11 @@ static void ppc_core99_init(MachineState *machine)
     for (i = 1; i < machine->smp.cpus; i++) {
         cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[i], 0);
         qdev_connect_gpio_out_named(dev, "cpu-reset", i, cpu_kick_irq);
+    }
+    if (PPC_INPUT(env) == PPC_FLAGS_INPUT_6xx) {
+        qdev_connect_gpio_out_named(dev, "tb-enable", 0,
+                                    qemu_allocate_irq(mac99_tb_enable,
+                                                      NULL, 0));
     }
     g_free(cpus);
 

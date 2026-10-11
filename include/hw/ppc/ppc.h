@@ -57,6 +57,7 @@ struct ppc_tb_t {
 uint64_t cpu_ppc_get_tb(ppc_tb_t *tb_env, uint64_t vmclk, int64_t tb_offset);
 void cpu_ppc_tb_init(CPUPPCState *env, uint32_t freq);
 void cpu_ppc_tb_reset(CPUPPCState *env);
+void cpu_ppc_tb_enable_all(bool enable);
 void cpu_ppc_tb_free(CPUPPCState *env);
 void cpu_ppc_hdecr_init(CPUPPCState *env);
 void cpu_ppc_hdecr_exit(CPUPPCState *env);

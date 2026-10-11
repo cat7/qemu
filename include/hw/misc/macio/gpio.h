@@ -33,6 +33,8 @@
 /* Offset of the first pin register in the mac-io */
 #define MACIO_GPIO_EXTINT_0     0x58
 #define MACIO_GPIO_MAX_CPUS     32
+/* Timebase enable, wired to the TBEN pin of every CPU */
+#define MACIO_GPIO_TB_ENABLE    0x73
 /* Pin registers from MACIO_GPIO_EXTINT_0 (0x58) through 0xa4 */
 #define MACIO_GPIO_NB_REGS      77
 
@@ -47,6 +49,7 @@ struct MacIOGPIOState {
     MemoryRegion gpiomem;
     qemu_irq gpio_extirqs[10];
     qemu_irq cpu_reset[MACIO_GPIO_MAX_CPUS];  /* asserted = held in reset */
+    qemu_irq tb_enable;                       /* low = time bases frozen */
     uint8_t gpio_levels[8];
     uint8_t gpio_regs[MACIO_GPIO_NB_REGS];
     uint32_t nb_cpus;
