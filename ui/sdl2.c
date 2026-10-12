@@ -80,6 +80,84 @@ static struct sdl2_console *get_scon_from_window(uint32_t window_id)
     return NULL;
 }
 
+#ifdef SDL_VIDEO_DRIVER_WINDOWS
+/*
+ * For a title-bar drag Windows runs a modal loop from the mouse-down until
+ * the release. It runs inside sdl2_poll_events() with the BQL held and
+ * stalls the whole guest, so move the window here instead.
+ */
+#define SDL2_WNDPROC_PROP "qemu-sdl2-wndproc"
+
+static HWND sdl2_drag_hwnd;
+static POINT sdl2_drag_grab;    /* cursor position within the window */
+
+static LRESULT CALLBACK sdl2_drag_wndproc(HWND hwnd, UINT msg,
+                                          WPARAM wparam, LPARAM lparam)
+{
+    WNDPROC wndproc = (WNDPROC)GetPropA(hwnd, SDL2_WNDPROC_PROP);
+    POINT pt;
+    RECT rect;
+
+    switch (msg) {
+    case WM_NCLBUTTONDOWN:
+        if (wparam == HTCAPTION && !IsZoomed(hwnd)) {
+            GetCursorPos(&pt);
+            GetWindowRect(hwnd, &rect);
+            sdl2_drag_grab.x = pt.x - rect.left;
+            sdl2_drag_grab.y = pt.y - rect.top;
+            sdl2_drag_hwnd = hwnd;
+            SetCapture(hwnd);
+            return 0;
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (sdl2_drag_hwnd == hwnd) {
+            GetCursorPos(&pt);
+            SetWindowPos(hwnd, NULL, pt.x - sdl2_drag_grab.x,
+                         pt.y - sdl2_drag_grab.y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (sdl2_drag_hwnd == hwnd) {
+            ReleaseCapture();
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        if (sdl2_drag_hwnd == hwnd) {
+            sdl2_drag_hwnd = NULL;
+        }
+        break;
+    case WM_NCDESTROY:
+        SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)wndproc);
+        RemovePropA(hwnd, SDL2_WNDPROC_PROP);
+        if (sdl2_drag_hwnd == hwnd) {
+            sdl2_drag_hwnd = NULL;
+        }
+        break;
+    }
+    return CallWindowProc(wndproc, hwnd, msg, wparam, lparam);
+}
+
+static void sdl2_drag_install(SDL_Window *window)
+{
+    SDL_SysWMinfo info;
+    HWND hwnd;
+
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(window, &info) ||
+        info.subsystem != SDL_SYSWM_WINDOWS) {
+        return;
+    }
+    hwnd = info.info.win.window;
+    SetPropA(hwnd, SDL2_WNDPROC_PROP,
+             (HANDLE)GetWindowLongPtr(hwnd, GWLP_WNDPROC));
+    SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)sdl2_drag_wndproc);
+}
+#endif
+
 void sdl2_window_create(struct sdl2_console *scon)
 {
     int flags = 0;
@@ -108,6 +186,9 @@ void sdl2_window_create(struct sdl2_console *scon)
                                          surface_width(scon->surface),
                                          surface_height(scon->surface),
                                          flags);
+#ifdef SDL_VIDEO_DRIVER_WINDOWS
+    sdl2_drag_install(scon->real_window);
+#endif
     if (scon->opengl) {
         const char *driver = "opengl";
 
