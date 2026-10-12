@@ -975,13 +975,36 @@ static int cdrom_probe_device(const char *filename)
     return letter && cdrom_letter_is_cd(letter) ? 100 : 0;
 }
 
+/*
+ * Whether a disc is in the drive. The drive itself may be absent (unplugged,
+ * or handed to a usb-host device); then wait for its letter to come back.
+ */
 static bool cdrom_check(BDRVRawState *s, ULONG *changes)
 {
     DWORD n = 0;
 
     *changes = 0;
-    return DeviceIoControl(s->cd_poll, IOCTL_STORAGE_CHECK_VERIFY2, NULL, 0,
-                           changes, sizeof(*changes), &n, NULL);
+    if (s->cd_poll == INVALID_HANDLE_VALUE) {
+        if (!cdrom_letter_is_cd(s->drive_path[0])) {
+            return false;
+        }
+        s->cd_poll = CreateFile(s->cd_path, FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING, 0, NULL);
+        if (s->cd_poll == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+    }
+    if (DeviceIoControl(s->cd_poll, IOCTL_STORAGE_CHECK_VERIFY2, NULL, 0,
+                        changes, sizeof(*changes), &n, NULL)) {
+        return true;
+    }
+    if (GetLastError() != ERROR_NOT_READY) {
+        /* The drive went away; this handle never sees it again. */
+        CloseHandle(s->cd_poll);
+        s->cd_poll = INVALID_HANDLE_VALUE;
+    }
+    return false;
 }
 
 static void cdrom_load_toc(BDRVRawState *s)
@@ -1095,9 +1118,19 @@ static int cdrom_open(BlockDriverState *bs, QDict *options, int flags,
         return -EINVAL;
     }
     letter = cdrom_drive_letter(name);
-    if (!letter || !cdrom_letter_is_cd(letter)) {
+    if (!letter) {
         error_setg(errp, "host_cdrom: '%s' is not a CD drive", name);
         return -ENOENT;
+    }
+    if (!cdrom_letter_is_cd(letter)) {
+        char root[4] = { letter, ':', '\\', '\0' };
+
+        if (GetDriveType(root) != DRIVE_NO_ROOT_DIR) {
+            error_setg(errp, "host_cdrom: '%s' is not a CD drive", name);
+            return -ENOENT;
+        }
+        warn_report("host_cdrom: no drive %c: yet, the tray stays empty "
+                    "until it appears", letter);
     }
     qdict_del(options, "drive");
 
@@ -1118,14 +1151,7 @@ static int cdrom_open(BlockDriverState *bs, QDict *options, int flags,
     s->hfile = INVALID_HANDLE_VALUE;
     snprintf(s->drive_path, sizeof(s->drive_path), "%c:\\", letter);
     snprintf(s->cd_path, sizeof(s->cd_path), "\\\\.\\%c:", letter);
-    s->cd_poll = CreateFile(s->cd_path, FILE_READ_ATTRIBUTES,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                            OPEN_EXISTING, 0, NULL);
-    if (s->cd_poll == INVALID_HANDLE_VALUE) {
-        error_setg_win32(errp, GetLastError(), "Could not open %s",
-                         s->cd_path);
-        return -EIO;
-    }
+    s->cd_poll = INVALID_HANDLE_VALUE;
     s->cd_present = cdrom_check(s, &changes);
     s->cd_changes = changes;
     cdrom_set_medium(s, s->cd_present);
@@ -1142,8 +1168,10 @@ static void cdrom_close(BlockDriverState *bs)
     timer_free(s->cd_timer);
     s->cd_timer = NULL;
     cdrom_set_medium(s, false);
-    CloseHandle(s->cd_poll);
-    s->cd_poll = INVALID_HANDLE_VALUE;
+    if (s->cd_poll != INVALID_HANDLE_VALUE) {
+        CloseHandle(s->cd_poll);
+        s->cd_poll = INVALID_HANDLE_VALUE;
+    }
 }
 
 static void cdrom_refresh_limits(BlockDriverState *bs, Error **errp)
