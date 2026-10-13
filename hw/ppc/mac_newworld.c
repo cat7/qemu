@@ -483,16 +483,18 @@ static void ppc_core99_init(MachineState *machine)
     }
     g_free(openpic_irqs);
 
-    /* Secondary CPUs' soft-reset lines */
-    dev = DEVICE(object_resolve_path_component(macio, "gpio"));
-    for (i = 1; i < machine->smp.cpus; i++) {
-        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[i], 0);
-        qdev_connect_gpio_out_named(dev, "cpu-reset", i, cpu_kick_irq);
-    }
-    if (PPC_INPUT(env) == PPC_FLAGS_INPUT_6xx) {
-        qdev_connect_gpio_out_named(dev, "tb-enable", 0,
-                                    qemu_allocate_irq(mac99_tb_enable,
-                                                      NULL, 0));
+    /* Secondary CPUs' soft-reset lines; the GPIO block exists with a PMU */
+    if (has_pmu) {
+        dev = DEVICE(object_resolve_path_component(macio, "gpio"));
+        for (i = 1; i < machine->smp.cpus; i++) {
+            cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[i], 0);
+            qdev_connect_gpio_out_named(dev, "cpu-reset", i, cpu_kick_irq);
+        }
+        if (PPC_INPUT(env) == PPC_FLAGS_INPUT_6xx) {
+            qdev_connect_gpio_out_named(dev, "tb-enable", 0,
+                                        qemu_allocate_irq(mac99_tb_enable,
+                                                          NULL, 0));
+        }
     }
     g_free(cpus);
 
