@@ -332,7 +332,19 @@ target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
 {
 #if defined(TARGET_PPC64)
     if (mmu_is_64bit(env->mmu_model)) {
-        /* XXX */
+        PowerPCCPU *cpu = env_archcpu(env);
+        uint64_t esid = ((uint64_t)(sr_num & 0xf) << 28) | SLB_ESID_V;
+        int n;
+
+        /* The SLB entry for that segment, in the format helper_store_sr takes */
+        for (n = 0; n < cpu->hash64_opts->slb_size; n++) {
+            ppc_slb_t *slb = &env->slb[n];
+
+            if (slb->esid == esid) {
+                return ((slb->vsid >> SLB_VSID_SHIFT) & 0xfffffff) |
+                       (((slb->vsid >> 8) & 0xf) << 27);
+            }
+        }
         return 0;
     }
 #endif
