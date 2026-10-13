@@ -879,6 +879,8 @@ static void sungem_mmio_greg_write(void *opaque, hwaddr addr, uint64_t val,
         case GREG_SWRST_RXRST | GREG_SWRST_TXRST:
             sungem_reset_all(s, false);
         }
+        /* The reset bits clear themselves when the reset is done */
+        s->gregs[GREG_SWRST >> 2] &= ~(GREG_SWRST_TXRST | GREG_SWRST_RXRST);
         break;
     }
 }
