@@ -369,6 +369,10 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
         /* flags = flags */
         vsid |= ((value >> 27) & 0xf) << 8;
 
+        /* The TLB is not tagged by VSID, drop translations of the old one */
+        if (env->slb[srnum].esid != esid || env->slb[srnum].vsid != vsid) {
+            env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        }
         ppc_store_slb(cpu, srnum, esid, vsid);
     } else
 #endif
