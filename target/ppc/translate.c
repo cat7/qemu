@@ -2498,8 +2498,28 @@ static inline void gen_check_tlb_flush(DisasContext *ctx, bool global)
         ctx->base.is_jmp = DISAS_EXIT_UPDATE;
     }
 }
+
+/* Complete a pending TLB flush, leaving the TB only when one was pending */
+static inline void gen_check_pending_tlb_flush(DisasContext *ctx)
+{
+    TCGv_i32 t;
+    TCGLabel *l;
+
+    if (!ctx->lazy_tlb_flush) {
+        return;
+    }
+    l = gen_new_label();
+    t = tcg_temp_new_i32();
+    tcg_gen_ld_i32(t, tcg_env, offsetof(CPUPPCState, tlb_need_flush));
+    tcg_gen_brcondi_i32(TCG_COND_EQ, t, 0, l);
+    gen_helper_check_tlb_flush_global(tcg_env);
+    gen_update_nip(ctx, ctx->base.pc_next);
+    tcg_gen_exit_tb(NULL, 0);
+    gen_set_label(l);
+}
 #else
 static inline void gen_check_tlb_flush(DisasContext *ctx, bool global) { }
+static inline void gen_check_pending_tlb_flush(DisasContext *ctx) { }
 #endif
 
 #if defined(TARGET_PPC64)

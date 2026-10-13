@@ -76,6 +76,15 @@ static bool trans_SYNC(DisasContext *ctx, arg_X_sync *a)
 
     tcg_gen_mb(bar | TCG_BAR_SC);
 
+    /*
+     * Before ISA 2.05 (970, POWER5) a heavyweight sync also completes a
+     * tlbie; 32-bit kernels on the 64-bit bridge never issue ptesync.
+     */
+    if (!sc && l == 0 && (ctx->insns_flags & PPC_64B) &&
+        !(ctx->insns_flags2 & PPC2_ISA205) && !ctx->pr) {
+        gen_check_pending_tlb_flush(ctx);
+    }
+
     return true;
 }
 
