@@ -445,9 +445,10 @@ static void sungem_tx_kick(void *opaque)
     sungem_update_status(s, GREG_STAT_TXALL, true);
 }
 
+/* Descriptors done..kick-1 belong to the device; none when they meet */
 static bool sungem_rx_full(SunGEMState *s, uint32_t kick, uint32_t done)
 {
-    return kick == ((done + 1) & s->rx_mask);
+    return (kick & s->rx_mask) == (done & s->rx_mask);
 }
 
 static bool sungem_can_receive(NetClientState *nc)
@@ -1045,6 +1046,9 @@ static void sungem_mmio_rxdma_write(void *opaque, hwaddr addr, uint64_t val,
     switch (addr) {
     case RXDMA_KICK:
         trace_sungem_rx_kick(val);
+        if (sungem_can_receive(qemu_get_queue(s->nic))) {
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        }
         break;
     case RXDMA_CFG:
         sungem_update_masks(s);
