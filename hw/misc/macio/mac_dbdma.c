@@ -757,6 +757,13 @@ static void dbdma_write(void *opaque, hwaddr addr,
     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
                     (uint32_t)addr >> DBDMA_CHANNEL_SHIFT, reg);
 
+    if (reg >= DBDMA_REGS) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "dbdma: write to unimplemented register 0x%"
+                      HWADDR_PRIx " <= 0x%08" PRIx64 "\n", addr, value);
+        return;
+    }
+
     /* cmdptr cannot be modified if channel is ACTIVE */
 
     if (reg == DBDMA_CMDPTR_LO && (ch->regs[DBDMA_STATUS] & ACTIVE)) {
@@ -803,6 +810,13 @@ static uint64_t dbdma_read(void *opaque, hwaddr addr,
     DBDMAState *s = opaque;
     DBDMA_channel *ch = &s->channels[channel];
     int reg = (addr - (channel << DBDMA_CHANNEL_SHIFT)) >> 2;
+
+    if (reg >= DBDMA_REGS) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "dbdma: read from unimplemented register 0x%"
+                      HWADDR_PRIx "\n", addr);
+        return 0;
+    }
 
     value = ch->regs[reg];
 
