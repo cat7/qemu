@@ -252,6 +252,7 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
 #if defined(TARGET_PPC64)
     if (mmu_is_64bit(env->mmu_model)) {
         env->tlb_need_flush = 0;
+        env->tlbie_pages_nb = 0;
         tlb_flush(env_cpu(env));
     } else
 #endif /* defined(TARGET_PPC64) */
@@ -291,7 +292,16 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 #if !defined(FLUSH_ALL_TLBS)
     addr &= TARGET_PAGE_MASK;
 #if defined(TARGET_PPC64)
-    if (mmu_is_64bit(env->mmu_model)) {
+    if (env->mmu_model == POWERPC_MMU_64B) {
+        /* Before ISA 2.06 RB holds the low 48 bits of the virtual address */
+        if (env->tlbie_pages_nb < TLBIE_PAGES_MAX) {
+            env->tlbie_pages[env->tlbie_pages_nb] = addr;
+        }
+        if (env->tlbie_pages_nb <= TLBIE_PAGES_MAX) {
+            env->tlbie_pages_nb++;
+        }
+        env->tlb_need_flush |= TLB_NEED_PAGES_FLUSH;
+    } else if (mmu_is_64bit(env->mmu_model)) {
         /* tlbie invalidate TLBs for all segments */
         /*
          * XXX: given the fact that there are too many segments to invalidate,

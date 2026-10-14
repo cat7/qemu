@@ -1343,6 +1343,12 @@ struct CPUArchState {
     uint32_t tlb_need_flush; /* Delayed flush needed */
 #define TLB_NEED_LOCAL_FLUSH   0x1
 #define TLB_NEED_GLOBAL_FLUSH  0x2
+#define TLB_NEED_PAGES_FLUSH   0x4 /* the tlbie pages below */
+#if defined(TARGET_PPC64)
+#define TLBIE_PAGES_MAX        16
+    uint32_t tlbie_pages_nb; /* > TLBIE_PAGES_MAX: too many, flush all */
+    target_ulong tlbie_pages[TLBIE_PAGES_MAX];
+#endif
 #endif
 
     /* Other registers */

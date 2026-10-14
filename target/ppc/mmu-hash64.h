@@ -10,6 +10,7 @@ int ppc_store_slb(PowerPCCPU *cpu, target_ulong slot,
 bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
                       hwaddr *raddrp, int *psizep, int *protp, int mmu_idx,
                       bool guest_visible);
+void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global);
 void ppc_hash64_tlb_flush_hpte(PowerPCCPU *cpu,
                                target_ulong pte_index,
                                target_ulong pte0, target_ulong pte1);

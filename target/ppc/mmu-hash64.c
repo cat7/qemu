@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "cpu.h"
+#include "exec/cputlb.h"
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
 #include "qemu/error-report.h"
@@ -279,6 +280,15 @@ int ppc_store_slb(PowerPCCPU *cpu, target_ulong slot,
         return -1;
     }
 
+    /*
+     * The TLB is not tagged by VSID: drop what an overwritten entry
+     * translated. A tlbie on another CPU reads the flag after the SLB.
+     */
+    if ((slb->esid & SLB_ESID_V) && (slb->esid != esid || slb->vsid != vsid)) {
+        qatomic_set(&env->tlb_need_flush,
+                    env->tlb_need_flush | TLB_NEED_LOCAL_FLUSH);
+        smp_wmb(); /* pairs with smp_rmb() in ppc_hash64_tlbie_pages() */
+    }
     slb->esid = esid;
     slb->vsid = vsid;
     slb->sps = sps;
@@ -1226,6 +1236,130 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
     *protp = prot;
     *psizep = apshift;
     return true;
+}
+
+/*
+ * Before ISA 2.06 tlbie RB holds bits 16-63 of the virtual address: the
+ * page within the segment and the low 20 bits of the VSID. In 32-bit mode
+ * only the page is known. Find the segments of @cpu whose VSID matches
+ * and, when @flush (on @cpu's own thread), drop the page's translations
+ * in them; returns whether there was one.
+ */
+static bool hash64_tlbie_cpu(PowerPCCPU *cpu, const target_ulong *rbs,
+                             unsigned nb, bool flush)
+{
+    CPUPPCState *env = &cpu->env;
+    CPUState *cs = CPU(cpu);
+    bool hit = false;
+    unsigned i;
+    int n;
+
+    for (i = 0; i < nb; i++) {
+        uint64_t rb = rbs[i];
+        uint64_t mask = rb >> 32 ? 0xfffff : 0;
+        uint64_t key = (rb >> SEGMENT_SHIFT_256M) & mask;
+        uint64_t page = rb & ~SEGMENT_MASK_256M & TARGET_PAGE_MASK;
+
+        for (n = 0; n < cpu->hash64_opts->slb_size; n++) {
+            ppc_slb_t *slb = &env->slb[n];
+            uint64_t esid = qatomic_read(&slb->esid);
+            uint64_t vsid = qatomic_read(&slb->vsid);
+            const PPCHash64SegmentPageSizes *sps = qatomic_read(&slb->sps);
+            unsigned shift;
+            vaddr ea;
+
+            if (!(esid & SLB_ESID_V)) {
+                continue;
+            }
+            if ((vsid & SLB_VSID_B) == SLB_VSID_B_256M &&
+                ((vsid & SLB_VSID_VSID) >> SLB_VSID_SHIFT & mask) != key) {
+                continue;
+            }
+            if (!flush) {
+                return true;
+            }
+            hit = true;
+            if ((vsid & SLB_VSID_B) != SLB_VSID_B_256M) {
+                tlb_flush(cs);
+                return true;
+            }
+            ea = (esid & SLB_ESID_ESID) | page;
+            shift = sps ? sps->page_shift : TARGET_PAGE_BITS;
+            if (shift > TARGET_PAGE_BITS) {
+                tlb_flush_range_by_mmuidx(cs, ea & ~((1ULL << shift) - 1),
+                                          1ULL << shift,
+                                          (1 << NB_MMU_MODES) - 1,
+                                          TARGET_LONG_BITS);
+            } else {
+                tlb_flush_page(cs, ea);
+            }
+        }
+    }
+    return hit;
+}
+
+typedef struct Hash64TlbiePages {
+    unsigned nb;
+    target_ulong rbs[TLBIE_PAGES_MAX];
+} Hash64TlbiePages;
+
+static void hash64_tlbie_work(CPUState *cs, run_on_cpu_data data)
+{
+    Hash64TlbiePages *p = data.host_ptr;
+    PowerPCCPU *cpu = POWERPC_CPU(cs);
+
+    if (cpu->env.tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
+        tlb_flush(cs);
+    } else {
+        hash64_tlbie_cpu(cpu, p->rbs, p->nb, true);
+    }
+    g_free(p);
+}
+
+static void hash64_tlbie_sync(CPUState *cs, run_on_cpu_data data)
+{
+}
+
+/*
+ * Complete the tlbie pages of @cpu: in its own TLB and, when @global, in
+ * the TLBs of the CPUs that hold one of their segments, the issuing CPU
+ * then waiting for them as for a broadcast flush.
+ */
+void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global)
+{
+    CPUPPCState *env = &cpu->env;
+    CPUState *src = CPU(cpu), *cs;
+    bool remote = false;
+
+    hash64_tlbie_cpu(cpu, env->tlbie_pages, env->tlbie_pages_nb, true);
+    if (!global) {
+        return;
+    }
+    CPU_FOREACH(cs) {
+        PowerPCCPU *other = POWERPC_CPU(cs);
+        Hash64TlbiePages *p;
+
+        if (cs == src) {
+            continue;
+        }
+        if (!hash64_tlbie_cpu(other, env->tlbie_pages, env->tlbie_pages_nb,
+                              false)) {
+            /* A segment it dropped may still be in its TLB */
+            smp_rmb(); /* pairs with smp_wmb() in ppc_store_slb() */
+            if (!(qatomic_read(&other->env.tlb_need_flush) &
+                  TLB_NEED_LOCAL_FLUSH)) {
+                continue;
+            }
+        }
+        p = g_new(Hash64TlbiePages, 1);
+        p->nb = env->tlbie_pages_nb;
+        memcpy(p->rbs, env->tlbie_pages, sizeof(p->rbs[0]) * p->nb);
+        async_run_on_cpu(cs, hash64_tlbie_work, RUN_ON_CPU_HOST_PTR(p));
+        remote = true;
+    }
+    if (remote) {
+        async_safe_run_on_cpu(src, hash64_tlbie_sync, RUN_ON_CPU_NULL);
+    }
 }
 
 void ppc_hash64_tlb_flush_hpte(PowerPCCPU *cpu, target_ulong ptex,

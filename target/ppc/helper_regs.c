@@ -28,6 +28,7 @@
 #include "cpu-models.h"
 #include "spr_common.h"
 #include "internal.h"
+#include "mmu-hash64.h"
 
 /* Swap temporary saved registers with GPRs */
 void hreg_swap_gpr_tgpr(CPUPPCState *env)
@@ -381,20 +382,49 @@ void store_40x_sler(CPUPPCState *env, uint32_t val)
 void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
+    uint32_t need = env->tlb_need_flush;
+    uint32_t keep = need & TLB_NEED_GLOBAL_FLUSH ?
+                    need & (TLB_NEED_GLOBAL_FLUSH | TLB_NEED_PAGES_FLUSH) : 0;
 
-    /* Handle global flushes first */
-    if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
-        env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
-        env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
-        tlb_flush_all_cpus_synced(cs);
+#if defined(TARGET_PPC64)
+    /* tlbie on the 970: only the translations of the pages it names */
+    if ((need & TLB_NEED_PAGES_FLUSH) &&
+        env->tlbie_pages_nb <= TLBIE_PAGES_MAX) {
+        if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
+            if (need & TLB_NEED_LOCAL_FLUSH) {
+                tlb_flush(cs);
+            }
+            ppc_hash64_tlbie_pages(env_archcpu(env), true);
+            keep = 0;
+        } else if (need & TLB_NEED_LOCAL_FLUSH) {
+            tlb_flush(cs);
+        } else {
+            ppc_hash64_tlbie_pages(env_archcpu(env), false);
+        }
+        /* A tlbie on another CPU reads the flags: clear them after */
+        qatomic_set(&env->tlb_need_flush, keep);
+        if (!keep) {
+            env->tlbie_pages_nb = 0;
+        }
         return;
     }
+#endif
 
-    /* Then handle local ones */
-    if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
-        env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+    /* Handle global flushes first */
+    if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
+        tlb_flush_all_cpus_synced(cs);
+        keep = 0;
+    } else if (need & (TLB_NEED_LOCAL_FLUSH | TLB_NEED_PAGES_FLUSH)) {
         tlb_flush(cs);
+    } else {
+        return;
     }
+    qatomic_set(&env->tlb_need_flush, keep);
+#if defined(TARGET_PPC64)
+    if (!keep) {
+        env->tlbie_pages_nb = 0;
+    }
+#endif
 }
 #endif /* !CONFIG_USER_ONLY */
 
