@@ -1343,6 +1343,10 @@ struct CPUArchState {
     uint32_t tlb_need_flush; /* Delayed flush needed */
 #define TLB_NEED_LOCAL_FLUSH   0x1
 #define TLB_NEED_GLOBAL_FLUSH  0x2
+#define TLB_NEED_PAGES_FLUSH   0x4 /* the tlbie pages below */
+#define TLBIE_PAGES_MAX        16
+    uint32_t tlbie_pages_nb; /* > TLBIE_PAGES_MAX: too many, flush all */
+    target_ulong tlbie_pages[TLBIE_PAGES_MAX];
 #endif
 
     /* Other registers */
@@ -1482,6 +1486,11 @@ struct CPUArchState {
      * running cycles.
      */
     uint64_t pmu_base_time;
+
+#if !defined(CONFIG_USER_ONLY)
+    /* 32-bit hash MMU: page indexes within a segment the TLB may hold */
+    unsigned long tlb_pidx[BITS_TO_LONGS(1 << 16)];
+#endif
 };
 
 #define THREAD_SIBLING_FOREACH(cs, cs_sibling)                  \

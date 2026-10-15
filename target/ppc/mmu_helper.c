@@ -320,7 +320,9 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
         break;
     case POWERPC_MMU_32B:
         env->tlb_need_flush = 0;
+        env->tlbie_pages_nb = 0;
         tlb_flush(env_cpu(env));
+        ppc_hash32_tlb_flushed(env_archcpu(env));
         break;
     default:
         /* XXX: TODO */
@@ -351,12 +353,19 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
         break;
     case POWERPC_MMU_32B:
         /*
-         * Actual CPUs invalidate entire congruence classes based on
-         * the geometry of their TLBs and some OSes take that into
-         * account, we just mark the TLB to be flushed later (context
-         * synchronizing event or sync instruction on 32-bit).
+         * The page is dropped in every segment at the next context
+         * synchronizing event or sync. Actual CPUs invalidate entire
+         * congruence classes based on the geometry of their TLBs and
+         * some OSes flush the whole TLB with a run of tlbie: more than
+         * TLBIE_PAGES_MAX pending pages flush it all.
          */
-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+        if (env->tlbie_pages_nb < TLBIE_PAGES_MAX) {
+            env->tlbie_pages[env->tlbie_pages_nb] = addr;
+        }
+        if (env->tlbie_pages_nb <= TLBIE_PAGES_MAX) {
+            env->tlbie_pages_nb++;
+        }
+        env->tlb_need_flush |= TLB_NEED_PAGES_FLUSH;
         break;
     default:
         /* Should never reach here with other MMU models */

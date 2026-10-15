@@ -9,6 +9,8 @@
 bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
                       hwaddr *raddrp, int *psizep, int *protp, int mmu_idx,
                       bool guest_visible);
+void ppc_hash32_tlbie_pages(PowerPCCPU *cpu, bool local, bool remote);
+void ppc_hash32_tlb_flushed(PowerPCCPU *cpu);
 
 /*
  * Segment register definitions

@@ -28,6 +28,7 @@
 #include "cpu-models.h"
 #include "spr_common.h"
 #include "internal.h"
+#include "mmu-hash32.h"
 
 /* Swap temporary saved registers with GPRs */
 void hreg_swap_gpr_tgpr(CPUPPCState *env)
@@ -381,19 +382,45 @@ void store_40x_sler(CPUPPCState *env, uint32_t val)
 void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
+    uint32_t need = env->tlb_need_flush;
+    bool pages = (need & TLB_NEED_PAGES_FLUSH) &&
+                 env->tlbie_pages_nb <= TLBIE_PAGES_MAX;
 
     /* Handle global flushes first */
-    if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
-        env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
-        env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
-        tlb_flush_all_cpus_synced(cs);
+    if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
+        if (pages) {
+            /* tlbie on the 32-bit hash MMU: only the pages it names */
+            if (need & TLB_NEED_LOCAL_FLUSH) {
+                tlb_flush(cs);
+                ppc_hash32_tlb_flushed(env_archcpu(env));
+            }
+            ppc_hash32_tlbie_pages(env_archcpu(env),
+                                   !(need & TLB_NEED_LOCAL_FLUSH), true);
+        } else {
+            tlb_flush_all_cpus_synced(cs);
+        }
+        env->tlb_need_flush = 0;
+        env->tlbie_pages_nb = 0;
         return;
     }
 
     /* Then handle local ones */
-    if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
-        env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
+    if (need & TLB_NEED_LOCAL_FLUSH || ((need & TLB_NEED_PAGES_FLUSH) &&
+                                        !pages)) {
         tlb_flush(cs);
+        if (env->mmu_model == POWERPC_MMU_32B) {
+            ppc_hash32_tlb_flushed(env_archcpu(env));
+        }
+    } else if (pages) {
+        ppc_hash32_tlbie_pages(env_archcpu(env), true, false);
+    } else {
+        return;
+    }
+    /* A pending tlbie still completes on the other CPUs at the next sync */
+    env->tlb_need_flush &= TLB_NEED_GLOBAL_FLUSH | TLB_NEED_PAGES_FLUSH;
+    if (!(env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
+        env->tlb_need_flush = 0;
+        env->tlbie_pages_nb = 0;
     }
 }
 #endif /* !CONFIG_USER_ONLY */
