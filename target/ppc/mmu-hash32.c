@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "exec/cputlb.h"
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
 #include "system/kvm.h"
@@ -376,6 +377,125 @@ static hwaddr ppc_hash32_htab_lookup(PowerPCCPU *cpu,
     return pte_offset;
 }
 
+/*
+ * env->tlb_pidx tells which page indexes within a segment the TLB may
+ * hold a hash translation for, so that a tlbie can leave out the CPUs
+ * that hold none. Only the CPU's own thread changes it, and only there
+ * are translations filled. A bit is set before the PTE is read and
+ * cleared only after its pages are flushed.
+ */
+#define HASH32_PIDX(ea)         (((ea) >> TARGET_PAGE_BITS) & 0xffff)
+
+static void hash32_tlb_mark(CPUPPCState *env, vaddr eaddr)
+{
+    unsigned i = HASH32_PIDX(eaddr);
+    unsigned long *w = &env->tlb_pidx[BIT_WORD(i)];
+
+    if (!(*w & BIT_MASK(i))) {
+        qatomic_set(w, *w | BIT_MASK(i));
+        smp_mb(); /* pairs with smp_mb() in ppc_hash32_tlbie_pages() */
+    }
+}
+
+void ppc_hash32_tlb_flushed(PowerPCCPU *cpu)
+{
+    CPUPPCState *env = &cpu->env;
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(env->tlb_pidx); i++) {
+        if (env->tlb_pidx[i]) {
+            qatomic_set(&env->tlb_pidx[i], 0);
+        }
+    }
+}
+
+/* Drop the translations of @pages in every segment, on @cpu's thread */
+static void hash32_tlbie_flush(PowerPCCPU *cpu, const target_ulong *pages,
+                               unsigned nb)
+{
+    CPUPPCState *env = &cpu->env;
+    unsigned i, n, pidx;
+    unsigned long *w;
+
+    for (i = 0; i < nb; i++) {
+        pidx = HASH32_PIDX(pages[i]);
+        w = &env->tlb_pidx[BIT_WORD(pidx)];
+        if (!(*w & BIT_MASK(pidx))) {
+            continue;
+        }
+        for (n = 0; n < 16; n++) {
+            tlb_flush_page(CPU(cpu), (target_ulong)n << 28 |
+                                     pidx << TARGET_PAGE_BITS);
+        }
+        qatomic_set(w, *w & ~BIT_MASK(pidx));
+    }
+}
+
+typedef struct Hash32TlbiePages {
+    unsigned nb;
+    target_ulong pages[TLBIE_PAGES_MAX];
+} Hash32TlbiePages;
+
+static void hash32_tlbie_work(CPUState *cs, run_on_cpu_data data)
+{
+    Hash32TlbiePages *p = data.host_ptr;
+
+    hash32_tlbie_flush(POWERPC_CPU(cs), p->pages, p->nb);
+    g_free(p);
+}
+
+static void hash32_tlbie_sync(CPUState *cs, run_on_cpu_data data)
+{
+}
+
+/*
+ * Complete the tlbie pages of @cpu: when @local in its own TLB and, when
+ * @remote, in the TLBs of the CPUs that may hold one of them, the issuing
+ * CPU then waiting for them as for a broadcast flush. The VSID is not
+ * known, as the page can belong to any address space.
+ */
+void ppc_hash32_tlbie_pages(PowerPCCPU *cpu, bool local, bool remote)
+{
+    CPUPPCState *env = &cpu->env;
+    CPUState *src = CPU(cpu), *cs;
+    bool queued = false;
+
+    if (local) {
+        hash32_tlbie_flush(cpu, env->tlbie_pages, env->tlbie_pages_nb);
+    }
+    if (!remote) {
+        return;
+    }
+    smp_mb(); /* the PTE stores before the bits, pairs with hash32_tlb_mark */
+    CPU_FOREACH(cs) {
+        CPUPPCState *other = &POWERPC_CPU(cs)->env;
+        Hash32TlbiePages *p;
+        unsigned i, pidx;
+
+        if (cs == src) {
+            continue;
+        }
+        for (i = 0; i < env->tlbie_pages_nb; i++) {
+            pidx = HASH32_PIDX(env->tlbie_pages[i]);
+            if (qatomic_read(&other->tlb_pidx[BIT_WORD(pidx)]) &
+                BIT_MASK(pidx)) {
+                break;
+            }
+        }
+        if (i == env->tlbie_pages_nb) {
+            continue;
+        }
+        p = g_new(Hash32TlbiePages, 1);
+        p->nb = env->tlbie_pages_nb;
+        memcpy(p->pages, env->tlbie_pages, sizeof(p->pages[0]) * p->nb);
+        async_run_on_cpu(cs, hash32_tlbie_work, RUN_ON_CPU_HOST_PTR(p));
+        queued = true;
+    }
+    if (queued) {
+        async_safe_run_on_cpu(src, hash32_tlbie_sync, RUN_ON_CPU_NULL);
+    }
+}
+
 bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
                       hwaddr *raddrp, int *psizep, int *protp, int mmu_idx,
                       bool guest_visible)
@@ -450,6 +570,9 @@ bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
     }
 
     /* 6. Locate the PTE in the hash table */
+    if (current_cpu == cs) {
+        hash32_tlb_mark(env, eaddr);
+    }
     pte_offset = ppc_hash32_htab_lookup(cpu, sr, eaddr, &pte);
     if (pte_offset == -1) {
         if (guest_visible) {
