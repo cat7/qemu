@@ -17,6 +17,12 @@
 #include "libqos/virtio.h"
 #include "libqos/virtio-9p-client.h"
 
+#ifdef _WIN32
+#define O_DIRECTORY 0
+#define getuid() 0
+#endif
+
+
 #define twalk(...) v9fs_twalk((TWalkOpt) __VA_ARGS__)
 #define tversion(...) v9fs_tversion((TVersionOpt) __VA_ARGS__)
 #define tattach(...) v9fs_tattach((TAttachOpt) __VA_ARGS__)

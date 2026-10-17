@@ -3,7 +3,9 @@
 
 #include <dirent.h>
 #include <utime.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include "fsdev/file-op-9p.h"
 #include "fsdev/9p-iov-marshal.h"
 #include "qemu/thread.h"

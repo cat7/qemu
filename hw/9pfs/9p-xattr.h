@@ -38,6 +38,7 @@ ssize_t local_removexattr_nofollow(FsContext *ctx, const char *path,
 
 extern XattrOperations mapped_user_xattr;
 extern XattrOperations passthrough_user_xattr;
+extern XattrOperations passthrough_apple_xattr;
 
 extern XattrOperations mapped_pacl_xattr;
 extern XattrOperations mapped_dacl_xattr;

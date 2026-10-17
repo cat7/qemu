@@ -112,3 +112,11 @@ XattrOperations passthrough_user_xattr = {
     .listxattr = pt_listxattr,
     .removexattr = pt_removexattr,
 };
+
+XattrOperations passthrough_apple_xattr = {
+    .name = "com.apple.",
+    .getxattr = pt_getxattr,
+    .setxattr = pt_setxattr,
+    .listxattr = pt_listxattr,
+    .removexattr = pt_removexattr,
+};

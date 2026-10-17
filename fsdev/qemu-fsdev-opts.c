@@ -49,6 +49,9 @@ static QemuOptsList qemu_fsdev_opts = {
         }, {
             .name = "max_xattr",
             .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "macos_compat",
+            .type = QEMU_OPT_BOOL,
         },
 
         THROTTLE_OPTS,
@@ -98,6 +101,9 @@ static QemuOptsList qemu_virtfs_opts = {
         }, {
             .name = "max_xattr",
             .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "macos_compat",
+            .type = QEMU_OPT_BOOL,
         },
 
         { /*End of list */ }
