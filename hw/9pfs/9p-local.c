@@ -20,6 +20,7 @@
 #include "9p-local.h"
 #include "9p-xattr.h"
 #include "9p-util.h"
+#include "9p-macos-compat.h"
 #include "fsdev/qemu-fsdev.h"   /* local_ops */
 #include <arpa/inet.h>
 #include <pwd.h>
@@ -556,6 +557,12 @@ static bool local_is_mapped_file_metadata(FsContext *fs_ctx, const char *name)
         !strcmp(name, VIRTFS_META_DIR) || !strcmp(name, VIRTFS_META_ROOT_FILE);
 }
 
+static bool local_is_macos_hidden(FsContext *fs_ctx, const char *name)
+{
+    return (fs_ctx->export_flags & V9FS_SM_MACOS_COMPAT) &&
+           macos_is_sidecar_dir(name);
+}
+
 static struct dirent *local_readdir(FsContext *ctx, V9fsFidOpenState *fs)
 {
     struct dirent *entry;
@@ -583,6 +590,11 @@ again:
             goto again;
         }
         entry->d_type = DT_UNKNOWN;
+    }
+
+    /* Hide .finf and .rsrc sidecar directories from Mac OS guest */
+    if (local_is_macos_hidden(ctx, entry->d_name)) {
+        goto again;
     }
 
     return entry;
@@ -1157,6 +1169,19 @@ static int local_unlinkat_common(FsContext *ctx, int dirfd, const char *name,
         }
     }
 
+    /* Sidecars (.finf/<n>, .rsrc/<n>) go with the file. */
+    if (ctx->export_flags & V9FS_SM_MACOS_COMPAT) {
+        if (macos_is_sidecar_dir(name)) {
+            errno = EINVAL;
+            return -1;
+        }
+        ret = qemu_unlinkat(dirfd, name, flags);
+        if (ret == 0) {
+            macos_remove_sidecars(dirfd, name);
+        }
+        return ret;
+    }
+
     return qemu_unlinkat(dirfd, name, flags);
 }
 
@@ -1216,36 +1241,171 @@ static int local_statfs(FsContext *s, V9fsPath *fs_path, struct statfs *stbuf)
     return ret;
 }
 
+static bool local_is_macos_xattr(FsContext *ctx, const char *name)
+{
+    return (ctx->export_flags & V9FS_SM_MACOS_COMPAT) &&
+           macos_is_apple_xattr(name);
+}
+
+/* Opens the parent of @path; *fname receives the last path element. */
+static int local_macos_parent(FsContext *ctx, const char *path, char **fname)
+{
+    g_autofree char *dirpath = g_path_get_dirname(path);
+    int dirfd = local_opendir_nofollow(ctx, dirpath);
+
+    if (dirfd != -1) {
+        *fname = g_path_get_basename(path);
+    }
+    return dirfd;
+}
+
+/* The compat layer returns -errno; callers expect -1 with errno set. */
+static ssize_t local_macos_ret(ssize_t ret)
+{
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
 static ssize_t local_lgetxattr(FsContext *ctx, V9fsPath *fs_path,
                                const char *name, void *value, size_t size)
 {
     char *path = fs_path->data;
+    g_autofree char *fname = NULL;
+    struct stat stbuf;
+    ssize_t ret;
+    int dirfd;
 
-    return v9fs_get_xattr(ctx, path, name, value, size);
+    if (!local_is_macos_xattr(ctx, name)) {
+        return v9fs_get_xattr(ctx, path, name, value, size);
+    }
+
+    dirfd = local_macos_parent(ctx, path, &fname);
+    if (dirfd == -1) {
+        return -1;
+    }
+    if (macos_is_finderinfo_xattr(name)) {
+        bool is_dir = qemu_fstatat(dirfd, fname, &stbuf,
+                                   AT_SYMLINK_NOFOLLOW) == 0 &&
+                      S_ISDIR(stbuf.st_mode);
+        ret = macos_get_finderinfo(dirfd, fname, is_dir, value, size);
+    } else {
+        ret = macos_get_resourcefork(dirfd, fname, value, size, 0);
+        if (ret == 0) {
+            ret = -ENODATA;
+        }
+    }
+    close_preserve_errno(dirfd);
+    return local_macos_ret(ret);
 }
 
+/*
+ * Host xattr names minus the Apple ones, followed by the Apple names the
+ * guest uses (FinderInfo always, ResourceFork only if present).
+ */
 static ssize_t local_llistxattr(FsContext *ctx, V9fsPath *fs_path,
                                 void *value, size_t size)
 {
+    static const char fi_name[] = "com.apple.FinderInfo";
+    static const char rf_name[] = "com.apple.ResourceFork";
     char *path = fs_path->data;
+    g_autofree char *fname = NULL;
+    g_autofree char *host = NULL;
+    g_autoptr(GByteArray) out = NULL;
+    ssize_t hlen, off;
+    int dirfd;
 
-    return v9fs_list_xattr(ctx, path, value, size);
+    if (!(ctx->export_flags & V9FS_SM_MACOS_COMPAT)) {
+        return v9fs_list_xattr(ctx, path, value, size);
+    }
+
+    hlen = v9fs_list_xattr(ctx, path, NULL, 0);
+    if (hlen > 0) {
+        host = g_malloc(hlen);
+        hlen = v9fs_list_xattr(ctx, path, host, hlen);
+    }
+    if (hlen < 0) {
+        if (errno != ENOTSUP && errno != ENODATA) {
+            return -1;
+        }
+        hlen = 0;
+    }
+
+    out = g_byte_array_new();
+    for (off = 0; off < hlen; off += strlen(host + off) + 1) {
+        if (!macos_is_apple_xattr(host + off)) {
+            g_byte_array_append(out, (guint8 *)host + off,
+                                strlen(host + off) + 1);
+        }
+    }
+    g_byte_array_append(out, (const guint8 *)fi_name, sizeof(fi_name));
+
+    dirfd = local_macos_parent(ctx, path, &fname);
+    if (dirfd != -1) {
+        if (macos_resourcefork_size(dirfd, fname) > 0) {
+            g_byte_array_append(out, (const guint8 *)rf_name,
+                                sizeof(rf_name));
+        }
+        close_preserve_errno(dirfd);
+    }
+
+    if (!value) {
+        return out->len;
+    }
+    if (size < out->len) {
+        errno = ERANGE;
+        return -1;
+    }
+    memcpy(value, out->data, out->len);
+    return out->len;
 }
 
 static int local_lsetxattr(FsContext *ctx, V9fsPath *fs_path, const char *name,
                            void *value, size_t size, int flags)
 {
     char *path = fs_path->data;
+    g_autofree char *fname = NULL;
+    ssize_t ret;
+    int dirfd;
 
-    return v9fs_set_xattr(ctx, path, name, value, size, flags);
+    if (!local_is_macos_xattr(ctx, name)) {
+        return v9fs_set_xattr(ctx, path, name, value, size, flags);
+    }
+
+    dirfd = local_macos_parent(ctx, path, &fname);
+    if (dirfd == -1) {
+        return -1;
+    }
+    if (macos_is_finderinfo_xattr(name)) {
+        ret = macos_set_finderinfo(dirfd, fname, value, size);
+    } else {
+        ret = macos_set_resourcefork(dirfd, fname, value, size, 0);
+    }
+    close_preserve_errno(dirfd);
+    return local_macos_ret(ret) < 0 ? -1 : 0;
 }
 
 static int local_lremovexattr(FsContext *ctx, V9fsPath *fs_path,
                               const char *name)
 {
     char *path = fs_path->data;
+    g_autofree char *fname = NULL;
+    int dirfd;
 
-    return v9fs_remove_xattr(ctx, path, name);
+    if (!local_is_macos_xattr(ctx, name)) {
+        return v9fs_remove_xattr(ctx, path, name);
+    }
+
+    dirfd = local_macos_parent(ctx, path, &fname);
+    if (dirfd == -1) {
+        return -1;
+    }
+    macos_remove_apple_xattr(dirfd, fname,
+                             macos_is_resourcefork_xattr(name));
+    close_preserve_errno(dirfd);
+    return 0;
 }
 
 static int local_name_to_path(FsContext *ctx, V9fsPath *dir_path,
@@ -1253,6 +1413,12 @@ static int local_name_to_path(FsContext *ctx, V9fsPath *dir_path,
 {
     if (ctx->export_flags & V9FS_SM_MAPPED_FILE &&
         local_is_mapped_file_metadata(ctx, name)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* macOS compat: reject attempts to walk into sidecar directories */
+    if (local_is_macos_hidden(ctx, name)) {
         errno = EINVAL;
         return -1;
     }
@@ -1311,6 +1477,13 @@ static int local_renameat(FsContext *ctx, V9fsPath *olddir,
         return -1;
     }
 
+    /* macOS compat: block renaming sidecar dirs, rename sidecars with file */
+    if ((ctx->export_flags & V9FS_SM_MACOS_COMPAT) &&
+        (macos_is_sidecar_dir(old_name) || macos_is_sidecar_dir(new_name))) {
+        errno = EINVAL;
+        return -1;
+    }
+
     odirfd = local_opendir_nofollow(ctx, olddir->data);
     if (odirfd == -1) {
         return -1;
@@ -1325,6 +1498,11 @@ static int local_renameat(FsContext *ctx, V9fsPath *olddir,
     ret = qemu_renameat(odirfd, old_name, ndirfd, new_name);
     if (ret < 0) {
         goto out;
+    }
+
+    /* macOS compat: also rename associated sidecar files */
+    if (ctx->export_flags & V9FS_SM_MACOS_COMPAT) {
+        macos_rename_sidecars(odirfd, old_name, ndirfd, new_name);
     }
 
     if (ctx->export_flags & V9FS_SM_MAPPED_FILE) {
@@ -1403,6 +1581,12 @@ static int local_unlinkat(FsContext *ctx, V9fsPath *dir,
 
     if (ctx->export_flags & V9FS_SM_MAPPED_FILE &&
         local_is_mapped_file_metadata(ctx, name)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* macOS compat: don't allow guest to delete sidecar directories */
+    if (local_is_macos_hidden(ctx, name)) {
         errno = EINVAL;
         return -1;
     }
@@ -1498,6 +1682,12 @@ static int local_init(FsContext *ctx, Error **errp)
     ctx->export_flags |= V9FS_PATHNAME_FSCONTEXT;
 
     ctx->private = data;
+
+    if (ctx->export_flags & V9FS_SM_MACOS_COMPAT) {
+        info_report("9pfs: macOS compatibility mode enabled for '%s'",
+                    ctx->fs_root);
+    }
+
     return 0;
 
 err:
@@ -1558,6 +1748,17 @@ static int local_parse_opts(QemuOpts *opts, FsDriverEntry *fse, Error **errp)
         error_setg(errp, "invalid security_model property '%s'", sec_model);
         error_append_security_model_hint(errp);
         return -1;
+    }
+
+    /*
+     * macOS compatibility mode: handle FinderInfo, resource forks,
+     * type/creator codes, and hide sidecar directories from the guest.
+     */
+    if (qemu_opt_get_bool(opts, "macos_compat", false)) {
+        fse->export_flags |= V9FS_SM_MACOS_COMPAT;
+        if (!sec_model || strcmp(sec_model, "none") != 0) {
+            warn_report("macos_compat works best with security_model=none");
+        }
     }
 
     if (multidevs) {

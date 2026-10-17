@@ -232,6 +232,9 @@ ssize_t macos_resourcefork_size(int dirfd, const char *name);
 /* Remove .finf/<n> and .rsrc/<n> when a file is deleted. */
 void macos_remove_sidecars(int dirfd, const char *name);
 
+/* Remove FinderInfo (@fork false) or the resource fork from all stores. */
+void macos_remove_apple_xattr(int dirfd, const char *name, bool fork);
+
 /* Rename sidecar files when a file is renamed/moved. */
 void macos_rename_sidecars(int olddirfd, const char *oldname,
                            int newdirfd, const char *newname);

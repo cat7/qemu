@@ -739,6 +739,25 @@ static int setxattr_at(int dirfd, const char *name,
 }
 
 /*
+ * Remove an xattr from a file relative to dirfd, ignoring errors.
+ */
+static void removexattr_at(int dirfd, const char *name,
+                           const char *xattr_name)
+{
+    int fd = openat(dirfd, name, O_RDONLY | O_NOFOLLOW);
+
+    if (fd < 0) {
+        return;
+    }
+#ifdef __APPLE__
+    fremovexattr(fd, xattr_name, 0);
+#else
+    fremovexattr(fd, xattr_name);
+#endif
+    close(fd);
+}
+
+/*
  * Unlink a sidecar file, ignoring ENOENT.
  */
 static void unlink_sidecar(int dirfd, const char *sidecar_dir,
@@ -1112,34 +1131,55 @@ ssize_t macos_get_resourcefork(int dirfd, const char *name,
 ssize_t macos_set_resourcefork(int dirfd, const char *name,
                                const void *buf, size_t buflen, off_t offset)
 {
-    int ret, fd;
+    ssize_t ret;
+    int fd;
 
     /*
-     * For small writes at offset 0, try xattr.
-     * For larger or offset writes, use sidecar.
+     * A whole fork replaces both stores, so a stale copy in the other one
+     * can never shadow it. macOS keeps forks of any size natively.
      */
-    if (offset == 0 && buflen <= RSRC_XATTR_MAX_SIZE) {
-        ret = setxattr_at(dirfd, name, XATTR_RESOURCEFORK_NAME,
-                          buf, buflen, 0);
-        if (ret == 0) {
-            return buflen;
+    if (offset == 0) {
+        if (buflen == 0) {
+            macos_remove_apple_xattr(dirfd, name, true);
+            return 0;
         }
-        /* xattr failed (no support, or too large) — fall through to sidecar */
+#ifndef __APPLE__
+        if (buflen <= RSRC_XATTR_MAX_SIZE)
+#endif
+        {
+            if (setxattr_at(dirfd, name, XATTR_RESOURCEFORK_NAME,
+                            buf, buflen, 0) == 0) {
+                unlink_sidecar(dirfd, SIDECAR_RSRC_DIR, name);
+                return buflen;
+            }
+        }
+        removexattr_at(dirfd, name, XATTR_RESOURCEFORK_NAME);
     }
 
-    /*
-     * Sidecar file .rsrc/<n>
-     */
     fd = open_sidecar_create(dirfd, SIDECAR_RSRC_DIR, name,
-                             O_WRONLY | O_CREAT,
+                             O_WRONLY | O_CREAT | (offset == 0 ? O_TRUNC : 0),
                              S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     if (fd < 0) {
         return -errno;
     }
 
     ret = pwrite(fd, buf, buflen, offset);
+    if (ret < 0) {
+        ret = -errno;
+    }
     close(fd);
-    return (ret < 0) ? -errno : ret;
+    return ret;
+}
+
+void macos_remove_apple_xattr(int dirfd, const char *name, bool fork)
+{
+    if (fork) {
+        removexattr_at(dirfd, name, XATTR_RESOURCEFORK_NAME);
+        unlink_sidecar(dirfd, SIDECAR_RSRC_DIR, name);
+    } else {
+        removexattr_at(dirfd, name, XATTR_FINDERINFO_NAME);
+        unlink_sidecar(dirfd, SIDECAR_FINF_DIR, name);
+    }
 }
 
 ssize_t macos_resourcefork_size(int dirfd, const char *name)
