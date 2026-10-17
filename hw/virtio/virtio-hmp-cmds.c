@@ -151,8 +151,6 @@ void hmp_virtio_status(Monitor *mon, const QDict *qdict)
     hmp_virtio_dump_features(mon, s->guest_features);
     monitor_printf(mon, "  Host features:\n");
     hmp_virtio_dump_features(mon, s->host_features);
-    monitor_printf(mon, "  Backend features:\n");
-    hmp_virtio_dump_features(mon, s->backend_features);
 
     if (s->vhost_dev) {
         monitor_printf(mon, "  VHost:\n");
