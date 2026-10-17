@@ -77,14 +77,16 @@ static const uint16_t macroman_to_unicode[128] = {
  *    0x01-0x1F  ->  U+F001-U+F01F  (control characters)
  *    0x22 "     ->  U+F020
  *    0x2A *     ->  U+F021
+ *    0x3A :     ->  U+F022
  *    0x3C <     ->  U+F023
  *    0x3E >     ->  U+F024
  *    0x3F ?     ->  U+F025
+ *    0x5C \     ->  U+F026
  *    0x7C |     ->  U+F027
+ *    trailing space  ->  U+F028
+ *    trailing period ->  U+F029
  *
- *  Note: 0x2F '/' and 0x5C '\' are path separators and should never appear
- *  in a single 9P name component.  0x3A ':' is the Mac path separator and
- *  also never appears in Mac filenames (and is handled separately by 9P).
+ *  ':' is legal in Mac OS X names; on NTFS it would name a stream.
  * =========================================================================
  */
 
@@ -100,9 +102,11 @@ static inline uint16_t win32_escape_char(uint8_t ch)
     switch (ch) {
     case '"':  return 0xF020;
     case '*':  return 0xF021;
+    case ':':  return 0xF022;
     case '<':  return 0xF023;
     case '>':  return 0xF024;
     case '?':  return 0xF025;
+    case '\\': return 0xF026;
     case '|':  return 0xF027;
     default:   return 0;
     }
@@ -120,10 +124,14 @@ static inline uint8_t win32_unescape_char(uint16_t cp)
     switch (cp) {
     case 0xF020: return '"';
     case 0xF021: return '*';
+    case 0xF022: return ':';
     case 0xF023: return '<';
     case 0xF024: return '>';
     case 0xF025: return '?';
+    case 0xF026: return '\\';
     case 0xF027: return '|';
+    case 0xF028: return ' ';
+    case 0xF029: return '.';
     default:     return 0;
     }
 }
@@ -288,6 +296,71 @@ static inline bool needs_encoding_conversion(const char *s)
         }
     }
     return false;
+}
+
+/*
+ * A guest name as stored on Windows: UTF-8 in the composed form (NFC)
+ * Windows uses, with characters NTFS rejects, and a trailing space or
+ * period, mapped to their SFM codepoints. A name that is not valid UTF-8
+ * is taken as Mac Roman.
+ */
+static inline char *win32_name_to_host(const char *name)
+{
+    g_autofree char *u = NULL;
+    GString *out;
+    const char *p;
+    uint8_t b[3];
+    uint16_t esc;
+
+    if (!strcmp(name, ".") || !strcmp(name, "..")) {
+        return g_strdup(name);
+    }
+    if (g_utf8_validate(name, -1, NULL)) {
+        u = g_utf8_normalize(name, -1, G_NORMALIZE_DEFAULT_COMPOSE);
+    } else {
+        u = macroman_to_utf8(name);
+    }
+    if (!u) {
+        u = g_strdup(name);
+    }
+    out = g_string_new(NULL);
+    for (p = u; *p; p++) {
+        esc = (uint8_t)*p < 0x80 ? win32_escape_char(*p) : 0;
+        if (!esc && p[1] == '\0' && (*p == ' ' || *p == '.')) {
+            esc = *p == ' ' ? 0xF028 : 0xF029;
+        }
+        if (esc) {
+            g_string_append_len(out, (char *)b, unicode_to_utf8(esc, b));
+        } else {
+            g_string_append_c(out, *p);
+        }
+    }
+    return g_string_free(out, FALSE);
+}
+
+/* The name a guest sees for a Windows name: SFM codepoints mapped back. */
+static inline char *win32_name_to_guest(const char *host)
+{
+    GString *out;
+    const char *p, *next;
+    gunichar c;
+    uint8_t ch;
+
+    if (!g_utf8_validate(host, -1, NULL)) {
+        return g_strdup(host);
+    }
+    out = g_string_new(NULL);
+    for (p = host; *p; p = next) {
+        next = g_utf8_next_char(p);
+        c = g_utf8_get_char(p);
+        ch = c <= 0xFFFF ? win32_unescape_char(c) : 0;
+        if (ch) {
+            g_string_append_c(out, ch);
+        } else {
+            g_string_append_len(out, p, next - p);
+        }
+    }
+    return g_string_free(out, FALSE);
 }
 
 #endif /* QEMU_9P_MACROMAN_H */
