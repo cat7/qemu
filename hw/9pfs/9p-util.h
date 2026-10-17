@@ -201,6 +201,8 @@ static inline int errno_to_dotl(int err) {
         err = 40; /* ==ELOOP on Linux */
     } else if (err == ENOATTR) {
         err = 61; /* ==ENODATA on Linux */
+    } else if (err == ENODATA) {
+        err = 61; /* ==ENODATA on Linux */
     } else if (err == ENOTSUP) {
         err = 95; /* ==EOPNOTSUPP on Linux */
     } else if (err == EOPNOTSUPP) {
