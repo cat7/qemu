@@ -5,7 +5,7 @@ fsdev_ss.add(when: ['CONFIG_FSDEV_9P'], if_true: files(
   '9p-marshal.c',
   'qemu-fsdev.c',
 ))
-if host_os in ['linux', 'darwin', 'freebsd']
+if host_os in ['linux', 'darwin', 'freebsd', 'windows']
   system_ss.add_all(fsdev_ss)
   stub_ss.add(files('qemu-fsdev-dummy.c'))
 endif
