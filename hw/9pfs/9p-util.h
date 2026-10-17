@@ -14,6 +14,109 @@
 #define QEMU_9P_UTIL_H
 
 #include "qemu/error-report.h"
+#include <dirent.h>
+
+#ifdef _WIN32
+/*
+ * Windows/MinGW compatibility: define POSIX constants and types
+ * that are missing from the MinGW headers.
+ */
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW  0
+#endif
+#ifndef O_NOCTTY
+#define O_NOCTTY    0
+#endif
+#ifndef O_NONBLOCK
+#define O_NONBLOCK  0
+#endif
+#ifndef O_NOATIME
+#define O_NOATIME   0
+#endif
+#ifndef O_PATH
+#define O_PATH      0
+#endif
+#ifndef O_DSYNC
+#define O_DSYNC     0
+#endif
+#ifndef O_SYNC
+#define O_SYNC      0
+#endif
+#ifndef O_ASYNC
+#define O_ASYNC     0
+#endif
+#ifndef FASYNC
+#define FASYNC      0
+#endif
+#ifndef O_DIRECT
+#define O_DIRECT    0
+#endif
+#ifndef O_LARGEFILE
+#define O_LARGEFILE 0
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC   0
+#endif
+#ifndef XATTR_CREATE
+#define XATTR_CREATE    0x1
+#endif
+#ifndef XATTR_REPLACE
+#define XATTR_REPLACE   0x2
+#endif
+#ifndef S_IFLNK
+#define S_IFLNK  0xA000
+#endif
+#ifndef S_IFSOCK
+#define S_IFSOCK 0xC000
+#endif
+#ifndef S_ISLNK
+#define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
+#endif
+#ifndef S_ISSOCK
+#define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
+#endif
+/* setuid/setgid/sticky bits */
+#ifndef S_ISUID
+#define S_ISUID 04000
+#endif
+#ifndef S_ISGID
+#define S_ISGID 02000
+#endif
+#ifndef S_ISVTX
+#define S_ISVTX 01000
+#endif
+/* AT_* constants */
+#ifndef AT_REMOVEDIR
+#define AT_REMOVEDIR        0x200
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+/* utimensat constants */
+#ifndef UTIME_NOW
+#define UTIME_NOW  ((1L << 30) - 1L)
+#endif
+#ifndef UTIME_OMIT
+#define UTIME_OMIT ((1L << 30) - 2L)
+#endif
+/* major/minor/makedev - Windows has no device number encoding */
+#ifndef major
+#define major(dev) 0
+#endif
+#ifndef minor
+#define minor(dev) ((unsigned int)(dev))
+#endif
+#ifndef makedev
+#define makedev(ma, mi) ((dev_t)(mi))
+#endif
+/* xattr size limit */
+#ifndef XATTR_SIZE_MAX
+#define XATTR_SIZE_MAX 65536
+#endif
+#endif /* _WIN32 */
 
 #ifdef O_PATH
 #define O_PATH_9P_UTIL O_PATH
@@ -26,8 +129,12 @@
  * FreeBSD does not have these flags, so we can only emulate their intended
  * behaviour (racily).
  */
+#ifndef XATTR_CREATE
 #define XATTR_CREATE    0x1
+#endif
+#ifndef XATTR_REPLACE
 #define XATTR_REPLACE   0x2
+#endif
 #endif
 
 #if !defined(CONFIG_LINUX)
@@ -64,6 +171,12 @@ static inline uint64_t host_dev_to_dotl_dev(dev_t dev)
 {
 #ifdef CONFIG_LINUX
     return dev;
+#elif defined(_WIN32)
+    /*
+     * Windows dev_t is simple (no major/minor encoding).
+     * Return it via makedev_dotl with dev as minor, 0 as major.
+     */
+    return makedev_dotl(0, (uint32_t)dev);
 #else
     return makedev_dotl(major(dev), minor(dev));
 #endif
@@ -93,6 +206,37 @@ static inline int errno_to_dotl(int err) {
     } else if (err == EOPNOTSUPP) {
         err = 95; /* ==EOPNOTSUPP on Linux */
     }
+#elif defined(_WIN32)
+    /*
+     * Windows/MinGW errno values mostly match Linux for common errors.
+     * Translate the ones that differ.
+     */
+    switch (err) {
+    case EPERM:         err = 1; break;
+    case ENOENT:        err = 2; break;
+    case EIO:           err = 5; break;
+    case ENXIO:         err = 6; break;
+    case EBADF:         err = 9; break;
+    case ENOMEM:        err = 12; break;
+    case EACCES:        err = 13; break;
+    case EBUSY:         err = 16; break;
+    case EEXIST:        err = 17; break;
+    case ENODEV:        err = 19; break;
+    case ENOTDIR:       err = 20; break;
+    case EISDIR:        err = 21; break;
+    case EINVAL:        err = 22; break;
+    case EMFILE:        err = 24; break;
+    case ENOSPC:        err = 28; break;
+    case ENAMETOOLONG:  err = 36; break;
+    case ENOTEMPTY:     err = 39; break;
+#ifdef ENODATA
+    case ENODATA:       err = 61; break; /* UCRT defines as 120 */
+#endif
+#ifdef ENOTSUP
+    case ENOTSUP:       err = 95; break;
+#endif
+    default: break; /* hope for the best */
+    }
 #else
 #error Missing errno translation to Linux for this host system
 #endif
@@ -101,10 +245,15 @@ static inline int errno_to_dotl(int err) {
 
 #ifdef CONFIG_DARWIN
 #define qemu_fgetxattr(...) fgetxattr(__VA_ARGS__, 0, 0)
+#elif defined(_WIN32)
+/* No fgetxattr on Windows; the macos_compat layer handles xattrs */
+#define qemu_fgetxattr(fd, name, value, size) (-1)
 #else
 #define qemu_fgetxattr fgetxattr
 #endif
 
+#ifndef _WIN32
+/* POSIX *at() functions - not available on Windows */
 #define qemu_openat     openat
 #define qemu_fstat      fstat
 #define qemu_fstatat    fstatat
@@ -113,6 +262,7 @@ static inline int errno_to_dotl(int err) {
 #define qemu_utimensat  utimensat
 #define qemu_unlinkat   unlinkat
 #define qemu_futimens   futimens
+#endif
 
 static inline void close_preserve_errno(int fd)
 {
@@ -121,6 +271,7 @@ static inline void close_preserve_errno(int fd)
     errno = serrno;
 }
 
+#ifndef _WIN32
 /**
  * close_if_special_file() - Close @fd if neither regular file nor directory.
  *
@@ -210,6 +361,7 @@ again:
     }
     return fd;
 }
+#endif /* !_WIN32 */
 
 #ifdef CONFIG_FREEBSD
 ssize_t fgetxattr(int dirfd, const char *name, void *value, size_t size);
@@ -229,12 +381,59 @@ ssize_t fremovexattrat_nofollow(int dirfd, const char *filename,
  * so ensure it is manually injected earlier and call here when
  * needed.
  */
+
+/* Ensure DT_* constants are available on all platforms */
+#ifndef DT_UNKNOWN
+#define DT_UNKNOWN 0
+#endif
+#ifndef DT_DIR
+#define DT_DIR 4
+#endif
+#ifndef DT_REG
+#define DT_REG 8
+#endif
+
 static inline off_t qemu_dirent_off(struct dirent *dent)
 {
 #ifdef CONFIG_DARWIN
     return dent->d_seekoff;
+#elif defined(_WIN32)
+    /*
+     * Windows/MinGW dirent has no d_off or d_seekoff.
+     * We store the telldir() value (snapshot position) in d_namlen,
+     * which is unused by QEMU on Windows (we use strlen(d_name) instead).
+     * d_ino is reserved for the real NTFS file index (inode equivalent)
+     * which is needed for correct 9P QID path generation.
+     * See local_readdir in 9p-local-win32.c.
+     */
+    return (off_t)dent->d_namlen;
 #else
     return dent->d_off;
+#endif
+}
+
+/**
+ * qemu_dirent_type() - Return the d_type for a directory entry.
+ *
+ * On most POSIX systems, struct dirent has a d_type member.
+ * On Windows/MinGW, struct dirent lacks d_type.  Our directory
+ * snapshot code (9p-local-win32.c) stores the type in d_reclen
+ * instead, since that field is unused on Windows.
+ *
+ * Returns DT_DIR, DT_REG, or DT_UNKNOWN.
+ */
+static inline unsigned char qemu_dirent_type(struct dirent *dent)
+{
+#ifdef _WIN32
+    /*
+     * MinGW struct dirent has no d_type.  Our Win32 snapshot code
+     * stores the file type (DT_DIR / DT_REG) in d_reclen.
+     */
+    return (unsigned char)dent->d_reclen;
+#elif defined(_DIRENT_HAVE_D_TYPE) || defined(CONFIG_DARWIN)
+    return dent->d_type;
+#else
+    return DT_UNKNOWN;
 #endif
 }
 

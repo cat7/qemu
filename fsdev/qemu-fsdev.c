@@ -59,6 +59,7 @@ static FsDriverTable FsDrivers[] = {
             "fmode",
             "dmode",
             "multidevs",
+            "macos_compat",
             "throttling.bps-total",
             "throttling.bps-read",
             "throttling.bps-write",
