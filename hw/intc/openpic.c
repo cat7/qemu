@@ -914,6 +914,17 @@ out:
     return retval;
 }
 
+/*
+ * The KeyLargo source window holds the 64 external sources only. The IPIs
+ * and timers that follow them in src[] have their own registers; guests
+ * that disable every "source" up to their IPI vector (NetBSD) must not
+ * reach them through here.
+ */
+static bool openpic_src_exists(OpenPICState *opp, int idx)
+{
+    return opp->model != OPENPIC_MODEL_KEYLARGO || idx < opp->irq_ipi0;
+}
+
 static void openpic_src_write(void *opaque, hwaddr addr, uint64_t val,
                               unsigned len)
 {
@@ -925,6 +936,9 @@ static void openpic_src_write(void *opaque, hwaddr addr, uint64_t val,
 
     addr = addr & 0xffff;
     idx = addr >> 5;
+    if (!openpic_src_exists(opp, idx)) {
+        return;
+    }
 
     switch (addr & 0x1f) {
     case 0x00:
@@ -950,6 +964,9 @@ static uint64_t openpic_src_read(void *opaque, uint64_t addr, unsigned len)
 
     addr = addr & 0xffff;
     idx = addr >> 5;
+    if (!openpic_src_exists(opp, idx)) {
+        return 0;
+    }
 
     switch (addr & 0x1f) {
     case 0x00:
