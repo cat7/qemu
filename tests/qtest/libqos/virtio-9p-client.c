@@ -16,6 +16,10 @@
 #include "qemu/bswap.h"
 #include "virtio-9p-client.h"
 
+#ifdef _WIN32
+#define getuid() 0
+#endif
+
 #define QVIRTIO_9P_TIMEOUT_US (10 * 1000 * 1000)
 static QGuestAllocator *alloc;
 

@@ -1031,7 +1031,6 @@ static int qid_path_suffixmap(V9fsPDU *pdu, const struct stat *stbuf,
 static int stat_to_qid(V9fsPDU *pdu, const struct stat *stbuf, V9fsQID *qidp)
 {
     int err;
-    size_t size;
 
     if (pdu->s->ctx.export_flags & V9FS_REMAP_INODES) {
         /* map inode+device to qid path (fast path) */
@@ -1044,6 +1043,16 @@ static int stat_to_qid(V9fsPDU *pdu, const struct stat *stbuf, V9fsQID *qidp)
             return err;
         }
     } else {
+#ifdef _WIN32
+        /*
+         * On Windows all files in an export share the same volume, so
+         * skip the multi-device check.  MinGW's st_ino is only 16 bits
+         * (unsigned short) — far too small for unique QID paths.
+         * win32_stat() stores the low 32 bits of the NTFS file index in
+         * st_rdev (which is unused on Windows).  Use that directly.
+         */
+        qidp->path = (uint64_t)(uint32_t)stbuf->st_rdev;
+#else
         if (pdu->s->dev_id != stbuf->st_dev) {
             if (pdu->s->ctx.export_flags & V9FS_FORBID_MULTIDEVS) {
                 error_report_once(
@@ -1064,8 +1073,12 @@ static int stat_to_qid(V9fsPDU *pdu, const struct stat *stbuf, V9fsQID *qidp)
             }
         }
         memset(&qidp->path, 0, sizeof(qidp->path));
+        {
+        size_t size;
         size = MIN(sizeof(stbuf->st_ino), sizeof(qidp->path));
         memcpy(&qidp->path, &stbuf->st_ino, size);
+        }
+#endif
     }
 
     qidp->version = stbuf->st_mtime ^ (stbuf->st_size << 8);
@@ -1404,7 +1417,11 @@ static int32_t blksize_to_iounit(const V9fsPDU *pdu, int32_t blksize)
 
 static int32_t stat_to_iounit(const V9fsPDU *pdu, const struct stat *stbuf)
 {
+#ifdef _WIN32
+    return blksize_to_iounit(pdu, 4096);
+#else
     return blksize_to_iounit(pdu, stbuf->st_blksize);
+#endif
 }
 
 static int stat_to_v9stat_dotl(V9fsPDU *pdu, const struct stat *stbuf,
@@ -1419,7 +1436,11 @@ static int stat_to_v9stat_dotl(V9fsPDU *pdu, const struct stat *stbuf,
     v9lstat->st_rdev = host_dev_to_dotl_dev(stbuf->st_rdev);
     v9lstat->st_size = stbuf->st_size;
     v9lstat->st_blksize = stat_to_iounit(pdu, stbuf);
+#ifdef _WIN32
+    v9lstat->st_blocks = stbuf->st_size / 512;
+#else
     v9lstat->st_blocks = stbuf->st_blocks;
+#endif
     v9lstat->st_atime_sec = stbuf->st_atime;
     v9lstat->st_mtime_sec = stbuf->st_mtime;
     v9lstat->st_ctime_sec = stbuf->st_ctime;
@@ -1427,6 +1448,10 @@ static int stat_to_v9stat_dotl(V9fsPDU *pdu, const struct stat *stbuf,
     v9lstat->st_atime_nsec = stbuf->st_atimespec.tv_nsec;
     v9lstat->st_mtime_nsec = stbuf->st_mtimespec.tv_nsec;
     v9lstat->st_ctime_nsec = stbuf->st_ctimespec.tv_nsec;
+#elif defined(_WIN32)
+    v9lstat->st_atime_nsec = 0;
+    v9lstat->st_mtime_nsec = 0;
+    v9lstat->st_ctime_nsec = 0;
 #else
     v9lstat->st_atime_nsec = stbuf->st_atim.tv_nsec;
     v9lstat->st_mtime_nsec = stbuf->st_mtim.tv_nsec;
@@ -2678,11 +2703,21 @@ static int coroutine_fn v9fs_do_readdir(V9fsPDU *pdu, V9fsFidState *fidp,
              * user would get that error anyway when accessing those
              * files/dirs through other ways.
              */
+            memset(&qid.path, 0, sizeof(qid.path));
             size = MIN(sizeof(dent->d_ino), sizeof(qid.path));
             memcpy(&qid.path, &dent->d_ino, size);
-            /* Fill the other fields with dummy values */
-            qid.type = 0;
             qid.version = 0;
+            /*
+             * Set qid.type from d_type so the client knows whether
+             * this entry is a directory.  On POSIX hosts d_type comes
+             * from the kernel; on Windows our directory snapshot
+             * populates it via GetFileAttributesW.
+             */
+            if (qemu_dirent_type(dent) == DT_DIR) {
+                qid.type = P9_QID_TYPE_DIR;
+            } else {
+                qid.type = 0;
+            }
         }
 
         off = qemu_dirent_off(dent);
@@ -2692,7 +2727,7 @@ static int coroutine_fn v9fs_do_readdir(V9fsPDU *pdu, V9fsFidState *fidp,
         /* 11 = 7 + 4 (7 = start offset, 4 = space for storing count) */
         len = pdu_marshal(pdu, 11 + count, "Qqbs",
                           &qid, off,
-                          dent->d_type, &name);
+                          qemu_dirent_type(dent), &name);
 
         v9fs_string_free(&name);
 
@@ -3775,6 +3810,9 @@ v9fs_fill_statfs(V9fsState *s, V9fsPDU *pdu, struct statfs *stbuf)
     fsid_val = (unsigned int)stbuf->f_fsid.val[0] |
                (unsigned long long)stbuf->f_fsid.val[1] << 32;
     f_namelen = NAME_MAX;
+#elif defined(_WIN32)
+    fsid_val = 0;
+    f_namelen = stbuf->f_namelen;
 #else
     fsid_val = (unsigned int) stbuf->f_fsid.__val[0] |
                (unsigned long long)stbuf->f_fsid.__val[1] << 32;
@@ -4166,29 +4204,36 @@ out_nofid:
 }
 
 #if defined(CONFIG_LINUX)
-/* Currently, only Linux has XATTR_SIZE_MAX */
-#define P9_XATTR_SIZE_MAX XATTR_SIZE_MAX
+/*
+ * Linux kernel xattrs are limited to 64KB (XATTR_SIZE_MAX), but Mac OS 9
+ * resource forks transported over the 9P xattr channel can be much larger.
+ * The macos-compat backend uses sidecar files for forks exceeding the xattr
+ * limit, so the 9P protocol layer must allow the full 16 MB through.
+ */
+#define P9_XATTR_SIZE_MAX (16 * 1024 * 1024)
 #elif defined(CONFIG_DARWIN)
 /*
- * Darwin doesn't seem to define a maximum xattr size in its user
- * space header, so manually configure it across platforms as 64k.
- *
- * Having no limit at all can lead to QEMU crashing during large g_malloc()
- * calls. Because QEMU does not currently support macOS guests, the below
- * preliminary solution only works due to its being a reflection of the limit of
- * Linux guests.
+ * APFS/HFS+ xattrs on macOS have no 64KB limit.  Mac OS 9 resource forks
+ * (transported over the 9P xattr channel by classicvirtio) can be several
+ * megabytes for complex applications.  The classic Mac Resource Manager
+ * supports forks up to 16 MB.
  */
-#define P9_XATTR_SIZE_MAX 65536
+#define P9_XATTR_SIZE_MAX (16 * 1024 * 1024)
 #elif defined(CONFIG_FREEBSD)
 /*
- * FreeBSD similarly doesn't define a maximum xattr size, the limit is
- * filesystem dependent.  On UFS filesystems it's 2 times the filesystem block
- * size, typically 32KB.  On ZFS it depends on the value of the xattr property;
- * with the default value there is no limit, and with xattr=sa it is 64KB.
- *
- * So, a limit of 64k seems reasonable here too.
+ * FreeBSD xattr limits vary by filesystem (32KB on UFS, 64KB on ZFS with
+ * xattr=sa, unlimited on ZFS default).  Mac OS 9 resource forks use sidecar
+ * files for larger data, so the 9P protocol layer must allow up to 16 MB.
  */
-#define P9_XATTR_SIZE_MAX 65536
+#define P9_XATTR_SIZE_MAX (16 * 1024 * 1024)
+#elif defined(_WIN32)
+/*
+ * On Windows, xattrs are emulated via NTFS Alternate Data Streams or sidecar
+ * files — neither has a 64KB limit.  Mac OS 9 resource forks (transported over
+ * the 9P xattr channel by classicvirtio) can be several megabytes for complex
+ * applications.  The Mac OS Resource Manager supports forks up to 16 MB.
+ */
+#define P9_XATTR_SIZE_MAX (16 * 1024 * 1024)
 #else
 #error Missing definition for P9_XATTR_SIZE_MAX for this host system
 #endif
@@ -4572,6 +4617,10 @@ void v9fs_reset(V9fsState *s)
 
 static void __attribute__((__constructor__)) v9fs_set_fd_limit(void)
 {
+#ifdef _WIN32
+    open_fd_hw = 512;
+    open_fd_rc = 256;
+#else
     struct rlimit rlim;
     if (getrlimit(RLIMIT_NOFILE, &rlim) < 0) {
         error_report("Failed to get the resource limit");
@@ -4579,4 +4628,5 @@ static void __attribute__((__constructor__)) v9fs_set_fd_limit(void)
     }
     open_fd_hw = rlim.rlim_cur - MIN(400, rlim.rlim_cur / 3);
     open_fd_rc = rlim.rlim_cur / 2;
+#endif
 }

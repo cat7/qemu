@@ -148,8 +148,10 @@ static void synth_fill_statbuf(V9fsSynthNode *node, struct stat *stbuf)
     stbuf->st_gid = 0;
     stbuf->st_rdev = 0;
     stbuf->st_size = 0;
+#ifndef _WIN32
     stbuf->st_blksize = 0;
     stbuf->st_blocks = 0;
+#endif
     stbuf->st_atime = 0;
     stbuf->st_mtime = 0;
     stbuf->st_ctime = 0;
@@ -233,7 +235,11 @@ static void synth_direntry(V9fsSynthNode *node,
 #ifdef CONFIG_DARWIN
     entry->d_seekoff = off + 1;
 #else
+#ifdef _WIN32
+    entry->d_namlen = (unsigned short)(off + 1);
+#else
     entry->d_off = off + 1;
+#endif
 #endif
 }
 

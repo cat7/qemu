@@ -78,6 +78,7 @@ ssize_t v9fs_list_xattr(FsContext *ctx, const char *path,
     char *orig_value, *orig_value_start;
     ssize_t xattr_len, parsed_len = 0, attr_len;
     char *dirpath, *name;
+#ifndef _WIN32
     int dirfd;
 
     /* Get the actual len */
@@ -101,6 +102,21 @@ ssize_t v9fs_list_xattr(FsContext *ctx, const char *path,
     xattr_len = flistxattrat_nofollow(dirfd, name, orig_value, xattr_len);
     g_free(name);
     close_preserve_errno(dirfd);
+#else
+    /* On Windows, use the stub flistxattrat_nofollow (returns 0) */
+    dirpath = g_path_get_dirname(path);
+    name = g_path_get_basename(path);
+    xattr_len = flistxattrat_nofollow(-1, name, value, 0);
+    if (xattr_len <= 0) {
+        g_free(name);
+        g_free(dirpath);
+        return xattr_len;
+    }
+    orig_value = g_malloc(xattr_len);
+    xattr_len = flistxattrat_nofollow(-1, name, orig_value, xattr_len);
+    g_free(name);
+    g_free(dirpath);
+#endif
     if (xattr_len < 0) {
         g_free(orig_value);
         return -1;
@@ -166,6 +182,9 @@ int v9fs_remove_xattr(FsContext *ctx,
 ssize_t local_getxattr_nofollow(FsContext *ctx, const char *path,
                                 const char *name, void *value, size_t size)
 {
+#ifdef _WIN32
+    return fgetxattrat_nofollow(-1, path, name, value, size);
+#else
     char *dirpath = g_path_get_dirname(path);
     char *filename = g_path_get_basename(path);
     int dirfd;
@@ -182,6 +201,7 @@ out:
     g_free(dirpath);
     g_free(filename);
     return ret;
+#endif
 }
 
 ssize_t pt_getxattr(FsContext *ctx, const char *path, const char *name,
@@ -194,6 +214,9 @@ ssize_t local_setxattr_nofollow(FsContext *ctx, const char *path,
                                 const char *name, void *value, size_t size,
                                 int flags)
 {
+#ifdef _WIN32
+    return fsetxattrat_nofollow(-1, path, name, value, size, flags);
+#else
     char *dirpath = g_path_get_dirname(path);
     char *filename = g_path_get_basename(path);
     int dirfd;
@@ -210,6 +233,7 @@ out:
     g_free(dirpath);
     g_free(filename);
     return ret;
+#endif
 }
 
 int pt_setxattr(FsContext *ctx, const char *path, const char *name, void *value,
@@ -221,6 +245,9 @@ int pt_setxattr(FsContext *ctx, const char *path, const char *name, void *value,
 ssize_t local_removexattr_nofollow(FsContext *ctx, const char *path,
                                    const char *name)
 {
+#ifdef _WIN32
+    return fremovexattrat_nofollow(-1, path, name);
+#else
     char *dirpath = g_path_get_dirname(path);
     char *filename = g_path_get_basename(path);
     int dirfd;
@@ -237,6 +264,7 @@ out:
     g_free(dirpath);
     g_free(filename);
     return ret;
+#endif
 }
 
 int pt_removexattr(FsContext *ctx, const char *path, const char *name)
@@ -272,20 +300,28 @@ int notsup_removexattr(FsContext *ctx, const char *path, const char *name)
 
 XattrOperations *mapped_xattr_ops[] = {
     &mapped_user_xattr,
+#ifndef _WIN32
     &mapped_pacl_xattr,
     &mapped_dacl_xattr,
+#endif
     NULL,
 };
 
 XattrOperations *passthrough_xattr_ops[] = {
     &passthrough_user_xattr,
+    &passthrough_apple_xattr,
+#ifndef _WIN32
     &passthrough_acl_xattr,
+#endif
     NULL,
 };
 
 /* for .user none model should be same as passthrough */
 XattrOperations *none_xattr_ops[] = {
     &passthrough_user_xattr,
+    &passthrough_apple_xattr,
+#ifndef _WIN32
     &none_acl_xattr,
+#endif
     NULL,
 };

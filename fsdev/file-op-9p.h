@@ -27,6 +27,32 @@
 #  undef MACHINE /* work around some unfortunate namespace pollution */
 # endif
 # include <sys/mount.h>
+#elif defined(_WIN32)
+/*
+ * Win32 compatibility: provide missing POSIX types and structures.
+ */
+# ifndef uid_t
+   typedef unsigned int uid_t;
+# endif
+# ifndef gid_t
+   typedef unsigned int gid_t;
+# endif
+# ifndef NAME_MAX
+#  define NAME_MAX 255
+# endif
+# ifndef PATH_MAX
+#  define PATH_MAX 260
+# endif
+  struct statfs {
+      long f_type;
+      long f_bsize;
+      long long f_blocks;
+      long long f_bfree;
+      long long f_bavail;
+      long long f_files;
+      long long f_ffree;
+      long f_namelen;
+  };
 #endif
 
 #define SM_LOCAL_MODE_BITS    0600
@@ -78,6 +104,11 @@ typedef struct ExtendedOps {
  * Disables certain performance warnings from being logged on host side.
  */
 #define V9FS_NO_PERF_WARN           0x00000800
+/*
+ * macOS compatibility: synthesize FinderInfo, handle resource forks,
+ * hide sidecar directories from guest.
+ */
+#define V9FS_SM_MACOS_COMPAT       0x00001000
 
 #define V9FS_SEC_MASK               0x0000003C
 
