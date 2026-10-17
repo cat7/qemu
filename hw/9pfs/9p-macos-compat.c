@@ -1147,6 +1147,10 @@ ssize_t macos_set_resourcefork(int dirfd, const char *name,
         if (buflen <= RSRC_XATTR_MAX_SIZE)
 #endif
         {
+#ifdef __APPLE__
+            /* macOS writes a fork in place: a longer old one keeps its tail */
+            removexattr_at(dirfd, name, XATTR_RESOURCEFORK_NAME);
+#endif
             if (setxattr_at(dirfd, name, XATTR_RESOURCEFORK_NAME,
                             buf, buflen, 0) == 0) {
                 unlink_sidecar(dirfd, SIDECAR_RSRC_DIR, name);
