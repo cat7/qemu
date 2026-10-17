@@ -272,14 +272,9 @@ static char *win32_full_path_name(FsContext *ctx, const char *dir_path,
     char *result;
     g_autofree char *converted_name = NULL;
 
-    /*
-     * If macos_compat is enabled, the guest sends Mac Roman encoded names
-     * that may contain characters illegal on Windows (e.g. 0x0D in "Icon\r").
-     * Convert to UTF-8 with SFM escaping for safe storage on NTFS.
-     */
-    if ((ctx->export_flags & V9FS_SM_MACOS_COMPAT) &&
-        needs_encoding_conversion(name)) {
-        converted_name = macroman_to_utf8(name);
+    /* Mac names may hold characters NTFS rejects (e.g. "Icon\r") */
+    if (ctx->export_flags & V9FS_SM_MACOS_COMPAT) {
+        converted_name = win32_name_to_host(name);
         name = converted_name;
     }
 
@@ -1059,15 +1054,10 @@ again:
         goto again;
     }
 
-    /*
-     * Convert UTF-8 filenames from Windows back to Mac Roman for the
-     * guest.  This reverses the macroman_to_utf8() conversion applied
-     * in win32_full_path_name(), including SFM PUA unescaping.
-     */
-    if ((ctx->export_flags & V9FS_SM_MACOS_COMPAT) &&
-        needs_encoding_conversion(entry->d_name)) {
-        g_autofree char *mac_name = utf8_to_macroman(entry->d_name);
-        g_strlcpy(entry->d_name, mac_name, sizeof(entry->d_name));
+    /* undo the SFM mapping of win32_name_to_host() */
+    if (ctx->export_flags & V9FS_SM_MACOS_COMPAT) {
+        g_autofree char *guest_name = win32_name_to_guest(entry->d_name);
+        g_strlcpy(entry->d_name, guest_name, sizeof(entry->d_name));
     }
 
     /*
@@ -1416,15 +1406,29 @@ static ssize_t local_lgetxattr(FsContext *ctx, V9fsPath *fs_path,
                                        is_dir, value, size);
         } else {
             ret = macos_get_resourcefork(dirpath, fname, value, size, 0);
+            if (ret == 0) {
+                ret = -ENODATA;     /* no fork */
+            }
         }
 
         g_free(fname);
         g_free(dirpath);
         g_free(path);
+        if (ret < 0) {
+            errno = -ret;
+            return -1;
+        }
         return ret;
     }
 
-    /* Non-Apple xattrs: not supported on Windows */
+    if (ctx->export_flags & V9FS_SM_MACOS_COMPAT) {
+        g_autofree char *path = win32_full_path(ctx, fs_path->data);
+        g_autofree char *dirpath = g_path_get_dirname(path);
+        g_autofree char *fname = g_path_get_basename(path);
+
+        normalize_path(dirpath);
+        return win32_get_xattr(dirpath, fname, name, value, size);
+    }
     errno = ENODATA;
     return -1;
 }
@@ -1482,9 +1486,21 @@ static int local_lsetxattr(FsContext *ctx, V9fsPath *fs_path,
         g_free(fname);
         g_free(dirpath);
         g_free(path);
-        return ret;
+        if (ret < 0) {
+            errno = -ret;
+            return -1;
+        }
+        return 0;
     }
 
+    if (ctx->export_flags & V9FS_SM_MACOS_COMPAT) {
+        g_autofree char *path = win32_full_path(ctx, fs_path->data);
+        g_autofree char *dirpath = g_path_get_dirname(path);
+        g_autofree char *fname = g_path_get_basename(path);
+
+        normalize_path(dirpath);
+        return win32_set_xattr(dirpath, fname, name, value, size, flags);
+    }
     errno = ENOTSUP;
     return -1;
 }
@@ -1492,9 +1508,24 @@ static int local_lsetxattr(FsContext *ctx, V9fsPath *fs_path,
 static int local_lremovexattr(FsContext *ctx, V9fsPath *fs_path,
                               const char *name)
 {
-    /* Could remove ADS stream, but not needed for classicvirtio */
-    errno = ENOTSUP;
-    return -1;
+    g_autofree char *path = NULL;
+    g_autofree char *dirpath = NULL;
+    g_autofree char *fname = NULL;
+
+    if (!(ctx->export_flags & V9FS_SM_MACOS_COMPAT)) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    path = win32_full_path(ctx, fs_path->data);
+    dirpath = g_path_get_dirname(path);
+    fname = g_path_get_basename(path);
+    normalize_path(dirpath);
+    if (macos_is_apple_xattr(name)) {
+        macos_remove_apple_xattr(dirpath, fname,
+                                 !macos_is_finderinfo_xattr(name));
+        return 0;
+    }
+    return win32_remove_xattr(dirpath, fname, name);
 }
 
 /* ================================================================
@@ -1506,13 +1537,9 @@ static int local_name_to_path(FsContext *ctx, V9fsPath *dir_path,
 {
     g_autofree char *converted_name = NULL;
 
-    /*
-     * Convert guest Mac Roman name to UTF-8 with SFM escaping so that the
-     * stored 9P path matches what's actually on the Windows filesystem.
-     */
-    if ((ctx->export_flags & V9FS_SM_MACOS_COMPAT) &&
-        needs_encoding_conversion(name)) {
-        converted_name = macroman_to_utf8(name);
+    /* the stored 9P path must match the name on the Windows filesystem */
+    if (ctx->export_flags & V9FS_SM_MACOS_COMPAT) {
+        converted_name = win32_name_to_host(name);
         name = converted_name;
     }
 

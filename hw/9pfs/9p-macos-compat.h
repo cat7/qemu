@@ -170,6 +170,16 @@ void macos_rename_sidecars(const char *old_parent, const char *oldname,
 ssize_t macos_list_xattrs(const char *dirpath, const char *name,
                           bool is_dir, void *buf, size_t buflen);
 
+void macos_remove_apple_xattr(const char *dirpath, const char *name,
+                              bool fork);
+
+ssize_t win32_get_xattr(const char *dirpath, const char *name,
+                        const char *xname, void *buf, size_t buflen);
+int win32_set_xattr(const char *dirpath, const char *name, const char *xname,
+                    const void *buf, size_t size, int flags);
+int win32_remove_xattr(const char *dirpath, const char *name,
+                       const char *xname);
+
 #else /* POSIX */
 
 /* ========================= FinderInfo ================================= */
