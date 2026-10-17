@@ -860,6 +860,7 @@ int macos_set_finderinfo(const char *dirpath, const char *name,
     /* Strategy 1: NTFS ADS */
     if (ads_write(dirpath, name, ADS_FINDERINFO,
                   buf, FINDERINFO_SIZE) == 0) {
+        sidecar_unlink_win32(dirpath, SIDECAR_FINF_DIR, name);
         return 0;
     }
 
@@ -1028,20 +1029,22 @@ ssize_t macos_get_resourcefork(const char *dirpath, const char *name,
 ssize_t macos_set_resourcefork(const char *dirpath, const char *name,
                                const void *buf, size_t buflen, off_t offset)
 {
-    /*
-     * For small writes at offset 0, try ADS.
-     * ADS is more efficient and keeps everything in one file record.
-     */
-    if (offset == 0 && buflen <= RSRC_XATTR_MAX_SIZE) {
-        if (ads_write(dirpath, name, ADS_RESOURCEFORK, buf, buflen) == 0) {
-            return buflen;
-        }
+    ssize_t ret;
+
+    /* A whole fork goes to the ADS (any size); the sidecar copy goes. */
+    if (offset == 0 &&
+        ads_write(dirpath, name, ADS_RESOURCEFORK, buf, buflen) == 0) {
+        sidecar_unlink_win32(dirpath, SIDECAR_RSRC_DIR, name);
+        return buflen;
     }
 
-    /* Fall back to sidecar .rsrc/<name> */
-    ssize_t ret = sidecar_write_win32(dirpath, SIDECAR_RSRC_DIR, name,
-                                      buf, buflen, offset, (offset == 0));
+    /* No ADS (e.g. FAT): sidecar .rsrc/<name> */
+    ret = sidecar_write_win32(dirpath, SIDECAR_RSRC_DIR, name,
+                              buf, buflen, offset, (offset == 0));
     if (ret >= 0) {
+        if (offset == 0) {
+            ads_delete(dirpath, name, ADS_RESOURCEFORK);
+        }
         return ret;
     }
 
@@ -1310,31 +1313,129 @@ bool macos_is_resourcefork_xattr(const char *name)
 ssize_t macos_list_xattrs(const char *dirpath, const char *name,
                           bool is_dir, void *buf, size_t buflen)
 {
-    size_t fi_len = strlen(XATTR_FINDERINFO_NAME) + 1;
-    size_t rf_len = strlen(XATTR_RESOURCEFORK_NAME) + 1;
-    size_t total = fi_len;
-    bool has_rsrc = false;
+    g_autoptr(GString) out = g_string_new(NULL);
+    g_autofree char *path = build_file_path(dirpath, name);
+    g_autofree wchar_t *wpath = utf8_to_wstr(path);
+    WIN32_FIND_STREAM_DATA sd;
+    HANDLE h;
 
+    g_string_append_len(out, XATTR_FINDERINFO_NAME,
+                        sizeof(XATTR_FINDERINFO_NAME));
     if (macos_resourcefork_size(dirpath, name) > 0) {
-        has_rsrc = true;
-        total += rf_len;
+        g_string_append_len(out, XATTR_RESOURCEFORK_NAME,
+                            sizeof(XATTR_RESOURCEFORK_NAME));
+    }
+
+    /* other xattrs are streams ":<name>:$DATA" */
+    h = wpath ? FindFirstStreamW(wpath, FindStreamInfoStandard, &sd, 0)
+              : INVALID_HANDLE_VALUE;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            char s[MAX_PATH + 36];
+            char *end;
+
+            if (!WideCharToMultiByte(CP_UTF8, 0, sd.cStreamName, -1,
+                                     s, sizeof(s), NULL, NULL) ||
+                s[0] != ':' || !(end = strstr(s + 1, ":$DATA")) ||
+                end == s + 1) {
+                continue;
+            }
+            *end = '\0';
+            if (macos_is_apple_xattr(s + 1)) {
+                continue;
+            }
+            g_string_append_len(out, s + 1, end - s);
+        } while (FindNextStreamW(h, &sd));
+        FindClose(h);
     }
 
     if (!buf) {
-        return total;
+        return out->len;
     }
-
-    if (buflen < total) {
+    if (buflen < out->len) {
         errno = ERANGE;
         return -1;
     }
+    memcpy(buf, out->str, out->len);
+    return out->len;
+}
 
-    memcpy(buf, XATTR_FINDERINFO_NAME, fi_len);
-    if (has_rsrc) {
-        memcpy((char *)buf + fi_len, XATTR_RESOURCEFORK_NAME, rf_len);
+/* Drop FinderInfo or the resource fork from both stores. */
+void macos_remove_apple_xattr(const char *dirpath, const char *name,
+                              bool fork)
+{
+    if (fork) {
+        ads_delete(dirpath, name, ADS_RESOURCEFORK);
+        sidecar_unlink_win32(dirpath, SIDECAR_RSRC_DIR, name);
+    } else {
+        ads_delete(dirpath, name, ADS_FINDERINFO);
+        sidecar_unlink_win32(dirpath, SIDECAR_FINF_DIR, name);
     }
+}
 
-    return total;
+/* Other xattrs live in a stream of the same name. */
+#define P9_XATTR_CREATE     1
+#define P9_XATTR_REPLACE    2
+
+static bool stream_name_ok(const char *xname)
+{
+    return xname[0] && !strpbrk(xname, ":/\\");
+}
+
+ssize_t win32_get_xattr(const char *dirpath, const char *name,
+                        const char *xname, void *buf, size_t buflen)
+{
+    ssize_t size;
+
+    if (!stream_name_ok(xname)) {
+        errno = ENODATA;
+        return -1;
+    }
+    size = ads_size(dirpath, name, xname);
+    if (size < 0) {
+        errno = ENODATA;
+        return -1;
+    }
+    if (!buf || !buflen) {
+        return size;
+    }
+    if (buflen < (size_t)size) {
+        errno = ERANGE;
+        return -1;
+    }
+    return ads_read(dirpath, name, xname, buf, size);
+}
+
+int win32_set_xattr(const char *dirpath, const char *name, const char *xname,
+                    const void *buf, size_t size, int flags)
+{
+    bool exists;
+
+    if (!stream_name_ok(xname)) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    exists = ads_size(dirpath, name, xname) >= 0;
+    if ((flags & P9_XATTR_CREATE) && exists) {
+        errno = EEXIST;
+        return -1;
+    }
+    if ((flags & P9_XATTR_REPLACE) && !exists) {
+        errno = ENODATA;
+        return -1;
+    }
+    return ads_write(dirpath, name, xname, buf, size);
+}
+
+int win32_remove_xattr(const char *dirpath, const char *name,
+                       const char *xname)
+{
+    if (!stream_name_ok(xname) || ads_size(dirpath, name, xname) < 0) {
+        errno = ENODATA;
+        return -1;
+    }
+    ads_delete(dirpath, name, xname);
+    return 0;
 }
 
 #else /* POSIX */
