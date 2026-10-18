@@ -845,14 +845,27 @@ size_t qemu_get_host_physmem(void);
  * for the current thread.
  */
 #ifdef __APPLE__
+/*
+ * The thread's last setting: 1 execute, -1 write, 0 not set yet. Every TB
+ * entry asks for execute, and the toggle itself is costly on Apple Silicon,
+ * so skip it when nothing changed.
+ */
+extern __thread int qemu_jit_state;
+
 static inline void qemu_thread_jit_execute(void)
 {
-    pthread_jit_write_protect_np(true);
+    if (qemu_jit_state != 1) {
+        pthread_jit_write_protect_np(true);
+        qemu_jit_state = 1;
+    }
 }
 
 static inline void qemu_thread_jit_write(void)
 {
-    pthread_jit_write_protect_np(false);
+    if (qemu_jit_state != -1) {
+        pthread_jit_write_protect_np(false);
+        qemu_jit_state = -1;
+    }
 }
 #else
 static inline void qemu_thread_jit_write(void) {}

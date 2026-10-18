@@ -31,6 +31,10 @@
 #include "qemu/hw-version.h"
 #include "monitor/monitor.h"
 
+#ifdef __APPLE__
+__thread int qemu_jit_state;
+#endif
+
 int socket_set_cork(int fd, int v)
 {
 #if defined(SOL_TCP) && defined(TCP_CORK)
