@@ -782,6 +782,10 @@ static void fixup_stat(struct stat *stbuf, const char *path)
     if (stbuf->st_nlink == 0) {
         stbuf->st_nlink = 1;
     }
+    /* NTFS keeps no execute bit: readable files are executable, as on FAT */
+    if (S_ISREG(stbuf->st_mode)) {
+        stbuf->st_mode |= (stbuf->st_mode & 0444) >> 2;
+    }
     /* Generate a synthetic inode number from the path */
     if (path) {
         stbuf->st_ino = win32_inode_from_path(path);
