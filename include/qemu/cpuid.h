@@ -28,6 +28,9 @@
 #ifndef bit_PCLMUL
 #define bit_PCLMUL      (1 << 1)
 #endif
+#ifndef bit_FMA
+#define bit_FMA         (1 << 12)
+#endif
 #ifndef bit_SSE4_1
 #define bit_SSE4_1      (1 << 19)
 #endif
