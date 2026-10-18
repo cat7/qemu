@@ -575,18 +575,63 @@ static int win32_stat(const char *path, struct stat *stbuf)
     return 0;
 }
 
+static void win32_set_errno(void);
+
+/*
+ * _wopen() without FILE_SHARE_DELETE would keep the guest from renaming
+ * or unlinking a file it holds open.
+ */
 static int win32_open(const char *path, int flags, int mode)
 {
-    wchar_t *wpath = win32_wide_path(path);
-    int ret;
+    g_autofree wchar_t *wpath = win32_wide_native(path);
+    DWORD access, creation, attrs;
+    HANDLE h;
+    int fd;
 
     if (!wpath) {
         errno = EINVAL;
         return -1;
     }
-    ret = _wopen(wpath, flags, mode);
-    g_free(wpath);
-    return ret;
+    switch (flags & (O_RDONLY | O_WRONLY | O_RDWR)) {
+    case O_WRONLY:
+        access = GENERIC_WRITE;
+        break;
+    case O_RDWR:
+        access = GENERIC_READ | GENERIC_WRITE;
+        break;
+    default:
+        access = GENERIC_READ;
+        break;
+    }
+    if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+        creation = CREATE_NEW;
+    } else if ((flags & (O_CREAT | O_TRUNC)) == (O_CREAT | O_TRUNC)) {
+        creation = CREATE_ALWAYS;
+    } else if (flags & O_CREAT) {
+        creation = OPEN_ALWAYS;
+    } else if (flags & O_TRUNC) {
+        creation = TRUNCATE_EXISTING;
+        access |= GENERIC_WRITE;
+    } else {
+        creation = OPEN_EXISTING;
+    }
+    attrs = (flags & O_CREAT) && !(mode & 0200) ? FILE_ATTRIBUTE_READONLY
+                                                 : FILE_ATTRIBUTE_NORMAL;
+    h = CreateFileW(wpath, access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, creation, attrs, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        win32_set_errno();
+        return -1;
+    }
+    fd = _open_osfhandle((intptr_t)h,
+                         flags & (O_RDONLY | O_WRONLY | O_RDWR | O_APPEND |
+                                  O_BINARY | O_TEXT));
+    if (fd < 0) {
+        CloseHandle(h);
+        errno = EMFILE;
+    }
+    return fd;
 }
 
 static int win32_mkdir(const char *path)
@@ -690,12 +735,55 @@ static DWORD win32_GetFileAttributes(const char *path)
     return ret;
 }
 
+/* FILE_RENAME_INFO with the Flags member of FileRenameInfoEx */
+typedef struct {
+    DWORD Flags;
+    HANDLE RootDirectory;
+    DWORD FileNameLength;
+    WCHAR FileName[1];
+} Win32RenameInfoEx;
+
+#define WIN32_FILE_RENAME_INFO_EX           22
+#define WIN32_RENAME_REPLACE_IF_EXISTS      0x1
+#define WIN32_RENAME_POSIX_SEMANTICS        0x2
+
+/*
+ * Replace a target that is open elsewhere: NTFS allows it only with
+ * POSIX semantics (Windows 10 1709 and later).
+ */
+static BOOL win32_rename_posix(const wchar_t *wold, const wchar_t *wnew)
+{
+    size_t len = wcslen(wnew) * sizeof(WCHAR);
+    g_autofree Win32RenameInfoEx *ri =
+        g_malloc0(offsetof(Win32RenameInfoEx, FileName) + len + sizeof(WCHAR));
+    HANDLE h;
+    BOOL ok;
+
+    h = CreateFileW(wold, DELETE | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    ri->Flags = WIN32_RENAME_REPLACE_IF_EXISTS | WIN32_RENAME_POSIX_SEMANTICS;
+    ri->FileNameLength = len;
+    memcpy(ri->FileName, wnew, len);
+    ok = SetFileInformationByHandle(h, WIN32_FILE_RENAME_INFO_EX, ri,
+                                    offsetof(Win32RenameInfoEx, FileName) +
+                                    len + sizeof(WCHAR));
+    CloseHandle(h);
+    return ok;
+}
+
 static BOOL win32_MoveFileEx(const char *old_path, const char *new_path,
                              DWORD flags)
 {
     wchar_t *wold = win32_wide_native(old_path);
     wchar_t *wnew = win32_wide_native(new_path);
     BOOL ret;
+    DWORD err;
 
     if (!wold || !wnew) {
         g_free(wold);
@@ -704,6 +792,15 @@ static BOOL win32_MoveFileEx(const char *old_path, const char *new_path,
         return FALSE;
     }
     ret = MoveFileExW(wold, wnew, flags);
+    if (!ret && (flags & MOVEFILE_REPLACE_EXISTING)) {
+        err = GetLastError();
+        if (err == ERROR_ACCESS_DENIED || err == ERROR_SHARING_VIOLATION) {
+            ret = win32_rename_posix(wold, wnew);
+            if (!ret) {
+                SetLastError(err);
+            }
+        }
+    }
     g_free(wold);
     g_free(wnew);
     return ret;
