@@ -2569,7 +2569,7 @@ static void tcg_out_nop_fill(tcg_insn_unit *p, int count)
 # define TCG_TARGET_CALL_STACK_OFFSET  LINK_AREA_SIZE
 #endif
 
-#define CPU_TEMP_BUF_SIZE  (CPU_TEMP_BUF_NLONGS * (int)sizeof(long))
+#define CPU_TEMP_BUF_SIZE  ((int)TCG_STATIC_FRAME_SIZE)
 #define REG_SAVE_SIZE      ((int)ARRAY_SIZE(tcg_target_callee_save_regs) * SZR)
 
 #define FRAME_SIZE ((TCG_TARGET_CALL_STACK_OFFSET   \

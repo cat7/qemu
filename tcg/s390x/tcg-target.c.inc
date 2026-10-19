@@ -3811,7 +3811,7 @@ static void tcg_target_init(TCGContext *s)
 
 #define FRAME_SIZE  ((int)(TCG_TARGET_CALL_STACK_OFFSET          \
                            + TCG_STATIC_CALL_ARGS_SIZE           \
-                           + CPU_TEMP_BUF_NLONGS * sizeof(long)))
+                           + TCG_STATIC_FRAME_SIZE))
 
 static void tcg_target_qemu_prologue(TCGContext *s)
 {
@@ -3823,7 +3823,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
     tcg_set_frame(s, TCG_REG_CALL_STACK,
                   TCG_STATIC_CALL_ARGS_SIZE + TCG_TARGET_CALL_STACK_OFFSET,
-                  CPU_TEMP_BUF_NLONGS * sizeof(long));
+                  TCG_STATIC_FRAME_SIZE);
 
     if (!tcg_use_softmmu && guest_base >= 0x80000) {
         tcg_out_movi(s, TCG_TYPE_PTR, TCG_GUEST_BASE_REG, guest_base);
