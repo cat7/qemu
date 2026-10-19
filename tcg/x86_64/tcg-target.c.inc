@@ -4516,9 +4516,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         insn = sars_insn[vece];
         goto gen_simd;
     case INDEX_op_x86_punpckl_vec:
+    case INDEX_op_zipl_vec:
         insn = punpckl_insn[vece];
         goto gen_simd;
     case INDEX_op_x86_punpckh_vec:
+    case INDEX_op_ziph_vec:
         insn = punpckh_insn[vece];
         goto gen_simd;
     case INDEX_op_x86_packss_vec:
@@ -4763,6 +4765,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_pshufb_vec:
     case INDEX_op_dot2s_vec:
     case INDEX_op_mulhrs_vec:
+    case INDEX_op_zipl_vec:
+    case INDEX_op_ziph_vec:
     case INDEX_op_extract2_vec:
         return C_O1_I2(x, x, x);
 
@@ -4917,6 +4921,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return type == TCG_TYPE_V128 && vece == MO_32 ? -1 : 0;
     case INDEX_op_mulhrs_vec:
         return vece == MO_16;
+    case INDEX_op_zipl_vec:
+    case INDEX_op_ziph_vec:
+        return type == TCG_TYPE_V128;
 
     default:
         return 0;

@@ -825,6 +825,12 @@ void tcg_gen_mulhrs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_mulhrs_vec);
 }
 
+void tcg_gen_zip_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                     bool hi)
+{
+    do_op3_nofail(vece, r, a, b, hi ? INDEX_op_ziph_vec : INDEX_op_zipl_vec);
+}
+
 bool tcg_can_emit_extract2_vec(void)
 {
     return tcg_op_supported(INDEX_op_extract2_vec, TCG_TYPE_V128, 0);

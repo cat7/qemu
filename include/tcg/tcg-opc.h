@@ -196,6 +196,9 @@ DEF(dot2s_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(dot2u_vec, 1, 2, 0, TCG_OPF_VECTOR)
 /* r = signed high half of a * b, rounded; see tcg_gen_mulhrs_vec() */
 DEF(mulhrs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/* r = interleaved low or high halves of a and b; see tcg_gen_zip_vec() */
+DEF(zipl_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(ziph_vec, 1, 2, 0, TCG_OPF_VECTOR)
 /* r = bytes ofs .. ofs + 15 of ah:al; see tcg_gen_extract2_vec() */
 DEF(extract2_vec, 1, 2, 1, TCG_OPF_VECTOR)
 

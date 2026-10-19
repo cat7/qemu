@@ -333,8 +333,26 @@ static void gen_vso_i64(int vrt, int vra, int vrb, bool left);
 static bool do_vmrg(DisasContext *ctx, arg_VX *a, unsigned vece, bool hi,
                     void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr))
 {
+    static const TCGOpcode list[] = {
+        INDEX_op_zipl_vec, INDEX_op_ziph_vec, 0
+    };
     TCGv_ptr ra, rb, rd;
     REQUIRE_VECTOR(ctx);
+    /* host order: vB elements even, vA odd */
+    if (native_vmxint_on && !HOST_BIG_ENDIAN
+        && tcg_op_supported(INDEX_op_add_vec, TCG_TYPE_V128, 0)
+        && tcg_can_emit_vecop_list(list, TCG_TYPE_V128, vece)) {
+        const TCGOpcode *hold = tcg_swap_vecop_list(list);
+        TCGv_vec va = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec vb = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(va, tcg_env, avr_full_offset(a->vra));
+        tcg_gen_ld_vec(vb, tcg_env, avr_full_offset(a->vrb));
+        tcg_gen_zip_vec(vece, va, vb, va, hi);
+        tcg_gen_st_vec(va, tcg_env, avr_full_offset(a->vrt));
+        tcg_swap_vecop_list(hold);
+        return true;
+    }
     if (vmxperm(vece == MO_8 ? VP_MRGB : vece == MO_16 ? VP_MRGH : VP_MRGW)) {
         gen_vmrg_i64(a->vrt, a->vra, a->vrb, vece, hi);
         return true;
