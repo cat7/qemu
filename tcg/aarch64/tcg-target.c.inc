@@ -2979,6 +2979,159 @@ static void fpa_and(TCGContext *s, TCGReg d, TCGReg n, TCGReg m)
     tcg_out32(s, FPA_AND8B | (m & 31) << 16 | (n & 31) << 5 | (d & 31));
 }
 
+#define FPA_NFIX    8
+
+/* Z iff v is +-0; v's bits in t */
+static void fpa_tstz(TCGContext *s, TCGReg v, bool dbl, TCGReg t)
+{
+    tcg_out32(s, (dbl ? FPA_UMOV_XD : FPA_UMOV_WS) | (v & 31) << 5 | t);
+    tgen_cmpi(s, dbl ? TCG_TYPE_I64 : TCG_TYPE_I32, TCG_COND_TSTNE, t,
+              dbl ? INT64_MAX : INT32_MAX);
+}
+
+static tcg_insn_unit *fpa_bcond(TCGContext *s, TCGCond cond)
+{
+    tcg_insn_unit *p = s->code_ptr;
+
+    tcg_out_insn(s, bcond_imm, B_C, cond, 0);
+    return p;
+}
+
+/*
+ * Out of line, for what the range checks reject: exact zeros (a zero
+ * sum, a zero factor, a zero dividend, frsp of a zero) and fused ops
+ * with a zero product and a zero or normal result, all with every
+ * operand a single for the single ops.  A zero sum of a nonzero
+ * product needs the error terms.  Sets rd and st and branches to
+ * *done; branches to the returned fixups otherwise.
+ */
+static int fpa_zero(TCGContext *s, TCGReg rd, TCGReg st, TCGReg a,
+                    TCGReg c, TCGReg b, unsigned desc,
+                    tcg_insn_unit **fix, tcg_insn_unit **done)
+{
+    unsigned op = desc & FPARITH_OP_MASK;
+    bool ix = desc & FPARITH_INEXACT;
+    bool rsp = op == FPARITH_RSP;
+    bool sgl = (desc & FPARITH_SINGLE) && !rsp;
+    bool dbl = !sgl;
+    bool fma = op >= FPARITH_MADD && op <= FPARITH_NMSUB;
+    unsigned emax = dbl ? 0x7fe : 0xfe, eprod = dbl ? 56 : 26;
+    TCGReg q = fma ? c : b, r = FPA_T(0), t = FPA_T(3);
+    TCGType rt = dbl ? TCG_TYPE_I64 : TCG_TYPE_I32;
+    tcg_insn_unit *ok = NULL, *nrm = NULL, *pz[2];
+    int n = 0;
+
+    if (sgl) {
+        TCGReg in[3] = { a, q, b };
+
+        for (int i = 0; i < (fma ? 3 : 2); i++) {
+            tcg_out32(s, FPA_FCVT_DS | (FPA_T(5 + i) & 31) << 5 | (t & 31));
+            fpa_out3(s, FPA_FCMEQ, true, t, t, in[i]);
+            tcg_out32(s, FPA_UMOV_WS | (t & 31) << 5 | TCG_REG_TMP2);
+            fix[n++] = s->code_ptr;
+            tcg_out_insn(s, cbz, CBZ, TCG_TYPE_I32, TCG_REG_TMP2, 0);
+        }
+    }
+
+    if (rsp) {
+        fpa_tstz(s, a, true, TCG_REG_TMP2);
+        fix[n++] = fpa_bcond(s, TCG_COND_NE);
+        tcg_out32(s, FPA_UMOV_XD | (FPA_T(2) & 31) << 5 | TCG_REG_TMP0);
+    } else {
+        fpa_tstz(s, r, dbl, TCG_REG_TMP0);
+    }
+
+    switch (op) {
+    case FPARITH_RSP:
+        break;
+    case FPARITH_ADD:
+    case FPARITH_SUB:
+        fix[n++] = fpa_bcond(s, TCG_COND_NE);
+        break;
+    case FPARITH_MUL:
+        fix[n++] = fpa_bcond(s, TCG_COND_NE);
+        fpa_tstz(s, a, true, TCG_REG_TMP2);
+        ok = fpa_bcond(s, TCG_COND_EQ);
+        fpa_tstz(s, b, true, TCG_REG_TMP2);
+        fix[n++] = fpa_bcond(s, TCG_COND_NE);
+        break;
+    case FPARITH_DIV:
+        fix[n++] = fpa_bcond(s, TCG_COND_NE);
+        fpa_tstz(s, a, true, TCG_REG_TMP2);
+        fix[n++] = fpa_bcond(s, TCG_COND_NE);
+        break;
+    default:
+        fpa_tstz(s, a, true, TCG_REG_TMP2);
+        pz[0] = fpa_bcond(s, TCG_COND_EQ);
+        fpa_tstz(s, c, true, TCG_REG_TMP2);
+        pz[1] = fpa_bcond(s, TCG_COND_EQ);
+        if (!ix) {
+            fix[n++] = fpa_bcond(s, TCG_COND_NE);
+        } else {
+            /* r is 0, the sum exact, the product's error term exact */
+            tgen_cmpi(s, rt, TCG_COND_TSTNE, TCG_REG_TMP0,
+                      dbl ? INT64_MAX : INT32_MAX);
+            fix[n++] = fpa_bcond(s, TCG_COND_NE);
+            tcg_out32(s, FPA_UMOV_WS | (FPA_T(1) & 31) << 5 | TCG_REG_TMP2);
+            tgen_cmpi(s, TCG_TYPE_I32, TCG_COND_NE, TCG_REG_TMP2, -1);
+            fix[n++] = fpa_bcond(s, TCG_COND_NE);
+            tcg_out32(s, (dbl ? FPA_UMOV_XD : FPA_UMOV_WS)
+                      | (FPA_T(2) & 31) << 5 | TCG_REG_TMP2);
+            tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_TMP2, TCG_REG_TMP2,
+                         dbl ? 52 : 23, dbl ? 62 : 30);
+            tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_TMP2,
+                         TCG_REG_TMP2, eprod);
+            tgen_cmpi(s, TCG_TYPE_I64, TCG_COND_GTU, TCG_REG_TMP2,
+                      emax - eprod);
+            fix[n++] = fpa_bcond(s, TCG_COND_GTU);
+            ok = s->code_ptr;
+            tcg_out_insn(s, branch, B, 0);
+        }
+        /* zero product: r zero or normal */
+        reloc_pc19(pz[0], tcg_splitwx_to_rx(s->code_ptr));
+        reloc_pc19(pz[1], tcg_splitwx_to_rx(s->code_ptr));
+        tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_TMP2, TCG_REG_TMP0,
+                     dbl ? 52 : 23, dbl ? 62 : 30);
+        tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_TMP2,
+                     TCG_REG_TMP2, 1);
+        tgen_cmpi(s, TCG_TYPE_I64, TCG_COND_LEU, TCG_REG_TMP2, emax - 1);
+        nrm = fpa_bcond(s, TCG_COND_LEU);
+        tgen_cmpi(s, rt, TCG_COND_TSTNE, TCG_REG_TMP0,
+                  dbl ? INT64_MAX : INT32_MAX);
+        fix[n++] = fpa_bcond(s, TCG_COND_NE);
+        break;
+    }
+    tcg_debug_assert(n <= FPA_NFIX);
+
+    if (nrm) {
+        reloc_pc19(nrm, tcg_splitwx_to_rx(s->code_ptr));
+    }
+    if (ok) {
+        if (fma) {
+            reloc_pc26(ok, tcg_splitwx_to_rx(s->code_ptr));
+        } else {
+            reloc_pc19(ok, tcg_splitwx_to_rx(s->code_ptr));
+        }
+    }
+    /* st = sign << 1 | zero << 2 */
+    tgen_cmpi(s, rt, TCG_COND_TSTNE, TCG_REG_TMP0,
+              dbl ? INT64_MAX : INT32_MAX);
+    tgen_cset(s, TCG_COND_EQ, TCG_REG_TMP2);
+    tcg_out_ubfm(s, TCG_TYPE_I64, st, TCG_REG_TMP0, dbl ? 63 : 31, dbl ? 63 : 31);
+    tcg_out32(s, 0xaa000000 | TCG_REG_TMP2 << 16 | 1 << 10 | st << 5 | st);
+    tcg_out_ubfm(s, TCG_TYPE_I64, st, st, 63, 62);
+    if (rsp) {
+        tcg_out_mov(s, TCG_TYPE_V64, rd, FPA_T(2));
+    } else if (sgl) {
+        tcg_out32(s, FPA_FCVT_DS | (r & 31) << 5 | (rd & 31));
+    } else {
+        tcg_out_mov(s, TCG_TYPE_V64, rd, r);
+    }
+    *done = s->code_ptr;
+    tcg_out_insn(s, branch, B, 0);
+    return n;
+}
+
 static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
                             TCGReg a, TCGReg c, TCGReg b, unsigned desc)
 {
@@ -2994,9 +3147,9 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     TCGReg p = a, q = fma ? c : b, z = b;
     TCGReg r = FPA_T(0), mask = FPA_T(1), tmp = TCG_VEC_TMP0;
     unsigned rlo = 2;
-    tcg_insn_unit *tbnz, *bdone;
+    tcg_insn_unit *tbnz, *bdone, *bdone2, *fix[FPA_NFIX];
     TCGReg save[TCG_TARGET_NB_REGS];
-    int nsave = 0, frame;
+    int nsave = 0, frame, nfix;
 
     if (rsp) {
         tcg_out32(s, FPA_FCVT_SD | (a & 31) << 5 | (r & 31));
@@ -3157,11 +3310,16 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     bdone = s->code_ptr;
     tcg_out_insn(s, branch, B, 0);
 
+    reloc_pc14(tbnz, tcg_splitwx_to_rx(s->code_ptr));
+    nfix = fpa_zero(s, rd, st, a, c, b, desc, fix, &bdone2);
+
     /*
      * Otherwise call tcg_fparith_ref(env, a, c, b, desc), saving the
      * call-clobbered registers that hold live values.
      */
-    reloc_pc14(tbnz, tcg_splitwx_to_rx(s->code_ptr));
+    for (int i = 0; i < nfix; i++) {
+        reloc_pc19(fix[i], tcg_splitwx_to_rx(s->code_ptr));
+    }
     for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
         if (s->reg_to_temp[i] && i != rd && i != st &&
             tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
@@ -3196,6 +3354,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     tcg_out32(s, FPA_FMOV_DX | TCG_REG_TMP0 << 5 | (rd & 31));
     tcg_out_mov(s, TCG_TYPE_I64, st, TCG_REG_TMP1);
     reloc_pc26(bdone, tcg_splitwx_to_rx(s->code_ptr));
+    reloc_pc26(bdone2, tcg_splitwx_to_rx(s->code_ptr));
 }
 
 /*
