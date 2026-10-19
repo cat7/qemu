@@ -2453,6 +2453,9 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_cmpsel_vec;
     case INDEX_op_fparith_vec:
         return type == TCG_TYPE_V64 && has_type && TCG_TARGET_HAS_fparith_vec;
+    case INDEX_op_vfparith_vec:
+        return type == TCG_TYPE_V128 && has_type &&
+               TCG_TARGET_HAS_vfparith_vec;
 
     default:
         if (op < INDEX_op_last_generic) {

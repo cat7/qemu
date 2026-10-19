@@ -538,6 +538,51 @@ bool tcg_can_emit_fparith(void);
 void tcg_gen_fparith_vec(unsigned desc, TCGv_vec r, TCGv_i64 status,
                          TCGv_vec a, TCGv_vec c, TCGv_vec b);
 
+/*
+ * Single precision on the four 32-bit lanes of V128 temps on the host,
+ * round to nearest even (VFPARITH_RI* excepted), subnormals neither
+ * flushed nor treated as zero.  desc is a VFPARITH_* operation, ORed
+ * for the conversions with a scale n << VFPARITH_SCALE.  Unary
+ * operations take b.
+ *
+ * When a lane has a subnormal operand or, for ADD through RI*, a NaN
+ * operand or result or, for ADD through RSQRT, a nonzero result of
+ * magnitude below 2^-125, r comes from the function set with
+ * tcg_set_vfparith_ref() instead, which the generated code calls with
+ * the env pointer, desc and a VFParithBuf holding a, b and c.
+ */
+enum {
+    VFPARITH_ADD,       /* a + b */
+    VFPARITH_SUB,       /* a - b */
+    VFPARITH_MADD,      /* a * c + b, fused */
+    VFPARITH_NMSUB,     /* -(a * c - b), fused */
+    VFPARITH_RE,        /* 1 / b */
+    VFPARITH_RSQRT,     /* 1 / sqrt(b), each rounded */
+    VFPARITH_MAX,       /* maximum, -0 < +0 */
+    VFPARITH_MIN,       /* minimum, -0 < +0 */
+    VFPARITH_RIN,       /* b to integral: nearest even */
+    VFPARITH_RIZ,       /* toward zero */
+    VFPARITH_RIP,       /* toward +inf */
+    VFPARITH_RIM,       /* toward -inf */
+    VFPARITH_CMPEQ,     /* all ones if a == b, NaN unordered */
+    VFPARITH_CMPGE,     /* a >= b */
+    VFPARITH_CMPGT,     /* a > b */
+    VFPARITH_CMPB,      /* bit 31: !(a <= b), bit 30: !(a >= -b) */
+    VFPARITH_CFS,       /* signed integer b / 2^n */
+    VFPARITH_CFU,       /* unsigned integer b / 2^n */
+    VFPARITH_CTS,       /* trunc(b * 2^n), saturated; NaN 0 */
+    VFPARITH_CTU,       /* same, unsigned */
+    VFPARITH_CTS_SAT,   /* all ones where CTS saturates */
+    VFPARITH_CTU_SAT,   /* all ones where CTU saturates */
+    VFPARITH_OP_MASK = 0x1f,
+    VFPARITH_SCALE = 8,
+};
+
+void tcg_set_vfparith_ref(VFParithRef fn);
+bool tcg_can_emit_vfparith(void);
+void tcg_gen_vfparith_vec(unsigned desc, TCGv_vec r,
+                          TCGv_vec a, TCGv_vec b, TCGv_vec c);
+
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);
