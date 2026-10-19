@@ -1253,6 +1253,56 @@ void helper_VPERM(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
     *r = result;
 }
 
+/* vperm as a table lookup in host byte order: table b:a, index 31 - s */
+#if defined(__aarch64__) && !HOST_BIG_ENDIAN
+#include <arm_neon.h>
+#elif defined(__x86_64__)
+#include <tmmintrin.h>
+#include "host/cpuinfo.h"
+
+static void __attribute__((target("ssse3")))
+vperm_ssse3(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
+{
+    __m128i i = _mm_andnot_si128(_mm_loadu_si128((__m128i *)c),
+                                 _mm_set1_epi8(31));
+    __m128i m = _mm_cmpeq_epi8(_mm_and_si128(i, _mm_set1_epi8(16)),
+                               _mm_set1_epi8(16));
+    __m128i ta = _mm_shuffle_epi8(_mm_loadu_si128((__m128i *)a), i);
+    __m128i tb = _mm_shuffle_epi8(_mm_loadu_si128((__m128i *)b), i);
+
+    _mm_storeu_si128((__m128i *)r, _mm_or_si128(_mm_and_si128(m, ta),
+                                                _mm_andnot_si128(m, tb)));
+}
+#endif
+
+void helper_VPERMN(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
+{
+#if HOST_BIG_ENDIAN
+    helper_VPERM(r, a, b, c);
+#elif defined(__aarch64__)
+    uint8x16x2_t t = { { vld1q_u8(b->u8), vld1q_u8(a->u8) } };
+
+    vst1q_u8(r->u8, vqtbl2q_u8(t, vbicq_u8(vdupq_n_u8(31),
+                                           vld1q_u8(c->u8))));
+#else
+    uint8_t t[32];
+    ppc_avr_t result;
+
+#if defined(__x86_64__)
+    if (cpuinfo & CPUINFO_AVX1) {
+        vperm_ssse3(r, a, b, c);
+        return;
+    }
+#endif
+    memcpy(t, b->u8, 16);
+    memcpy(t + 16, a->u8, 16);
+    for (int i = 0; i < 16; i++) {
+        result.u8[i] = t[~c->u8[i] & 31];
+    }
+    *r = result;
+#endif
+}
+
 void helper_VPERMR(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
 {
     ppc_avr_t result;
