@@ -3845,6 +3845,333 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     tcg_patch32(jdone, s->code_ptr - (jdone + 4));
 }
 
+/*
+ * vfparith_vec, on the fparith_vec scratch registers.  Lane checks
+ * collect all ones in good for lanes the host result covers.
+ */
+#define OPC_VSQRTPS     (0x51 | P_EXT)
+#define OPC_VANDPS      (0x54 | P_EXT)
+#define OPC_VANDNPS     (0x55 | P_EXT)
+#define OPC_VORPS       (0x56 | P_EXT)
+#define OPC_VXORPS      (0x57 | P_EXT)
+#define OPC_VCVTDQ2PS   (0x5b | P_EXT)
+#define OPC_VCVTTPS2DQ  (0x5b | P_EXT | P_SIMDF3)
+#define OPC_VMINPS      (0x5d | P_EXT)
+#define OPC_VMAXPS      (0x5f | P_EXT)
+#define OPC_VROUNDPS    (0x08 | P_EXT3A | P_DATA16)
+#define OPC_VBLENDVPS   (0x4a | P_EXT3A | P_DATA16)
+#define OPC_VFMADD231PS (0xb8 | P_EXT38 | P_DATA16)     /* d = n * m + d */
+#define OPC_VFMSUB231PS (0xba | P_EXT38 | P_DATA16)     /* d = n * m - d */
+#define OPC_VPTEST      (0x17 | P_EXT38 | P_DATA16)
+
+enum {
+    VFA_EQ_OQ = 0x00,
+    VFA_LT_OS = 0x01,
+    VFA_LE_OS = 0x02,
+    VFA_UNORD = 0x03,
+    VFA_NLT_US = 0x05,
+    VFA_GE_OS = 0x0d,
+    VFA_GT_OS = 0x0e,
+};
+
+/* r = v op [pool: k in each lane], then imm8 unless imm < 0 */
+static void vfa_pool(TCGContext *s, int opc, TCGReg r, TCGReg v,
+                     uint32_t k, int imm)
+{
+    uint64_t k2 = k | (uint64_t)k << 32;
+
+    tcg_out_vex_opc(s, opc, r, v, 0, 0);
+    tcg_out8(s, LOWREGMASK(r) << 3 | 5);
+    tcg_out32(s, 0);
+    new_pool_l2(s, R_386_PC32, s->code_ptr - 4, imm < 0 ? -4 : -5, k2, k2);
+    if (imm >= 0) {
+        tcg_out8(s, imm);
+    }
+}
+
+static void vfa_cmp(TCGContext *s, TCGReg d, TCGReg n, TCGReg m, int pred)
+{
+    tcg_out_vex_modrm(s, OPC_FPA_CMP, d, n, m);
+    tcg_out8(s, pred);
+}
+
+static void vfa_const(TCGContext *s, TCGReg d, uint32_t k)
+{
+    tcg_out_dupi_vec(s, TCG_TYPE_V128, MO_32, d, k | (uint64_t)k << 32);
+}
+
+/*
+ * good &= lanes of v that are zero or at least min in magnitude, NaN
+ * lanes included unless nan (good = with first).  zero holds +0.
+ */
+static void vfa_check(TCGContext *s, TCGReg v, uint32_t min, bool nan,
+                      bool first)
+{
+    TCGReg good = FPA_T(1), t1 = FPA_T(2), t2 = FPA_T(3), zero = FPA_T(5);
+
+    vfa_pool(s, OPC_VANDPS, t1, v, 0x7fffffff, -1);
+    vfa_pool(s, OPC_FPA_CMP, t2, t1, min, nan ? VFA_GE_OS : VFA_NLT_US);
+    vfa_cmp(s, t1, t1, zero, VFA_EQ_OQ);
+    tcg_out_vex_modrm(s, OPC_VORPS, first ? good : t1, t1, t2);
+    if (!first) {
+        tcg_out_vex_modrm(s, OPC_VANDPS, good, good, t1);
+    }
+}
+
+/* jump if a lane of good is not all ones; returns the rel32 to patch */
+static tcg_insn_unit *vfa_jbad(TCGContext *s)
+{
+    TCGReg ones = FPA_T(2);
+
+    tcg_out_vex_modrm(s, OPC_PCMPEQB, ones, ones, ones);
+    tcg_out_vex_modrm(s, OPC_VPTEST, FPA_T(1), 0, ones);
+    tcg_out_opc(s, OPC_JCC_long + JCC_JAE, 0, 0, 0);
+    tcg_out32(s, 0);
+    return s->code_ptr - 4;
+}
+
+/* d = b * 2^n, exact short of overflow */
+static void vfa_scale(TCGContext *s, TCGReg d, TCGReg b, unsigned n)
+{
+    if (n) {
+        vfa_pool(s, OPC_FPA_MUL, d, b, (127 + n) << 23, -1);
+    } else {
+        tcg_out_mov(s, TCG_TYPE_V128, d, b);
+    }
+}
+
+static void tcg_out_vfparith(TCGContext *s, TCGReg rd, TCGReg a,
+                             TCGReg b, TCGReg c, unsigned desc)
+{
+    unsigned op = desc & VFPARITH_OP_MASK;
+    unsigned n = desc >> VFPARITH_SCALE;
+    TCGReg r = FPA_T(0), t1 = FPA_T(2), t2 = FPA_T(3), t3 = FPA_T(4);
+    TCGReg zero = FPA_T(5);
+    TCGReg in[3] = { a, b, c };
+    TCGReg save[TCG_TARGET_NB_REGS];
+    tcg_insn_unit *jref[2], *jdone;
+    int nin, nref = 0, nsave = 0, frame, base;
+    bool nan_in = op >= VFPARITH_MAX && op <= VFPARITH_RIM;
+    bool out = op <= VFPARITH_RSQRT;
+
+    switch (op) {
+    case VFPARITH_MADD:
+    case VFPARITH_NMSUB:
+        nin = 3;
+        break;
+    case VFPARITH_RE:
+    case VFPARITH_RSQRT:
+    case VFPARITH_RIN ... VFPARITH_RIM:
+        in[0] = b;
+        nin = 1;
+        break;
+    case VFPARITH_CFS ... VFPARITH_CTU_SAT:
+        nin = 0;
+        break;
+    default:
+        nin = 2;
+        break;
+    }
+
+    /* operands first: arithmetic on subnormals takes microcode assists */
+    if (nin) {
+        tcg_out_vex_modrm(s, OPC_PXOR, zero, zero, zero);
+        for (int i = 0; i < nin; i++) {
+            vfa_check(s, in[i], 0x00800000, nan_in, i == 0);
+        }
+        jref[nref++] = vfa_jbad(s);
+    }
+
+    switch (op) {
+    case VFPARITH_ADD:
+        tcg_out_vex_modrm(s, OPC_FPA_ADD, r, a, b);
+        break;
+    case VFPARITH_SUB:
+        tcg_out_vex_modrm(s, OPC_FPA_SUB, r, a, b);
+        break;
+    case VFPARITH_MADD:
+        tcg_out_mov(s, TCG_TYPE_V128, r, b);
+        tcg_out_vex_modrm(s, OPC_VFMADD231PS, r, a, c);
+        break;
+    case VFPARITH_NMSUB:
+        /* -(a * c - b): the sign of an exact zero is that of the fma */
+        tcg_out_mov(s, TCG_TYPE_V128, r, b);
+        tcg_out_vex_modrm(s, OPC_VFMSUB231PS, r, a, c);
+        vfa_pool(s, OPC_VXORPS, r, r, 0x80000000, -1);
+        break;
+    case VFPARITH_RE:
+        vfa_const(s, t1, 0x3f800000);
+        tcg_out_vex_modrm(s, OPC_FPA_DIV, r, t1, b);
+        break;
+    case VFPARITH_RSQRT:
+        tcg_out_vex_modrm(s, OPC_VSQRTPS, t2, 0, b);
+        vfa_const(s, t1, 0x3f800000);
+        tcg_out_vex_modrm(s, OPC_FPA_DIV, r, t1, t2);
+        break;
+    case VFPARITH_MAX:
+    case VFPARITH_MIN:
+        /* equal operands, +0 and -0 among them: a & b for max, a | b */
+        tcg_out_vex_modrm(s, op == VFPARITH_MAX ? OPC_VMAXPS : OPC_VMINPS,
+                          r, a, b);
+        tcg_out_vex_modrm(s, op == VFPARITH_MAX ? OPC_VANDPS : OPC_VORPS,
+                          t1, a, b);
+        vfa_cmp(s, t2, a, b, VFA_EQ_OQ);
+        tcg_out_vex_modrm(s, OPC_VBLENDVPS, r, r, t1);
+        tcg_out8(s, (t2 - TCG_REG_XMM0) << 4);
+        break;
+    case VFPARITH_RIN:
+    case VFPARITH_RIZ:
+    case VFPARITH_RIP:
+    case VFPARITH_RIM:
+        {
+            static const uint8_t mode[4] = { 0, 3, 2, 1 };
+            tcg_out_vex_modrm(s, OPC_VROUNDPS, r, 0, b);
+            tcg_out8(s, 8 | mode[op - VFPARITH_RIN]);
+        }
+        break;
+    case VFPARITH_CMPEQ:
+        vfa_cmp(s, r, a, b, VFA_EQ_OQ);
+        break;
+    case VFPARITH_CMPGE:
+        vfa_cmp(s, r, a, b, VFA_GE_OS);
+        break;
+    case VFPARITH_CMPGT:
+        vfa_cmp(s, r, a, b, VFA_GT_OS);
+        break;
+    case VFPARITH_CMPB:
+        /* NaN lanes compare false both ways */
+        vfa_cmp(s, t1, a, b, VFA_LE_OS);
+        vfa_pool(s, OPC_VXORPS, t2, b, 0x80000000, -1);
+        vfa_cmp(s, t2, a, t2, VFA_GE_OS);
+        vfa_pool(s, OPC_VANDNPS, r, t1, 0x80000000, -1);
+        vfa_pool(s, OPC_VANDNPS, t2, t2, 0x40000000, -1);
+        tcg_out_vex_modrm(s, OPC_VORPS, r, r, t2);
+        break;
+    case VFPARITH_CFS:
+        tcg_out_vex_modrm(s, OPC_VCVTDQ2PS, r, 0, b);
+        if (n) {
+            vfa_pool(s, OPC_FPA_MUL, r, r, (127 - n) << 23, -1);
+        }
+        break;
+    case VFPARITH_CFU:
+        /* (b >> 16) * 2^16 + (b & 0xffff), each part exact, one rounding */
+        vfa_pool(s, OPC_PAND, r, b, 0xffff, -1);
+        tcg_out_vex_modrm(s, OPC_VCVTDQ2PS, r, 0, r);
+        tcg_out_vex_modrm(s, OPC_PSHIFTD_Ib, 2, t1, b);
+        tcg_out8(s, 16);
+        tcg_out_vex_modrm(s, OPC_VCVTDQ2PS, t1, 0, t1);
+        vfa_pool(s, OPC_VFMADD231PS, r, t1, 0x47800000, -1);
+        if (n) {
+            vfa_pool(s, OPC_FPA_MUL, r, r, (127 - n) << 23, -1);
+        }
+        break;
+    case VFPARITH_CTS:
+        /* out of range and NaN convert to INT32_MIN */
+        vfa_scale(s, t1, b, n);
+        tcg_out_vex_modrm(s, OPC_VCVTTPS2DQ, r, 0, t1);
+        vfa_pool(s, OPC_FPA_CMP, t2, t1, 0x4f000000, VFA_GE_OS);
+        tcg_out_vex_modrm(s, OPC_PXOR, r, r, t2);
+        vfa_cmp(s, t2, t1, t1, VFA_UNORD);
+        tcg_out_vex_modrm(s, OPC_PANDN, r, t2, r);
+        break;
+    case VFPARITH_CTU:
+        /* y >= 2^31 converts as y - 2^31 with bit 31 set */
+        vfa_scale(s, t1, b, n);
+        vfa_pool(s, OPC_FPA_CMP, t2, t1, 0x4f000000, VFA_GE_OS);
+        vfa_pool(s, OPC_VANDPS, t3, t2, 0x4f000000, -1);
+        tcg_out_vex_modrm(s, OPC_FPA_SUB, t3, t1, t3);
+        tcg_out_vex_modrm(s, OPC_VCVTTPS2DQ, r, 0, t3);
+        vfa_pool(s, OPC_PAND, t2, t2, 0x80000000, -1);
+        tcg_out_vex_modrm(s, OPC_POR, r, r, t2);
+        tcg_out_vex_modrm(s, OPC_PXOR, zero, zero, zero);
+        vfa_cmp(s, t2, t1, zero, VFA_GE_OS);
+        tcg_out_vex_modrm(s, OPC_PAND, r, r, t2);
+        vfa_pool(s, OPC_FPA_CMP, t2, t1, 0x4f800000, VFA_GE_OS);
+        tcg_out_vex_modrm(s, OPC_POR, r, r, t2);
+        break;
+    case VFPARITH_CTS_SAT:
+        /* b >= 2^(31-n) or b < -2^(31-n) */
+        vfa_pool(s, OPC_FPA_CMP, r, b, (158 - n) << 23, VFA_GE_OS);
+        vfa_pool(s, OPC_FPA_CMP, t1, b, 0x80000000u | (158 - n) << 23,
+                 VFA_LT_OS);
+        tcg_out_vex_modrm(s, OPC_VORPS, r, r, t1);
+        break;
+    case VFPARITH_CTU_SAT:
+        /* b >= 2^(32-n) or b <= -2^-n */
+        vfa_pool(s, OPC_FPA_CMP, r, b, (159 - n) << 23, VFA_GE_OS);
+        vfa_pool(s, OPC_FPA_CMP, t1, b, 0x80000000u | (127 - n) << 23,
+                 VFA_LE_OS);
+        tcg_out_vex_modrm(s, OPC_VORPS, r, r, t1);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (out) {
+        tcg_out_vex_modrm(s, OPC_PXOR, zero, zero, zero);
+        vfa_check(s, r, 0x01000000, true, true);
+        jref[nref++] = vfa_jbad(s);
+    }
+    tcg_out_mov(s, TCG_TYPE_V128, rd, r);
+    if (!nref) {
+        return;
+    }
+    tcg_out8(s, OPC_JMP_long);
+    jdone = s->code_ptr;
+    tcg_out32(s, 0);
+
+    /*
+     * Otherwise call tcg_vfparith_ref(env, desc, buf) with buf on the
+     * stack above the Win64 shadow area, saving the call-clobbered
+     * registers that hold live values.
+     */
+    for (int i = 0; i < nref; i++) {
+        tcg_patch32(jref[i], s->code_ptr - (jref[i] + 4));
+    }
+    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
+        if (s->reg_to_temp[i] && i != rd &&
+            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+            save[nsave++] = i;
+        }
+    }
+#ifdef _WIN64
+    base = 32;
+#else
+    base = 0;
+#endif
+    frame = base + sizeof(VFParithBuf) + nsave * 32;
+    tcg_out_addi(s, TCG_REG_ESP, -frame);
+    tcg_out_st(s, TCG_TYPE_V128, a, TCG_REG_ESP,
+               base + offsetof(VFParithBuf, a));
+    tcg_out_st(s, TCG_TYPE_V128, b, TCG_REG_ESP,
+               base + offsetof(VFParithBuf, b));
+    tcg_out_st(s, TCG_TYPE_V128, c, TCG_REG_ESP,
+               base + offsetof(VFParithBuf, c));
+    for (int i = 0; i < nsave; i++) {
+        TCGType t = save[i] < 16 ? TCG_TYPE_I64
+                    : s->reg_to_temp[save[i]]->type == TCG_TYPE_V256
+                    ? TCG_TYPE_V256 : TCG_TYPE_V128;
+        tcg_out_st(s, t, save[i], TCG_REG_ESP,
+                   base + sizeof(VFParithBuf) + i * 32);
+    }
+    tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
+    tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[1], desc);
+    tcg_out_modrm_offset(s, OPC_LEA | P_REXW, tcg_target_call_iarg_regs[2],
+                         TCG_REG_ESP, base);
+    tcg_out_branch(s, 1, (const tcg_insn_unit *)tcg_vfparith_ref);
+    for (int i = 0; i < nsave; i++) {
+        TCGType t = save[i] < 16 ? TCG_TYPE_I64
+                    : s->reg_to_temp[save[i]]->type == TCG_TYPE_V256
+                    ? TCG_TYPE_V256 : TCG_TYPE_V128;
+        tcg_out_ld(s, t, save[i], TCG_REG_ESP,
+                   base + sizeof(VFParithBuf) + i * 32);
+    }
+    tcg_out_ld(s, TCG_TYPE_V128, rd, TCG_REG_ESP,
+               base + offsetof(VFParithBuf, r));
+    tcg_out_addi(s, TCG_REG_ESP, frame);
+    tcg_patch32(jdone, s->code_ptr - (jdone + 4));
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -4169,6 +4496,10 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_fparith(s, a0, a1, a2, args[3], args[4], args[5]);
         break;
 
+    case INDEX_op_vfparith_vec:
+        tcg_out_vfparith(s, a0, a1, a2, args[3], args[4]);
+        break;
+
     case INDEX_op_mov_vec:  /* Always emitted via tcg_out_mov.  */
     case INDEX_op_dup_vec:  /* Always emitted via tcg_out_dup_vec.  */
     default:
@@ -4246,6 +4577,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I4(x, x, x, xO, x);
     case INDEX_op_fparith_vec:
         return C_O2_I3(x, r, x, x, x);
+    case INDEX_op_vfparith_vec:
+        return C_O1_I3(x, x, x, x);
 
     default:
         return C_NotImplemented;
