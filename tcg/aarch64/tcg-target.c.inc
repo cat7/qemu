@@ -3989,6 +3989,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         }
         break;
 
+    case INDEX_op_extract2_vec:
+        /* ext a0, al, ah, #ofs */
+        tcg_out32(s, 0x6e000000 | (a2 & 31) << 16 | args[3] << 11
+                  | (a1 & 31) << 5 | (a0 & 31));
+        break;
+
     case INDEX_op_bitsel_vec:
         a3 = args[3];
         if (a0 == a3) {
@@ -4153,6 +4159,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_dot2s_vec:
     case INDEX_op_dot2u_vec:
     case INDEX_op_mulhrs_vec:
+    case INDEX_op_extract2_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_not_vec:
     case INDEX_op_neg_vec:
