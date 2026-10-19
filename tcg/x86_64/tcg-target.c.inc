@@ -71,9 +71,6 @@ static const int tcg_target_reg_alloc_order[] = {
     TCG_REG_XMM3,
     TCG_REG_XMM4,
     TCG_REG_XMM5,
-#ifndef _WIN64
-    /* The Win64 ABI has xmm6-xmm15 as caller-saves, and we do not save
-       any of them.  Therefore only allow xmm0-xmm5 to be allocated.  */
     TCG_REG_XMM6,
     TCG_REG_XMM7,
     TCG_REG_XMM8,
@@ -84,7 +81,6 @@ static const int tcg_target_reg_alloc_order[] = {
     TCG_REG_XMM13,
     TCG_REG_XMM14,
     TCG_REG_XMM15,
-#endif
 };
 
 #define TCG_TMP_VEC  TCG_REG_XMM5
@@ -3536,8 +3532,7 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
 }
 
 /*
- * fparith_vec.  XMM8-XMM14 are reserved for it (saved by the prologue
- * on Win64, where they are call-saved); it also uses TCG_TMP_VEC.
+ * fparith_vec.  XMM8-XMM14 are reserved for it; it also uses TCG_TMP_VEC.
  * Scalar ops take P_SIMDF2 for double, P_SIMDF3 for single; the FMA
  * forms P_VEXW for double.
  */
@@ -5312,11 +5307,11 @@ static const int tcg_target_callee_save_regs[] = {
 #define PUSH_SIZE \
     ((1 + ARRAY_SIZE(tcg_target_callee_save_regs)) * sizeof(tcg_target_long))
 
-/* fparith_vec: saved and default MXCSR, then XMM8-14 on Win64 */
+/* Saved and default MXCSR for fparith_vec, then XMM6-15 on Win64 */
 #define FPA_FRAME_OFS \
     (TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE)
 #ifdef _WIN64
-#define FPA_FRAME_SIZE  (16 + FPA_NREGS * 16)
+#define FPA_FRAME_SIZE  (16 + 10 * 16)
 #else
 #define FPA_FRAME_SIZE  16
 #endif
@@ -5368,13 +5363,16 @@ static void tcg_target_qemu_prologue(TCGContext *s)
         tcg_out_modrm_offset(s, OPC_MXCSR, 3, TCG_REG_ESP, FPA_FRAME_OFS);
         tcg_out_sti(s, TCG_TYPE_I32, 0x1f80, TCG_REG_ESP, FPA_FRAME_OFS + 4);
         tcg_out_modrm_offset(s, OPC_MXCSR, 2, TCG_REG_ESP, FPA_FRAME_OFS + 4);
+    }
 #ifdef _WIN64
-        for (i = 0; i < FPA_NREGS; i++) {
-            tcg_out_vex_modrm_offset(s, OPC_MOVDQU_WxVx, FPA_T(i), 0,
+    /* XMM6-15 are call-saved on Win64; all are used once AVX is. */
+    if (have_avx1) {
+        for (i = 0; i < 10; i++) {
+            tcg_out_vex_modrm_offset(s, OPC_MOVDQU_WxVx, TCG_REG_XMM6 + i, 0,
                                      TCG_REG_ESP, FPA_FRAME_OFS + 16 + i * 16);
         }
-#endif
     }
+#endif
 
     /* jmp *tb.  */
     tcg_out_modrm(s, OPC_GRP5, EXT5_JMPN_Ev, tcg_target_call_iarg_regs[1]);
@@ -5389,13 +5387,15 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     /* TB epilogue */
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
 
-    if (TCG_TARGET_HAS_fparith_vec) {
 #ifdef _WIN64
-        for (i = 0; i < FPA_NREGS; i++) {
-            tcg_out_vex_modrm_offset(s, OPC_MOVDQU_VxWx, FPA_T(i), 0,
+    if (have_avx1) {
+        for (i = 0; i < 10; i++) {
+            tcg_out_vex_modrm_offset(s, OPC_MOVDQU_VxWx, TCG_REG_XMM6 + i, 0,
                                      TCG_REG_ESP, FPA_FRAME_OFS + 16 + i * 16);
         }
+    }
 #endif
+    if (TCG_TARGET_HAS_fparith_vec) {
         tcg_out_modrm_offset(s, OPC_MXCSR, 2, TCG_REG_ESP, FPA_FRAME_OFS);
     }
 
@@ -5432,6 +5432,7 @@ static void tcg_target_init(TCGContext *s)
         tcg_target_available_regs[TCG_TYPE_V256] = ALL_VECTOR_REGS;
     }
 
+    /* Win64 saves only the low half of XMM6-15 across calls. */
     tcg_target_call_clobber_regs = ALL_VECTOR_REGS;
     tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_EAX);
     tcg_regset_set_reg(tcg_target_call_clobber_regs, TCG_REG_EDX);
@@ -5453,19 +5454,6 @@ static void tcg_target_init(TCGContext *s)
             tcg_regset_set_reg(s->reserved_regs, FPA_T(i));
         }
     }
-#ifdef _WIN64
-    /* These are call saved, and we don't save them, so don't use them. */
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM6);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM7);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM8);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM9);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM10);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM11);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM12);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM13);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM14);
-    tcg_regset_set_reg(s->reserved_regs, TCG_REG_XMM15);
-#endif
 }
 
 typedef struct {
