@@ -51,6 +51,9 @@
 #ifndef TCG_TARGET_HAS_mulhrs_vec
 #define TCG_TARGET_HAS_mulhrs_vec       0
 #endif
+#ifndef TCG_TARGET_HAS_zip_vec
+#define TCG_TARGET_HAS_zip_vec          0
+#endif
 #ifndef TCG_TARGET_HAS_extract2_vec
 #define TCG_TARGET_HAS_extract2_vec     0
 #endif

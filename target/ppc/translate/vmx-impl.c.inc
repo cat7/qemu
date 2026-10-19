@@ -366,11 +366,40 @@ static void gen_vsum2sws_i64(int vrt, int vra, int vrb);
 static void gen_vsumsws_i64(int vrt, int vra, int vrb);
 static void gen_vso_i64(int vrt, int vra, int vrb, bool left);
 
+static bool gen_vmrg_zip(int vrt, int vra, int vrb, unsigned vece, bool hi)
+{
+    static const TCGOpcode list[] = {
+        INDEX_op_zipl_vec, INDEX_op_ziph_vec, 0
+    };
+    const TCGOpcode *hold;
+    TCGv_vec va, vb;
+
+    /* host order: vB elements even, vA odd */
+    if (!native_vmxint_on || HOST_BIG_ENDIAN
+        || !tcg_op_supported(INDEX_op_add_vec, TCG_TYPE_V128, 0)
+        || !tcg_can_emit_vecop_list(list, TCG_TYPE_V128, vece)) {
+        return false;
+    }
+    hold = tcg_swap_vecop_list(list);
+    va = tcg_temp_new_vec(TCG_TYPE_V128);
+    vb = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(va, tcg_env, avr_full_offset(vra));
+    tcg_gen_ld_vec(vb, tcg_env, avr_full_offset(vrb));
+    tcg_gen_zip_vec(vece, va, vb, va, hi);
+    tcg_gen_st_vec(va, tcg_env, avr_full_offset(vrt));
+    tcg_swap_vecop_list(hold);
+    return true;
+}
+
 #define GEN_VXFORM_VMRG(name, vece, hi)                                 \
 static void glue(gen_, name)(DisasContext *ctx)                         \
 {                                                                       \
     if (unlikely(!ctx->altivec_enabled)) {                              \
         gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (gen_vmrg_zip(rD(ctx->opcode), rA(ctx->opcode),                  \
+                     rB(ctx->opcode), vece, hi)) {                      \
         return;                                                         \
     }                                                                   \
     if (vmxperm((vece) == MO_8 ? VP_MRGB : (vece) == MO_16 ? VP_MRGH   \

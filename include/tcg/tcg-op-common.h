@@ -601,6 +601,13 @@ void tcg_gen_dot2u_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 /* r = (a * b + 2^(n - 2)) >> (n - 1) for signed n-bit elements, modulo 2^n */
 void tcg_gen_mulhrs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 
+/*
+ * Element 2i of r = element i of a, element 2i + 1 = element i of b, of
+ * their low halves, or of their high halves if hi; in host order.
+ */
+void tcg_gen_zip_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                     bool hi);
+
 /* V128: r = bytes ofs .. ofs + 15 of the 32 bytes ah:al, 0 < ofs < 16 */
 bool tcg_can_emit_extract2_vec(void);
 void tcg_gen_extract2_vec(TCGv_vec r, TCGv_vec al, TCGv_vec ah,
