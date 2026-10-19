@@ -3198,6 +3198,282 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     reloc_pc26(bdone, tcg_splitwx_to_rx(s->code_ptr));
 }
 
+/*
+ * vfparith_vec, on the fparith_vec scratch registers.  Lane checks
+ * collect all ones in bad for lanes the host result does not cover.
+ */
+enum {
+    VFA_FADD    = 0x4e20d400,
+    VFA_FSUB    = 0x4ea0d400,
+    VFA_FDIV    = 0x6e20fc00,
+    VFA_FMLA    = 0x4e20cc00,   /* d += n * m */
+    VFA_FMAX    = 0x4e20f400,
+    VFA_FMIN    = 0x4ea0f400,
+    VFA_FCMEQ   = 0x4e20e400,
+    VFA_FCMGE   = 0x6e20e400,
+    VFA_FCMGT   = 0x6ea0e400,
+    VFA_FACGE   = 0x6e20ec00,
+    VFA_FACGT   = 0x6ea0ec00,
+    VFA_AND     = 0x4e201c00,
+    VFA_ORR     = 0x4ea01c00,
+    VFA_ORN     = 0x4ee01c00,
+    VFA_BIC     = 0x4e601c00,
+    VFA_FSQRT   = 0x6ea1f800,
+    VFA_FNEG    = 0x6ea0f800,
+    VFA_FCMEQ0  = 0x4ea0d800,
+    VFA_MVN     = 0x6e205800,
+    VFA_UMAXV   = 0x6eb0a800,
+    VFA_FRINTN  = 0x4e218800,
+    VFA_FRINTM  = 0x4e219800,
+    VFA_FRINTP  = 0x4ea18800,
+    VFA_FRINTZ  = 0x4ea19800,
+    VFA_SCVTF   = 0x4e21d800,
+    VFA_UCVTF   = 0x6e21d800,
+    VFA_FCVTZS  = 0x4ea1b800,
+    VFA_FCVTZU  = 0x6ea1b800,
+    VFA_SCVTF_X = 0x4f00e400,   /* fixed point: | (64 - fbits) << 16 */
+    VFA_UCVTF_X = 0x6f00e400,
+    VFA_FCVTZS_X = 0x4f00fc00,
+    VFA_FCVTZU_X = 0x6f00fc00,
+};
+
+static void vfa3(TCGContext *s, uint32_t insn, TCGReg d, TCGReg n, TCGReg m)
+{
+    tcg_out32(s, insn | (m & 31) << 16 | (n & 31) << 5 | (d & 31));
+}
+
+static void vfa2(TCGContext *s, uint32_t insn, TCGReg d, TCGReg n)
+{
+    tcg_out32(s, insn | (n & 31) << 5 | (d & 31));
+}
+
+/* conversion insn, or its fixed point form fix with fbits */
+static void vfa_cvt(TCGContext *s, uint32_t insn, uint32_t fix,
+                    unsigned fbits, TCGReg d, TCGReg n)
+{
+    if (fbits) {
+        insn = fix | (64 - fbits) << 16;
+    }
+    vfa2(s, insn, d, n);
+}
+
+static void vfa_const(TCGContext *s, TCGReg d, uint32_t v)
+{
+    tcg_out_dupi_vec(s, TCG_TYPE_V128, MO_32, d, v);
+}
+
+/*
+ * bad |= lanes of v below min in magnitude and nonzero, and with nan
+ * NaN lanes too (bad = with first).
+ */
+static void vfa_check(TCGContext *s, TCGReg v, TCGReg min, bool nan,
+                      bool first)
+{
+    TCGReg bad = FPA_T(1), t1 = FPA_T(2), t2 = FPA_T(3);
+
+    vfa2(s, VFA_FCMEQ0, t2, v);
+    if (nan) {
+        vfa3(s, VFA_FACGE, t1, v, min);
+        vfa3(s, VFA_ORR, t1, t1, t2);
+        if (first) {
+            vfa2(s, VFA_MVN, bad, t1);
+        } else {
+            vfa3(s, VFA_ORN, bad, bad, t1);
+        }
+    } else {
+        vfa3(s, VFA_FACGT, t1, min, v);
+        vfa3(s, VFA_BIC, first ? bad : t1, t1, t2);
+        if (!first) {
+            vfa3(s, VFA_ORR, bad, bad, t1);
+        }
+    }
+}
+
+static void tcg_out_vfparith(TCGContext *s, TCGReg rd, TCGReg a,
+                             TCGReg b, TCGReg c, unsigned desc)
+{
+    unsigned op = desc & VFPARITH_OP_MASK;
+    unsigned n = desc >> VFPARITH_SCALE;
+    TCGReg r = FPA_T(0), t1 = FPA_T(2), t2 = FPA_T(3), kmin = FPA_T(4);
+    TCGReg t3 = FPA_T(5);
+    TCGReg in[3] = { a, b, c };
+    TCGReg save[TCG_TARGET_NB_REGS];
+    tcg_insn_unit *cbnz, *bdone;
+    int nin = 0, nsave = 0, frame;
+    bool nan_in = false, out = op <= VFPARITH_RSQRT;
+
+    switch (op) {
+    case VFPARITH_ADD:
+        vfa3(s, VFA_FADD, r, a, b);
+        nin = 2;
+        break;
+    case VFPARITH_SUB:
+        vfa3(s, VFA_FSUB, r, a, b);
+        nin = 2;
+        break;
+    case VFPARITH_MADD:
+        tcg_out_mov(s, TCG_TYPE_V128, r, b);
+        vfa3(s, VFA_FMLA, r, a, c);
+        nin = 3;
+        break;
+    case VFPARITH_NMSUB:
+        /* -(a * c + -b): the sign of an exact zero is that of the fma */
+        vfa2(s, VFA_FNEG, r, b);
+        vfa3(s, VFA_FMLA, r, a, c);
+        vfa2(s, VFA_FNEG, r, r);
+        nin = 3;
+        break;
+    case VFPARITH_RE:
+        vfa_const(s, t1, 0x3f800000);
+        vfa3(s, VFA_FDIV, r, t1, b);
+        in[0] = b;
+        nin = 1;
+        break;
+    case VFPARITH_RSQRT:
+        vfa2(s, VFA_FSQRT, t2, b);
+        vfa_const(s, t1, 0x3f800000);
+        vfa3(s, VFA_FDIV, r, t1, t2);
+        in[0] = b;
+        nin = 1;
+        break;
+    case VFPARITH_MAX:
+        vfa3(s, VFA_FMAX, r, a, b);
+        nin = 2;
+        nan_in = true;
+        break;
+    case VFPARITH_MIN:
+        vfa3(s, VFA_FMIN, r, a, b);
+        nin = 2;
+        nan_in = true;
+        break;
+    case VFPARITH_RIN:
+    case VFPARITH_RIZ:
+    case VFPARITH_RIP:
+    case VFPARITH_RIM:
+        {
+            static const uint32_t ri[4] = {
+                VFA_FRINTN, VFA_FRINTZ, VFA_FRINTP, VFA_FRINTM
+            };
+            vfa2(s, ri[op - VFPARITH_RIN], r, b);
+        }
+        in[0] = b;
+        nin = 1;
+        nan_in = true;
+        break;
+    case VFPARITH_CMPEQ:
+        vfa3(s, VFA_FCMEQ, r, a, b);
+        nin = 2;
+        break;
+    case VFPARITH_CMPGE:
+        vfa3(s, VFA_FCMGE, r, a, b);
+        nin = 2;
+        break;
+    case VFPARITH_CMPGT:
+        vfa3(s, VFA_FCMGT, r, a, b);
+        nin = 2;
+        break;
+    case VFPARITH_CMPB:
+        /* NaN lanes compare false both ways */
+        vfa3(s, VFA_FCMGE, t1, b, a);
+        vfa2(s, VFA_FNEG, t2, b);
+        vfa3(s, VFA_FCMGE, t2, a, t2);
+        vfa_const(s, r, 0x80000000);
+        vfa3(s, VFA_BIC, r, r, t1);
+        vfa_const(s, t3, 0x40000000);
+        vfa3(s, VFA_BIC, t3, t3, t2);
+        vfa3(s, VFA_ORR, r, r, t3);
+        nin = 2;
+        break;
+    case VFPARITH_CFS:
+        vfa_cvt(s, VFA_SCVTF, VFA_SCVTF_X, n, r, b);
+        break;
+    case VFPARITH_CFU:
+        vfa_cvt(s, VFA_UCVTF, VFA_UCVTF_X, n, r, b);
+        break;
+    case VFPARITH_CTS:
+        vfa_cvt(s, VFA_FCVTZS, VFA_FCVTZS_X, n, r, b);
+        break;
+    case VFPARITH_CTU:
+        vfa_cvt(s, VFA_FCVTZU, VFA_FCVTZU_X, n, r, b);
+        break;
+    case VFPARITH_CTS_SAT:
+        /* b >= 2^(31-n) or b < -2^(31-n) */
+        vfa_const(s, t1, (158 - n) << 23);
+        vfa3(s, VFA_FCMGE, r, b, t1);
+        vfa2(s, VFA_FNEG, t1, t1);
+        vfa3(s, VFA_FCMGT, t1, t1, b);
+        vfa3(s, VFA_ORR, r, r, t1);
+        break;
+    case VFPARITH_CTU_SAT:
+        /* b >= 2^(32-n) or b <= -2^-n */
+        vfa_const(s, t1, (159 - n) << 23);
+        vfa3(s, VFA_FCMGE, r, b, t1);
+        vfa_const(s, t1, 0x80000000u | (127 - n) << 23);
+        vfa3(s, VFA_FCMGE, t1, t1, b);
+        vfa3(s, VFA_ORR, r, r, t1);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (!nin && !out) {
+        tcg_out_mov(s, TCG_TYPE_V128, rd, r);
+        return;
+    }
+
+    vfa_const(s, kmin, 0x00800000);
+    for (int i = 0; i < nin; i++) {
+        vfa_check(s, in[i], kmin, nan_in, i == 0);
+    }
+    if (out) {
+        vfa_const(s, kmin, 0x01000000);
+        vfa_check(s, r, kmin, true, nin == 0);
+    }
+    vfa2(s, VFA_UMAXV, t1, FPA_T(1));
+    tcg_out32(s, FPA_UMOV_WS | (t1 & 31) << 5 | TCG_REG_TMP0);
+
+    /* cbnz tmp0, ref */
+    cbnz = s->code_ptr;
+    tcg_out_insn(s, cbz, CBNZ, TCG_TYPE_I32, TCG_REG_TMP0, 0);
+    tcg_out_mov(s, TCG_TYPE_V128, rd, r);
+    bdone = s->code_ptr;
+    tcg_out_insn(s, branch, B, 0);
+
+    /*
+     * Otherwise call tcg_vfparith_ref(env, desc, buf) with buf on the
+     * stack, saving the call-clobbered registers that hold live values.
+     */
+    reloc_pc19(cbnz, tcg_splitwx_to_rx(s->code_ptr));
+    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
+        if (s->reg_to_temp[i] && i != rd &&
+            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+            save[nsave++] = i;
+        }
+    }
+    frame = sizeof(VFParithBuf) + nsave * 16;
+    tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
+                 frame);
+    tcg_out_st(s, TCG_TYPE_V128, a, TCG_REG_SP, offsetof(VFParithBuf, a));
+    tcg_out_st(s, TCG_TYPE_V128, b, TCG_REG_SP, offsetof(VFParithBuf, b));
+    tcg_out_st(s, TCG_TYPE_V128, c, TCG_REG_SP, offsetof(VFParithBuf, c));
+    for (int i = 0; i < nsave; i++) {
+        tcg_out_st(s, save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
+                   save[i], TCG_REG_SP, sizeof(VFParithBuf) + i * 16);
+    }
+    tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_X0, TCG_AREG0);
+    tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_X1, desc);
+    tcg_out_movr_sp(s, TCG_TYPE_I64, TCG_REG_X2, TCG_REG_SP);
+    tcg_out_call_int(s, (const tcg_insn_unit *)tcg_vfparith_ref);
+    for (int i = 0; i < nsave; i++) {
+        tcg_out_ld(s, save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
+                   save[i], TCG_REG_SP, sizeof(VFParithBuf) + i * 16);
+    }
+    tcg_out_ld(s, TCG_TYPE_V128, rd, TCG_REG_SP, offsetof(VFParithBuf, r));
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
+                 frame);
+    reloc_pc26(bdone, tcg_splitwx_to_rx(s->code_ptr));
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -3512,6 +3788,10 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_fparith(s, a0, a1, a2, args[3], args[4], args[5]);
         break;
 
+    case INDEX_op_vfparith_vec:
+        tcg_out_vfparith(s, a0, a1, a2, args[3], args[4]);
+        break;
+
     case INDEX_op_bitsel_vec:
         a3 = args[3];
         if (a0 == a3) {
@@ -3693,6 +3973,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I3(w, w, w, w);
     case INDEX_op_fparith_vec:
         return C_O2_I3(w, r, w, w, w);
+    case INDEX_op_vfparith_vec:
+        return C_O1_I3(w, w, w, w);
     case INDEX_op_aa64_sli_vec:
         return C_O1_I2(w, 0, w);
 

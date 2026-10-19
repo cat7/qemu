@@ -790,6 +790,13 @@ typedef struct FParithResult {
 typedef FParithResult (*FParithRef)(void *env, uint64_t a, uint64_t c,
                                     uint64_t b, uint32_t desc);
 
+/* see tcg_gen_vfparith_vec(); the ref function stores r */
+typedef struct VFParithBuf {
+    uint8_t r[16] QEMU_ALIGNED(16);
+    uint8_t a[16], b[16], c[16];
+} VFParithBuf;
+typedef void (*VFParithRef)(void *env, uint32_t desc, VFParithBuf *buf);
+
 TCGOp *tcg_emit_op(TCGOpcode opc, unsigned nargs);
 void tcg_op_remove(TCGContext *s, TCGOp *op);
 
