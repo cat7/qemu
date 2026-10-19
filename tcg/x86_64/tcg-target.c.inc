@@ -322,6 +322,7 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_PMOVZXWD    (0x33 | P_EXT38 | P_DATA16)
 #define OPC_PMOVZXDQ    (0x35 | P_EXT38 | P_DATA16)
 #define OPC_PMULLW      (0xd5 | P_EXT | P_DATA16)
+#define OPC_PMADDWD     (0xf5 | P_EXT | P_DATA16)
 #define OPC_PMULLD      (0x40 | P_EXT38 | P_DATA16)
 #define OPC_VPMULLQ     (0x40 | P_EXT38 | P_DATA16 | P_VEXW | P_EVEX)
 #define OPC_POR         (0xeb | P_EXT | P_DATA16)
@@ -4527,6 +4528,9 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_x86_pshufb_vec:
         insn = OPC_PSHUFB;
         goto gen_simd;
+    case INDEX_op_dot2s_vec:
+        insn = OPC_PMADDWD;
+        goto gen_simd;
     case INDEX_op_x86_pblendvb_vec:
         /* a0 = a3 bit 7 ? a2 : a1, per byte */
         tcg_out_vex_modrm_type(s, OPC_VPBLENDVB, a0, a1, a2, type);
@@ -4745,6 +4749,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_vpshldi_vec:
     case INDEX_op_x86_vgf2p8affineqb_vec:
     case INDEX_op_x86_pshufb_vec:
+    case INDEX_op_dot2s_vec:
         return C_O1_I2(x, x, x);
 
     case INDEX_op_abs_vec:
@@ -4892,6 +4897,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
 
     case INDEX_op_perm2_vec:
         return type == TCG_TYPE_V128 ? -1 : 0;
+    case INDEX_op_dot2s_vec:
+        return type == TCG_TYPE_V128 && vece == MO_32;
+    case INDEX_op_dot2u_vec:
+        return type == TCG_TYPE_V128 && vece == MO_32 ? -1 : 0;
 
     default:
         return 0;
@@ -4917,6 +4926,31 @@ static void expand_vec_perm2(TCGv_vec v0, TCGv_vec a, TCGv_vec b,
     tcg_temp_free_vec(m);
     tcg_temp_free_vec(ta);
     tcg_temp_free_vec(tb);
+}
+
+/*
+ * pmaddwd of the signed halves, less 2^16 times the sums of the
+ * products of each half with the sign mask of the other.
+ */
+static void expand_vec_dot2u(TCGType type, TCGv_vec v0, TCGv_vec a,
+                             TCGv_vec b)
+{
+    TCGv_vec t = tcg_temp_new_vec(type);
+    TCGv_vec u = tcg_temp_new_vec(type);
+
+    tcg_gen_sari_vec(MO_16, t, a, 15);
+    vec_gen_3(INDEX_op_dot2s_vec, type, MO_32,
+              tcgv_vec_arg(t), tcgv_vec_arg(t), tcgv_vec_arg(b));
+    tcg_gen_sari_vec(MO_16, u, b, 15);
+    vec_gen_3(INDEX_op_dot2s_vec, type, MO_32,
+              tcgv_vec_arg(u), tcgv_vec_arg(u), tcgv_vec_arg(a));
+    tcg_gen_add_vec(MO_32, t, t, u);
+    tcg_gen_shli_vec(MO_32, t, t, 16);
+    vec_gen_3(INDEX_op_dot2s_vec, type, MO_32,
+              tcgv_vec_arg(u), tcgv_vec_arg(a), tcgv_vec_arg(b));
+    tcg_gen_sub_vec(MO_32, v0, u, t);
+    tcg_temp_free_vec(t);
+    tcg_temp_free_vec(u);
 }
 
 static void gen_vgf2p8affineqb0(TCGType type, TCGv_vec v0,
@@ -5305,6 +5339,10 @@ void tcg_expand_vec_op(TCGOpcode opc, TCGType type, unsigned vece,
         a3 = va_arg(va, TCGArg);
         expand_vec_perm2(v0, v1, temp_tcgv_vec(arg_temp(a2)),
                          temp_tcgv_vec(arg_temp(a3)));
+        break;
+
+    case INDEX_op_dot2u_vec:
+        expand_vec_dot2u(type, v0, v1, temp_tcgv_vec(arg_temp(a2)));
         break;
 
     default:
