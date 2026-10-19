@@ -42,7 +42,7 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
  */
 enum { NFP_AB, NFP_ACB, NFP_RSP, NFP_CMPU };
 
-static bool native_fcmp_on, native_frsp_on, native_vmx_on;
+static bool native_fcmp_on, native_frsp_on, native_vmx_on, native_vmxint_on;
 
 static bool native_env(const char *name, bool dflt)
 {
@@ -54,6 +54,7 @@ static bool native_env(const char *name, bool dflt)
 static void native_fp_init(void)
 {
 #ifndef CONFIG_USER_ONLY
+    native_vmxint_on = native_env("PPC_NATIVE_VMX", true);
     if (native_env("PPC_STRICT_FP", false)) {
         return;
     }
