@@ -187,6 +187,8 @@ DEF(perm2_vec, 1, 3, 0, TCG_OPF_VECTOR)
 /* r = sum of the products of the halves of each element of a and b */
 DEF(dot2s_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(dot2u_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/* r = signed high half of a * b, rounded; see tcg_gen_mulhrs_vec() */
+DEF(mulhrs_vec, 1, 2, 0, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

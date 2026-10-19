@@ -598,6 +598,9 @@ void tcg_gen_perm2_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx);
 void tcg_gen_dot2s_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_dot2u_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 
+/* r = (a * b + 2^(n - 2)) >> (n - 1) for signed n-bit elements, modulo 2^n */
+void tcg_gen_mulhrs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);
