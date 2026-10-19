@@ -350,12 +350,45 @@ GEN_VXFORM_V(vsububm, MO_8, tcg_gen_gvec_sub, 0, 16);
 GEN_VXFORM_V(vsubuhm, MO_16, tcg_gen_gvec_sub, 0, 17);
 GEN_VXFORM_V(vsubuwm, MO_32, tcg_gen_gvec_sub, 0, 18);
 GEN_VXFORM_V(vsubudm, MO_64, tcg_gen_gvec_sub, 0, 19);
-GEN_VXFORM(vmrghb, 6, 0);
-GEN_VXFORM(vmrghh, 6, 1);
-GEN_VXFORM(vmrghw, 6, 2);
-GEN_VXFORM(vmrglb, 6, 4);
-GEN_VXFORM(vmrglh, 6, 5);
-GEN_VXFORM(vmrglw, 6, 6);
+enum { VPK_US, VPK_SU, VPK_SS, VPK_PX };
+enum { VSUM_UB, VSUM_SB, VSUM_SH };
+enum {
+    VP_MRGB, VP_MRGH, VP_MRGW, VP_UPKH, VP_UPKPX, VP_PKM, VP_PKS,
+    VP_PKUWUS, VP_PKPX, VP_SUM4, VP_SUMS, VP_SO, VP_N
+};
+
+static bool vmxperm(int op);
+static void gen_vmrg_i64(int vrt, int vra, int vrb, unsigned vece, bool hi);
+static void gen_vpkum_i64(int vrt, int vra, int vrb, unsigned vece);
+static void gen_vpk_vec(int vrt, int vra, int vrb, unsigned vece, int kind);
+static void gen_vsum4_vec(int vrt, int vra, int vrb, int kind);
+static void gen_vsum2sws_i64(int vrt, int vra, int vrb);
+static void gen_vsumsws_i64(int vrt, int vra, int vrb);
+static void gen_vso_i64(int vrt, int vra, int vrb, bool left);
+
+#define GEN_VXFORM_VMRG(name, vece, hi)                                 \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (vmxperm((vece) == MO_8 ? VP_MRGB : (vece) == MO_16 ? VP_MRGH   \
+                : VP_MRGW)) {                                           \
+        gen_vmrg_i64(rD(ctx->opcode), rA(ctx->opcode),                  \
+                     rB(ctx->opcode), vece, hi);                        \
+        return;                                                         \
+    }                                                                   \
+    gen_helper_##name(gen_avr_ptr(rD(ctx->opcode)),                     \
+                      gen_avr_ptr(rA(ctx->opcode)),                     \
+                      gen_avr_ptr(rB(ctx->opcode)));                    \
+}
+GEN_VXFORM_VMRG(vmrghb, MO_8, true);
+GEN_VXFORM_VMRG(vmrghh, MO_16, true);
+GEN_VXFORM_VMRG(vmrghw, MO_32, true);
+GEN_VXFORM_VMRG(vmrglb, MO_8, false);
+GEN_VXFORM_VMRG(vmrglh, MO_16, false);
+GEN_VXFORM_VMRG(vmrglw, MO_32, false);
 
 static void trans_vmrgew(DisasContext *ctx)
 {
@@ -674,8 +707,25 @@ static void trans_vclzd(DisasContext *ctx)
 GEN_VXFORM_V(vmuluwm, MO_32, tcg_gen_gvec_mul, 4, 2);
 GEN_VXFORM(vsrv, 2, 28);
 GEN_VXFORM(vslv, 2, 29);
-GEN_VXFORM(vslo, 6, 16);
-GEN_VXFORM(vsro, 6, 17);
+
+#define GEN_VXFORM_VSO(name, left)                                      \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (vmxperm(VP_SO)) {                                               \
+        gen_vso_i64(rD(ctx->opcode), rA(ctx->opcode), rB(ctx->opcode),  \
+                    left);                                              \
+        return;                                                         \
+    }                                                                   \
+    gen_helper_##name(gen_avr_ptr(rD(ctx->opcode)),                     \
+                      gen_avr_ptr(rA(ctx->opcode)),                     \
+                      gen_avr_ptr(rB(ctx->opcode)));                    \
+}
+GEN_VXFORM_VSO(vslo, true);
+GEN_VXFORM_VSO(vsro, false);
 
 static bool do_vector_gvec3_VX(DisasContext *ctx, arg_VX *a, int vece,
                                void (*gen_gvec)(unsigned, uint32_t, uint32_t,
@@ -1057,24 +1107,66 @@ TRANS(VRLQMI, do_vector_rotl_quad, false, true)
 
 GEN_VXFORM_TRANS(vsl, 2, 7);
 GEN_VXFORM_TRANS(vsr, 2, 11);
-GEN_VXFORM_ENV(vpkuhum, 7, 0);
-GEN_VXFORM_ENV(vpkuwum, 7, 1);
+
+#define GEN_VXFORM_VPK(name, cond, native)                              \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    int vrt = rD(ctx->opcode), vra = rA(ctx->opcode);                   \
+    int vrb = rB(ctx->opcode);                                          \
+                                                                        \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (cond) {                                                         \
+        native;                                                         \
+        return;                                                         \
+    }                                                                   \
+    gen_helper_##name(tcg_env, gen_avr_ptr(vrt), gen_avr_ptr(vra),      \
+                      gen_avr_ptr(vrb));                                \
+}
+GEN_VXFORM_VPK(vpkuhum, vmxperm(VP_PKM), gen_vpkum_i64(vrt, vra, vrb, MO_16));
+GEN_VXFORM_VPK(vpkuwum, vmxperm(VP_PKM), gen_vpkum_i64(vrt, vra, vrb, MO_32));
 GEN_VXFORM_ENV(vpkudum, 7, 17);
-GEN_VXFORM_ENV(vpkuhus, 7, 2);
-GEN_VXFORM_ENV(vpkuwus, 7, 3);
+GEN_VXFORM_VPK(vpkuhus, vmxperm(VP_PKS),
+               gen_vpk_vec(vrt, vra, vrb, MO_16, VPK_US));
+GEN_VXFORM_VPK(vpkuwus, vmxperm(VP_PKUWUS),
+               gen_vpk_vec(vrt, vra, vrb, MO_32, VPK_US));
 GEN_VXFORM_ENV(vpkudus, 7, 19);
-GEN_VXFORM_ENV(vpkshus, 7, 4);
-GEN_VXFORM_ENV(vpkswus, 7, 5);
+GEN_VXFORM_VPK(vpkshus, vmxperm(VP_PKS),
+               gen_vpk_vec(vrt, vra, vrb, MO_16, VPK_SU));
+GEN_VXFORM_VPK(vpkswus, vmxperm(VP_PKS),
+               gen_vpk_vec(vrt, vra, vrb, MO_32, VPK_SU));
 GEN_VXFORM_ENV(vpksdus, 7, 21);
-GEN_VXFORM_ENV(vpkshss, 7, 6);
-GEN_VXFORM_ENV(vpkswss, 7, 7);
+GEN_VXFORM_VPK(vpkshss, vmxperm(VP_PKS),
+               gen_vpk_vec(vrt, vra, vrb, MO_16, VPK_SS));
+GEN_VXFORM_VPK(vpkswss, vmxperm(VP_PKS),
+               gen_vpk_vec(vrt, vra, vrb, MO_32, VPK_SS));
 GEN_VXFORM_ENV(vpksdss, 7, 23);
-GEN_VXFORM(vpkpx, 7, 12);
-GEN_VXFORM_ENV(vsum4ubs, 4, 24);
-GEN_VXFORM_ENV(vsum4sbs, 4, 28);
-GEN_VXFORM_ENV(vsum4shs, 4, 25);
-GEN_VXFORM_ENV(vsum2sws, 4, 26);
-GEN_VXFORM_ENV(vsumsws, 4, 30);
+
+static void gen_vpkpx(DisasContext *ctx)
+{
+    if (unlikely(!ctx->altivec_enabled)) {
+        gen_exception(ctx, POWERPC_EXCP_VPU);
+        return;
+    }
+    if (vmxperm(VP_PKPX)) {
+        gen_vpk_vec(rD(ctx->opcode), rA(ctx->opcode), rB(ctx->opcode),
+                    MO_32, VPK_PX);
+        return;
+    }
+    gen_helper_vpkpx(gen_avr_ptr(rD(ctx->opcode)), gen_avr_ptr(rA(ctx->opcode)),
+                     gen_avr_ptr(rB(ctx->opcode)));
+}
+
+GEN_VXFORM_VPK(vsum4ubs, vmxperm(VP_SUM4),
+               gen_vsum4_vec(vrt, vra, vrb, VSUM_UB));
+GEN_VXFORM_VPK(vsum4sbs, vmxperm(VP_SUM4),
+               gen_vsum4_vec(vrt, vra, vrb, VSUM_SB));
+GEN_VXFORM_VPK(vsum4shs, vmxperm(VP_SUM4),
+               gen_vsum4_vec(vrt, vra, vrb, VSUM_SH));
+GEN_VXFORM_VPK(vsum2sws, vmxperm(VP_SUMS), gen_vsum2sws_i64(vrt, vra, vrb));
+GEN_VXFORM_VPK(vsumsws, vmxperm(VP_SUMS), gen_vsumsws_i64(vrt, vra, vrb));
 /*
  * Single precision arithmetic on the host (vfparith_vec).  Vectors whose
  * host result might differ from the helper's for either VSCR[NJ] (NaNs,
@@ -1312,6 +1404,450 @@ static void vmxint_gen(const TCGOpcode *list, VmxIntFn *fn, bool sat,
         tcg_gen_st_vec(v, tcg_env, offsetof(CPUPPCState, vscr_sat));
     }
     tcg_swap_vecop_list(hold);
+}
+
+/*
+ * Merges, packs, unpacks and sums on the host, with the helpers' results
+ * and VSCR[SAT]: as 64-bit halves (VP_I) or host vector ops (VP_V).  The
+ * vector ops move data between halves by a dup load of one doubleword
+ * and a select with vmx_lanes.  Per host the faster of these and the
+ * helper; other hosts take the x86 choice.  PPC_NATIVE_VMX=0 keeps the
+ * helpers.
+ */
+enum { VP_H, VP_V, VP_I };
+
+static const uint8_t vmxperm_how[VP_N] = {
+#ifdef __aarch64__
+    [VP_MRGB] = VP_H, [VP_MRGH] = VP_I, [VP_MRGW] = VP_I,
+    [VP_UPKH] = VP_I, [VP_UPKPX] = VP_H,
+    [VP_PKM] = VP_H, [VP_PKS] = VP_H, [VP_PKUWUS] = VP_H, [VP_PKPX] = VP_H,
+    [VP_SUM4] = VP_V, [VP_SUMS] = VP_I, [VP_SO] = VP_I,
+#else
+    [VP_MRGB] = VP_I, [VP_MRGH] = VP_I, [VP_MRGW] = VP_I,
+    [VP_UPKH] = VP_I, [VP_UPKPX] = VP_V,
+    [VP_PKM] = VP_I, [VP_PKS] = VP_V, [VP_PKUWUS] = VP_H, [VP_PKPX] = VP_V,
+    [VP_SUM4] = VP_V, [VP_SUMS] = VP_I, [VP_SO] = VP_I,
+#endif
+};
+
+static const TCGOpcode vmxperm_req[] = {
+    INDEX_op_add_vec, INDEX_op_sub_vec, INDEX_op_shli_vec,
+    INDEX_op_shri_vec, INDEX_op_sari_vec, INDEX_op_cmp_vec,
+    INDEX_op_umin_vec, INDEX_op_smin_vec, INDEX_op_smax_vec, 0
+};
+
+static const TCGOpcode vmxperm_list[] = {
+    INDEX_op_add_vec, INDEX_op_sub_vec, INDEX_op_shli_vec,
+    INDEX_op_shri_vec, INDEX_op_sari_vec, INDEX_op_cmp_vec,
+    INDEX_op_umin_vec, INDEX_op_smin_vec, INDEX_op_smax_vec,
+    INDEX_op_ssadd_vec, 0
+};
+
+static const TCGOpcode vmxperm_list64[] = {
+    INDEX_op_shli_vec, INDEX_op_shri_vec, 0
+};
+
+static bool vmxperm(int op)
+{
+    if (!native_vmxint_on || vmxperm_how[op] == VP_H) {
+        return false;
+    }
+    return vmxperm_how[op] == VP_I
+           || (tcg_op_supported(INDEX_op_add_vec, TCG_TYPE_V128, 0)
+               && tcg_can_emit_vecop_list(vmxperm_req, TCG_TYPE_V128, MO_16)
+               && tcg_can_emit_vecop_list(vmxperm_req, TCG_TYPE_V128, MO_32)
+               && tcg_can_emit_vecop_list(vmxperm_list64, TCG_TYPE_V128,
+                                          MO_64));
+}
+
+/* both lanes: doubleword hi/lo of reg */
+static TCGv_vec vi_dupd(int reg, bool hi)
+{
+    TCGv_vec r = vi_new();
+
+    tcg_gen_dup_mem_vec(MO_64, r, tcg_env, avr64_offset(reg, hi));
+    return r;
+}
+
+static TCGv_vec vi_lanes(void)
+{
+    TCGv_vec m = vi_new();
+
+    tcg_gen_ld_vec(m, tcg_env, offsetof(CPUPPCState, vmx_lanes));
+    return m;
+}
+
+/* high lane of h, low lane of l */
+static TCGv_vec vi_sel(TCGv_vec m, TCGv_vec h, TCGv_vec l)
+{
+    TCGv_vec r = vi_new();
+
+    tcg_gen_bitsel_vec(MO_64, r, m, h, l);
+    return r;
+}
+
+static void vi_or_sat(TCGv_vec sat)
+{
+    TCGv_vec v = vi_new();
+
+    tcg_gen_ld_vec(v, tcg_env, offsetof(CPUPPCState, vscr_sat));
+    tcg_gen_or_vec(MO_32, v, v, sat);
+    tcg_gen_st_vec(v, tcg_env, offsetof(CPUPPCState, vscr_sat));
+}
+
+static void vi_or_sat_i64(TCGv_i64 sat)
+{
+    TCGv_i64 v = tcg_temp_new_i64();
+    int ofs = offsetof(CPUPPCState, vscr_sat.u64[0]);
+
+    tcg_gen_ld_i64(v, tcg_env, ofs);
+    tcg_gen_or_i64(v, v, sat);
+    tcg_gen_st_i64(v, tcg_env, ofs);
+}
+
+/* swap the bits under m with those n above them */
+static void vi_swap_i64(TCGv_i64 x, int n, uint64_t m)
+{
+    TCGv_i64 t = tcg_temp_new_i64();
+
+    tcg_gen_shri_i64(t, x, n);
+    tcg_gen_xor_i64(t, t, x);
+    tcg_gen_andi_i64(t, t, m);
+    tcg_gen_xor_i64(x, x, t);
+    tcg_gen_shli_i64(t, t, n);
+    tcg_gen_xor_i64(x, x, t);
+}
+
+/* vmrgh (hi) / vmrgl of vece elements */
+static void gen_vmrg_i64(int vrt, int vra, int vrb, unsigned vece, bool hi)
+{
+    TCGv_i64 a = tcg_temp_new_i64(), b = tcg_temp_new_i64();
+    TCGv_i64 x = tcg_temp_new_i64(), y = tcg_temp_new_i64();
+
+    get_avr64(a, vra, hi);
+    get_avr64(b, vrb, hi);
+    /* a.w0:b.w0, a.w1:b.w1 */
+    tcg_gen_shri_i64(x, b, 32);
+    tcg_gen_deposit_i64(x, a, x, 0, 32);
+    tcg_gen_deposit_i64(y, b, a, 32, 32);
+    if (vece <= MO_16) {
+        vi_swap_i64(x, 16, 0x00000000ffff0000ull);
+        vi_swap_i64(y, 16, 0x00000000ffff0000ull);
+    }
+    if (vece == MO_8) {
+        vi_swap_i64(x, 8, 0x0000ff000000ff00ull);
+        vi_swap_i64(y, 8, 0x0000ff000000ff00ull);
+    }
+    set_avr64(vrt, x, true);
+    set_avr64(vrt, y, false);
+}
+
+/* vupkhsh (hi) / vupklsh */
+static void gen_vupkh_i64(int vrt, int vrb, bool hi)
+{
+    TCGv_i64 x = tcg_temp_new_i64(), t = tcg_temp_new_i64();
+    TCGv_i64 r = tcg_temp_new_i64(), s = tcg_temp_new_i64();
+
+    get_avr64(x, vrb, hi);
+    tcg_gen_sextract_i64(r, x, 32, 16);
+    tcg_gen_sari_i64(t, x, 48);
+    tcg_gen_deposit_i64(r, r, t, 32, 32);
+    tcg_gen_ext16s_i64(s, x);
+    tcg_gen_sextract_i64(t, x, 16, 16);
+    tcg_gen_deposit_i64(s, s, t, 32, 32);
+    set_avr64(vrt, r, true);
+    set_avr64(vrt, s, false);
+}
+
+/* vupkhpx (hi) / vupklpx */
+static void gen_vupkpx_vec(int vrt, int vrb, bool hi)
+{
+    const TCGOpcode *hold = tcg_swap_vecop_list(vmxperm_list);
+    TCGv_vec a = vi_dupd(vrb, hi), x = vi_new(), t = vi_new();
+    TCGv_vec r = vi_new();
+
+    /* high lane: word 0 of the doubleword, low lane: word 1, at the top */
+    tcg_gen_and_vec(MO_64, x, a, vi_k(MO_64, 0xffffffff00000000ull));
+    tcg_gen_shli_vec(MO_64, t, a, 32);
+    x = vi_sel(vi_lanes(), x, t);
+    /* each pixel to the top of a word */
+    tcg_gen_shri_vec(MO_64, t, x, 16);
+    tcg_gen_or_vec(MO_64, x, x, t);
+    tcg_gen_sari_vec(MO_32, r, x, 8);
+    tcg_gen_and_vec(MO_32, r, r, vi_k(MO_32, 0xff000000));
+    tcg_gen_shri_vec(MO_32, t, x, 10);
+    tcg_gen_and_vec(MO_32, t, t, vi_k(MO_32, 0x001f0000));
+    tcg_gen_or_vec(MO_32, r, r, t);
+    tcg_gen_shri_vec(MO_32, t, x, 13);
+    tcg_gen_and_vec(MO_32, t, t, vi_k(MO_32, 0x00001f00));
+    tcg_gen_or_vec(MO_32, r, r, t);
+    tcg_gen_shri_vec(MO_32, t, x, 16);
+    tcg_gen_and_vec(MO_32, t, t, vi_k(MO_32, 0x0000001f));
+    tcg_gen_or_vec(MO_32, r, r, t);
+    tcg_gen_st_vec(r, tcg_env, avr_full_offset(vrt));
+    tcg_swap_vecop_list(hold);
+}
+
+/* low halves of the vece elements of x to the low 32 bits */
+static void vi_pk_i64(TCGv_i64 x, unsigned vece)
+{
+    TCGv_i64 t = tcg_temp_new_i64();
+
+    if (vece == MO_16) {
+        tcg_gen_andi_i64(x, x, 0x00ff00ff00ff00ffull);
+        tcg_gen_shri_i64(t, x, 8);
+        tcg_gen_or_i64(x, x, t);
+    }
+    tcg_gen_shri_i64(t, x, 32);
+    tcg_gen_deposit_i64(x, x, t, 16, 16);
+}
+
+/* vpkuhum / vpkuwum */
+static void gen_vpkum_i64(int vrt, int vra, int vrb, unsigned vece)
+{
+    TCGv_i64 v[4];
+
+    for (int i = 0; i < 4; i++) {
+        v[i] = tcg_temp_new_i64();
+        get_avr64(v[i], i < 2 ? vra : vrb, !(i & 1));
+        vi_pk_i64(v[i], vece);
+    }
+    tcg_gen_deposit_i64(v[1], v[1], v[0], 32, 32);
+    tcg_gen_deposit_i64(v[3], v[3], v[2], 32, 32);
+    set_avr64(vrt, v[1], true);
+    set_avr64(vrt, v[3], false);
+}
+
+/*
+ * Narrow the vece elements of x, saturating, to the low 32 bits of each
+ * lane; sat |= saturated.
+ */
+static void vi_pk(TCGv_vec x, unsigned vece, int kind, TCGv_vec sat)
+{
+    unsigned n = 4 << vece;
+    uint64_t lo = (1ull << n) - 1;
+    TCGv_vec t = vi_new(), u = vi_new();
+
+    switch (kind) {
+    case VPK_US:
+        tcg_gen_umin_vec(vece, t, x, vi_k(vece, lo));
+        break;
+    case VPK_SU:
+        tcg_gen_smax_vec(vece, t, x, vi_k(vece, 0));
+        tcg_gen_smin_vec(vece, t, t, vi_k(vece, lo));
+        break;
+    case VPK_SS:
+        tcg_gen_smin_vec(vece, t, x, vi_k(vece, lo >> 1));
+        tcg_gen_smax_vec(vece, t, t, vi_k(vece, -(lo >> 1) - 1));
+        break;
+    case VPK_PX:
+        tcg_gen_shri_vec(MO_32, t, x, 9);
+        tcg_gen_and_vec(MO_32, t, t, vi_k(MO_32, 0xfc00));
+        tcg_gen_shri_vec(MO_32, u, x, 6);
+        tcg_gen_and_vec(MO_32, u, u, vi_k(MO_32, 0x3e0));
+        tcg_gen_or_vec(MO_32, t, t, u);
+        tcg_gen_shri_vec(MO_32, u, x, 3);
+        tcg_gen_and_vec(MO_32, u, u, vi_k(MO_32, 0x1f));
+        tcg_gen_or_vec(MO_32, x, t, u);
+        break;
+    }
+    if (kind != VPK_PX) {
+        tcg_gen_xor_vec(vece, x, x, t);
+        tcg_gen_or_vec(vece, sat, sat, x);
+        if (kind == VPK_SS) {
+            tcg_gen_and_vec(vece, x, t, vi_k(vece, lo));
+        } else {
+            tcg_gen_mov_vec(x, t);
+        }
+    }
+    /* elements now zero-extended */
+    if (vece == MO_16) {
+        tcg_gen_shri_vec(MO_64, t, x, 8);
+        tcg_gen_or_vec(MO_64, x, x, t);
+        tcg_gen_and_vec(MO_64, x, x, vi_k(MO_64, 0x0000ffff0000ffffull));
+    }
+    tcg_gen_shri_vec(MO_64, t, x, 16);
+    tcg_gen_or_vec(MO_64, x, x, t);
+}
+
+/* saturating packs and vpkpx */
+static void gen_vpk_vec(int vrt, int vra, int vrb, unsigned vece, int kind)
+{
+    const TCGOpcode *hold = tcg_swap_vecop_list(vmxperm_list);
+    TCGv_vec m = vi_lanes();
+    TCGv_vec p = vi_sel(m, native_avr(vra), vi_dupd(vrb, true));
+    TCGv_vec q = vi_sel(m, vi_dupd(vra, false), native_avr(vrb));
+    TCGv_vec sat = vi_new();
+
+    /* p: a.hi, b.hi; q: a.lo, b.lo */
+    tcg_gen_dupi_vec(MO_32, sat, 0);
+    vi_pk(p, vece, kind, sat);
+    vi_pk(q, vece, kind, sat);
+    tcg_gen_shli_vec(MO_64, p, p, 32);
+    tcg_gen_and_vec(MO_64, q, q, vi_k(MO_64, 0xffffffff));
+    tcg_gen_or_vec(MO_64, p, p, q);
+    tcg_gen_st_vec(p, tcg_env, avr_full_offset(vrt));
+    if (kind != VPK_PX) {
+        vi_or_sat(sat);
+    }
+    tcg_swap_vecop_list(hold);
+}
+
+/* r = b + x signed saturating, |x| <= 2^16; sat |= overflow */
+static void vi_ssadd32x(TCGv_vec r, TCGv_vec b, TCGv_vec x, TCGv_vec sat)
+{
+    TCGv_vec o, t;
+
+    if (tcg_can_emit_vec_op(INDEX_op_ssadd_vec, TCG_TYPE_V128, MO_32)) {
+        vi_ssadd32(r, b, x, sat);
+        return;
+    }
+    /* b clamped to [INT32_MIN - min(x, 0), INT32_MAX - max(x, 0)] */
+    o = vi_new();
+    t = vi_new();
+    tcg_gen_smax_vec(MO_32, o, x, vi_k(MO_32, 0));
+    tcg_gen_sub_vec(MO_32, o, vi_k(MO_32, INT32_MAX), o);
+    tcg_gen_smin_vec(MO_32, t, x, vi_k(MO_32, 0));
+    tcg_gen_sub_vec(MO_32, t, vi_k(MO_32, INT32_MIN), t);
+    tcg_gen_smax_vec(MO_32, t, b, t);
+    tcg_gen_smin_vec(MO_32, t, t, o);
+    tcg_gen_xor_vec(MO_32, o, t, b);
+    tcg_gen_or_vec(MO_32, sat, sat, o);
+    tcg_gen_add_vec(MO_32, r, t, x);
+}
+
+static void gen_vsum4_vec(int vrt, int vra, int vrb, int kind)
+{
+    const TCGOpcode *hold = tcg_swap_vecop_list(vmxperm_list);
+    TCGv_vec a = native_avr(vra), b = native_avr(vrb);
+    TCGv_vec x = vi_new(), t = vi_new(), sat = vi_new();
+
+    tcg_gen_dupi_vec(MO_32, sat, 0);
+    switch (kind) {
+    case VSUM_UB:
+        tcg_gen_shri_vec(MO_16, x, a, 8);
+        tcg_gen_and_vec(MO_16, t, a, vi_k(MO_16, 0xff));
+        tcg_gen_add_vec(MO_16, x, x, t);
+        tcg_gen_shri_vec(MO_32, t, x, 16);
+        tcg_gen_and_vec(MO_32, x, x, vi_k(MO_32, 0xffff));
+        tcg_gen_add_vec(MO_32, x, x, t);
+        vi_usadd32(x, x, b, sat);
+        break;
+    case VSUM_SB:
+        tcg_gen_sari_vec(MO_16, x, a, 8);
+        tcg_gen_shli_vec(MO_16, t, a, 8);
+        tcg_gen_sari_vec(MO_16, t, t, 8);
+        tcg_gen_add_vec(MO_16, a, x, t);
+        /* fall through */
+    case VSUM_SH:
+        tcg_gen_sari_vec(MO_32, x, a, 16);
+        tcg_gen_shli_vec(MO_32, t, a, 16);
+        tcg_gen_sari_vec(MO_32, t, t, 16);
+        tcg_gen_add_vec(MO_32, x, x, t);
+        vi_ssadd32x(x, b, x, sat);
+        break;
+    }
+    tcg_gen_st_vec(x, tcg_env, avr_full_offset(vrt));
+    vi_or_sat(sat);
+    tcg_swap_vecop_list(hold);
+}
+
+/* t = t saturated to int32, zero-extended; sat |= overflow */
+static void vi_sat32_i64(TCGv_i64 t, TCGv_i64 sat)
+{
+    TCGv_i64 r = tcg_temp_new_i64(), m = tcg_temp_new_i64();
+
+    tcg_gen_ext32s_i64(r, t);
+    tcg_gen_sari_i64(m, t, 63);
+    tcg_gen_xori_i64(m, m, INT32_MAX);
+    tcg_gen_movcond_i64(TCG_COND_NE, m, t, r, m, r);
+    tcg_gen_setcond_i64(TCG_COND_NE, r, t, r);
+    tcg_gen_or_i64(sat, sat, r);
+    tcg_gen_ext32u_i64(t, m);
+}
+
+/* sum of both words of x, sign-extended */
+static TCGv_i64 vi_addw_i64(TCGv_i64 x)
+{
+    TCGv_i64 r = tcg_temp_new_i64(), w = tcg_temp_new_i64();
+
+    tcg_gen_sari_i64(r, x, 32);
+    tcg_gen_ext32s_i64(w, x);
+    tcg_gen_add_i64(r, r, w);
+    return r;
+}
+
+static void gen_vsumsws_i64(int vrt, int vra, int vrb)
+{
+    TCGv_i64 hi = tcg_temp_new_i64(), lo = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64(), sat = tcg_temp_new_i64();
+
+    get_avr64(hi, vra, true);
+    get_avr64(lo, vra, false);
+    get_avr64(t, vrb, false);
+    tcg_gen_ext32s_i64(t, t);
+    hi = vi_addw_i64(hi);
+    tcg_gen_add_i64(t, t, vi_addw_i64(lo));
+    tcg_gen_add_i64(t, t, hi);
+    tcg_gen_movi_i64(sat, 0);
+    vi_sat32_i64(t, sat);
+    set_avr64(vrt, t, false);
+    set_avr64(vrt, tcg_constant_i64(0), true);
+    vi_or_sat_i64(sat);
+}
+
+static void gen_vsum2sws_i64(int vrt, int vra, int vrb)
+{
+    TCGv_i64 a[2], t[2], sat = tcg_temp_new_i64();
+
+    for (int i = 0; i < 2; i++) {
+        a[i] = tcg_temp_new_i64();
+        t[i] = tcg_temp_new_i64();
+        get_avr64(a[i], vra, i);
+        get_avr64(t[i], vrb, i);
+    }
+    tcg_gen_movi_i64(sat, 0);
+    for (int i = 0; i < 2; i++) {
+        tcg_gen_ext32s_i64(t[i], t[i]);
+        tcg_gen_add_i64(t[i], t[i], vi_addw_i64(a[i]));
+        vi_sat32_i64(t[i], sat);
+        set_avr64(vrt, t[i], i);
+    }
+    vi_or_sat_i64(sat);
+}
+
+/* vslo (left) / vsro: shift by octets, count from vB bits 121:124 */
+static void gen_vso_i64(int vrt, int vra, int vrb, bool left)
+{
+    TCGv_i64 hi = tcg_temp_new_i64(), lo = tcg_temp_new_i64();
+    TCGv_i64 m = tcg_temp_new_i64(), b = tcg_temp_new_i64();
+    TCGv_i64 x = tcg_temp_new_i64(), y = tcg_temp_new_i64();
+    TCGv_i64 z = tcg_constant_i64(0), k = tcg_constant_i64(0x40);
+    TCGv_i64 in = left ? lo : hi, out = left ? hi : lo;
+
+    get_avr64(hi, vra, true);
+    get_avr64(lo, vra, false);
+    get_avr64(b, vrb, false);
+    tcg_gen_andi_i64(m, b, 0x38);
+    /* x: the half shifted into, y: the half shifted out of */
+    if (left) {
+        tcg_gen_shl_i64(x, out, m);
+        tcg_gen_shl_i64(y, in, m);
+        tcg_gen_shri_i64(in, in, 1);
+        tcg_gen_xori_i64(m, m, 63);
+        tcg_gen_shr_i64(in, in, m);
+    } else {
+        tcg_gen_shr_i64(x, out, m);
+        tcg_gen_shr_i64(y, in, m);
+        tcg_gen_shli_i64(in, in, 1);
+        tcg_gen_xori_i64(m, m, 63);
+        tcg_gen_shl_i64(in, in, m);
+    }
+    tcg_gen_or_i64(x, x, in);
+    tcg_gen_movcond_i64(TCG_COND_TSTNE, x, b, k, y, x);
+    tcg_gen_movcond_i64(TCG_COND_TSTNE, y, b, k, z, y);
+    set_avr64(vrt, x, left);
+    set_avr64(vrt, y, !left);
 }
 
 #define GEN_VXFORM_VFP(name, opc2, opc3, desc)                          \
@@ -1732,14 +2268,30 @@ static void glue(gen_, name)(DisasContext *ctx)                         \
         rb = gen_avr_ptr(rB(ctx->opcode));                              \
         gen_helper_##name(cpu_gpr[rD(ctx->opcode)], rb);                \
     }
+
+#define GEN_VXFORM_VUPK(name, op, native)                               \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    int vrt = rD(ctx->opcode), vrb = rB(ctx->opcode);                   \
+                                                                        \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (vmxperm(op)) {                                                  \
+        native;                                                         \
+        return;                                                         \
+    }                                                                   \
+    gen_helper_##name(gen_avr_ptr(vrt), gen_avr_ptr(vrb));              \
+}
 GEN_VXFORM_NOA(vupkhsb, 7, 8);
-GEN_VXFORM_NOA(vupkhsh, 7, 9);
+GEN_VXFORM_VUPK(vupkhsh, VP_UPKH, gen_vupkh_i64(vrt, vrb, true));
 GEN_VXFORM_NOA(vupkhsw, 7, 25);
 GEN_VXFORM_NOA(vupklsb, 7, 10);
-GEN_VXFORM_NOA(vupklsh, 7, 11);
+GEN_VXFORM_VUPK(vupklsh, VP_UPKH, gen_vupkh_i64(vrt, vrb, false));
 GEN_VXFORM_NOA(vupklsw, 7, 27);
-GEN_VXFORM_NOA(vupkhpx, 7, 13);
-GEN_VXFORM_NOA(vupklpx, 7, 15);
+GEN_VXFORM_VUPK(vupkhpx, VP_UPKPX, gen_vupkpx_vec(vrt, vrb, true));
+GEN_VXFORM_VUPK(vupklpx, VP_UPKPX, gen_vupkpx_vec(vrt, vrb, false));
 GEN_VXFORM_NOA_VFP(vrefp, 5, 4, VFPARITH_RE);
 GEN_VXFORM_NOA_VFP(vrsqrtefp, 5, 5, VFPARITH_RSQRT);
 GEN_VXFORM_NOA_ENV(vexptefp, 5, 6);
