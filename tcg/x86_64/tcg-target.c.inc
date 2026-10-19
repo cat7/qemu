@@ -324,6 +324,7 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_PMULLW      (0xd5 | P_EXT | P_DATA16)
 #define OPC_PMADDWD     (0xf5 | P_EXT | P_DATA16)
 #define OPC_PMULHRSW    (0x0b | P_EXT38 | P_DATA16)
+#define OPC_PALIGNR     (0x0f | P_EXT3A | P_DATA16)
 #define OPC_PMULLD      (0x40 | P_EXT38 | P_DATA16)
 #define OPC_VPMULLQ     (0x40 | P_EXT38 | P_DATA16 | P_VEXW | P_EVEX)
 #define OPC_POR         (0xeb | P_EXT | P_DATA16)
@@ -4635,6 +4636,13 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         insn = vpshldi_insn[vece];
         sub = args[3];
         goto gen_simd_imm8;
+    case INDEX_op_extract2_vec:
+        /* palignr a0, ah, al */
+        insn = OPC_PALIGNR;
+        a1 = args[2];
+        a2 = args[1];
+        sub = args[3];
+        goto gen_simd_imm8;
     case INDEX_op_x86_vgf2p8affineqb_vec:
         insn = OPC_VGF2P8AFFINEQB;
         sub = args[3];
@@ -4755,6 +4763,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_pshufb_vec:
     case INDEX_op_dot2s_vec:
     case INDEX_op_mulhrs_vec:
+    case INDEX_op_extract2_vec:
         return C_O1_I2(x, x, x);
 
     case INDEX_op_abs_vec:

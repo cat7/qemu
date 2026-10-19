@@ -608,6 +608,11 @@ void tcg_gen_dot2u_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 /* r = (a * b + 2^(n - 2)) >> (n - 1) for signed n-bit elements, modulo 2^n */
 void tcg_gen_mulhrs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 
+/* V128: r = bytes ofs .. ofs + 15 of the 32 bytes ah:al, 0 < ofs < 16 */
+bool tcg_can_emit_extract2_vec(void);
+void tcg_gen_extract2_vec(TCGv_vec r, TCGv_vec al, TCGv_vec ah,
+                          unsigned ofs);
+
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);

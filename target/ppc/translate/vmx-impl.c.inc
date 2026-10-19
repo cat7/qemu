@@ -2879,6 +2879,21 @@ static void gen_vsldoi(DisasContext *ctx)
         gen_exception(ctx, POWERPC_EXCP_VPU);
         return;
     }
+    if (native_vmxint_on && !HOST_BIG_ENDIAN && tcg_can_emit_extract2_vec()) {
+        /* host order: bytes 16 - SH .. 31 - SH of vA:vB */
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        int n = VSH(ctx->opcode);
+
+        tcg_gen_ld_vec(a, tcg_env, avr_full_offset(rA(ctx->opcode)));
+        if (n) {
+            TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+            tcg_gen_ld_vec(b, tcg_env, avr_full_offset(rB(ctx->opcode)));
+            tcg_gen_extract2_vec(a, b, a, 16 - n);
+        }
+        tcg_gen_st_vec(a, tcg_env, avr_full_offset(rD(ctx->opcode)));
+        return;
+    }
     if (native_vmxint_on) {
         /* high 128 bits of (vA:vB) << 8 * SH */
         int n = VSH(ctx->opcode), q = n >> 3, s = (n & 7) * 8;
