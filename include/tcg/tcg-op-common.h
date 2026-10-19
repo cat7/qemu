@@ -590,6 +590,14 @@ bool tcg_can_emit_vfparith(void);
 void tcg_gen_vfparith_vec(unsigned desc, TCGv_vec r,
                           TCGv_vec a, TCGv_vec b, TCGv_vec c);
 
+/*
+ * Two-table byte permute of V128 temps, in host byte order: byte i of r
+ * is byte idx[i] of a if idx[i] < 16, byte idx[i] - 16 of b if
+ * idx[i] < 32; undefined for idx[i] >= 32.
+ */
+bool tcg_can_emit_perm2(void);
+void tcg_gen_perm2_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx);
+
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);

@@ -3960,6 +3960,17 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_vfparith(s, a0, a1, a2, args[3], args[4]);
         break;
 
+    case INDEX_op_perm2_vec:
+        /* tbl a0, {a1, a2}, a3: the table in consecutive registers */
+        if (a2 != a1 + 1) {
+            tcg_out_mov(s, TCG_TYPE_V128, FPA_T(7), a1);
+            tcg_out_mov(s, TCG_TYPE_V128, TCG_VEC_TMP0, a2);
+            a1 = FPA_T(7);
+        }
+        tcg_out32(s, 0x4e002000 | (args[3] & 31) << 16 | (a1 & 31) << 5
+                  | (a0 & 31));
+        break;
+
     case INDEX_op_bitsel_vec:
         a3 = args[3];
         if (a0 == a3) {
@@ -4005,6 +4016,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_shlv_vec:
     case INDEX_op_bitsel_vec:
         return 1;
+    case INDEX_op_perm2_vec:
+        return type == TCG_TYPE_V128;
     case INDEX_op_rotli_vec:
     case INDEX_op_shrv_vec:
     case INDEX_op_sarv_vec:
@@ -4142,6 +4155,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fparith_vec:
         return C_O2_I3(w, r, w, w, w);
     case INDEX_op_vfparith_vec:
+    case INDEX_op_perm2_vec:
         return C_O1_I3(w, w, w, w);
     case INDEX_op_aa64_sli_vec:
         return C_O1_I2(w, 0, w);
