@@ -810,6 +810,16 @@ void tcg_gen_perm2_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx)
     }
 }
 
+void tcg_gen_dot2s_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_dot2s_vec);
+}
+
+void tcg_gen_dot2u_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_dot2u_vec);
+}
+
 VFParithRef tcg_vfparith_ref;
 
 void tcg_set_vfparith_ref(VFParithRef fn)
