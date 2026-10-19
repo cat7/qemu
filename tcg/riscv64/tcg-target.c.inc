@@ -2936,7 +2936,7 @@ static const int tcg_target_callee_save_regs[] = {
 /* Stack frame parameters.  */
 #define REG_SIZE   ((int)sizeof(tcg_target_long))
 #define SAVE_SIZE  ((int)ARRAY_SIZE(tcg_target_callee_save_regs) * REG_SIZE)
-#define TEMP_SIZE  (CPU_TEMP_BUF_NLONGS * (int)sizeof(long))
+#define TEMP_SIZE  ((int)TCG_STATIC_FRAME_SIZE)
 #define FRAME_SIZE ((TCG_STATIC_CALL_ARGS_SIZE + TEMP_SIZE + SAVE_SIZE \
                      + TCG_TARGET_STACK_ALIGN - 1) \
                     & -TCG_TARGET_STACK_ALIGN)

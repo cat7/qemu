@@ -975,7 +975,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
      * below the frame pointer.  Use the logical (aligned) offset here;
      * the stack bias is applied in temp_allocate_frame().
      */
-    tmp_buf_size = CPU_TEMP_BUF_NLONGS * (int)sizeof(long);
+    tmp_buf_size = (int)TCG_STATIC_FRAME_SIZE;
     tcg_set_frame(s, TCG_REG_I6, -tmp_buf_size, tmp_buf_size);
 
     /*

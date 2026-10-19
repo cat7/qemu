@@ -3907,7 +3907,7 @@ static void tcg_target_init(TCGContext *s)
 #define FRAME_SIZE \
     ((PUSH_SIZE \
       + TCG_STATIC_CALL_ARGS_SIZE \
-      + CPU_TEMP_BUF_NLONGS * sizeof(long) \
+      + TCG_STATIC_FRAME_SIZE \
       + TCG_TARGET_STACK_ALIGN - 1) \
      & ~(TCG_TARGET_STACK_ALIGN - 1))
 
@@ -3942,7 +3942,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
     /* Inform TCG about how to find TCG locals with register, offset, size.  */
     tcg_set_frame(s, TCG_REG_SP, TCG_STATIC_CALL_ARGS_SIZE,
-                  CPU_TEMP_BUF_NLONGS * sizeof(long));
+                  TCG_STATIC_FRAME_SIZE);
 
     if (!tcg_use_softmmu) {
         /*
