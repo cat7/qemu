@@ -182,6 +182,8 @@ DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 DEF(fparith_vec, 2, 3, 1, TCG_OPF_VECTOR)
 /* r = 4 x single on the host; see tcg_gen_vfparith_vec() */
 DEF(vfparith_vec, 1, 3, 1, TCG_OPF_VECTOR)
+/* r = bytes of a:b selected by idx; see tcg_gen_perm2_vec() */
+DEF(perm2_vec, 1, 3, 0, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

@@ -3222,9 +3222,22 @@ TRANS_FLAGS2(ALTIVEC_207, VADDEUQM, do_va_helper, gen_helper_VADDEUQM)
 TRANS_FLAGS2(ALTIVEC_207, VSUBEUQM, do_va_helper, gen_helper_VSUBEUQM)
 TRANS_FLAGS2(ALTIVEC_207, VSUBECUQ, do_va_helper, gen_helper_VSUBECUQ)
 
+/* host order: table vB:vA, index 31 - (vC & 31) */
 static bool trans_VPERM(DisasContext *ctx, arg_VA *a)
 {
     REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
+    if (native_vmxint_on && !HOST_BIG_ENDIAN && tcg_can_emit_perm2()) {
+        TCGv_vec i, r;
+
+        REQUIRE_VECTOR(ctx);
+        i = tcg_temp_new_vec(TCG_TYPE_V128);
+        r = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_andc_vec(MO_8, i, tcg_constant_vec(TCG_TYPE_V128, MO_8, 31),
+                         native_avr(a->rc));
+        tcg_gen_perm2_vec(r, native_avr(a->vrb), native_avr(a->vra), i);
+        tcg_gen_st_vec(r, tcg_env, avr_full_offset(a->vrt));
+        return true;
+    }
     return do_va_helper(ctx, a, native_vmxint_on ? gen_helper_VPERMN
                                                  : gen_helper_VPERM);
 }
