@@ -323,6 +323,7 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_PMOVZXDQ    (0x35 | P_EXT38 | P_DATA16)
 #define OPC_PMULLW      (0xd5 | P_EXT | P_DATA16)
 #define OPC_PMADDWD     (0xf5 | P_EXT | P_DATA16)
+#define OPC_PMULHRSW    (0x0b | P_EXT38 | P_DATA16)
 #define OPC_PMULLD      (0x40 | P_EXT38 | P_DATA16)
 #define OPC_VPMULLQ     (0x40 | P_EXT38 | P_DATA16 | P_VEXW | P_EVEX)
 #define OPC_POR         (0xeb | P_EXT | P_DATA16)
@@ -4503,6 +4504,9 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_dot2s_vec:
         insn = OPC_PMADDWD;
         goto gen_simd;
+    case INDEX_op_mulhrs_vec:
+        insn = OPC_PMULHRSW;
+        goto gen_simd;
     case INDEX_op_x86_pblendvb_vec:
         /* a0 = a3 bit 7 ? a2 : a1, per byte */
         tcg_out_vex_modrm_type(s, OPC_VPBLENDVB, a0, a1, a2, type);
@@ -4722,6 +4726,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_vgf2p8affineqb_vec:
     case INDEX_op_x86_pshufb_vec:
     case INDEX_op_dot2s_vec:
+    case INDEX_op_mulhrs_vec:
         return C_O1_I2(x, x, x);
 
     case INDEX_op_abs_vec:
@@ -4873,6 +4878,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return type == TCG_TYPE_V128 && vece == MO_32;
     case INDEX_op_dot2u_vec:
         return type == TCG_TYPE_V128 && vece == MO_32 ? -1 : 0;
+    case INDEX_op_mulhrs_vec:
+        return vece == MO_16;
 
     default:
         return 0;
