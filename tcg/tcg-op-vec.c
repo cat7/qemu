@@ -785,6 +785,31 @@ void tcg_gen_fparith_vec(unsigned desc, TCGv_vec r, TCGv_i64 status,
     op->args[5] = desc;
 }
 
+bool tcg_can_emit_perm2(void)
+{
+    return TCG_TARGET_HAS_v128
+           && tcg_can_emit_vec_op(INDEX_op_perm2_vec, TCG_TYPE_V128, MO_8);
+}
+
+void tcg_gen_perm2_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx)
+{
+    TCGArg ri = tcgv_vec_arg(r), ai = tcgv_vec_arg(a);
+    TCGArg bi = tcgv_vec_arg(b), ii = tcgv_vec_arg(idx);
+    int can = tcg_can_emit_vec_op(INDEX_op_perm2_vec, TCG_TYPE_V128, MO_8);
+
+    tcg_debug_assert(tcgv_vec_temp(r)->base_type == TCG_TYPE_V128);
+    if (can > 0) {
+        vec_gen_4(INDEX_op_perm2_vec, TCG_TYPE_V128, MO_8, ri, ai, bi, ii);
+    } else {
+        const TCGOpcode *hold_list = tcg_swap_vecop_list(NULL);
+
+        tcg_debug_assert(can < 0);
+        tcg_expand_vec_op(INDEX_op_perm2_vec, TCG_TYPE_V128, MO_8,
+                          ri, ai, bi, ii);
+        tcg_swap_vecop_list(hold_list);
+    }
+}
+
 VFParithRef tcg_vfparith_ref;
 
 void tcg_set_vfparith_ref(VFParithRef fn)

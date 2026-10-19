@@ -2456,6 +2456,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_vfparith_vec:
         return type == TCG_TYPE_V128 && has_type &&
                TCG_TARGET_HAS_vfparith_vec;
+    case INDEX_op_perm2_vec:
+        return type == TCG_TYPE_V128 && has_type && TCG_TARGET_HAS_perm2_vec;
 
     default:
         if (op < INDEX_op_last_generic) {

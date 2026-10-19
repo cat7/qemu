@@ -4315,6 +4315,14 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_x86_packus_vec:
         insn = packus_insn[vece];
         goto gen_simd;
+    case INDEX_op_x86_pshufb_vec:
+        insn = OPC_PSHUFB;
+        goto gen_simd;
+    case INDEX_op_x86_pblendvb_vec:
+        /* a0 = a3 bit 7 ? a2 : a1, per byte */
+        tcg_out_vex_modrm_type(s, OPC_VPBLENDVB, a0, a1, a2, type);
+        tcg_out8(s, (args[3] - TCG_REG_XMM0) << 4);
+        break;
     case INDEX_op_x86_vpshldv_vec:
         insn = vpshldv_insn[vece];
         a1 = a2;
@@ -4527,6 +4535,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_punpckh_vec:
     case INDEX_op_x86_vpshldi_vec:
     case INDEX_op_x86_vgf2p8affineqb_vec:
+    case INDEX_op_x86_pshufb_vec:
         return C_O1_I2(x, x, x);
 
     case INDEX_op_abs_vec:
@@ -4544,6 +4553,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I3(x, 0, x, x);
 
     case INDEX_op_bitsel_vec:
+    case INDEX_op_x86_pblendvb_vec:
         return C_O1_I3(x, x, x, x);
     case INDEX_op_cmpsel_vec:
         return C_O1_I4(x, x, x, xO, x);
@@ -4671,9 +4681,33 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_abs_vec:
         return vece <= MO_32 || have_avx512vl;
 
+    case INDEX_op_perm2_vec:
+        return type == TCG_TYPE_V128 ? -1 : 0;
+
     default:
         return 0;
     }
+}
+
+/* vpshufb from each table, vpblendvb on index bit 4 */
+static void expand_vec_perm2(TCGv_vec v0, TCGv_vec a, TCGv_vec b,
+                             TCGv_vec idx)
+{
+    TCGv_vec m = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec ta = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec tb = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_shli_vec(MO_16, m, idx, 3);
+    vec_gen_3(INDEX_op_x86_pshufb_vec, TCG_TYPE_V128, MO_8,
+              tcgv_vec_arg(ta), tcgv_vec_arg(a), tcgv_vec_arg(idx));
+    vec_gen_3(INDEX_op_x86_pshufb_vec, TCG_TYPE_V128, MO_8,
+              tcgv_vec_arg(tb), tcgv_vec_arg(b), tcgv_vec_arg(idx));
+    vec_gen_4(INDEX_op_x86_pblendvb_vec, TCG_TYPE_V128, MO_8,
+              tcgv_vec_arg(v0), tcgv_vec_arg(ta), tcgv_vec_arg(tb),
+              tcgv_vec_arg(m));
+    tcg_temp_free_vec(m);
+    tcg_temp_free_vec(ta);
+    tcg_temp_free_vec(tb);
 }
 
 static void gen_vgf2p8affineqb0(TCGType type, TCGv_vec v0,
@@ -5056,6 +5090,12 @@ void tcg_expand_vec_op(TCGOpcode opc, TCGType type, unsigned vece,
         a4 = va_arg(va, TCGArg);
         a5 = va_arg(va, TCGArg);
         expand_vec_cmpsel(type, vece, a0, a1, a2, a3, a4, a5);
+        break;
+
+    case INDEX_op_perm2_vec:
+        a3 = va_arg(va, TCGArg);
+        expand_vec_perm2(v0, v1, temp_tcgv_vec(arg_temp(a2)),
+                         temp_tcgv_vec(arg_temp(a3)));
         break;
 
     default:
