@@ -1361,6 +1361,8 @@ struct CPUArchState {
     ppc_vsr_t vsr[64] QEMU_ALIGNED(16);
     /* Non-zero if and only if VSCR_SAT should be set */
     ppc_vsr_t vscr_sat QEMU_ALIGNED(16);
+    /* Constant: ones in the high doubleword, zeros in the low one */
+    ppc_vsr_t vmx_lanes QEMU_ALIGNED(16);
     /* SPE registers */
     uint64_t spe_acc;
     uint32_t spe_fscr;

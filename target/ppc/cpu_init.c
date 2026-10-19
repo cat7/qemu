@@ -7343,6 +7343,8 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
     /* clean any pending stop state */
     env->resume_as_sreset = 0;
 #endif
+    env->vmx_lanes.VsrD(0) = -1;
+    env->vmx_lanes.VsrD(1) = 0;
     hreg_compute_hflags(env);
     env->reserve_addr = (target_ulong)-1ULL;
     /* Be sure no exception or interrupt is pending */
