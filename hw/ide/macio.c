@@ -77,7 +77,7 @@ static void pmac_ide_atapi_raw_cb(void *opaque, int ret)
 
     len = MIN(MIN(io->len, s->io_buffer_size),
               s->cd_raw_n * s->cd_sector_size - skip);
-    dma_memory_write(&address_space_memory, io->addr, s->io_buffer + skip,
+    dma_memory_write(io->as, io->addr, s->io_buffer + skip,
                      len, MEMTXATTRS_UNSPECIFIED);
     io->addr += len;
     io->len -= len;
@@ -146,7 +146,7 @@ static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
 
         s->atapi_out_end = NULL;
         s->io_buffer_size = MIN(s->io_buffer_size, io->len);
-        dma_memory_read(&address_space_memory, io->addr, s->io_buffer,
+        dma_memory_read(io->as, io->addr, s->io_buffer,
                         s->io_buffer_size, MEMTXATTRS_UNSPECIFIED);
         s->packet_transfer_size = s->io_buffer_size;
         io->len = 0;
