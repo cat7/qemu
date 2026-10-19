@@ -2478,6 +2478,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_dot2s_vec:
     case INDEX_op_dot2u_vec:
         return has_type && TCG_TARGET_HAS_dot2_vec;
+    case INDEX_op_mulhrs_vec:
+        return has_type && TCG_TARGET_HAS_mulhrs_vec;
 
     default:
         if (op < INDEX_op_last_generic) {

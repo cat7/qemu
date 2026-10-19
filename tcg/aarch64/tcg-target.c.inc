@@ -4145,6 +4145,18 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         }
         break;
 
+    case INDEX_op_mulhrs_vec:
+        /* smull2 tmp, smull a0, rshrn a0, a0, #15, rshrn2 a0, tmp, #15 */
+        {
+            uint32_t ab = (a2 & 31) << 16 | (a1 & 31) << 5;
+
+            tcg_out32(s, 0x4e60c000 | ab | (TCG_VEC_TMP0 & 31));
+            tcg_out32(s, 0x0e60c000 | ab | (a0 & 31));
+            tcg_out32(s, 0x0f118c00 | (a0 & 31) << 5 | (a0 & 31));
+            tcg_out32(s, 0x4f118c00 | (TCG_VEC_TMP0 & 31) << 5 | (a0 & 31));
+        }
+        break;
+
     case INDEX_op_bitsel_vec:
         a3 = args[3];
         if (a0 == a3) {
@@ -4195,6 +4207,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_dot2s_vec:
     case INDEX_op_dot2u_vec:
         return type == TCG_TYPE_V128 && vece == MO_32;
+    case INDEX_op_mulhrs_vec:
+        return type == TCG_TYPE_V128 && vece == MO_16;
     case INDEX_op_rotli_vec:
     case INDEX_op_shrv_vec:
     case INDEX_op_sarv_vec:
@@ -4306,6 +4320,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_aa64_sshl_vec:
     case INDEX_op_dot2s_vec:
     case INDEX_op_dot2u_vec:
+    case INDEX_op_mulhrs_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_not_vec:
     case INDEX_op_neg_vec:

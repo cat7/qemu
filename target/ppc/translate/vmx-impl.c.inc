@@ -1254,11 +1254,18 @@ static bool vmxint_ok(const TCGOpcode *list)
            && tcg_can_emit_vecop_list(list, TCG_TYPE_V128, MO_32);
 }
 
-static bool vmxint_ok32(const TCGOpcode *list)
+/* vmh[r]addshs by host rounded high products */
+static const TCGOpcode vmxint_list_mh[] = {
+    INDEX_op_add_vec, INDEX_op_sub_vec, INDEX_op_neg_vec, INDEX_op_mul_vec,
+    INDEX_op_shli_vec, INDEX_op_sari_vec, INDEX_op_sssub_vec,
+    INDEX_op_mulhrs_vec, 0
+};
+
+static bool vmxint_ok_at(const TCGOpcode *list, unsigned vece)
 {
     return native_vmxint_on
            && tcg_op_supported(INDEX_op_add_vec, TCG_TYPE_V128, 0)
-           && tcg_can_emit_vecop_list(list, TCG_TYPE_V128, MO_32);
+           && tcg_can_emit_vecop_list(list, TCG_TYPE_V128, vece);
 }
 
 typedef void VmxIntFn(TCGv_vec t, TCGv_vec a, TCGv_vec b, TCGv_vec c,
@@ -1447,6 +1454,40 @@ static void gen_vmhraddshs_vec(TCGv_vec t, TCGv_vec a, TCGv_vec b,
                                TCGv_vec c, TCGv_vec sat)
 {
     gen_vmhaddshs(t, a, b, c, sat, true);
+}
+
+/* the same from the rounded high product, exact for 0x8000 * 0x8000 */
+static void gen_vmhaddshs_mh(TCGv_vec t, TCGv_vec a, TCGv_vec b,
+                             TCGv_vec c, TCGv_vec sat, bool round)
+{
+    TCGv_vec m = vi_new(), w = vi_new();
+
+    tcg_gen_mulhrs_vec(MO_16, m, a, b);
+    if (!round) {
+        /* less 1 where bit 14 of the product is set */
+        tcg_gen_mul_vec(MO_16, w, a, b);
+        tcg_gen_shli_vec(MO_16, w, w, 1);
+        tcg_gen_sari_vec(MO_16, w, w, 15);
+        tcg_gen_add_vec(MO_16, m, m, w);
+    }
+    /* m wraps only for 2^15, -m is exact */
+    tcg_gen_neg_vec(MO_16, m, m);
+    tcg_gen_sssub_vec(MO_16, t, c, m);
+    tcg_gen_sub_vec(MO_16, w, c, m);
+    tcg_gen_xor_vec(MO_16, w, w, t);
+    tcg_gen_or_vec(MO_16, sat, sat, w);
+}
+
+static void gen_vmhaddshs_rs(TCGv_vec t, TCGv_vec a, TCGv_vec b,
+                             TCGv_vec c, TCGv_vec sat)
+{
+    gen_vmhaddshs_mh(t, a, b, c, sat, false);
+}
+
+static void gen_vmhraddshs_rs(TCGv_vec t, TCGv_vec a, TCGv_vec b,
+                              TCGv_vec c, TCGv_vec sat)
+{
+    gen_vmhaddshs_mh(t, a, b, c, sat, true);
 }
 
 /* vrt = fn(vra, vrb, vrc); vrc < 0: none */
@@ -3359,7 +3400,7 @@ static bool do_va_int(DisasContext *ctx, arg_VA *a, VmxIntFn *fn,
     VmxIntFn *dfn, void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))
 {
     REQUIRE_VECTOR(ctx);
-    if (dfn && vmxint_ok32(vmxint_list_dot)) {
+    if (dfn && vmxint_ok_at(vmxint_list_dot, MO_32)) {
         vmxint_gen(vmxint_list_dot, dfn, false, a->vrt, a->vra, a->vrb, a->rc);
         return true;
     }
@@ -3395,11 +3436,11 @@ static bool do_va_env_helper(DisasContext *ctx, arg_VA *a,
 
 static bool do_va_int_sat(DisasContext *ctx, arg_VA *a,
     const TCGOpcode *list, VmxIntFn *fn,
-    const TCGOpcode *dlist, VmxIntFn *dfn,
+    const TCGOpcode *dlist, unsigned dvece, VmxIntFn *dfn,
     void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))
 {
     REQUIRE_VECTOR(ctx);
-    if (dfn && vmxint_ok32(dlist)) {
+    if (dfn && vmxint_ok_at(dlist, dvece)) {
         vmxint_gen(dlist, dfn, true, a->vrt, a->vra, a->vrb, a->rc);
         return true;
     }
@@ -3411,15 +3452,17 @@ static bool do_va_int_sat(DisasContext *ctx, arg_VA *a,
 }
 
 TRANS_FLAGS(ALTIVEC, VMSUMUHS, do_va_int_sat, vmxint_list,
-            gen_vmsumuhs_vec, NULL, NULL, gen_helper_VMSUMUHS)
+            gen_vmsumuhs_vec, NULL, 0, NULL, gen_helper_VMSUMUHS)
 TRANS_FLAGS(ALTIVEC, VMSUMSHS, do_va_int_sat, vmxint_list_ss,
-            gen_vmsumshs_vec, vmxint_list_dot_ss, gen_vmsumshs_dot,
+            gen_vmsumshs_vec, vmxint_list_dot_ss, MO_32, gen_vmsumshs_dot,
             gen_helper_VMSUMSHS)
 
 TRANS_FLAGS(ALTIVEC, VMHADDSHS, do_va_int_sat, vmxint_list,
-            gen_vmhaddshs_vec, NULL, NULL, gen_helper_VMHADDSHS)
+            gen_vmhaddshs_vec, vmxint_list_mh, MO_16, gen_vmhaddshs_rs,
+            gen_helper_VMHADDSHS)
 TRANS_FLAGS(ALTIVEC, VMHRADDSHS, do_va_int_sat, vmxint_list,
-            gen_vmhraddshs_vec, NULL, NULL, gen_helper_VMHRADDSHS)
+            gen_vmhraddshs_vec, vmxint_list_mh, MO_16, gen_vmhraddshs_rs,
+            gen_helper_VMHRADDSHS)
 
 GEN_VXFORM_NOA(vclzb, 1, 28)
 GEN_VXFORM_NOA(vclzh, 1, 29)
