@@ -327,5 +327,7 @@ TCGTBCPUState ppc_get_tb_cpu_state(CPUState *cs);
 typedef struct FParithResult FParithResult;
 FParithResult ppc_fparith_ref(void *env, uint64_t a, uint64_t c,
                               uint64_t b, uint32_t desc);
+typedef struct VFParithBuf VFParithBuf;
+void ppc_vfparith_ref(void *env, uint32_t desc, VFParithBuf *buf);
 
 #endif /* PPC_INTERNAL_H */

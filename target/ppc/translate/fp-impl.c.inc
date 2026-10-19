@@ -42,7 +42,7 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
  */
 enum { NFP_AB, NFP_ACB, NFP_RSP, NFP_CMPU };
 
-static bool native_fcmp_on, native_frsp_on;
+static bool native_fcmp_on, native_frsp_on, native_vmx_on;
 
 static bool native_env(const char *name, bool dflt)
 {
@@ -54,8 +54,15 @@ static bool native_env(const char *name, bool dflt)
 static void native_fp_init(void)
 {
 #ifndef CONFIG_USER_ONLY
-    if (!tcg_can_emit_fparith() || !native_env("PPC_NATIVE_FP", true) ||
-        native_env("PPC_STRICT_FP", false)) {
+    if (native_env("PPC_STRICT_FP", false)) {
+        return;
+    }
+    native_vmx_on = tcg_can_emit_vfparith() &&
+                    native_env("PPC_NATIVE_VMX", true);
+    if (native_vmx_on) {
+        tcg_set_vfparith_ref(ppc_vfparith_ref);
+    }
+    if (!tcg_can_emit_fparith() || !native_env("PPC_NATIVE_FP", true)) {
         return;
     }
     ppc_native_fp = native_env("PPC_NATIVE_FP_RELAXED", false)
