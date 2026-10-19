@@ -5286,7 +5286,7 @@ static const int tcg_target_callee_save_regs[] = {
 
 /* fparith_vec: saved and default MXCSR, then XMM8-14 on Win64 */
 #define FPA_FRAME_OFS \
-    (TCG_STATIC_CALL_ARGS_SIZE + CPU_TEMP_BUF_NLONGS * sizeof(long))
+    (TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE)
 #ifdef _WIN64
 #define FPA_FRAME_SIZE  (16 + FPA_NREGS * 16)
 #else
@@ -5296,7 +5296,7 @@ static const int tcg_target_callee_save_regs[] = {
 #define FRAME_SIZE \
     ((PUSH_SIZE \
       + TCG_STATIC_CALL_ARGS_SIZE \
-      + CPU_TEMP_BUF_NLONGS * sizeof(long) \
+      + TCG_STATIC_FRAME_SIZE \
       + FPA_FRAME_SIZE \
       + TCG_TARGET_STACK_ALIGN - 1) \
      & ~(TCG_TARGET_STACK_ALIGN - 1))
@@ -5311,7 +5311,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     /* Reserve some stack space, also for TCG temps.  */
     stack_addend = FRAME_SIZE - PUSH_SIZE;
     tcg_set_frame(s, TCG_REG_CALL_STACK, TCG_STATIC_CALL_ARGS_SIZE,
-                  CPU_TEMP_BUF_NLONGS * sizeof(long));
+                  TCG_STATIC_FRAME_SIZE);
 
     /* Save all callee saved registers.  */
     for (i = 0; i < ARRAY_SIZE(tcg_target_callee_save_regs); i++) {
