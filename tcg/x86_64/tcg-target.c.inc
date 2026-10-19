@@ -3582,6 +3582,157 @@ static void fpa_range(TCGContext *s, TCGReg off, TCGReg v, bool dbl,
     }
 }
 
+#define FPA_NFIX    8
+
+/* ZF iff v is +-0; clobbers st */
+static void fpa_tstz(TCGContext *s, TCGReg st, TCGReg v, bool dbl)
+{
+    tcg_out_mov(s, dbl ? TCG_TYPE_I64 : TCG_TYPE_I32, st, v);
+    tgen_arithr(s, ARITH_ADD + (dbl ? P_REXW : 0), st, st);
+}
+
+/* ZF iff the low lane of the mask m is clear; clobbers st */
+static void fpa_tstm(TCGContext *s, TCGReg st, TCGReg m)
+{
+    tcg_out_vex_modrm(s, OPC_MOVMSKPS, st, 0, m);
+    tgen_arithi(s, ARITH_AND, st, 1, 0);
+}
+
+static tcg_insn_unit *fpa_jcc(TCGContext *s, int cc)
+{
+    tcg_out_opc(s, OPC_JCC_long + cc, 0, 0, 0);
+    tcg_out32(s, 0);
+    return s->code_ptr - 4;
+}
+
+static void fpa_patch(tcg_insn_unit *p, tcg_insn_unit *target)
+{
+    tcg_patch32(p, target - (p + 4));
+}
+
+/* rd = res, st = sign << 1 | zero << 2; returns the jump to patch */
+static tcg_insn_unit *fpa_zero_end(TCGContext *s, TCGReg rd, TCGReg st,
+                                   TCGReg r, TCGReg res, bool sgl, bool zero)
+{
+    if (sgl) {
+        tcg_out_vex_modrm(s, OPC_CVTSS2SD, rd, r, r);
+    }
+    tcg_out_vex_modrm(s, OPC_MOVMSKPD, st, 0, res);
+    tgen_arithi(s, ARITH_AND, st, 1, 0);
+    tgen_arithr(s, ARITH_ADD, st, st);
+    if (zero) {
+        tgen_arithi(s, ARITH_OR, st, 4, 0);
+    }
+    tcg_out_mov(s, TCG_TYPE_V64, rd, res);
+    tcg_out8(s, OPC_JMP_long);
+    tcg_out32(s, 0);
+    return s->code_ptr - 4;
+}
+
+/*
+ * Out of line, for what the range checks reject: exact zeros (a zero
+ * sum, a zero factor, a zero dividend, frsp of a zero) and fused ops
+ * with a zero product and a zero or normal result, all with every
+ * operand a single for the single ops.  A zero sum of a nonzero
+ * product needs the error terms.  Sets rd and st and jumps to done[];
+ * jumps to the returned fixups otherwise.
+ */
+static int fpa_zero(TCGContext *s, TCGReg rd, TCGReg st, TCGReg a,
+                    TCGReg c, TCGReg b, unsigned desc,
+                    tcg_insn_unit **fix, tcg_insn_unit **done)
+{
+    unsigned op = desc & FPARITH_OP_MASK;
+    bool ix = desc & FPARITH_INEXACT;
+    bool rsp = op == FPARITH_RSP;
+    bool sgl = (desc & FPARITH_SINGLE) && !rsp;
+    bool dbl = !sgl;
+    bool fma = op >= FPARITH_MADD && op <= FPARITH_NMSUB;
+    unsigned emax = dbl ? 0x7fe : 0xfe, eprod = dbl ? 56 : 26;
+    TCGReg q = fma ? c : b, r = FPA_T(0), m = FPA_T(1), t = FPA_T(3);
+    TCGReg res = rsp ? FPA_T(2) : sgl ? rd : r;
+    tcg_insn_unit *ok[2] = { NULL, NULL }, *nrm = NULL, *pz[2];
+    int n = 0;
+
+    if (sgl) {
+        TCGReg in[3] = { a, q, b };
+
+        for (int i = 0; i < (fma ? 3 : 2); i++) {
+            tcg_out_vex_modrm(s, OPC_CVTSD2SS, t, t, in[i]);
+            tcg_out_vex_modrm(s, OPC_CVTSS2SD, t, t, t);
+            fpa_neq(s, true, i ? t : m, t, in[i]);
+            if (i) {
+                tcg_out_vex_modrm(s, OPC_POR, m, m, t);
+            }
+        }
+        fpa_tstm(s, st, m);
+        fix[n++] = fpa_jcc(s, JCC_JNE);
+    }
+
+    fpa_tstz(s, st, rsp ? a : r, dbl);
+    switch (op) {
+    case FPARITH_RSP:
+    case FPARITH_ADD:
+    case FPARITH_SUB:
+        fix[n++] = fpa_jcc(s, JCC_JNE);
+        break;
+    case FPARITH_MUL:
+        fix[n++] = fpa_jcc(s, JCC_JNE);
+        fpa_tstz(s, st, a, true);
+        ok[0] = fpa_jcc(s, JCC_JE);
+        fpa_tstz(s, st, b, true);
+        fix[n++] = fpa_jcc(s, JCC_JNE);
+        break;
+    case FPARITH_DIV:
+        fix[n++] = fpa_jcc(s, JCC_JNE);
+        fpa_tstz(s, st, a, true);
+        fix[n++] = fpa_jcc(s, JCC_JNE);
+        break;
+    default:
+        fpa_tstz(s, st, a, true);
+        pz[0] = fpa_jcc(s, JCC_JE);
+        fpa_tstz(s, st, c, true);
+        pz[1] = fpa_jcc(s, JCC_JE);
+        if (!ix) {
+            fix[n++] = fpa_jcc(s, JCC_JNE);
+        } else {
+            /* r is 0, the sum exact, the product's error term exact */
+            fpa_tstz(s, st, r, dbl);
+            fix[n++] = fpa_jcc(s, JCC_JNE);
+            fpa_tstm(s, st, FPA_T(5));
+            fix[n++] = fpa_jcc(s, JCC_JNE);
+            fpa_range(s, m, FPA_T(2), dbl, eprod, emax, true);
+            fpa_tstm(s, st, m);
+            fix[n++] = fpa_jcc(s, JCC_JNE);
+            tcg_out8(s, OPC_JMP_long);
+            tcg_out32(s, 0);
+            ok[1] = s->code_ptr - 4;
+        }
+        /* zero product: r zero or normal */
+        fpa_patch(pz[0], s->code_ptr);
+        fpa_patch(pz[1], s->code_ptr);
+        fpa_range(s, m, r, dbl, 1, emax, true);
+        fpa_tstm(s, st, m);
+        nrm = fpa_jcc(s, JCC_JE);
+        fpa_tstz(s, st, r, dbl);
+        fix[n++] = fpa_jcc(s, JCC_JNE);
+        break;
+    }
+    tcg_debug_assert(n <= FPA_NFIX);
+
+    for (int i = 0; i < 2; i++) {
+        if (ok[i]) {
+            fpa_patch(ok[i], s->code_ptr);
+        }
+    }
+    done[1] = fpa_zero_end(s, rd, st, r, res, sgl, true);
+    done[0] = NULL;
+    if (nrm) {
+        fpa_patch(nrm, s->code_ptr);
+        done[0] = fpa_zero_end(s, rd, st, r, res, sgl, false);
+    }
+    return n;
+}
+
 static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
                             TCGReg a, TCGReg c, TCGReg b, unsigned desc)
 {
@@ -3598,9 +3749,9 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     TCGReg r = FPA_T(0), off = FPA_T(1), t2 = FPA_T(2), t3 = FPA_T(3);
     TCGReg t4 = FPA_T(4), ixm = FPA_T(5), tmp = TCG_TMP_VEC, res = r;
     unsigned rlo = 2;
-    tcg_insn_unit *jref, *jdone;
+    tcg_insn_unit *jref, *jdone, *jzero[2], *fix[FPA_NFIX];
     TCGReg save[TCG_TARGET_NB_REGS];
-    int nsave = 0, frame, base;
+    int nsave = 0, frame, base, nfix;
 
     if (rsp) {
         tcg_out_vex_modrm(s, OPC_CVTSD2SS, r, r, a);
@@ -3765,7 +3916,11 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
      * the result through a pointer in RCX and passes b and desc on
      * the stack above the 32-byte shadow area.
      */
-    tcg_patch32(jref, s->code_ptr - (jref + 4));
+    fpa_patch(jref, s->code_ptr);
+    nfix = fpa_zero(s, rd, st, a, c, b, desc, fix, jzero);
+    for (int i = 0; i < nfix; i++) {
+        fpa_patch(fix[i], s->code_ptr);
+    }
     for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
         if (s->reg_to_temp[i] && i != rd && i != st &&
             tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
@@ -3814,7 +3969,12 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
         tcg_out_ld(s, t, save[i], TCG_REG_ESP, base + i * 32);
     }
     tcg_out_addi(s, TCG_REG_ESP, frame);
-    tcg_patch32(jdone, s->code_ptr - (jdone + 4));
+    fpa_patch(jdone, s->code_ptr);
+    for (int i = 0; i < 2; i++) {
+        if (jzero[i]) {
+            fpa_patch(jzero[i], s->code_ptr);
+        }
+    }
 }
 
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
