@@ -30,6 +30,7 @@
 #include "qapi/error.h"
 #include "qemu/guest-random.h"
 #include "tcg/tcg-gvec-desc.h"
+#include "tcg/tcg-op-common.h"
 
 #include "helper_regs.h"
 /*****************************************************************************/
@@ -1604,6 +1605,67 @@ void helper_vlogefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 
     for (i = 0; i < ARRAY_SIZE(r->f32); i++) {
         r->f32[i] = float32_log2(b->f32[i], &env->vec_status);
+    }
+}
+
+/* The helper result of a vfparith_vec op (vmx-impl.c.inc) */
+void ppc_vfparith_ref(void *opaque, uint32_t desc, VFParithBuf *buf)
+{
+    CPUPPCState *env = opaque;
+    ppc_avr_t *r = (ppc_avr_t *)buf->r, *a = (ppc_avr_t *)buf->a;
+    ppc_avr_t *b = (ppc_avr_t *)buf->b, *c = (ppc_avr_t *)buf->c;
+
+    switch (desc & VFPARITH_OP_MASK) {
+    case VFPARITH_ADD:
+        helper_vaddfp(env, r, a, b);
+        break;
+    case VFPARITH_SUB:
+        helper_vsubfp(env, r, a, b);
+        break;
+    case VFPARITH_MADD:
+        helper_vmaddfp(env, r, a, b, c);
+        break;
+    case VFPARITH_NMSUB:
+        helper_vnmsubfp(env, r, a, b, c);
+        break;
+    case VFPARITH_RE:
+        helper_vrefp(env, r, b);
+        break;
+    case VFPARITH_RSQRT:
+        helper_vrsqrtefp(env, r, b);
+        break;
+    case VFPARITH_MAX:
+        helper_vmaxfp(env, r, a, b);
+        break;
+    case VFPARITH_MIN:
+        helper_vminfp(env, r, a, b);
+        break;
+    case VFPARITH_RIN:
+        helper_vrfin(env, r, b);
+        break;
+    case VFPARITH_RIZ:
+        helper_vrfiz(env, r, b);
+        break;
+    case VFPARITH_RIP:
+        helper_vrfip(env, r, b);
+        break;
+    case VFPARITH_RIM:
+        helper_vrfim(env, r, b);
+        break;
+    case VFPARITH_CMPEQ:
+        helper_vcmpeqfp(env, r, a, b);
+        break;
+    case VFPARITH_CMPGE:
+        helper_vcmpgefp(env, r, a, b);
+        break;
+    case VFPARITH_CMPGT:
+        helper_vcmpgtfp(env, r, a, b);
+        break;
+    case VFPARITH_CMPB:
+        helper_vcmpbfp(env, r, a, b);
+        break;
+    default:
+        g_assert_not_reached();
     }
 }
 

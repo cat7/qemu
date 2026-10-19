@@ -1075,10 +1075,68 @@ GEN_VXFORM_ENV(vsum4sbs, 4, 28);
 GEN_VXFORM_ENV(vsum4shs, 4, 25);
 GEN_VXFORM_ENV(vsum2sws, 4, 26);
 GEN_VXFORM_ENV(vsumsws, 4, 30);
-GEN_VXFORM_ENV(vaddfp, 5, 0);
-GEN_VXFORM_ENV(vsubfp, 5, 1);
-GEN_VXFORM_ENV(vmaxfp, 5, 16);
-GEN_VXFORM_ENV(vminfp, 5, 17);
+/*
+ * Single precision arithmetic on the host (vfparith_vec).  Vectors whose
+ * host result might differ from the helper's for either VSCR[NJ] (NaNs,
+ * subnormal operands, results below 2^-125) get the helper's result
+ * from ppc_vfparith_ref().  PPC_NATIVE_VMX=0 keeps the helpers.
+ */
+static TCGv_vec native_avr(int regno)
+{
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_ld_vec(v, tcg_env, avr_full_offset(regno));
+    return v;
+}
+
+/* vrt = desc(vra, vrb, vrc) */
+static void native_vmx_op(unsigned desc, int vrt, int vra, int vrb, int vrc)
+{
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec vb = native_avr(vrb);
+    TCGv_vec va = vra >= 0 ? native_avr(vra) : vb;
+    TCGv_vec vc = vrc >= 0 ? native_avr(vrc) : vb;
+
+    tcg_gen_vfparith_vec(desc, r, va, vb, vc);
+    tcg_gen_st_vec(r, tcg_env, avr_full_offset(vrt));
+}
+
+#define GEN_VXFORM_VFP(name, opc2, opc3, desc)                          \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (native_vmx_on) {                                                \
+        native_vmx_op(desc, rD(ctx->opcode), rA(ctx->opcode),           \
+                      rB(ctx->opcode), -1);                             \
+        return;                                                         \
+    }                                                                   \
+    gen_helper_##name(tcg_env, gen_avr_ptr(rD(ctx->opcode)),            \
+                      gen_avr_ptr(rA(ctx->opcode)),                     \
+                      gen_avr_ptr(rB(ctx->opcode)));                    \
+}
+
+#define GEN_VXFORM_NOA_VFP(name, opc2, opc3, desc)                      \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (native_vmx_on) {                                                \
+        native_vmx_op(desc, rD(ctx->opcode), -1, rB(ctx->opcode), -1);  \
+        return;                                                         \
+    }                                                                   \
+    gen_helper_##name(tcg_env, gen_avr_ptr(rD(ctx->opcode)),            \
+                      gen_avr_ptr(rB(ctx->opcode)));                    \
+}
+
+GEN_VXFORM_VFP(vaddfp, 5, 0, VFPARITH_ADD);
+GEN_VXFORM_VFP(vsubfp, 5, 1, VFPARITH_SUB);
+GEN_VXFORM_VFP(vmaxfp, 5, 16, VFPARITH_MAX);
+GEN_VXFORM_VFP(vminfp, 5, 17, VFPARITH_MIN);
 GEN_VXFORM_HETRO(vextublx, 6, 24)
 GEN_VXFORM_HETRO(vextuhlx, 6, 25)
 GEN_VXFORM_HETRO(vextuwlx, 6, 26)
@@ -1356,10 +1414,39 @@ static bool do_vcmpq(DisasContext *ctx, arg_VX_bf *a, bool sign)
 TRANS(VCMPSQ, do_vcmpq, true)
 TRANS(VCMPUQ, do_vcmpq, false)
 
-GEN_VXRFORM(vcmpeqfp, 3, 3)
-GEN_VXRFORM(vcmpgefp, 3, 7)
-GEN_VXRFORM(vcmpgtfp, 3, 11)
-GEN_VXRFORM(vcmpbfp, 3, 15)
+static void gen_vcmpfp(DisasContext *ctx, unsigned desc, bool rc,
+                       void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))
+{
+    int vrt = rD(ctx->opcode), vra = rA(ctx->opcode), vrb = rB(ctx->opcode);
+
+    if (unlikely(!ctx->altivec_enabled)) {
+        gen_exception(ctx, POWERPC_EXCP_VPU);
+        return;
+    }
+    if (native_vmx_on) {
+        native_vmx_op(desc, vrt, vra, vrb, -1);
+        if (rc) {
+            do_vcmp_rc(vrt);
+        }
+        return;
+    }
+    helper(tcg_env, gen_avr_ptr(vrt), gen_avr_ptr(vra), gen_avr_ptr(vrb));
+}
+
+#define GEN_VXRFORM_VFP(name, opc2, opc3, desc)                         \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    gen_vcmpfp(ctx, desc, false, gen_helper_##name);                    \
+}                                                                       \
+static void glue(gen_, name##_)(DisasContext *ctx)                      \
+{                                                                       \
+    gen_vcmpfp(ctx, desc, true, gen_helper_##name##_dot);               \
+}
+
+GEN_VXRFORM_VFP(vcmpeqfp, 3, 3, VFPARITH_CMPEQ)
+GEN_VXRFORM_VFP(vcmpgefp, 3, 7, VFPARITH_CMPGE)
+GEN_VXRFORM_VFP(vcmpgtfp, 3, 11, VFPARITH_CMPGT)
+GEN_VXRFORM_VFP(vcmpbfp, 3, 15, VFPARITH_CMPB)
 
 static void gen_vsplti(DisasContext *ctx, int vece)
 {
@@ -1440,14 +1527,14 @@ GEN_VXFORM_NOA(vupklsh, 7, 11);
 GEN_VXFORM_NOA(vupklsw, 7, 27);
 GEN_VXFORM_NOA(vupkhpx, 7, 13);
 GEN_VXFORM_NOA(vupklpx, 7, 15);
-GEN_VXFORM_NOA_ENV(vrefp, 5, 4);
-GEN_VXFORM_NOA_ENV(vrsqrtefp, 5, 5);
+GEN_VXFORM_NOA_VFP(vrefp, 5, 4, VFPARITH_RE);
+GEN_VXFORM_NOA_VFP(vrsqrtefp, 5, 5, VFPARITH_RSQRT);
 GEN_VXFORM_NOA_ENV(vexptefp, 5, 6);
 GEN_VXFORM_NOA_ENV(vlogefp, 5, 7);
-GEN_VXFORM_NOA_ENV(vrfim, 5, 11);
-GEN_VXFORM_NOA_ENV(vrfin, 5, 8);
-GEN_VXFORM_NOA_ENV(vrfip, 5, 10);
-GEN_VXFORM_NOA_ENV(vrfiz, 5, 9);
+GEN_VXFORM_NOA_VFP(vrfim, 5, 11, VFPARITH_RIM);
+GEN_VXFORM_NOA_VFP(vrfin, 5, 8, VFPARITH_RIN);
+GEN_VXFORM_NOA_VFP(vrfip, 5, 10, VFPARITH_RIP);
+GEN_VXFORM_NOA_VFP(vrfiz, 5, 9, VFPARITH_RIZ);
 
 static void gen_vprtyb_vec(unsigned vece, TCGv_vec t, TCGv_vec b)
 {
@@ -1582,10 +1669,39 @@ GEN_VXFORM_UIMM_SPLAT(vextractub, 6, 8, 15);
 GEN_VXFORM_UIMM_SPLAT(vextractuh, 6, 9, 14);
 GEN_VXFORM_UIMM_SPLAT(vextractuw, 6, 10, 12);
 GEN_VXFORM_UIMM_SPLAT(vextractd, 6, 11, 8);
-GEN_VXFORM_UIMM_ENV(vcfux, 5, 12);
-GEN_VXFORM_UIMM_ENV(vcfsx, 5, 13);
-GEN_VXFORM_UIMM_ENV(vctuxs, 5, 14);
-GEN_VXFORM_UIMM_ENV(vctsxs, 5, 15);
+/* vcf*, vct*: exact on the host; vct* OR the saturated lanes into SAT */
+#define GEN_VXFORM_UIMM_VFP(name, opc2, opc3, desc, sat)                \
+static void glue(gen_, name)(DisasContext *ctx)                         \
+{                                                                       \
+    unsigned uim = UIMM5(ctx->opcode);                                  \
+    int vrt = rD(ctx->opcode), vrb = rB(ctx->opcode);                   \
+                                                                        \
+    if (unlikely(!ctx->altivec_enabled)) {                              \
+        gen_exception(ctx, POWERPC_EXCP_VPU);                           \
+        return;                                                         \
+    }                                                                   \
+    if (native_vmx_on) {                                                \
+        if (sat >= 0) {                                                 \
+            TCGv_vec b = native_avr(vrb);                               \
+            TCGv_vec m = tcg_temp_new_vec(TCG_TYPE_V128);               \
+            TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);               \
+                                                                        \
+            tcg_gen_vfparith_vec(sat | uim << VFPARITH_SCALE, m, b, b, b); \
+            tcg_gen_ld_vec(v, tcg_env, offsetof(CPUPPCState, vscr_sat)); \
+            tcg_gen_or_vec(MO_32, v, v, m);                             \
+            tcg_gen_st_vec(v, tcg_env, offsetof(CPUPPCState, vscr_sat)); \
+        }                                                               \
+        native_vmx_op(desc | uim << VFPARITH_SCALE, vrt, -1, vrb, -1);  \
+        return;                                                         \
+    }                                                                   \
+    gen_helper_##name(tcg_env, gen_avr_ptr(vrt), gen_avr_ptr(vrb),      \
+                      tcg_constant_i32(uim));                           \
+}
+
+GEN_VXFORM_UIMM_VFP(vcfux, 5, 12, VFPARITH_CFU, -1);
+GEN_VXFORM_UIMM_VFP(vcfsx, 5, 13, VFPARITH_CFS, -1);
+GEN_VXFORM_UIMM_VFP(vctuxs, 5, 14, VFPARITH_CTU, VFPARITH_CTU_SAT);
+GEN_VXFORM_UIMM_VFP(vctsxs, 5, 15, VFPARITH_CTS, VFPARITH_CTS_SAT);
 GEN_VXFORM_DUAL(vspltb, PPC_ALTIVEC, PPC_NONE,
                 vextractub, PPC_NONE, PPC2_ISA300);
 GEN_VXFORM_DUAL(vsplth, PPC_ALTIVEC, PPC_NONE,
@@ -2282,7 +2398,26 @@ static void glue(gen_, name0##_##name1)(DisasContext *ctx)              \
         }                                                               \
     }
 
-GEN_VAFORM_PAIRED(vmaddfp, vnmsubfp, 23)
+static void gen_vmaddfp_vnmsubfp(DisasContext *ctx)
+{
+    bool neg = Rc(ctx->opcode);
+    void (*helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr) =
+        neg ? gen_helper_vnmsubfp : gen_helper_vmaddfp;
+    int vrt = rD(ctx->opcode), vra = rA(ctx->opcode);
+    int vrb = rB(ctx->opcode), vrc = rC(ctx->opcode);
+
+    if (unlikely(!ctx->altivec_enabled)) {
+        gen_exception(ctx, POWERPC_EXCP_VPU);
+        return;
+    }
+    if (native_vmx_on) {
+        native_vmx_op(neg ? VFPARITH_NMSUB : VFPARITH_MADD,
+                      vrt, vra, vrb, vrc);
+        return;
+    }
+    helper(tcg_env, gen_avr_ptr(vrt), gen_avr_ptr(vra), gen_avr_ptr(vrb),
+           gen_avr_ptr(vrc));
+}
 
 static bool do_va_helper(DisasContext *ctx, arg_VA *a,
     void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))
