@@ -825,6 +825,19 @@ void tcg_gen_mulhrs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_mulhrs_vec);
 }
 
+bool tcg_can_emit_extract2_vec(void)
+{
+    return tcg_op_supported(INDEX_op_extract2_vec, TCG_TYPE_V128, 0);
+}
+
+void tcg_gen_extract2_vec(TCGv_vec r, TCGv_vec al, TCGv_vec ah,
+                          unsigned ofs)
+{
+    tcg_debug_assert(ofs > 0 && ofs < 16);
+    vec_gen_4(INDEX_op_extract2_vec, TCG_TYPE_V128, MO_8, tcgv_vec_arg(r),
+              tcgv_vec_arg(al), tcgv_vec_arg(ah), ofs);
+}
+
 VFParithRef tcg_vfparith_ref;
 
 void tcg_set_vfparith_ref(VFParithRef fn)
