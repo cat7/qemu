@@ -591,6 +591,13 @@ void tcg_gen_vfparith_vec(unsigned desc, TCGv_vec r,
 bool tcg_can_emit_perm2(void);
 void tcg_gen_perm2_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec idx);
 
+/*
+ * Each vece element of r = lo(a) * lo(b) + hi(a) * hi(b) of its halves,
+ * signed (s) or unsigned (u), modulo 2^(8 << vece).
+ */
+void tcg_gen_dot2s_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_dot2u_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset);
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr base, TCGArg offset, TCGType t);
