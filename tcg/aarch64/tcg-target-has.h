@@ -57,6 +57,7 @@
 #define TCG_TARGET_HAS_perm2_vec        1
 #define TCG_TARGET_HAS_dot2_vec         1
 #define TCG_TARGET_HAS_mulhrs_vec       1
+#define TCG_TARGET_HAS_zip_vec          1
 #define TCG_TARGET_HAS_extract2_vec     1
 
 #define TCG_TARGET_extract_valid(type, ofs, len)   1

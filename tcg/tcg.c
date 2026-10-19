@@ -2467,6 +2467,9 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_dot2_vec;
     case INDEX_op_mulhrs_vec:
         return has_type && TCG_TARGET_HAS_mulhrs_vec;
+    case INDEX_op_zipl_vec:
+    case INDEX_op_ziph_vec:
+        return has_type && TCG_TARGET_HAS_zip_vec;
     case INDEX_op_extract2_vec:
         return type == TCG_TYPE_V128 && has_type &&
                TCG_TARGET_HAS_extract2_vec;
