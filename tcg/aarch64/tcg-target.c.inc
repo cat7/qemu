@@ -3231,8 +3231,14 @@ static int fpa_zero(TCGContext *s, TCGReg rd, TCGReg st, TCGReg a,
 
     if (sgl) {
         TCGReg in[3] = { a, q, b };
+        unsigned known[3] = {
+            FPARITH_SGL_A, fma ? FPARITH_SGL_C : FPARITH_SGL_B, FPARITH_SGL_B
+        };
 
         for (int i = 0; i < (fma ? 3 : 2); i++) {
+            if (desc & known[i]) {
+                continue;
+            }
             tcg_out32(s, FPA_FCVT_DS | (FPA_T(5 + i) & 31) << 5 | (t & 31));
             fpa_out3(s, FPA_FCMEQ, true, t, t, in[i]);
             tcg_out32(s, FPA_UMOV_WS | (t & 31) << 5 | TCG_REG_TMP2);
