@@ -60,6 +60,7 @@
 #define TCG_TARGET_HAS_zip_vec          1
 #define TCG_TARGET_HAS_extract2_vec     1
 #define TCG_TARGET_HAS_qemu_ldst_vec    1
+#define TCG_TARGET_HAS_qemu_anc_vec     1
 #define TCG_TARGET_NEED_OOL
 #define TCG_TARGET_HAS_fcvt_vec         1
 
