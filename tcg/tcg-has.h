@@ -57,6 +57,9 @@
 #ifndef TCG_TARGET_HAS_extract2_vec
 #define TCG_TARGET_HAS_extract2_vec     0
 #endif
+#ifndef TCG_TARGET_HAS_qemu_ldst_vec
+#define TCG_TARGET_HAS_qemu_ldst_vec    0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif
