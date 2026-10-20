@@ -7345,6 +7345,9 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
 #endif
     env->vmx_lanes.VsrD(0) = -1;
     env->vmx_lanes.VsrD(1) = 0;
+#ifdef CONFIG_TCG
+    ppc_fparith_fpscr_init(env);
+#endif
     hreg_compute_hflags(env);
     env->reserve_addr = (target_ulong)-1ULL;
     /* Be sure no exception or interrupt is pending */
