@@ -3949,6 +3949,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     unsigned rlo = 2;
     tcg_insn_unit *jref;
     OOLStub *ool;
+    int nchk = 0;
 
     fpa_alloc(s, sgl && fma ? 7 : sgl || ix ? 6 : 4,
               1ull << rd | 1ull << a | 1ull << c | 1ull << b);
@@ -3973,14 +3974,23 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     }
 
     if (sgl) {
-        /* operands to single; off = all ones unless each was a single */
+        /*
+         * operands to single; off = all ones unless each was a single,
+         * the operands known to be singles unchecked
+         */
         TCGReg in[3] = { p, q, z };
         TCGReg cv[3] = { t4, tmp, FPA_T(6) };
+        unsigned known[3] = {
+            FPARITH_SGL_A, fma ? FPARITH_SGL_C : FPARITH_SGL_B, FPARITH_SGL_B
+        };
 
         for (int i = 0; i < (fma ? 3 : 2); i++) {
             tcg_out_vex_modrm(s, OPC_CVTSD2SS, cv[i], cv[i], in[i]);
+            if (desc & known[i]) {
+                continue;
+            }
             tcg_out_vex_modrm(s, OPC_CVTSS2SD, ixm, cv[i], cv[i]);
-            if (i) {
+            if (nchk++) {
                 fpa_neq(s, true, ixm, ixm, in[i]);
                 tcg_out_vex_modrm(s, OPC_POR, off, off, ixm);
             } else {
@@ -4080,7 +4090,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
         fpa_pool(s, OPC_PXOR, r, r, dbl ? INT64_MIN : 0x80000000u);
     }
 
-    fpa_range(s, off, r, dbl, rlo, emax, !sgl);
+    fpa_range(s, off, r, dbl, rlo, emax, !nchk);
     if (ix && op == FPARITH_DIV) {
         fpa_range(s, off, p, dbl, eprod, emax, false);
     }
