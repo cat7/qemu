@@ -176,7 +176,7 @@ static void native_fp_op(DisasContext *ctx, unsigned desc, int kind,
     }
     tcg_gen_brcondi_i64(TCG_COND_TSTNE, st, FPARITH_ST_OFF, slow);
     tcg_gen_st_vec(r, tcg_env, fpr_offset(frt));
-    tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
+    clear_fpr_dw1(frt);
     native_fp_fpscr(st, relaxed);
 }
 
