@@ -39,6 +39,9 @@
 #ifndef TCG_TARGET_HAS_fparith_vec
 #define TCG_TARGET_HAS_fparith_vec      0
 #endif
+#ifndef TCG_TARGET_HAS_fcvt_vec
+#define TCG_TARGET_HAS_fcvt_vec         0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif

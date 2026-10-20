@@ -785,6 +785,46 @@ void tcg_gen_fparith_vec(unsigned desc, TCGv_vec r, TCGv_i64 status,
     op->args[5] = desc;
 }
 
+FCvt32to64Ref tcg_fcvt_to64_ref;
+FCvt64to32Ref tcg_fcvt_to32_ref;
+
+void tcg_set_fcvt_ref(FCvt32to64Ref to64, FCvt64to32Ref to32)
+{
+    tcg_fcvt_to64_ref = to64;
+    tcg_fcvt_to32_ref = to32;
+}
+
+bool tcg_can_emit_fcvt(void)
+{
+    return tcg_op_supported(INDEX_op_f32to64_vec, TCG_TYPE_V64, 0);
+}
+
+void tcg_gen_f32to64_vec(TCGv_vec r, TCGv_i32 s)
+{
+    TCGOp *op;
+
+    tcg_debug_assert(tcgv_vec_temp(r)->base_type == TCG_TYPE_V64);
+    tcg_debug_assert(tcg_fcvt_to64_ref);
+    op = tcg_emit_op(INDEX_op_f32to64_vec, 2);
+    TCGOP_TYPE(op) = TCG_TYPE_V64;
+    TCGOP_VECE(op) = MO_64;
+    op->args[0] = tcgv_vec_arg(r);
+    op->args[1] = tcgv_i32_arg(s);
+}
+
+void tcg_gen_f64to32_vec(TCGv_i32 r, TCGv_vec d)
+{
+    TCGOp *op;
+
+    tcg_debug_assert(tcgv_vec_temp(d)->base_type == TCG_TYPE_V64);
+    tcg_debug_assert(tcg_fcvt_to32_ref);
+    op = tcg_emit_op(INDEX_op_f64to32_vec, 2);
+    TCGOP_TYPE(op) = TCG_TYPE_V64;
+    TCGOP_VECE(op) = MO_64;
+    op->args[0] = tcgv_i32_arg(r);
+    op->args[1] = tcgv_vec_arg(d);
+}
+
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                         TCGv_vec a, TCGv_vec b, TCGv_vec c, TCGv_vec d)
 {

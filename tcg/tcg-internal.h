@@ -106,5 +106,7 @@ TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *op,
 bool tcg_op_imm_match(TCGOpcode op, TCGType type, tcg_target_ulong imm);
 
 extern FParithRef tcg_fparith_ref;
+extern FCvt32to64Ref tcg_fcvt_to64_ref;
+extern FCvt64to32Ref tcg_fcvt_to32_ref;
 
 #endif /* TCG_INTERNAL_H */

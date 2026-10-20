@@ -38,11 +38,13 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
  * sequence, emitted after the TB's exit, which then leaves the TB.
  * PPC_NATIVE_FP=0 turns it off, PPC_NATIVE_FP_RELAXED=1 leaves FI, XX
  * and FX alone in the arithmetic, PPC_NATIVE_FCMP=0 and
- * PPC_NATIVE_FRSP=0 keep the helpers for fcmpu and frsp.
+ * PPC_NATIVE_FRSP=0 keep the helpers for fcmpu and frsp.  The single
+ * loads and stores convert on the host unless PPC_NATIVE_FPCVT=0.
  */
 enum { NFP_AB, NFP_ACB, NFP_RSP, NFP_CMPU };
 
 static bool native_fcmp_on, native_frsp_on;
+static bool native_fcvt_on;
 
 static bool native_env(const char *name, bool dflt)
 {
@@ -63,6 +65,11 @@ static void native_fp_init(void)
     tcg_set_fparith_ref(ppc_fparith_ref);
     native_fcmp_on = native_env("PPC_NATIVE_FCMP", true);
     native_frsp_on = native_env("PPC_NATIVE_FRSP", true);
+    native_fcvt_on = tcg_can_emit_fcvt() &&
+                     native_env("PPC_NATIVE_FPCVT", true);
+    if (native_fcvt_on) {
+        tcg_set_fcvt_ref(helper_todouble, helper_tosingle);
+    }
 #endif
 }
 
@@ -1204,7 +1211,22 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
     gen_set_access_type(ctx, ACCESS_FLOAT);
     t0 = tcg_temp_new_i64();
     ea = do_ea_calc(ctx, ra, displ);
-    if (store) {
+    if (single && native_fcvt_on) {
+        TCGv_i32 w = tcg_temp_new_i32();
+        TCGv_vec v;
+
+        if (store) {
+            v = native_fpr(rt);
+            tcg_gen_f64to32_vec(w, v);
+            tcg_gen_qemu_st_i32(w, ea, ctx->mem_idx, DEF_MEMOP(MO_UL));
+        } else {
+            v = tcg_temp_new_vec(TCG_TYPE_V64);
+            tcg_gen_qemu_ld_i32(w, ea, ctx->mem_idx, DEF_MEMOP(MO_UL));
+            tcg_gen_f32to64_vec(v, w);
+            tcg_gen_st_vec(v, tcg_env, fpr_offset(rt));
+            clear_fpr_dw1(rt);
+        }
+    } else if (store) {
         get_fpr(t0, rt);
         if (single) {
             gen_qemu_st32fs(ctx, t0, ea);
