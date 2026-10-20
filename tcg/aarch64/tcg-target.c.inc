@@ -2998,7 +2998,9 @@ static const TCGOutOpStore outop_st = {
  * back to ret.  The call-clobbered registers live at the op are saved
  * around calls.
  */
-typedef enum { OOL_FPARITH, OOL_VFPARITH } OOLKind;
+typedef enum {
+    OOL_FPARITH, OOL_F32TO64, OOL_F64TO32, OOL_VFPARITH
+} OOLKind;
 
 typedef struct OOLStub {
     struct OOLStub *next;
@@ -3016,6 +3018,7 @@ static __thread OOLStub *ool_head, **ool_tail;
 
 static void tcg_out_fpa_load(OOLStub *t);
 static bool tcg_out_fparith_ool(TCGContext *s, OOLStub *t);
+static bool tcg_out_fcvt_ool(TCGContext *s, OOLStub *t);
 static bool tcg_out_vfparith_ool(TCGContext *s, OOLStub *t);
 
 /* A stub for the branch at jmp, returning to the current position */
@@ -3073,6 +3076,10 @@ static int tcg_out_ool_finalize(TCGContext *s)
         case OOL_FPARITH:
             tcg_out_fpa_load(t);
             ok = tcg_out_fparith_ool(s, t);
+            break;
+        case OOL_F32TO64:
+        case OOL_F64TO32:
+            ok = tcg_out_fcvt_ool(s, t);
             break;
         case OOL_VFPARITH:
             ok = tcg_out_vfparith_ool(s, t);
@@ -3544,6 +3551,62 @@ static bool tcg_out_fparith_ool(TCGContext *s, OOLStub *t)
     ool_restore(s, t);
     tcg_out32(s, FPA_FMOV_DX | TCG_REG_TMP0 << 5 | (rd & 31));
     tcg_out_mov(s, TCG_TYPE_I64, st, TCG_REG_TMP1);
+    tcg_out_goto(s, t->ret);
+    return true;
+}
+
+/*
+ * f32to64_vec: fmov, fcvt, and NaNs out of line.  f64to32_vec: fcvt
+ * there and back, out of line unless equal.
+ */
+static void tcg_out_f32to64(TCGContext *s, TCGReg rd, TCGReg ws)
+{
+    tcg_insn_unit *jmp;
+    OOLStub *t;
+
+    tcg_out32(s, 0x1e270000 | (ws & 31) << 5 | (rd & 31));     /* fmov s, w */
+    tcg_out32(s, FPA_FCVT_DS | (rd & 31) << 5 | (rd & 31));
+    tcg_out32(s, 0x1e602000 | (rd & 31) << 16 | (rd & 31) << 5);  /* fcmp */
+    jmp = s->code_ptr;
+    tcg_out32(s, 0x54000000 | 6);                               /* b.vs */
+    t = ool_new(s, OOL_F32TO64, jmp, 1ull << rd);
+    t->rd = rd;
+    t->a = ws;
+}
+
+static void tcg_out_f64to32(TCGContext *s, TCGReg wd, TCGReg dn)
+{
+    TCGReg v = TCG_VEC_TMP0;
+    tcg_insn_unit *jmp;
+    OOLStub *t;
+
+    tcg_out32(s, FPA_FCVT_SD | (dn & 31) << 5 | (v & 31));
+    tcg_out32(s, FPA_UMOV_WS | (v & 31) << 5 | wd);
+    tcg_out32(s, FPA_FCVT_DS | (v & 31) << 5 | (v & 31));
+    tcg_out32(s, 0x1e602000 | (dn & 31) << 16 | (v & 31) << 5);   /* fcmp */
+    jmp = s->code_ptr;
+    tcg_out32(s, 0x54000000 | 1);                               /* b.ne */
+    t = ool_new(s, OOL_F64TO32, jmp, 1ull << wd);
+    t->rd = wd;
+    t->a = dn;
+}
+
+static bool tcg_out_fcvt_ool(TCGContext *s, OOLStub *t)
+{
+    if (!reloc_pc19(t->jmp, tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
+    }
+    ool_save(s, t);
+    if (t->kind == OOL_F32TO64) {
+        tcg_out_mov(s, TCG_TYPE_I32, TCG_REG_X0, t->a);
+        tcg_out_call_int(s, (const tcg_insn_unit *)tcg_fcvt_to64_ref);
+        tcg_out32(s, FPA_FMOV_DX | TCG_REG_X0 << 5 | (t->rd & 31));
+    } else {
+        tcg_out32(s, FPA_UMOV_XD | (t->a & 31) << 5 | TCG_REG_X0);
+        tcg_out_call_int(s, (const tcg_insn_unit *)tcg_fcvt_to32_ref);
+        tcg_out_mov(s, TCG_TYPE_I32, t->rd, TCG_REG_X0);
+    }
+    ool_restore(s, t);
     tcg_out_goto(s, t->ret);
     return true;
 }
@@ -4198,6 +4261,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                   | (a1 & 31) << 5 | (a0 & 31));
         break;
 
+    case INDEX_op_f32to64_vec:
+        tcg_out_f32to64(s, a0, a1);
+        break;
+    case INDEX_op_f64to32_vec:
+        tcg_out_f64to32(s, a0, a1);
+        break;
     case INDEX_op_qemu_ld_vec:
         tcg_out_qemu_ldst_vec(s, a0, a1, a2, true);
         break;
@@ -4386,7 +4455,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_ld_vec:
     case INDEX_op_dupm_vec:
     case INDEX_op_qemu_ld_vec:
+    case INDEX_op_f32to64_vec:
         return C_O1_I1(w, r);
+    case INDEX_op_f64to32_vec:
+        return C_O1_I1(r, w);
     case INDEX_op_st_vec:
     case INDEX_op_qemu_st_vec:
         return C_O0_I2(w, r);
