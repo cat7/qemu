@@ -179,6 +179,14 @@ typedef struct NativeFPSlow {
     uint8_t kind, frt, x, y, z;
 } NativeFPSlow;
 
+/* An anchor of FP loads and stores off one base, see fp-impl.c.inc */
+typedef struct FPAnchor {
+    TCGv_ptr e, p;
+    TCGv_i64 pg;
+    target_ulong last;
+    int ra;
+} FPAnchor;
+
 struct DisasContext {
     DisasContextBase base;
     target_ulong cia;  /* current instruction address */
@@ -218,6 +226,9 @@ struct DisasContext {
     bool fp_fast;
     int n_nfp;
     NativeFPSlow nfp[64];
+    bool anc_on;
+    FPAnchor anc[4];
+    target_ulong anc_seen[32];
 };
 
 #define DISAS_EXIT         DISAS_TARGET_0  /* exit to main loop, pc updated */
@@ -5118,6 +5129,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->bhrb_enable = (hflags >> HFLAGS_BHRB_ENABLE) & 1;
     ctx->fp_fast = (hflags >> HFLAGS_FP_FAST) & 1;
     ctx->n_nfp = 0;
+    native_anchor_init(ctx);
 
     ctx->singlestep_flags = 0;
     if ((hflags >> HFLAGS_SE) & 1) {

@@ -348,6 +348,35 @@ bool tcg_can_emit_qemu_ldst_vec(void);
 void tcg_gen_qemu_ld_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_st_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
 
+/*
+ * Anchored guest accesses, for runs of accesses at constant offsets from
+ * one base, 64-bit guest addresses.  tcg_gen_qemu_anchor() reads the TLB
+ * entry for mmu index idx of the page of lo = base + lo_ofs (truncated
+ * to 32 bits when narrow, as all addresses here): *e becomes that entry
+ * when it maps the page for loads (ld) or stores and hi = base + hi_ofs
+ * is on the same page, else an entry that maps nothing; *pg the page of
+ * lo; *p the host address of lo less lo_ofs.  An anchored access to
+ * base + ofs, within [lo, hi], goes to p + ofs while e maps pg for the
+ * access, through the slow path otherwise.  Not for plugin-instrumented
+ * code.
+ */
+bool tcg_can_emit_qemu_anchor(void);
+void tcg_gen_qemu_anchor(TCGv_ptr *e, TCGv_i64 *pg, TCGv_ptr *p,
+                         TCGv_i64 base, int32_t lo_ofs, int32_t hi_ofs,
+                         bool narrow, TCGArg idx, bool ld);
+void tcg_gen_qemu_ld_anc_i32(TCGv_i32 val, TCGv_ptr e, TCGv_i64 pg,
+                             TCGv_ptr p, TCGv_i64 base, int32_t ofs,
+                             bool narrow, TCGArg idx, MemOp memop);
+void tcg_gen_qemu_ld_anc_i64(TCGv_i64 val, TCGv_ptr e, TCGv_i64 pg,
+                             TCGv_ptr p, TCGv_i64 base, int32_t ofs,
+                             bool narrow, TCGArg idx, MemOp memop);
+void tcg_gen_qemu_st_anc_i32(TCGv_i32 val, TCGv_ptr e, TCGv_i64 pg,
+                             TCGv_ptr p, TCGv_i64 base, int32_t ofs,
+                             bool narrow, TCGArg idx, MemOp memop);
+void tcg_gen_qemu_st_anc_i64(TCGv_i64 val, TCGv_ptr e, TCGv_i64 pg,
+                             TCGv_ptr p, TCGv_i64 base, int32_t ofs,
+                             bool narrow, TCGArg idx, MemOp memop);
+
 /* Atomic ops */
 
 void tcg_gen_atomic_cmpxchg_i32_chk(TCGv_i32, TCGTemp *, TCGv_i32, TCGv_i32,
