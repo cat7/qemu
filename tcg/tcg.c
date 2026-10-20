@@ -116,6 +116,9 @@ static void tcg_register_jit_int(const void *buf, size_t size,
 
 /* Forward declarations for functions declared and used in tcg-target.c.inc. */
 static void tcg_out_tb_start(TCGContext *s);
+#ifdef TCG_TARGET_NEED_OOL
+static int tcg_out_ool_finalize(TCGContext *s);
+#endif
 static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg1,
                        intptr_t arg2);
 static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg);
@@ -6797,6 +6800,12 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     if (i < 0) {
         return i;
     }
+#ifdef TCG_TARGET_NEED_OOL
+    i = tcg_out_ool_finalize(s);
+    if (i < 0) {
+        return i;
+    }
+#endif
     i = tcg_out_pool_finalize(s);
     if (i < 0) {
         return i;
