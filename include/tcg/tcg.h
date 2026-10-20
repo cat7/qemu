@@ -788,7 +788,8 @@ typedef struct FParithResult {
     uint64_t r, status;
 } FParithResult;
 typedef FParithResult (*FParithRef)(void *env, uint64_t a, uint64_t c,
-                                    uint64_t b, uint32_t desc);
+                                    uint64_t b, uint32_t desc,
+                                    uint64_t status);
 
 /* see tcg_gen_f32to64_vec() and tcg_gen_f64to32_vec() */
 typedef uint64_t (*FCvt32to64Ref)(uint32_t s);
