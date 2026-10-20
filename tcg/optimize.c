@@ -2436,6 +2436,13 @@ static bool fold_qemu_st(OptContext *ctx, TCGOp *op)
     return true;
 }
 
+/* Anchored accesses keep the vector copies: they do not clobber */
+static bool fold_qemu_anc(OptContext *ctx, TCGOp *op)
+{
+    ctx->prev_mb = NULL;
+    return finish_folding(ctx, op);
+}
+
 static bool fold_remainder(OptContext *ctx, TCGOp *op)
 {
     if (fold_const2(ctx, op) ||
@@ -3230,6 +3237,10 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_qemu_st2:
         case INDEX_op_qemu_st_vec:
             done = fold_qemu_st(&ctx, op);
+            break;
+        case INDEX_op_qemu_ld_anc_vec:
+        case INDEX_op_qemu_st_anc_vec:
+            done = fold_qemu_anc(&ctx, op);
             break;
         case INDEX_op_rems:
         case INDEX_op_remu:
