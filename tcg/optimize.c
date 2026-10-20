@@ -36,6 +36,7 @@ typedef struct MemCopyInfo {
     QSIMPLEQ_ENTRY (MemCopyInfo) next;
     TCGTemp *ts;
     TCGType type;
+    unsigned seq;
 } MemCopyInfo;
 
 typedef struct TempOptInfo {
@@ -54,6 +55,7 @@ typedef struct OptContext {
 
     IntervalTreeRoot mem_copy;
     QSIMPLEQ_HEAD(, MemCopyInfo) mem_free;
+    unsigned mem_seq;
 
     /* In flight values from optimization. */
     TCGType type;
@@ -274,11 +276,39 @@ static void reset_temp(OptContext *ctx, TCGArg arg)
     reset_ts(ctx, arg_temp(arg));
 }
 
+/*
+ * Keep the last few V64 copies (the FPRs of the scalar FP ops), as many
+ * as the vector registers an op with many scratch registers leaves:
+ * older ones would be spilled.
+ */
+static void limit_mem_copy_v64(OptContext *ctx)
+{
+    int max = tcg_vector_regs() - 12;
+    MemCopyInfo *mc, *old = NULL;
+    int n = 0;
+
+    for (mc = mem_copy_first(ctx, 0, -1); mc; mc = mem_copy_next(mc, 0, -1)) {
+        if (mc->type == TCG_TYPE_V64) {
+            n++;
+            if (!old || mc->seq < old->seq) {
+                old = mc;
+            }
+        }
+    }
+    if (n >= MAX(max, 1)) {
+        remove_mem_copy(ctx, old);
+    }
+}
+
 static void record_mem_copy(OptContext *ctx, TCGType type,
                             TCGTemp *ts, intptr_t start, intptr_t last)
 {
     MemCopyInfo *mc;
     TempOptInfo *ti;
+
+    if (type == TCG_TYPE_V64) {
+        limit_mem_copy_v64(ctx);
+    }
 
     mc = QSIMPLEQ_FIRST(&ctx->mem_free);
     if (mc) {
@@ -291,6 +321,7 @@ static void record_mem_copy(OptContext *ctx, TCGType type,
     mc->itree.start = start;
     mc->itree.last = last;
     mc->type = type;
+    mc->seq = ctx->mem_seq++;
     interval_tree_insert(&mc->itree, &ctx->mem_copy);
 
     ts = find_better_copy(ts);
