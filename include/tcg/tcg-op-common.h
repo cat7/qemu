@@ -546,6 +546,18 @@ enum {
 
 void tcg_set_fparith_ref(FParithRef fn);
 bool tcg_can_emit_fparith(void);
+
+/*
+ * IEEE single (the 32 bits of an i32 temp) and double (a V64 temp) for
+ * loads and stores of singles.  f32to64: the double of equal value, or
+ * for a NaN the function set with tcg_set_fcvt_ref().  f64to32: the
+ * single of equal value when there is one (a zero, an infinity, a single
+ * normal or subnormal), else that function.
+ */
+void tcg_set_fcvt_ref(FCvt32to64Ref to64, FCvt64to32Ref to32);
+bool tcg_can_emit_fcvt(void);
+void tcg_gen_f32to64_vec(TCGv_vec r, TCGv_i32 s);
+void tcg_gen_f64to32_vec(TCGv_i32 r, TCGv_vec d);
 void tcg_gen_fparith_vec(unsigned desc, TCGv_vec r, TCGv_i64 status,
                          TCGv_vec a, TCGv_vec c, TCGv_vec b);
 

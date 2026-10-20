@@ -66,6 +66,7 @@
 #define TCG_TARGET_HAS_extract2_vec     1
 #define TCG_TARGET_HAS_qemu_ldst_vec    1
 #define TCG_TARGET_NEED_OOL
+#define TCG_TARGET_HAS_fcvt_vec         1
 
 #define TCG_TARGET_deposit_valid(type, ofs, len) \
     ((ofs) == 0 && ((len) == 8 || (len) == 16))

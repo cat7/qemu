@@ -3620,7 +3620,9 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
  * ret.  The call-clobbered registers live at the op are saved around
  * calls.
  */
-typedef enum { OOL_FPARITH, OOL_VFPARITH } OOLKind;
+typedef enum {
+    OOL_FPARITH, OOL_F32TO64, OOL_F64TO32, OOL_VFPARITH
+} OOLKind;
 
 typedef struct OOLStub {
     struct OOLStub *next;
@@ -3639,6 +3641,7 @@ static __thread OOLStub *ool_head, **ool_tail;
 
 static void tcg_out_fparith_ool(TCGContext *s, OOLStub *t);
 static void tcg_out_fpa_load(OOLStub *t);
+static void tcg_out_fcvt_ool(TCGContext *s, OOLStub *t);
 static void tcg_out_vfparith_ool(TCGContext *s, OOLStub *t);
 
 /* A stub for the rel32 at jmp, returning to the current position */
@@ -3699,6 +3702,10 @@ static int tcg_out_ool_finalize(TCGContext *s)
         case OOL_FPARITH:
             tcg_out_fpa_load(t);
             tcg_out_fparith_ool(s, t);
+            break;
+        case OOL_F32TO64:
+        case OOL_F64TO32:
+            tcg_out_fcvt_ool(s, t);
             break;
         case OOL_VFPARITH:
             tcg_out_vfparith_ool(s, t);
@@ -4193,6 +4200,79 @@ static void tcg_out_fparith_ool(TCGContext *s, OOLStub *t)
     tcg_out_mov(s, TCG_TYPE_I64, rd, TCG_REG_RAX);
     tcg_out_mov(s, TCG_TYPE_I64, st, TCG_REG_RDX);
 #endif
+    ool_restore(s, t, base);
+    ool_jmp(s, t->ret);
+}
+
+/*
+ * f32to64_vec: vmovd, vcvtss2sd, and NaNs out of line.  f64to32_vec:
+ * vcvtsd2ss there and back, out of line unless equal.
+ */
+#define OPC_UCOMISD     (0x2e | P_EXT | P_DATA16)
+
+static tcg_insn_unit *fcvt_jcc(TCGContext *s, int cond)
+{
+    tcg_out_opc(s, OPC_JCC_long + cond, 0, 0, 0);
+    tcg_out32(s, 0);
+    return s->code_ptr - 4;
+}
+
+static void tcg_out_f32to64(TCGContext *s, TCGReg rd, TCGReg ws)
+{
+    tcg_insn_unit *jmp;
+    OOLStub *t;
+
+    tcg_out_vex_modrm(s, OPC_MOVD_VyEy, rd, 0, ws);
+    tcg_out_vex_modrm(s, OPC_CVTSS2SD, rd, rd, rd);
+    tcg_out_vex_modrm(s, OPC_UCOMISD, rd, 0, rd);
+    jmp = fcvt_jcc(s, JCC_JP);
+    t = ool_new(s, OOL_F32TO64, jmp, 1ull << rd);
+    t->rd = rd;
+    t->a = ws;
+}
+
+static void tcg_out_f64to32(TCGContext *s, TCGReg wd, TCGReg dn)
+{
+    TCGReg v = TCG_TMP_VEC;
+    tcg_insn_unit *jne, *jp;
+    OOLStub *t;
+
+    tcg_out_vex_modrm(s, OPC_CVTSD2SS, v, v, dn);
+    tcg_out_vex_modrm(s, OPC_MOVD_EyVy, v, 0, wd);
+    tcg_out_vex_modrm(s, OPC_CVTSS2SD, v, v, v);
+    tcg_out_vex_modrm(s, OPC_UCOMISD, v, 0, dn);
+    jne = fcvt_jcc(s, JCC_JNE);
+    jp = fcvt_jcc(s, JCC_JP);
+    t = ool_new(s, OOL_F64TO32, jne, 1ull << wd);
+    t->jmp2 = jp;
+    t->rd = wd;
+    t->a = dn;
+}
+
+static void tcg_out_fcvt_ool(TCGContext *s, OOLStub *t)
+{
+#ifdef _WIN64
+    int base = 32;
+    TCGReg arg = TCG_REG_RCX;
+#else
+    int base = 0;
+    TCGReg arg = TCG_REG_RDI;
+#endif
+
+    fpa_patch(t->jmp, s->code_ptr);
+    if (t->jmp2) {
+        fpa_patch(t->jmp2, s->code_ptr);
+    }
+    ool_save(s, t, base);
+    if (t->kind == OOL_F32TO64) {
+        tcg_out_mov(s, TCG_TYPE_I32, arg, t->a);
+        tcg_out_branch(s, 1, (const tcg_insn_unit *)tcg_fcvt_to64_ref);
+        tcg_out_vex_modrm(s, OPC_MOVD_VyEy + P_REXW, t->rd, 0, TCG_REG_RAX);
+    } else {
+        tcg_out_vex_modrm(s, OPC_MOVD_EyVy + P_REXW, t->a, 0, arg);
+        tcg_out_branch(s, 1, (const tcg_insn_unit *)tcg_fcvt_to32_ref);
+        tcg_out_mov(s, TCG_TYPE_I32, t->rd, TCG_REG_RAX);
+    }
     ool_restore(s, t, base);
     ool_jmp(s, t->ret);
 }
@@ -4868,6 +4948,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_vfparith(s, a0, a1, a2, args[3], args[4]);
         break;
 
+    case INDEX_op_f32to64_vec:
+        tcg_out_f32to64(s, a0, a1);
+        break;
+    case INDEX_op_f64to32_vec:
+        tcg_out_f64to32(s, a0, a1);
+        break;
     case INDEX_op_qemu_ld_vec:
         tcg_out_qemu_ldst_vec(s, a0, a1, a2, true);
         break;
@@ -4963,6 +5049,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I3(x, x, x, x);
     case INDEX_op_qemu_ld_vec:
         return C_O1_I1(x, L);
+    case INDEX_op_f32to64_vec:
+        return C_O1_I1(x, r);
+    case INDEX_op_f64to32_vec:
+        return C_O1_I1(r, x);
     case INDEX_op_qemu_st_vec:
         return C_O0_I2(x, L);
 

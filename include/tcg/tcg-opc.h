@@ -206,6 +206,9 @@ DEF(qemu_ld_vec, 1, 1, 1,
     TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
 DEF(qemu_st_vec, 0, 2, 1,
     TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
+/* single <-> double; see tcg_gen_f32to64_vec() */
+DEF(f32to64_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(f64to32_vec, 1, 1, 0, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
