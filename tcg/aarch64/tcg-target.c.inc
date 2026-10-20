@@ -2993,6 +2993,102 @@ static const TCGOutOpStore outop_st = {
 };
 
 /*
+ * Out-of-line code, emitted after the TB's code and its qemu_ld/st slow
+ * paths: the op branches there for the rare cases, the stub branches
+ * back to ret.  The call-clobbered registers live at the op are saved
+ * around calls.
+ */
+typedef enum { OOL_FPARITH, OOL_VFPARITH } OOLKind;
+
+typedef struct OOLStub {
+    struct OOLStub *next;
+    OOLKind kind;
+    tcg_insn_unit *jmp;
+    const tcg_insn_unit *ret;
+    TCGReg rd, st, a, c, b;
+    unsigned desc;
+    TCGReg fpa[7];
+    int nsave;
+    TCGReg save[TCG_TARGET_NB_REGS];
+} OOLStub;
+
+static __thread OOLStub *ool_head, **ool_tail;
+
+static void tcg_out_fpa_load(OOLStub *t);
+static bool tcg_out_fparith_ool(TCGContext *s, OOLStub *t);
+static bool tcg_out_vfparith_ool(TCGContext *s, OOLStub *t);
+
+/* A stub for the branch at jmp, returning to the current position */
+static OOLStub *ool_new(TCGContext *s, OOLKind kind, tcg_insn_unit *jmp,
+                        TCGRegSet nosave)
+{
+    OOLStub *t = tcg_malloc(sizeof(*t));
+
+    t->next = NULL;
+    t->kind = kind;
+    t->jmp = jmp;
+    t->ret = tcg_splitwx_to_rx(s->code_ptr);
+    t->nsave = 0;
+    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
+        if (s->reg_to_temp[i] && !tcg_regset_test_reg(nosave, i) &&
+            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+            t->save[t->nsave++] = i;
+        }
+    }
+    *ool_tail = t;
+    ool_tail = &t->next;
+    return t;
+}
+
+static void ool_save(TCGContext *s, OOLStub *t)
+{
+    if (t->nsave) {
+        tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_SP,
+                     TCG_REG_SP, t->nsave * 16);
+    }
+    for (int i = 0; i < t->nsave; i++) {
+        tcg_out_st(s, t->save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
+                   t->save[i], TCG_REG_SP, i * 16);
+    }
+}
+
+static void ool_restore(TCGContext *s, OOLStub *t)
+{
+    for (int i = 0; i < t->nsave; i++) {
+        tcg_out_ld(s, t->save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
+                   t->save[i], TCG_REG_SP, i * 16);
+    }
+    if (t->nsave) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP,
+                     TCG_REG_SP, t->nsave * 16);
+    }
+}
+
+static int tcg_out_ool_finalize(TCGContext *s)
+{
+    for (OOLStub *t = ool_head; t; t = t->next) {
+        bool ok = false;
+
+        switch (t->kind) {
+        case OOL_FPARITH:
+            tcg_out_fpa_load(t);
+            ok = tcg_out_fparith_ool(s, t);
+            break;
+        case OOL_VFPARITH:
+            ok = tcg_out_vfparith_ool(s, t);
+            break;
+        }
+        if (!ok) {
+            return -2;
+        }
+        if (unlikely((void *)s->code_ptr > s->code_gen_highwater)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
  * fparith_vec.  Scratch registers 0-6 are allocated per op, 7 is V30,
  * reserved; it also uses TCG_VEC_TMP0 and the integer temporaries.
  */
@@ -3000,6 +3096,11 @@ static const TCGOutOpStore outop_st = {
 #define FPA_T(n)        ((n) < FPA_NALLOC ? fpa_reg[n] : TCG_REG_V30)
 
 static __thread TCGReg fpa_reg[FPA_NALLOC];
+
+static void tcg_out_fpa_load(OOLStub *t)
+{
+    memcpy(fpa_reg, t->fpa, sizeof(fpa_reg));
+}
 
 /* n scratch vector registers, none of them in used */
 static void fpa_alloc(TCGContext *s, int n, TCGRegSet used)
@@ -3240,9 +3341,8 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     TCGReg p = a, q = fma ? c : b, z = b;
     TCGReg r, mask, tmp = TCG_VEC_TMP0;
     unsigned rlo = 2;
-    tcg_insn_unit *tbnz, *bdone, *bdone2, *fix[FPA_NFIX];
-    TCGReg save[TCG_TARGET_NB_REGS];
-    int nsave = 0, frame, nfix;
+    tcg_insn_unit *tbnz;
+    OOLStub *ool;
 
     fpa_alloc(s, FPA_NALLOC, 1ull << rd | 1ull << a | 1ull << c | 1ull << b);
     r = FPA_T(0);
@@ -3394,7 +3494,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     tcg_out32(s, 0xaa000000 | TCG_REG_TMP0 << 16 | 1 << 10 | st << 5 | st);
     tcg_out32(s, 0xaa000000 | TCG_REG_TMP1 << 16 | 5 << 10 | st << 5 | st);
 
-    /* tbnz st, #5, ref */
+    /* tbnz st, #5, out of line */
     tbnz = s->code_ptr;
     tcg_out_insn(s, tbz, TBNZ, st, 5, 0);
     if (rsp) {
@@ -3404,54 +3504,48 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     } else {
         tcg_out_mov(s, TCG_TYPE_V64, rd, r);
     }
-    bdone = s->code_ptr;
-    tcg_out_insn(s, branch, B, 0);
+    ool = ool_new(s, OOL_FPARITH, tbnz, 1ull << rd | 1ull << st);
+    ool->rd = rd;
+    ool->st = st;
+    ool->a = a;
+    ool->c = c;
+    ool->b = b;
+    ool->desc = desc;
+    memcpy(ool->fpa, fpa_reg, sizeof(fpa_reg));
+}
 
-    reloc_pc14(tbnz, tcg_splitwx_to_rx(s->code_ptr));
-    nfix = fpa_zero(s, rd, st, a, c, b, desc, fix, &bdone2);
+/*
+ * The rest of fparith_vec, after the TB: exact zeros, else the call
+ * of tcg_fparith_ref(env, a, c, b, desc).
+ */
+static bool tcg_out_fparith_ool(TCGContext *s, OOLStub *t)
+{
+    TCGReg rd = t->rd, st = t->st;
+    tcg_insn_unit *fix[FPA_NFIX], *bdone;
+    int nfix;
 
-    /*
-     * Otherwise call tcg_fparith_ref(env, a, c, b, desc), saving the
-     * call-clobbered registers that hold live values.
-     */
+    if (!reloc_pc14(t->jmp, tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
+    }
+    nfix = fpa_zero(s, rd, st, t->a, t->c, t->b, t->desc, fix, &bdone);
+    reloc_pc26(bdone, t->ret);
     for (int i = 0; i < nfix; i++) {
         reloc_pc19(fix[i], tcg_splitwx_to_rx(s->code_ptr));
     }
-    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
-        if (s->reg_to_temp[i] && i != rd && i != st &&
-            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
-            save[nsave++] = i;
-        }
-    }
-    frame = ROUND_UP(nsave * 16, 16);
-    if (frame) {
-        tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_SP,
-                     TCG_REG_SP, frame);
-    }
-    for (int i = 0; i < nsave; i++) {
-        tcg_out_st(s, save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
-                   save[i], TCG_REG_SP, i * 16);
-    }
-    tcg_out32(s, FPA_UMOV_XD | (a & 31) << 5 | TCG_REG_X1);
-    tcg_out32(s, FPA_UMOV_XD | (c & 31) << 5 | TCG_REG_X2);
-    tcg_out32(s, FPA_UMOV_XD | (b & 31) << 5 | TCG_REG_X3);
+    ool_save(s, t);
+    tcg_out32(s, FPA_UMOV_XD | (t->a & 31) << 5 | TCG_REG_X1);
+    tcg_out32(s, FPA_UMOV_XD | (t->c & 31) << 5 | TCG_REG_X2);
+    tcg_out32(s, FPA_UMOV_XD | (t->b & 31) << 5 | TCG_REG_X3);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_X0, TCG_AREG0);
-    tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_X4, desc);
+    tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_X4, t->desc);
     tcg_out_call_int(s, (const tcg_insn_unit *)tcg_fparith_ref);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_X0);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_X1);
-    for (int i = 0; i < nsave; i++) {
-        tcg_out_ld(s, save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
-                   save[i], TCG_REG_SP, i * 16);
-    }
-    if (frame) {
-        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP,
-                     TCG_REG_SP, frame);
-    }
+    ool_restore(s, t);
     tcg_out32(s, FPA_FMOV_DX | TCG_REG_TMP0 << 5 | (rd & 31));
     tcg_out_mov(s, TCG_TYPE_I64, st, TCG_REG_TMP1);
-    reloc_pc26(bdone, tcg_splitwx_to_rx(s->code_ptr));
-    reloc_pc26(bdone2, tcg_splitwx_to_rx(s->code_ptr));
+    tcg_out_goto(s, t->ret);
+    return true;
 }
 
 /*
@@ -3552,9 +3646,9 @@ static void tcg_out_vfparith(TCGContext *s, TCGReg rd, TCGReg a,
     unsigned n = desc >> VFPARITH_SCALE;
     TCGReg r, t1, t2, kmin, t3;
     TCGReg in[3] = { a, b, c };
-    TCGReg save[TCG_TARGET_NB_REGS];
-    tcg_insn_unit *cbnz, *bdone;
-    int nin = 0, nsave = 0, frame;
+    tcg_insn_unit *cbnz;
+    OOLStub *t;
+    int nin = 0;
     bool nan_in = false, out = op <= VFPARITH_RSQRT;
 
     fpa_alloc(s, 6, 1ull << rd | 1ull << a | 1ull << b | 1ull << c);
@@ -3694,46 +3788,45 @@ static void tcg_out_vfparith(TCGContext *s, TCGReg rd, TCGReg a,
     vfa2(s, VFA_UMAXV, t1, FPA_T(1));
     tcg_out32(s, FPA_UMOV_WS | (t1 & 31) << 5 | TCG_REG_TMP0);
 
-    /* cbnz tmp0, ref */
+    /* cbnz tmp0, out of line */
     cbnz = s->code_ptr;
     tcg_out_insn(s, cbz, CBNZ, TCG_TYPE_I32, TCG_REG_TMP0, 0);
     tcg_out_mov(s, TCG_TYPE_V128, rd, r);
-    bdone = s->code_ptr;
-    tcg_out_insn(s, branch, B, 0);
+    t = ool_new(s, OOL_VFPARITH, cbnz, 1ull << rd);
+    t->rd = rd;
+    t->a = a;
+    t->b = b;
+    t->c = c;
+    t->desc = desc;
+}
 
-    /*
-     * Otherwise call tcg_vfparith_ref(env, desc, buf) with buf on the
-     * stack, saving the call-clobbered registers that hold live values.
-     */
-    reloc_pc19(cbnz, tcg_splitwx_to_rx(s->code_ptr));
-    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
-        if (s->reg_to_temp[i] && i != rd &&
-            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
-            save[nsave++] = i;
-        }
+/*
+ * The call of tcg_vfparith_ref(env, desc, buf), buf on the stack, after
+ * the TB.
+ */
+static bool tcg_out_vfparith_ool(TCGContext *s, OOLStub *t)
+{
+    int frame = sizeof(VFParithBuf);
+
+    if (!reloc_pc19(t->jmp, tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
     }
-    frame = sizeof(VFParithBuf) + nsave * 16;
+    ool_save(s, t);
     tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
                  frame);
-    tcg_out_st(s, TCG_TYPE_V128, a, TCG_REG_SP, offsetof(VFParithBuf, a));
-    tcg_out_st(s, TCG_TYPE_V128, b, TCG_REG_SP, offsetof(VFParithBuf, b));
-    tcg_out_st(s, TCG_TYPE_V128, c, TCG_REG_SP, offsetof(VFParithBuf, c));
-    for (int i = 0; i < nsave; i++) {
-        tcg_out_st(s, save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
-                   save[i], TCG_REG_SP, sizeof(VFParithBuf) + i * 16);
-    }
+    tcg_out_st(s, TCG_TYPE_V128, t->a, TCG_REG_SP, offsetof(VFParithBuf, a));
+    tcg_out_st(s, TCG_TYPE_V128, t->b, TCG_REG_SP, offsetof(VFParithBuf, b));
+    tcg_out_st(s, TCG_TYPE_V128, t->c, TCG_REG_SP, offsetof(VFParithBuf, c));
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_X0, TCG_AREG0);
-    tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_X1, desc);
+    tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_X1, t->desc);
     tcg_out_movr_sp(s, TCG_TYPE_I64, TCG_REG_X2, TCG_REG_SP);
     tcg_out_call_int(s, (const tcg_insn_unit *)tcg_vfparith_ref);
-    for (int i = 0; i < nsave; i++) {
-        tcg_out_ld(s, save[i] < 32 ? TCG_TYPE_I64 : TCG_TYPE_V128,
-                   save[i], TCG_REG_SP, sizeof(VFParithBuf) + i * 16);
-    }
-    tcg_out_ld(s, TCG_TYPE_V128, rd, TCG_REG_SP, offsetof(VFParithBuf, r));
+    tcg_out_ld(s, TCG_TYPE_V128, t->rd, TCG_REG_SP, offsetof(VFParithBuf, r));
     tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
                  frame);
-    reloc_pc26(bdone, tcg_splitwx_to_rx(s->code_ptr));
+    ool_restore(s, t);
+    tcg_out_goto(s, t->ret);
+    return true;
 }
 
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
@@ -4448,6 +4541,8 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
 static void tcg_out_tb_start(TCGContext *s)
 {
+    ool_head = NULL;
+    ool_tail = &ool_head;
     tcg_out_bti(s, BTI_J);
 }
 

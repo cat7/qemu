@@ -3587,6 +3587,103 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
 }
 
 /*
+ * Out-of-line code, emitted after the TB's code and its qemu_ld/st slow
+ * paths: the op jumps there for the rare cases, the stub jumps back to
+ * ret.  The call-clobbered registers live at the op are saved around
+ * calls.
+ */
+typedef enum { OOL_FPARITH, OOL_VFPARITH } OOLKind;
+
+typedef struct OOLStub {
+    struct OOLStub *next;
+    OOLKind kind;
+    tcg_insn_unit *jmp, *jmp2;  /* rel32 to patch */
+    tcg_insn_unit *ret;
+    TCGReg rd, st, a, c, b;
+    unsigned desc;
+    TCGReg fpa[7];
+    int nsave;
+    TCGReg save[TCG_TARGET_NB_REGS];
+    TCGType save_type[TCG_TARGET_NB_REGS];
+} OOLStub;
+
+static __thread OOLStub *ool_head, **ool_tail;
+
+static void tcg_out_fparith_ool(TCGContext *s, OOLStub *t);
+static void tcg_out_fpa_load(OOLStub *t);
+static void tcg_out_vfparith_ool(TCGContext *s, OOLStub *t);
+
+/* A stub for the rel32 at jmp, returning to the current position */
+static OOLStub *ool_new(TCGContext *s, OOLKind kind, tcg_insn_unit *jmp,
+                        TCGRegSet nosave)
+{
+    OOLStub *t = tcg_malloc(sizeof(*t));
+
+    t->next = NULL;
+    t->kind = kind;
+    t->jmp = jmp;
+    t->jmp2 = NULL;
+    t->ret = s->code_ptr;
+    t->nsave = 0;
+    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
+        if (s->reg_to_temp[i] && !tcg_regset_test_reg(nosave, i) &&
+            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+            t->save_type[t->nsave] =
+                i < 16 ? TCG_TYPE_I64
+                : s->reg_to_temp[i]->type == TCG_TYPE_V256 ? TCG_TYPE_V256
+                : TCG_TYPE_V128;
+            t->save[t->nsave++] = i;
+        }
+    }
+    *ool_tail = t;
+    ool_tail = &t->next;
+    return t;
+}
+
+/* Below base: the call's argument area */
+static void ool_save(TCGContext *s, OOLStub *t, int base)
+{
+    tcg_out_addi(s, TCG_REG_ESP, -(base + t->nsave * 32));
+    for (int i = 0; i < t->nsave; i++) {
+        tcg_out_st(s, t->save_type[i], t->save[i], TCG_REG_ESP, base + i * 32);
+    }
+}
+
+static void ool_restore(TCGContext *s, OOLStub *t, int base)
+{
+    for (int i = 0; i < t->nsave; i++) {
+        tcg_out_ld(s, t->save_type[i], t->save[i], TCG_REG_ESP, base + i * 32);
+    }
+    tcg_out_addi(s, TCG_REG_ESP, base + t->nsave * 32);
+}
+
+static void ool_jmp(TCGContext *s, tcg_insn_unit *dest)
+{
+    tcg_out8(s, OPC_JMP_long);
+    tcg_out32(s, 0);
+    tcg_patch32(s->code_ptr - 4, dest - s->code_ptr);
+}
+
+static int tcg_out_ool_finalize(TCGContext *s)
+{
+    for (OOLStub *t = ool_head; t; t = t->next) {
+        switch (t->kind) {
+        case OOL_FPARITH:
+            tcg_out_fpa_load(t);
+            tcg_out_fparith_ool(s, t);
+            break;
+        case OOL_VFPARITH:
+            tcg_out_vfparith_ool(s, t);
+            break;
+        }
+        if (unlikely((void *)s->code_ptr > s->code_gen_highwater)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
  * fparith_vec.  Its scratch registers are allocated per op; it also uses
  * TCG_TMP_VEC.  Scalar ops take P_SIMDF2 for double, P_SIMDF3 for
  * single; the FMA forms P_VEXW for double.
@@ -3595,6 +3692,11 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
 #define FPA_T(n)        fpa_reg[n]
 
 static __thread TCGReg fpa_reg[FPA_NREGS];
+
+static void tcg_out_fpa_load(OOLStub *t)
+{
+    memcpy(fpa_reg, t->fpa, sizeof(fpa_reg));
+}
 
 /* n scratch vector registers, none of them in used */
 static void fpa_alloc(TCGContext *s, int n, TCGRegSet used)
@@ -3838,9 +3940,8 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     TCGReg p = a, q = fma ? c : b, z = b;
     TCGReg r, off, t2, t3, t4, ixm, tmp = TCG_TMP_VEC, res;
     unsigned rlo = 2;
-    tcg_insn_unit *jref, *jdone, *jzero[2], *fix[FPA_NFIX];
-    TCGReg save[TCG_TARGET_NB_REGS];
-    int nsave = 0, frame, base, nfix;
+    tcg_insn_unit *jref;
+    OOLStub *ool;
 
     fpa_alloc(s, sgl && fma ? 7 : sgl || ix ? 6 : 4,
               1ull << rd | 1ull << a | 1ull << c | 1ull << b);
@@ -4004,53 +4105,57 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
         tgen_arithr(s, ARITH_ADD, st, st);
     }
     tcg_out_mov(s, TCG_TYPE_V64, rd, res);
-    tcg_out8(s, OPC_JMP_long);
-    jdone = s->code_ptr;
-    tcg_out32(s, 0);
+    ool = ool_new(s, OOL_FPARITH, jref, 1ull << rd | 1ull << st);
+    ool->rd = rd;
+    ool->st = st;
+    ool->a = a;
+    ool->c = c;
+    ool->b = b;
+    ool->desc = desc;
+    memcpy(ool->fpa, fpa_reg, sizeof(fpa_reg));
+}
 
-    /*
-     * Otherwise call tcg_fparith_ref(env, a, c, b, desc), saving the
-     * call-clobbered registers that hold live values.  Win64 returns
-     * the result through a pointer in RCX and passes b and desc on
-     * the stack above the 32-byte shadow area.
-     */
-    fpa_patch(jref, s->code_ptr);
-    nfix = fpa_zero(s, rd, st, a, c, b, desc, fix, jzero);
+/*
+ * The rest of fparith_vec, after the TB: exact zeros, else the call of
+ * tcg_fparith_ref(env, a, c, b, desc).  Win64 returns the result
+ * through a pointer in RCX and passes b and desc on the stack above
+ * the 32-byte shadow area.
+ */
+static void tcg_out_fparith_ool(TCGContext *s, OOLStub *t)
+{
+    TCGReg rd = t->rd, st = t->st, a = t->a, c = t->c, b = t->b;
+    tcg_insn_unit *jzero[2], *fix[FPA_NFIX];
+    int nfix, base;
+
+    fpa_patch(t->jmp, s->code_ptr);
+    nfix = fpa_zero(s, rd, st, a, c, b, t->desc, fix, jzero);
+    for (int i = 0; i < 2; i++) {
+        if (jzero[i]) {
+            fpa_patch(jzero[i], t->ret);
+        }
+    }
     for (int i = 0; i < nfix; i++) {
         fpa_patch(fix[i], s->code_ptr);
-    }
-    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
-        if (s->reg_to_temp[i] && i != rd && i != st &&
-            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
-            save[nsave++] = i;
-        }
     }
 #ifdef _WIN64
     base = 64;
 #else
     base = 0;
 #endif
-    frame = base + nsave * 32;
-    tcg_out_addi(s, TCG_REG_ESP, -frame);
-    for (int i = 0; i < nsave; i++) {
-        TCGType t = save[i] < 16 ? TCG_TYPE_I64
-                    : s->reg_to_temp[save[i]]->type == TCG_TYPE_V256
-                    ? TCG_TYPE_V256 : TCG_TYPE_V128;
-        tcg_out_st(s, t, save[i], TCG_REG_ESP, base + i * 32);
-    }
+    ool_save(s, t, base);
 #ifdef _WIN64
     tcg_out_modrm_offset(s, OPC_LEA | P_REXW, TCG_REG_RCX, TCG_REG_ESP, 48);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_RDX, TCG_AREG0);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_R8, a);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_R9, c);
     tcg_out_st(s, TCG_TYPE_I64, b, TCG_REG_ESP, 32);
-    tcg_out_sti(s, TCG_TYPE_I32, desc, TCG_REG_ESP, 40);
+    tcg_out_sti(s, TCG_TYPE_I32, t->desc, TCG_REG_ESP, 40);
 #else
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_RDI, TCG_AREG0);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_RSI, a);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_RDX, c);
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_RCX, b);
-    tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_R8, desc);
+    tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_R8, t->desc);
 #endif
     tcg_out_branch(s, 1, (const tcg_insn_unit *)tcg_fparith_ref);
 #ifdef _WIN64
@@ -4060,19 +4165,8 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     tcg_out_mov(s, TCG_TYPE_I64, rd, TCG_REG_RAX);
     tcg_out_mov(s, TCG_TYPE_I64, st, TCG_REG_RDX);
 #endif
-    for (int i = 0; i < nsave; i++) {
-        TCGType t = save[i] < 16 ? TCG_TYPE_I64
-                    : s->reg_to_temp[save[i]]->type == TCG_TYPE_V256
-                    ? TCG_TYPE_V256 : TCG_TYPE_V128;
-        tcg_out_ld(s, t, save[i], TCG_REG_ESP, base + i * 32);
-    }
-    tcg_out_addi(s, TCG_REG_ESP, frame);
-    fpa_patch(jdone, s->code_ptr);
-    for (int i = 0; i < 2; i++) {
-        if (jzero[i]) {
-            fpa_patch(jzero[i], s->code_ptr);
-        }
-    }
+    ool_restore(s, t, base);
+    ool_jmp(s, t->ret);
 }
 
 /*
@@ -4177,9 +4271,9 @@ static void tcg_out_vfparith(TCGContext *s, TCGReg rd, TCGReg a,
     unsigned n = desc >> VFPARITH_SCALE;
     TCGReg r, t1, t2, t3, zero;
     TCGReg in[3] = { a, b, c };
-    TCGReg save[TCG_TARGET_NB_REGS];
-    tcg_insn_unit *jref[2], *jdone;
-    int nin, nref = 0, nsave = 0, frame, base;
+    tcg_insn_unit *jref[2];
+    OOLStub *t;
+    int nin, nref = 0;
     bool nan_in = op >= VFPARITH_MAX && op <= VFPARITH_RIM;
     bool out = op <= VFPARITH_RSQRT;
 
@@ -4352,60 +4446,47 @@ static void tcg_out_vfparith(TCGContext *s, TCGReg rd, TCGReg a,
     if (!nref) {
         return;
     }
-    tcg_out8(s, OPC_JMP_long);
-    jdone = s->code_ptr;
-    tcg_out32(s, 0);
+    t = ool_new(s, OOL_VFPARITH, jref[0], 1ull << rd);
+    t->jmp2 = nref > 1 ? jref[1] : NULL;
+    t->rd = rd;
+    t->a = a;
+    t->b = b;
+    t->c = c;
+    t->desc = desc;
+}
 
-    /*
-     * Otherwise call tcg_vfparith_ref(env, desc, buf) with buf on the
-     * stack above the Win64 shadow area, saving the call-clobbered
-     * registers that hold live values.
-     */
-    for (int i = 0; i < nref; i++) {
-        tcg_patch32(jref[i], s->code_ptr - (jref[i] + 4));
-    }
-    for (TCGReg i = 0; i < TCG_TARGET_NB_REGS; i++) {
-        if (s->reg_to_temp[i] && i != rd &&
-            tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
-            save[nsave++] = i;
-        }
-    }
+/*
+ * The call of tcg_vfparith_ref(env, desc, buf) after the TB, buf on the
+ * stack above the Win64 shadow area.
+ */
+static void tcg_out_vfparith_ool(TCGContext *s, OOLStub *t)
+{
 #ifdef _WIN64
-    base = 32;
+    int base = 32;
 #else
-    base = 0;
+    int base = 0;
 #endif
-    frame = base + sizeof(VFParithBuf) + nsave * 32;
-    tcg_out_addi(s, TCG_REG_ESP, -frame);
-    tcg_out_st(s, TCG_TYPE_V128, a, TCG_REG_ESP,
-               base + offsetof(VFParithBuf, a));
-    tcg_out_st(s, TCG_TYPE_V128, b, TCG_REG_ESP,
-               base + offsetof(VFParithBuf, b));
-    tcg_out_st(s, TCG_TYPE_V128, c, TCG_REG_ESP,
-               base + offsetof(VFParithBuf, c));
-    for (int i = 0; i < nsave; i++) {
-        TCGType t = save[i] < 16 ? TCG_TYPE_I64
-                    : s->reg_to_temp[save[i]]->type == TCG_TYPE_V256
-                    ? TCG_TYPE_V256 : TCG_TYPE_V128;
-        tcg_out_st(s, t, save[i], TCG_REG_ESP,
-                   base + sizeof(VFParithBuf) + i * 32);
+
+    fpa_patch(t->jmp, s->code_ptr);
+    if (t->jmp2) {
+        fpa_patch(t->jmp2, s->code_ptr);
     }
+    ool_save(s, t, base + sizeof(VFParithBuf));
+    tcg_out_st(s, TCG_TYPE_V128, t->a, TCG_REG_ESP,
+               base + offsetof(VFParithBuf, a));
+    tcg_out_st(s, TCG_TYPE_V128, t->b, TCG_REG_ESP,
+               base + offsetof(VFParithBuf, b));
+    tcg_out_st(s, TCG_TYPE_V128, t->c, TCG_REG_ESP,
+               base + offsetof(VFParithBuf, c));
     tcg_out_mov(s, TCG_TYPE_PTR, tcg_target_call_iarg_regs[0], TCG_AREG0);
-    tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[1], desc);
+    tcg_out_movi(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[1], t->desc);
     tcg_out_modrm_offset(s, OPC_LEA | P_REXW, tcg_target_call_iarg_regs[2],
                          TCG_REG_ESP, base);
     tcg_out_branch(s, 1, (const tcg_insn_unit *)tcg_vfparith_ref);
-    for (int i = 0; i < nsave; i++) {
-        TCGType t = save[i] < 16 ? TCG_TYPE_I64
-                    : s->reg_to_temp[save[i]]->type == TCG_TYPE_V256
-                    ? TCG_TYPE_V256 : TCG_TYPE_V128;
-        tcg_out_ld(s, t, save[i], TCG_REG_ESP,
-                   base + sizeof(VFParithBuf) + i * 32);
-    }
-    tcg_out_ld(s, TCG_TYPE_V128, rd, TCG_REG_ESP,
+    tcg_out_ld(s, TCG_TYPE_V128, t->rd, TCG_REG_ESP,
                base + offsetof(VFParithBuf, r));
-    tcg_out_addi(s, TCG_REG_ESP, frame);
-    tcg_patch32(jdone, s->code_ptr - (jdone + 4));
+    ool_restore(s, t, base + sizeof(VFParithBuf));
+    ool_jmp(s, t->ret);
 }
 
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
@@ -5562,7 +5643,8 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
 static void tcg_out_tb_start(TCGContext *s)
 {
-    /* nothing to do */
+    ool_head = NULL;
+    ool_tail = &ool_head;
 }
 
 static void tcg_out_nop_fill(tcg_insn_unit *p, int count)
