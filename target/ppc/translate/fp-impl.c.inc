@@ -1344,7 +1344,7 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
 
         if (store) {
             v = native_fpr(rt);
-            tcg_gen_f64to32_vec(w, v);
+            tcg_gen_f64to32_vec(w, v, fpr_single_on && (fpr_single >> rt & 1));
             ANC_ST(i32, w, DEF_MEMOP(MO_UL));
         } else {
             v = tcg_temp_new_vec(TCG_TYPE_V64);
