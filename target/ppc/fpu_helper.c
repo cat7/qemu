@@ -806,13 +806,48 @@ void ppc_fparith_fpscr_init(CPUPPCState *env)
     }
 }
 
+/* The helper sequence of an inline FP op, on fpscr */
+static FParithResult fparith_helpers(CPUPPCState *env, uint64_t a,
+                                     uint64_t c, uint64_t b, uint32_t desc,
+                                     uint64_t fpscr)
+{
+    static uint64_t (* const ab[2][4])(CPUPPCState *, uint64_t, uint64_t) = {
+        { helper_FADD, helper_FSUB, helper_FMUL, helper_FDIV },
+        { helper_FADDS, helper_FSUBS, helper_FMULS, helper_FDIVS },
+    };
+    static uint64_t (* const acb[2][4])(CPUPPCState *, uint64_t, uint64_t,
+                                        uint64_t) = {
+        { helper_FMADD, helper_FMSUB, helper_FNMADD, helper_FNMSUB },
+        { helper_FMADDS, helper_FMSUBS, helper_FNMADDS, helper_FNMSUBS },
+    };
+    target_ulong save = env->fpscr;
+    unsigned op = desc & FPARITH_OP_MASK;
+    bool sgl = desc & FPARITH_SINGLE;
+    uint64_t r;
+
+    env->fpscr = fpscr;
+    helper_reset_fpstatus(env);
+    if (op == FPARITH_RSP) {
+        r = helper_FRSP(env, a);
+    } else if (op >= FPARITH_MADD) {
+        r = acb[sgl][op - FPARITH_MADD](env, a, c, b);
+    } else {
+        r = ab[sgl][op](env, a, b);
+    }
+    helper_compute_fprf_float64(env, r);
+    helper_float_check_status(env);
+    fpscr = env->fpscr;
+    env->fpscr = save;
+    return (FParithResult) { r, fpscr };
+}
+
 /*
- * The inline FP ops' (fp-impl.c.inc) result and status for the cases
- * they do not compute themselves: the helpers' result, FPARITH_ST_OFF if
- * the helpers would set more than FI, XX and FX.
+ * The inline FP ops' (fp-impl.c.inc) result and FPSCR for the cases they
+ * do not compute themselves.  The helpers do not raise exceptions in
+ * HFLAGS_FP_FAST TBs (no exception enabled).
  */
 FParithResult ppc_fparith_ref(void *opaque, uint64_t a, uint64_t c,
-                              uint64_t b, uint32_t desc)
+                              uint64_t b, uint32_t desc, uint64_t fpscr)
 {
     static const int mflags[] = {
         MADD_FLGS, MSUB_FLGS, NMADD_FLGS, NMSUB_FLGS,
@@ -824,6 +859,8 @@ FParithResult ppc_fparith_ref(void *opaque, uint64_t a, uint64_t c,
     bool fma = op >= FPARITH_MADD && op <= FPARITH_NMSUB;
     uint64_t in[3] = { a, b, c };
     int nin = op == FPARITH_RSP ? 1 : fma ? 3 : 2;
+    bool relaxed = !(desc & FPARITH_INEXACT);
+    uint64_t mask = relaxed ? FP_FPRF : FP_FPRF | FP_FI;
     uint64_t r, st, exp, frac;
     int cls, flags, i;
     bool infzero;
@@ -843,9 +880,10 @@ FParithResult ppc_fparith_ref(void *opaque, uint64_t a, uint64_t c,
                 if (sgl || op == FPARITH_RSP) {
                     r &= ~MAKE_64BIT_MASK(0, 29);
                 }
+                st = FPARITH_CLASS_QNAN << FPARITH_ST_CLASS
+                     | (r >> 63 ? FPARITH_ST_NEG : 0);
                 return (FParithResult) {
-                    r, FPARITH_CLASS_QNAN << FPARITH_ST_CLASS
-                       | (r >> 63 ? FPARITH_ST_NEG : 0)
+                    r, (fpscr & ~mask) | env->fparith_fpscr[relaxed][st]
                 };
             }
         }
@@ -882,7 +920,7 @@ FParithResult ppc_fparith_ref(void *opaque, uint64_t a, uint64_t c,
     flags = get_float_exception_flags(&s);
     if (flags & (float_flag_invalid | float_flag_divbyzero |
                  float_flag_overflow | float_flag_underflow)) {
-        return (FParithResult) { 0, FPARITH_ST_OFF };
+        return fparith_helpers(env, a, c, b, desc, fpscr);
     }
 
  done:
@@ -897,7 +935,9 @@ FParithResult ppc_fparith_ref(void *opaque, uint64_t a, uint64_t c,
     }
     st = (flags & float_flag_inexact ? FPARITH_ST_INEXACT : 0)
          | (r >> 63 ? FPARITH_ST_NEG : 0) | cls << FPARITH_ST_CLASS;
-    return (FParithResult) { r, st };
+    return (FParithResult) {
+        r, (fpscr & ~mask) | env->fparith_fpscr[relaxed][st]
+    };
 }
 
 /* frsp - frsp. */

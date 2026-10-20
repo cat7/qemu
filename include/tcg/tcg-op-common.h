@@ -534,15 +534,16 @@ void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
  * and, for the single operations, FPARITH_SGL_* for operands known to
  * be singles.  Two-operand operations take a and b; c is ignored.
  *
- * status holds FPARITH_ST_INEXACT (with FPARITH_INEXACT: the result was
- * rounded), FPARITH_ST_NEG (the result is negative) and the result's
- * FPARITH_CLASS_* at FPARITH_ST_CLASS.  Results the host operation and
- * its inexact test cannot vouch for (non-normal and near-underflow
- * results, operands too small for the error terms, single operations on
- * non-single inputs) come from the function set with tcg_set_fparith_ref(),
- * which the generated code calls with the env pointer.  It returns
- * FPARITH_ST_OFF when the caller must use its own implementation; r is
- * undefined then.
+ * The status word: so = (si & ~mask) | the 32-bit word at env + tbl
+ * + 4 * st, st being FPARITH_ST_INEXACT (with FPARITH_INEXACT: the
+ * result was rounded) | FPARITH_ST_NEG (the result is negative) | the
+ * result's FPARITH_CLASS_* << FPARITH_ST_CLASS.  Results the host
+ * operation and its inexact test cannot vouch for (non-normal and
+ * near-underflow results, operands too small for the error terms,
+ * single operations on non-single inputs) come from the function set
+ * with tcg_set_fparith_ref(), which the generated code calls with the
+ * env pointer, a, c, b, desc and si; it returns r and so and must not
+ * raise exceptions.
  */
 enum {
     FPARITH_ADD,        /* a + b */
@@ -566,7 +567,6 @@ enum {
     FPARITH_ST_INEXACT = 1,
     FPARITH_ST_NEG = 2,
     FPARITH_ST_CLASS = 2,       /* shift of the 3-bit class */
-    FPARITH_ST_OFF = 0x20,
 };
 
 enum {
@@ -591,8 +591,9 @@ void tcg_set_fcvt_ref(FCvt32to64Ref to64, FCvt64to32Ref to32);
 bool tcg_can_emit_fcvt(void);
 void tcg_gen_f32to64_vec(TCGv_vec r, TCGv_i32 s);
 void tcg_gen_f64to32_vec(TCGv_i32 r, TCGv_vec d);
-void tcg_gen_fparith_vec(unsigned desc, TCGv_vec r, TCGv_i64 status,
-                         TCGv_vec a, TCGv_vec c, TCGv_vec b);
+void tcg_gen_fparith_vec(unsigned desc, TCGv_vec r, TCGv_i64 so,
+                         TCGv_vec a, TCGv_vec c, TCGv_vec b, TCGv_i64 si,
+                         int32_t tbl, uint32_t mask);
 
 /*
  * Single precision on the four 32-bit lanes of V128 temps on the host,
