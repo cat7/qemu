@@ -417,6 +417,13 @@ static uintptr_t G_GNUC_UNUSED get_jmp_target_addr(TCGContext *s, int which)
     return (uintptr_t)tcg_splitwx_to_rx(&s->gen_tb->jmp_target_addr[which]);
 }
 
+/* The vector registers the allocator may use */
+int tcg_vector_regs(void)
+{
+    return ctpop64(tcg_target_available_regs[TCG_TYPE_V128] &
+                   ~tcg_ctx->reserved_regs);
+}
+
 static int __attribute__((unused))
 tlb_mask_table_ofs(TCGContext *s, int which)
 {
