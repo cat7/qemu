@@ -760,6 +760,84 @@ void tcg_gen_qemu_st_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
     tcg_gen_qemu_st_i128_int(val, addr, idx, memop);
 }
 
+static void plugin_gen_mem_callbacks_vec(TCGv_vec val,
+                                         TCGv_i64 copy_addr,
+                                         TCGTemp *orig_addr, MemOpIdx oi,
+                                         enum qemu_plugin_mem_rw rw)
+{
+#ifdef CONFIG_PLUGIN
+    if (tcg_ctx->plugin_insn != NULL) {
+        QEMU_BUILD_BUG_ON(HOST_BIG_ENDIAN ||
+                          offsetof(CPUState, neg.plugin_mem_value_high) !=
+                          offsetof(CPUState, neg.plugin_mem_value_low) + 8);
+        tcg_gen_st_vec(val, tcg_env,
+                       offsetof(CPUState, neg.plugin_mem_value_low) -
+                       sizeof(CPUState));
+        plugin_gen_mem_callbacks(copy_addr, orig_addr, oi, rw);
+    }
+#endif
+}
+
+bool tcg_can_emit_qemu_ldst_vec(void)
+{
+    return !HOST_BIG_ENDIAN &&
+           tcg_op_supported(INDEX_op_qemu_ld_vec, TCG_TYPE_V128, 0);
+}
+
+/* As tcg_gen_qemu_ld_i128, into a V128 temp holding the value */
+void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
+                             MemOp memop, TCGType addr_type)
+{
+    TCGv_i64 copy_addr;
+    MemOpIdx oi;
+    TCGOp *op;
+
+    tcg_debug_assert(addr_type == tcg_ctx->addr_type);
+    tcg_debug_assert((memop & (MO_SIZE | MO_SIGN)) == MO_128);
+    check_max_alignment(memop_alignment_bits(memop));
+    tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
+
+    if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {
+        memop &= ~MO_ATOM_MASK;
+        memop |= MO_ATOM_NONE;
+    }
+    oi = make_memop_idx(memop, idx);
+
+    copy_addr = plugin_maybe_preserve_addr(addr);
+    op = tcg_emit_op(INDEX_op_qemu_ld_vec, 3);
+    TCGOP_TYPE(op) = TCG_TYPE_V128;
+    op->args[0] = tcgv_vec_arg(val);
+    op->args[1] = temp_arg(addr);
+    op->args[2] = oi;
+    plugin_gen_mem_callbacks_vec(val, copy_addr, addr, oi, QEMU_PLUGIN_MEM_R);
+}
+
+/* As tcg_gen_qemu_st_i128, from a V128 temp holding the value */
+void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
+                             MemOp memop, TCGType addr_type)
+{
+    MemOpIdx oi;
+    TCGOp *op;
+
+    tcg_debug_assert(addr_type == tcg_ctx->addr_type);
+    tcg_debug_assert((memop & (MO_SIZE | MO_SIGN)) == MO_128);
+    check_max_alignment(memop_alignment_bits(memop));
+    tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+
+    if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {
+        memop &= ~MO_ATOM_MASK;
+        memop |= MO_ATOM_NONE;
+    }
+    oi = make_memop_idx(memop, idx);
+
+    op = tcg_emit_op(INDEX_op_qemu_st_vec, 3);
+    TCGOP_TYPE(op) = TCG_TYPE_V128;
+    op->args[0] = tcgv_vec_arg(val);
+    op->args[1] = temp_arg(addr);
+    op->args[2] = oi;
+    plugin_gen_mem_callbacks_vec(val, NULL, addr, oi, QEMU_PLUGIN_MEM_W);
+}
+
 void tcg_gen_ext_i32(TCGv_i32 ret, TCGv_i32 val, MemOp opc)
 {
     switch (opc & MO_SSIZE) {
