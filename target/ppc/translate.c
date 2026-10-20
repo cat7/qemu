@@ -5638,17 +5638,28 @@ static inline void get_fpr(TCGv_i64 dst, int regno)
     tcg_gen_ld_i64(dst, tcg_env, fpr_offset(regno));
 }
 
+/* The CPU being translated has VSX: FPRs are halves of the VSRs */
+static __thread bool fpr_in_vsr;
+
+/*
+ * Before PowerISA v3.1 the result of doubleword 1 of the VSR
+ * corresponding to the target FPR was undefined. However,
+ * most (if not all) real hardware were setting the result to 0.
+ * Starting at ISA v3.1, the result for doubleword 1 is now defined
+ * to be 0.  Without VSX nothing reads it.
+ */
+static inline void clear_fpr_dw1(int regno)
+{
+    if (fpr_in_vsr) {
+        tcg_gen_st_i64(tcg_constant_i64(0), tcg_env,
+                       vsr64_offset(regno, false));
+    }
+}
+
 static inline void set_fpr(int regno, TCGv_i64 src)
 {
     tcg_gen_st_i64(src, tcg_env, fpr_offset(regno));
-    /*
-     * Before PowerISA v3.1 the result of doubleword 1 of the VSR
-     * corresponding to the target FPR was undefined. However,
-     * most (if not all) real hardware were setting the result to 0.
-     * Starting at ISA v3.1, the result for doubleword 1 is now defined
-     * to be 0.
-     */
-    tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(regno, false));
+    clear_fpr_dw1(regno);
 }
 
 /*
@@ -6583,6 +6594,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->hv = (hflags >> HFLAGS_HV) & 1;
     ctx->insns_flags = env->insns_flags;
     ctx->insns_flags2 = env->insns_flags2;
+    fpr_in_vsr = env->insns_flags2 & PPC2_VSX;
     ctx->access_type = -1;
     ctx->need_access_type = !mmu_is_64bit(env->mmu_model);
     ctx->le_mode = (hflags >> HFLAGS_LE) & 1;
