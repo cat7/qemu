@@ -3998,7 +3998,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg so,
     ixm = FPA_T(5);
 
     if (rsp) {
-        tcg_out_vex_modrm(s, OPC_CVTSD2SS, r, r, a);
+        tcg_out_vex_modrm(s, OPC_CVTSD2SS, r, a, a);
         tcg_out_vex_modrm(s, OPC_CVTSS2SD, t2, r, r);
         if (ix) {
             fpa_neq(s, true, ixm, t2, a);
@@ -4022,7 +4022,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg so,
         };
 
         for (int i = 0; i < (fma ? 3 : 2); i++) {
-            tcg_out_vex_modrm(s, OPC_CVTSD2SS, cv[i], cv[i], in[i]);
+            tcg_out_vex_modrm(s, OPC_CVTSD2SS, cv[i], in[i], in[i]);
             if (desc & known[i]) {
                 continue;
             }
@@ -4272,7 +4272,7 @@ static void tcg_out_f64to32(TCGContext *s, TCGReg wd, TCGReg dn)
     tcg_insn_unit *jne, *jp;
     OOLStub *t;
 
-    tcg_out_vex_modrm(s, OPC_CVTSD2SS, v, v, dn);
+    tcg_out_vex_modrm(s, OPC_CVTSD2SS, v, dn, dn);
     tcg_out_vex_modrm(s, OPC_MOVD_EyVy, v, 0, wd);
     tcg_out_vex_modrm(s, OPC_CVTSS2SD, v, v, v);
     tcg_out_vex_modrm(s, OPC_UCOMISD, v, 0, dn);
