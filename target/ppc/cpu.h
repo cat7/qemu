@@ -1308,6 +1308,19 @@ struct CPUArchState {
                            /* used to speed-up TLB assist handlers */
 
     target_ulong nip;      /* next instruction pointer */
+    /*
+     * The registers the generated code reaches most often, at small
+     * offsets from env.
+     */
+    target_ulong fpscr;     /* Floating point status and control register */
+    /* Vector status and control register, minus VSCR_SAT */
+    uint32_t vscr;
+    /* VSX registers (including FP and AVR) */
+    ppc_vsr_t vsr[64] QEMU_ALIGNED(16);
+    /* Non-zero if and only if VSCR_SAT should be set */
+    ppc_vsr_t vscr_sat QEMU_ALIGNED(16);
+    /* Constant: ones in the high doubleword, zeros in the low one */
+    ppc_vsr_t vmx_lanes QEMU_ALIGNED(16);
 
     /* when a memory exception occurs, the access type is stored here */
     int access_type;
@@ -1355,21 +1368,12 @@ struct CPUArchState {
     /* Composite status for PMC[1-6] enabled and counting insns or cycles. */
     uint8_t pmc_ins_cnt;
     uint8_t pmc_cyc_cnt;
-    /* Vector status and control register, minus VSCR_SAT */
-    uint32_t vscr;
-    /* VSX registers (including FP and AVR) */
-    ppc_vsr_t vsr[64] QEMU_ALIGNED(16);
-    /* Non-zero if and only if VSCR_SAT should be set */
-    ppc_vsr_t vscr_sat QEMU_ALIGNED(16);
-    /* Constant: ones in the high doubleword, zeros in the low one */
-    ppc_vsr_t vmx_lanes QEMU_ALIGNED(16);
     /* SPE registers */
     uint64_t spe_acc;
     uint32_t spe_fscr;
     /* SPE and Altivec share status as they'll never be used simultaneously */
     float_status vec_status;
     float_status fp_status; /* Floating point execution context */
-    target_ulong fpscr;     /* Floating point status and control register */
 
     /* Internal devices resources */
     ppc_tb_t *tb_env;      /* Time base and decrementer */
