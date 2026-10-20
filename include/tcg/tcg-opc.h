@@ -201,6 +201,11 @@ DEF(zipl_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(ziph_vec, 1, 2, 0, TCG_OPF_VECTOR)
 /* r = bytes ofs .. ofs + 15 of ah:al; see tcg_gen_extract2_vec() */
 DEF(extract2_vec, 1, 2, 1, TCG_OPF_VECTOR)
+/* MO_128 guest memory <-> V128; see tcg_gen_qemu_ld_vec_chk() */
+DEF(qemu_ld_vec, 1, 1, 1,
+    TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
+DEF(qemu_st_vec, 0, 2, 1,
+    TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

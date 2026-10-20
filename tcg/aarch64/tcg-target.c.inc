@@ -1644,6 +1644,23 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         return false;
     }
 
+    if (lb->type == TCG_TYPE_V128) {
+        /* qemu_ld_vec: the I128 result in x0:x1 */
+        TCGLabelQemuLdst v = *lb;
+
+        v.type = TCG_TYPE_I128;
+        v.datalo_reg = TCG_REG_X0;
+        v.datahi_reg = TCG_REG_X1;
+        tcg_out_ld_helper_args(s, &v, &ldst_helper_param);
+        tcg_out_call_int(s, qemu_ld_helpers[MO_128]);
+        tcg_out_ld_helper_ret(s, &v, false, &ldst_helper_param);
+        /* fmov d, x0; ins v.d[1], x1 */
+        tcg_out32(s, 0x9e670000 | TCG_REG_X0 << 5 | (lb->datalo_reg & 31));
+        tcg_out32(s, 0x4e181c00 | TCG_REG_X1 << 5 | (lb->datalo_reg & 31));
+        tcg_out_goto(s, lb->raddr);
+        return true;
+    }
+
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
@@ -1654,9 +1671,31 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
+    TCGLabelQemuLdst v;
 
     if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
         return false;
+    }
+
+    if (lb->type == TCG_TYPE_V128) {
+        /* qemu_st_vec: the value as an I128 pair, in no argument reg */
+        static const TCGReg cand[3] = { TCG_REG_X6, TCG_REG_X7, TCG_REG_X8 };
+        TCGReg pair[2];
+        int n = 0;
+
+        for (int i = 0; i < 3 && n < 2; i++) {
+            if (cand[i] != lb->addr_reg) {
+                pair[n++] = cand[i];
+            }
+        }
+        /* fmov x, d; umov x, v.d[1] */
+        tcg_out32(s, 0x9e660000 | (lb->datalo_reg & 31) << 5 | pair[0]);
+        tcg_out32(s, 0x4e183c00 | (lb->datalo_reg & 31) << 5 | pair[1]);
+        v = *lb;
+        v.type = TCG_TYPE_I128;
+        v.datalo_reg = pair[0];
+        v.datahi_reg = pair[1];
+        lb = &v;
     }
 
     tcg_out_st_helper_args(s, lb, &ldst_helper_param);
@@ -1887,6 +1926,46 @@ static const TCGOutOpQemuLdSt outop_qemu_st = {
     .base.static_constraint = C_O0_I2(rz, r),
     .out = tgen_qemu_st,
 };
+
+/*
+ * qemu_ld_vec / qemu_st_vec: one 16-byte access, the bytes reversed
+ * with rev64 and ext for MO_BSWAP.  The 8-byte halves of an aligned
+ * access are single-copy atomic.
+ */
+static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data, TCGReg addr,
+                                  MemOpIdx oi, bool is_ld)
+{
+    MemOp mop = get_memop(oi);
+    TCGLabelQemuLdst *ldst;
+    HostAddress h;
+    TCGReg v = data;
+
+    ldst = prepare_host_addr(s, &h, addr, oi, is_ld);
+    tcg_debug_assert(h.aa.atom < MO_128 || have_lse2);
+
+    if (!is_ld && (mop & MO_BSWAP)) {
+        v = TCG_VEC_TMP0;
+    }
+    if (is_ld) {
+        tcg_out_insn_ldst_reg(s, Ildst_imm_LDRVQ, data, h.base,
+                              h.index_ext, h.index);
+    }
+    if (mop & MO_BSWAP) {
+        /* rev64 v.16b, data.16b; ext v.16b, v.16b, v.16b, #8 */
+        tcg_out32(s, 0x4e200800 | (data & 31) << 5 | (v & 31));
+        tcg_out32(s, 0x6e004000 | (v & 31) << 16 | (v & 31) << 5 | (v & 31));
+    }
+    if (!is_ld) {
+        tcg_out_insn_ldst_reg(s, Ildst_imm_STRVQ, v, h.base,
+                              h.index_ext, h.index);
+    }
+
+    if (ldst) {
+        ldst->type = TCG_TYPE_V128;
+        ldst->datalo_reg = data;
+        ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
+    }
+}
 
 static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
                                    TCGReg addr_reg, MemOpIdx oi, bool is_ld)
@@ -4194,6 +4273,13 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                   | (a1 & 31) << 5 | (a0 & 31));
         break;
 
+    case INDEX_op_qemu_ld_vec:
+        tcg_out_qemu_ldst_vec(s, a0, a1, a2, true);
+        break;
+    case INDEX_op_qemu_st_vec:
+        tcg_out_qemu_ldst_vec(s, a0, a1, a2, false);
+        break;
+
     case INDEX_op_bitsel_vec:
         a3 = args[3];
         if (a0 == a3) {
@@ -4374,8 +4460,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I1(w, w);
     case INDEX_op_ld_vec:
     case INDEX_op_dupm_vec:
+    case INDEX_op_qemu_ld_vec:
         return C_O1_I1(w, r);
     case INDEX_op_st_vec:
+    case INDEX_op_qemu_st_vec:
         return C_O0_I2(w, r);
     case INDEX_op_dup_vec:
         return C_O1_I1(w, wr);

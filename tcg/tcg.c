@@ -2486,6 +2486,10 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_extract2_vec:
         return type == TCG_TYPE_V128 && has_type &&
                TCG_TARGET_HAS_extract2_vec;
+    case INDEX_op_qemu_ld_vec:
+    case INDEX_op_qemu_st_vec:
+        return type == TCG_TYPE_V128 && has_type &&
+               TCG_TARGET_HAS_qemu_ldst_vec;
 
     default:
         if (op < INDEX_op_last_generic) {
@@ -2952,6 +2956,8 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_qemu_st:
             case INDEX_op_qemu_ld2:
             case INDEX_op_qemu_st2:
+            case INDEX_op_qemu_ld_vec:
+            case INDEX_op_qemu_st_vec:
                 {
                     const char *s_al, *s_tlb, *s_op, *s_at;
                     MemOpIdx oi = op->args[k++];

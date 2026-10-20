@@ -41,9 +41,17 @@ static bool trans_LVX(DisasContext *ctx, arg_X *a)
     REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
     REQUIRE_VECTOR(ctx);
     gen_set_access_type(ctx, ACCESS_INT);
-    avr = tcg_temp_new_i128();
     EA = do_ea_calc(ctx, a->ra, cpu_gpr[a->rb]);
     tcg_gen_andi_tl(EA, EA, ~0xf);
+    if (native_vmxint_on && tcg_can_emit_qemu_ldst_vec()) {
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_qemu_ld_vec(v, EA, ctx->mem_idx,
+                            DEF_MEMOP(MO_128 | MO_ATOM_IFALIGN_PAIR));
+        tcg_gen_st_vec(v, tcg_env, avr_full_offset(a->rt));
+        return true;
+    }
+    avr = tcg_temp_new_i128();
     tcg_gen_qemu_ld_i128(avr, EA, ctx->mem_idx,
                          DEF_MEMOP(MO_128 | MO_ATOM_IFALIGN_PAIR));
     set_avr_full(a->rt, avr);
@@ -64,9 +72,17 @@ static bool trans_STVX(DisasContext *ctx, arg_STVX *a)
     REQUIRE_INSNS_FLAGS(ctx, ALTIVEC);
     REQUIRE_VECTOR(ctx);
     gen_set_access_type(ctx, ACCESS_INT);
-    avr = tcg_temp_new_i128();
     EA = do_ea_calc(ctx, a->ra, cpu_gpr[a->rb]);
     tcg_gen_andi_tl(EA, EA, ~0xf);
+    if (native_vmxint_on && tcg_can_emit_qemu_ldst_vec()) {
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(v, tcg_env, avr_full_offset(a->rt));
+        tcg_gen_qemu_st_vec(v, EA, ctx->mem_idx,
+                            DEF_MEMOP(MO_128 | MO_ATOM_IFALIGN_PAIR));
+        return true;
+    }
+    avr = tcg_temp_new_i128();
     get_avr_full(avr, a->rt);
     tcg_gen_qemu_st_i128(avr, EA, ctx->mem_idx,
                          DEF_MEMOP(MO_128 | MO_ATOM_IFALIGN_PAIR));

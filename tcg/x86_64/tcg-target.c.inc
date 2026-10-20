@@ -1850,11 +1850,27 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
 {
     MemOp opc = get_memop(l->oi);
     tcg_insn_unit **label_ptr = &l->label_ptr[0];
+    TCGLabelQemuLdst v;
 
     /* resolve label address */
     tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
     if (label_ptr[1]) {
         tcg_patch32(label_ptr[1], s->code_ptr - label_ptr[1] - 4);
+    }
+
+    if (l->type == TCG_TYPE_V128) {
+        /* qemu_ld_vec: the I128 result through rax:rdx */
+        v = *l;
+        v.type = TCG_TYPE_I128;
+        v.datalo_reg = TCG_REG_RAX;
+        v.datahi_reg = TCG_REG_RDX;
+        tcg_out_ld_helper_args(s, &v, &ldst_helper_param);
+        tcg_out_branch(s, 1, qemu_ld_helpers[MO_128]);
+        tcg_out_ld_helper_ret(s, &v, false, &ldst_helper_param);
+        tcg_out_pair_to_vec(s, TCG_TYPE_I64, l->datalo_reg,
+                            TCG_REG_RAX, TCG_REG_RDX);
+        tcg_out_jmp(s, l->raddr);
+        return true;
     }
 
     tcg_out_ld_helper_args(s, l, &ldst_helper_param);
@@ -1872,11 +1888,31 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l)
 {
     MemOp opc = get_memop(l->oi);
     tcg_insn_unit **label_ptr = &l->label_ptr[0];
+    TCGLabelQemuLdst v;
 
     /* resolve label address */
     tcg_patch32(label_ptr[0], s->code_ptr - label_ptr[0] - 4);
     if (label_ptr[1]) {
         tcg_patch32(label_ptr[1], s->code_ptr - label_ptr[1] - 4);
+    }
+
+    if (l->type == TCG_TYPE_V128) {
+        /* qemu_st_vec: the value as an I128 pair, in neither argument reg */
+        static const TCGReg cand[3] = { TCG_REG_R10, TCG_REG_R11, TCG_REG_RAX };
+        TCGReg pair[2];
+        int n = 0;
+
+        for (int i = 0; i < 3 && n < 2; i++) {
+            if (cand[i] != l->addr_reg) {
+                pair[n++] = cand[i];
+            }
+        }
+        tcg_out_vec_to_pair(s, TCG_TYPE_I64, pair[0], pair[1], l->datalo_reg);
+        v = *l;
+        v.type = TCG_TYPE_I128;
+        v.datalo_reg = pair[0];
+        v.datahi_reg = pair[1];
+        l = &v;
     }
 
     tcg_out_st_helper_args(s, l, &ldst_helper_param);
@@ -2346,6 +2382,50 @@ static const TCGOutOpQemuLdSt2 outop_qemu_st2 = {
     .base.static_constraint = C_O0_I3(L, L, L),
     .out = tgen_qemu_st2,
 };
+
+/*
+ * qemu_ld_vec / qemu_st_vec: one 16-byte access, the bytes reversed
+ * with vpshufb for MO_BSWAP.  The 8-byte halves of an aligned access
+ * are single-copy atomic.
+ */
+static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data, TCGReg addr,
+                                  MemOpIdx oi, bool is_ld)
+{
+    MemOp mop = get_memop(oi);
+    TCGLabelQemuLdst *ldst;
+    HostAddress h;
+    TCGReg v = data;
+
+    ldst = prepare_host_addr(s, &h, addr, oi, is_ld);
+    tcg_debug_assert(h.aa.atom < MO_128 || h.aa.align >= MO_128);
+
+    if (!is_ld && (mop & MO_BSWAP)) {
+        v = TCG_TMP_VEC;
+    }
+    if (is_ld) {
+        tcg_out_vex_modrm_sib_offset(s, OPC_MOVDQU_VxWx + h.seg, data, 0,
+                                     h.base, h.index, 0, h.ofs);
+    }
+    if (mop & MO_BSWAP) {
+        /* vpshufb [15..0], data, v */
+        tcg_out_vex_opc(s, OPC_PSHUFB, v, data, 0, 0);
+        tcg_out8(s, LOWREGMASK(v) << 3 | 5);
+        tcg_out32(s, 0);
+        new_pool_l2(s, R_386_PC32, s->code_ptr - 4, -4,
+                    0x08090a0b0c0d0e0full, 0x0001020304050607ull);
+    }
+    if (!is_ld) {
+        tcg_out_vex_modrm_sib_offset(s, OPC_MOVDQU_WxVx + h.seg, v, 0,
+                                     h.base, h.index, 0, h.ofs);
+    }
+
+    if (ldst) {
+        ldst->type = TCG_TYPE_V128;
+        ldst->datalo_reg = data;
+        ldst->datahi_reg = -1;
+        ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
+    }
+}
 
 static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
 {
@@ -4707,6 +4787,13 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_vfparith(s, a0, a1, a2, args[3], args[4]);
         break;
 
+    case INDEX_op_qemu_ld_vec:
+        tcg_out_qemu_ldst_vec(s, a0, a1, a2, true);
+        break;
+    case INDEX_op_qemu_st_vec:
+        tcg_out_qemu_ldst_vec(s, a0, a1, a2, false);
+        break;
+
     case INDEX_op_mov_vec:  /* Always emitted via tcg_out_mov.  */
     case INDEX_op_dup_vec:  /* Always emitted via tcg_out_dup_vec.  */
     default:
@@ -4793,6 +4880,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O2_I3(x, r, x, x, x);
     case INDEX_op_vfparith_vec:
         return C_O1_I3(x, x, x, x);
+    case INDEX_op_qemu_ld_vec:
+        return C_O1_I1(x, L);
+    case INDEX_op_qemu_st_vec:
+        return C_O0_I2(x, L);
 
     default:
         return C_NotImplemented;
