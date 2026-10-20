@@ -192,6 +192,23 @@ static void remove_mem_copy_all(OptContext *ctx)
     tcg_debug_assert(interval_tree_is_empty(&ctx->mem_copy));
 }
 
+/*
+ * Vector registers do not survive a call or the slow path of a guest
+ * memory access: forget the vector copies, so that a later load of the
+ * memory is a load rather than a spill and a reload of the temp.
+ */
+static void remove_mem_copy_vec(OptContext *ctx)
+{
+    MemCopyInfo *mc, *next;
+
+    for (mc = mem_copy_first(ctx, 0, -1); mc; mc = next) {
+        next = mem_copy_next(mc, 0, -1);
+        if (mc->type >= TCG_TYPE_V64) {
+            remove_mem_copy(ctx, mc);
+        }
+    }
+}
+
 static TCGTemp *find_better_copy(TCGTemp *ts)
 {
     TCGTemp *i, *ret;
@@ -1554,6 +1571,8 @@ static bool fold_call(OptContext *ctx, TCGOp *op)
     /* If the function has side effects, reset mem data. */
     if (!(flags & TCG_CALL_NO_SIDE_EFFECTS)) {
         remove_mem_copy_all(ctx);
+    } else {
+        remove_mem_copy_vec(ctx);
     }
 
     /* Reset temp data for outputs. */
@@ -2396,6 +2415,7 @@ static bool fold_qemu_ld_1reg(OptContext *ctx, TCGOp *op)
 
     /* Opcodes that touch guest memory stop the mb optimization.  */
     ctx->prev_mb = NULL;
+    remove_mem_copy_vec(ctx);
 
     return fold_masks_zs(ctx, op, z_mask, s_mask);
 }
@@ -2404,6 +2424,7 @@ static bool fold_qemu_ld_2reg(OptContext *ctx, TCGOp *op)
 {
     /* Opcodes that touch guest memory stop the mb optimization.  */
     ctx->prev_mb = NULL;
+    remove_mem_copy_vec(ctx);
     return finish_folding(ctx, op);
 }
 
@@ -2411,6 +2432,7 @@ static bool fold_qemu_st(OptContext *ctx, TCGOp *op)
 {
     /* Opcodes that touch guest memory stop the mb optimization.  */
     ctx->prev_mb = NULL;
+    remove_mem_copy_vec(ctx);
     return true;
 }
 
