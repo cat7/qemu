@@ -182,7 +182,7 @@ DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 DEF(fparith_vec, 2, 4, 3, TCG_OPF_VECTOR)
 /* single <-> double; see tcg_gen_f32to64_vec() */
 DEF(f32to64_vec, 1, 1, 0, TCG_OPF_VECTOR)
-DEF(f64to32_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(f64to32_vec, 1, 1, 1, TCG_OPF_VECTOR)
 /* guest memory through an anchor; see tcg_gen_qemu_anchor() */
 DEF(qemu_ld_anc_vec, 1, 4, 2, TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
 DEF(qemu_st_anc_vec, 0, 5, 2, TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)

@@ -4149,20 +4149,25 @@ static void tcg_out_f32to64(TCGContext *s, TCGReg rd, TCGReg ws)
     t->a = ws;
 }
 
-static void tcg_out_f64to32(TCGContext *s, TCGReg wd, TCGReg dn)
+/* sgl: dn holds a single or a NaN, only NaNs out of line */
+static void tcg_out_f64to32(TCGContext *s, TCGReg wd, TCGReg dn, bool sgl)
 {
     TCGReg v = TCG_TMP_VEC;
-    tcg_insn_unit *jne, *jp;
+    tcg_insn_unit *jne = NULL, *jp;
     OOLStub *t;
 
     tcg_out_vex_modrm(s, OPC_CVTSD2SS, v, dn, dn);
     tcg_out_vex_modrm(s, OPC_MOVD_EyVy, v, 0, wd);
-    tcg_out_vex_modrm(s, OPC_CVTSS2SD, v, v, v);
-    tcg_out_vex_modrm(s, OPC_UCOMISD, v, 0, dn);
-    jne = fcvt_jcc(s, JCC_JNE);
+    if (sgl) {
+        tcg_out_vex_modrm(s, OPC_UCOMISD, dn, 0, dn);
+    } else {
+        tcg_out_vex_modrm(s, OPC_CVTSS2SD, v, v, v);
+        tcg_out_vex_modrm(s, OPC_UCOMISD, v, 0, dn);
+        jne = fcvt_jcc(s, JCC_JNE);
+    }
     jp = fcvt_jcc(s, JCC_JP);
-    t = ool_new(s, OOL_F64TO32, jne, 1ull << wd);
-    t->jmp2 = jp;
+    t = ool_new(s, OOL_F64TO32, jne ? jne : jp, 1ull << wd);
+    t->jmp2 = jne ? jp : NULL;
     t->rd = wd;
     t->a = dn;
 }
@@ -4592,7 +4597,7 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_f32to64(s, a0, a1);
         break;
     case INDEX_op_f64to32_vec:
-        tcg_out_f64to32(s, a0, a1);
+        tcg_out_f64to32(s, a0, a1, a2);
         break;
     case INDEX_op_qemu_ld_anc_vec:
         tcg_out_qemu_anc(s, args, true);
