@@ -1095,6 +1095,10 @@ typedef struct TCGOutOpSubtract {
                     TCGReg a0, tcg_target_long a1, TCGReg a2);
 } TCGOutOpSubtract;
 
+static TCGReg tcg_reg_alloc(TCGContext *s, TCGRegSet required_regs,
+                            TCGRegSet allocated_regs,
+                            TCGRegSet preferred_regs, bool rev);
+
 #include "tcg-target.c.inc"
 
 #ifndef CONFIG_TCG_INTERPRETER

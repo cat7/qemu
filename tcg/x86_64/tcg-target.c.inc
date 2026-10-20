@@ -3504,12 +3504,24 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
 }
 
 /*
- * fparith_vec.  XMM8-XMM14 are reserved for it; it also uses TCG_TMP_VEC.
- * Scalar ops take P_SIMDF2 for double, P_SIMDF3 for single; the FMA
- * forms P_VEXW for double.
+ * fparith_vec.  Its scratch registers are allocated per op; it also uses
+ * TCG_TMP_VEC.  Scalar ops take P_SIMDF2 for double, P_SIMDF3 for
+ * single; the FMA forms P_VEXW for double.
  */
-#define FPA_T(n)        (TCG_REG_XMM8 + (n))
 #define FPA_NREGS       7
+#define FPA_T(n)        fpa_reg[n]
+
+static __thread TCGReg fpa_reg[FPA_NREGS];
+
+/* n scratch vector registers, none of them in used */
+static void fpa_alloc(TCGContext *s, int n, TCGRegSet used)
+{
+    used |= s->reserved_regs;
+    for (int i = 0; i < n; i++) {
+        fpa_reg[i] = tcg_reg_alloc(s, ALL_VECTOR_REGS, used, 0, false);
+        tcg_regset_set_reg(used, fpa_reg[i]);
+    }
+}
 
 #define OPC_FPA_ADD     (0x58 | P_EXT)
 #define OPC_FPA_MUL     (0x59 | P_EXT)
@@ -3741,12 +3753,20 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     /* smallest exponent at which a rounding error is representable */
     unsigned eprod = dbl ? 56 : 26;
     TCGReg p = a, q = fma ? c : b, z = b;
-    TCGReg r = FPA_T(0), off = FPA_T(1), t2 = FPA_T(2), t3 = FPA_T(3);
-    TCGReg t4 = FPA_T(4), ixm = FPA_T(5), tmp = TCG_TMP_VEC, res = r;
+    TCGReg r, off, t2, t3, t4, ixm, tmp = TCG_TMP_VEC, res;
     unsigned rlo = 2;
     tcg_insn_unit *jref, *jdone, *jzero[2], *fix[FPA_NFIX];
     TCGReg save[TCG_TARGET_NB_REGS];
     int nsave = 0, frame, base, nfix;
+
+    fpa_alloc(s, sgl && fma ? 7 : sgl || ix ? 6 : 4,
+              1ull << rd | 1ull << a | 1ull << c | 1ull << b);
+    r = res = FPA_T(0);
+    off = FPA_T(1);
+    t2 = FPA_T(2);
+    t3 = FPA_T(3);
+    t4 = FPA_T(4);
+    ixm = FPA_T(5);
 
     if (rsp) {
         tcg_out_vex_modrm(s, OPC_CVTSD2SS, r, r, a);
@@ -5048,11 +5068,6 @@ static void tcg_target_init(TCGContext *s)
     s->reserved_regs = 0;
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_CALL_STACK);
     tcg_regset_set_reg(s->reserved_regs, TCG_TMP_VEC);
-    if (TCG_TARGET_HAS_fparith_vec) {
-        for (int i = 0; i < FPA_NREGS; i++) {
-            tcg_regset_set_reg(s->reserved_regs, FPA_T(i));
-        }
-    }
 }
 
 typedef struct {
