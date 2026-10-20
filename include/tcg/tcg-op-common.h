@@ -501,8 +501,9 @@ void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,
  * Scalar IEEE binary floating point on the host, round to nearest even,
  * on the low 64 bits of V64 temps holding doubles.  desc is an
  * FPARITH_* operation, optionally ORed with FPARITH_SINGLE (operate in
- * single precision; the result is widened to double) and
- * FPARITH_INEXACT.  Two-operand operations take a and b; c is ignored.
+ * single precision; the result is widened to double), FPARITH_INEXACT
+ * and, for the single operations, FPARITH_SGL_* for operands known to
+ * be singles.  Two-operand operations take a and b; c is ignored.
  *
  * status holds FPARITH_ST_INEXACT (with FPARITH_INEXACT: the result was
  * rounded), FPARITH_ST_NEG (the result is negative) and the result's
@@ -527,6 +528,9 @@ enum {
     FPARITH_OP_MASK = 0xf,
     FPARITH_SINGLE = 0x10,
     FPARITH_INEXACT = 0x20,
+    FPARITH_SGL_A = 0x40,
+    FPARITH_SGL_B = 0x80,
+    FPARITH_SGL_C = 0x100,
 };
 
 enum {

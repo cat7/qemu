@@ -3970,6 +3970,13 @@ static inline void get_fpr(TCGv_i64 dst, int regno)
 static __thread bool fpr_in_vsr;
 
 /*
+ * FPRs written in the TB so far as singles (by the inline single ops and
+ * single loads), unless the CPU has VSX or DFP
+ */
+static __thread uint32_t fpr_single;
+static __thread bool fpr_single_on;
+
+/*
  * Before PowerISA v3.1 the result of doubleword 1 of the VSR
  * corresponding to the target FPR was undefined. However,
  * most (if not all) real hardware were setting the result to 0.
@@ -3986,8 +3993,18 @@ static inline void clear_fpr_dw1(int regno)
 
 static inline void set_fpr(int regno, TCGv_i64 src)
 {
+    fpr_single &= ~(1u << regno);
     tcg_gen_st_i64(src, tcg_env, fpr_offset(regno));
     clear_fpr_dw1(regno);
+}
+
+/* set_fpr of a value that is a single if FPR from is one */
+static inline void set_fpr_like(int regno, TCGv_i64 src, int from)
+{
+    uint32_t sgl = fpr_single >> from & 1;
+
+    set_fpr(regno, src);
+    fpr_single |= sgl << regno;
 }
 
 /*
@@ -5070,6 +5087,8 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->insns_flags = env->insns_flags;
     ctx->insns_flags2 = env->insns_flags2;
     fpr_in_vsr = env->insns_flags2 & PPC2_VSX;
+    fpr_single_on = !(env->insns_flags2 & (PPC2_VSX | PPC2_DFP));
+    fpr_single = 0;
     ctx->access_type = -1;
     ctx->need_access_type = !mmu_is_64bit(env->mmu_model);
     ctx->le_mode = (hflags >> HFLAGS_LE) & 1;

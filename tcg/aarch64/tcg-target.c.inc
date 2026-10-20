@@ -3518,6 +3518,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     unsigned rlo = 2;
     tcg_insn_unit *tbnz;
     OOLStub *ool;
+    int nchk = 0;
 
     fpa_alloc(s, FPA_NALLOC, 1ull << rd | 1ull << a | 1ull << c | 1ull << b);
     r = FPA_T(0);
@@ -3537,21 +3538,32 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     }
 
     if (sgl) {
-        /* operands to single; st = all ones if each was a single */
+        /*
+         * operands to single; st = all ones if each was a single, the
+         * operands known to be singles unchecked
+         */
         TCGReg in[3] = { p, q, z };
+        unsigned known[3] = {
+            FPARITH_SGL_A, fma ? FPARITH_SGL_C : FPARITH_SGL_B, FPARITH_SGL_B
+        };
 
         for (int i = 0; i < (fma ? 3 : 2); i++) {
             TCGReg cv = FPA_T(5 + i);
 
             tcg_out32(s, FPA_FCVT_SD | (in[i] & 31) << 5 | (cv & 31));
+            if (desc & known[i]) {
+                continue;
+            }
             tcg_out32(s, FPA_FCVT_DS | (cv & 31) << 5 | (FPA_T(4) & 31));
-            fpa_out3(s, FPA_FCMEQ, true, i ? FPA_T(4) : tmp,
+            fpa_out3(s, FPA_FCMEQ, true, nchk ? FPA_T(4) : tmp,
                      FPA_T(4), in[i]);
-            if (i) {
+            if (nchk++) {
                 fpa_and(s, tmp, tmp, FPA_T(4));
             }
         }
-        tcg_out32(s, FPA_UMOV_WS | (tmp & 31) << 5 | st);
+        if (nchk) {
+            tcg_out32(s, FPA_UMOV_WS | (tmp & 31) << 5 | st);
+        }
         p = FPA_T(5);
         q = FPA_T(6);
         z = FPA_T(7);
@@ -3648,7 +3660,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     if (ix && fma) {
         fpa_range(s, FPA_T(2), dbl, eprod, emax, false);
     }
-    if (sgl) {
+    if (nchk) {
         /* cmn wst, #1; csinc tmp1, tmp1, xzr, eq */
         tcg_out_insn(s, addsub_imm, ADDSI, TCG_TYPE_I32, TCG_REG_XZR, st, 1);
         tcg_out_insn(s, csel, CSINC, TCG_TYPE_I64, TCG_REG_TMP1,

@@ -151,6 +151,13 @@ static void native_fp_op(DisasContext *ctx, unsigned desc, int kind,
     if (!relaxed) {
         desc |= FPARITH_INEXACT;
     }
+    if ((desc & FPARITH_SINGLE) && fpr_single_on) {
+        desc |= (fpr_single >> x & 1 ? FPARITH_SGL_A : 0) |
+                 (kind == NFP_ACB
+                  ? (fpr_single >> y & 1 ? FPARITH_SGL_C : 0) |
+                    (fpr_single >> z & 1 ? FPARITH_SGL_B : 0)
+                  : (y >= 0 && fpr_single >> y & 1 ? FPARITH_SGL_B : 0));
+    }
     if (kind == NFP_ACB) {
         tcg_gen_fparith_vec(desc, r, st, vx, vy, vz);
     } else {
@@ -159,6 +166,12 @@ static void native_fp_op(DisasContext *ctx, unsigned desc, int kind,
     tcg_gen_brcondi_i64(TCG_COND_TSTNE, st, FPARITH_ST_OFF, slow);
     tcg_gen_st_vec(r, tcg_env, fpr_offset(frt));
     clear_fpr_dw1(frt);
+    if (fpr_single_on && ((desc & FPARITH_SINGLE) ||
+                          (desc & FPARITH_OP_MASK) == FPARITH_RSP)) {
+        fpr_single |= 1u << frt;
+    } else {
+        fpr_single &= ~(1u << frt);
+    }
     native_fp_fpscr(st, relaxed);
 }
 
@@ -575,7 +588,7 @@ static bool trans_FMR(DisasContext *ctx, arg_FMR *a)
     REQUIRE_FPU(ctx);
     t0 = tcg_temp_new_i64();
     get_fpr(t0, a->rb);
-    set_fpr(a->rt, t0);
+    set_fpr_like(a->rt, t0, a->rb);
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -593,7 +606,7 @@ static bool do_move_b(DisasContext *ctx, arg_X_tb_rc *a, int64_t val,
     t1 = tcg_temp_new_i64();
     get_fpr(t0, a->rb);
     tcg_op(t1, t0, val);
-    set_fpr(a->rt, t1);
+    set_fpr_like(a->rt, t1, a->rb);
     if (unlikely(a->rc)) {
         gen_set_cr1_from_fpscr(ctx);
     }
@@ -1208,6 +1221,9 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
             tcg_gen_f32to64_vec(v, w);
             tcg_gen_st_vec(v, tcg_env, fpr_offset(rt));
             clear_fpr_dw1(rt);
+            if (fpr_single_on) {
+                fpr_single |= 1u << rt;
+            }
         }
     } else if (store) {
         get_fpr(t0, rt);
