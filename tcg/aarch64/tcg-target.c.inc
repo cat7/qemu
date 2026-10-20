@@ -3797,7 +3797,8 @@ static void tcg_out_f32to64(TCGContext *s, TCGReg rd, TCGReg ws)
     t->a = ws;
 }
 
-static void tcg_out_f64to32(TCGContext *s, TCGReg wd, TCGReg dn)
+/* sgl: dn holds a single or a NaN, only NaNs out of line */
+static void tcg_out_f64to32(TCGContext *s, TCGReg wd, TCGReg dn, bool sgl)
 {
     TCGReg v = TCG_VEC_TMP0;
     tcg_insn_unit *jmp;
@@ -3805,10 +3806,16 @@ static void tcg_out_f64to32(TCGContext *s, TCGReg wd, TCGReg dn)
 
     tcg_out32(s, FPA_FCVT_SD | (dn & 31) << 5 | (v & 31));
     tcg_out32(s, FPA_UMOV_WS | (v & 31) << 5 | wd);
-    tcg_out32(s, FPA_FCVT_DS | (v & 31) << 5 | (v & 31));
-    tcg_out32(s, 0x1e602000 | (dn & 31) << 16 | (v & 31) << 5);   /* fcmp */
-    jmp = s->code_ptr;
-    tcg_out32(s, 0x54000000 | 1);                               /* b.ne */
+    if (sgl) {
+        tcg_out32(s, 0x1e602000 | (dn & 31) << 16 | (dn & 31) << 5); /* fcmp */
+        jmp = s->code_ptr;
+        tcg_out32(s, 0x54000000 | 6);                           /* b.vs */
+    } else {
+        tcg_out32(s, FPA_FCVT_DS | (v & 31) << 5 | (v & 31));
+        tcg_out32(s, 0x1e602000 | (dn & 31) << 16 | (v & 31) << 5);   /* fcmp */
+        jmp = s->code_ptr;
+        tcg_out32(s, 0x54000000 | 1);                           /* b.ne */
+    }
     t = ool_new(s, OOL_F64TO32, jmp, 1ull << wd);
     t->rd = wd;
     t->a = dn;
@@ -4556,7 +4563,7 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_f32to64(s, a0, a1);
         break;
     case INDEX_op_f64to32_vec:
-        tcg_out_f64to32(s, a0, a1);
+        tcg_out_f64to32(s, a0, a1, a2);
         break;
     case INDEX_op_qemu_ld_anc_vec:
         tcg_out_qemu_anc(s, args, true);

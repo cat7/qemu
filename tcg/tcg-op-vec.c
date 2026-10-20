@@ -816,17 +816,18 @@ void tcg_gen_f32to64_vec(TCGv_vec r, TCGv_i32 s)
     op->args[1] = tcgv_i32_arg(s);
 }
 
-void tcg_gen_f64to32_vec(TCGv_i32 r, TCGv_vec d)
+void tcg_gen_f64to32_vec(TCGv_i32 r, TCGv_vec d, bool sgl)
 {
     TCGOp *op;
 
     tcg_debug_assert(tcgv_vec_temp(d)->base_type == TCG_TYPE_V64);
     tcg_debug_assert(tcg_fcvt_to32_ref);
-    op = tcg_emit_op(INDEX_op_f64to32_vec, 2);
+    op = tcg_emit_op(INDEX_op_f64to32_vec, 3);
     TCGOP_TYPE(op) = TCG_TYPE_V64;
     TCGOP_VECE(op) = MO_64;
     op->args[0] = tcgv_i32_arg(r);
     op->args[1] = tcgv_vec_arg(d);
+    op->args[2] = sgl;
 }
 
 bool tcg_can_emit_perm2(void)
