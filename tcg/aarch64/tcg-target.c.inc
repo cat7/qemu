@@ -2914,10 +2914,24 @@ static const TCGOutOpStore outop_st = {
 };
 
 /*
- * fparith_vec.  Scratch registers V23-V30 are reserved for it, and it
- * also uses TCG_VEC_TMP0 and the integer temporaries.
+ * fparith_vec.  Scratch registers 0-6 are allocated per op, 7 is V30,
+ * reserved; it also uses TCG_VEC_TMP0 and the integer temporaries.
  */
-#define FPA_T(n)        (TCG_REG_V23 + (n))
+#define FPA_NALLOC      7
+#define FPA_T(n)        ((n) < FPA_NALLOC ? fpa_reg[n] : TCG_REG_V30)
+
+static __thread TCGReg fpa_reg[FPA_NALLOC];
+
+/* n scratch vector registers, none of them in used */
+static void fpa_alloc(TCGContext *s, int n, TCGRegSet used)
+{
+    used |= s->reserved_regs;
+    for (int i = 0; i < n; i++) {
+        fpa_reg[i] = tcg_reg_alloc(s, tcg_target_available_regs[TCG_TYPE_V128],
+                                   used, 0, false);
+        tcg_regset_set_reg(used, fpa_reg[i]);
+    }
+}
 
 enum {
     FPA_FMUL    = 0x1e200800,   /* | ftype << 22 */
@@ -3145,11 +3159,15 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     /* smallest exponent at which a rounding error is representable */
     unsigned eprod = dbl ? 56 : 26;
     TCGReg p = a, q = fma ? c : b, z = b;
-    TCGReg r = FPA_T(0), mask = FPA_T(1), tmp = TCG_VEC_TMP0;
+    TCGReg r, mask, tmp = TCG_VEC_TMP0;
     unsigned rlo = 2;
     tcg_insn_unit *tbnz, *bdone, *bdone2, *fix[FPA_NFIX];
     TCGReg save[TCG_TARGET_NB_REGS];
     int nsave = 0, frame, nfix;
+
+    fpa_alloc(s, FPA_NALLOC, 1ull << rd | 1ull << a | 1ull << c | 1ull << b);
+    r = FPA_T(0);
+    mask = FPA_T(1);
 
     if (rsp) {
         tcg_out32(s, FPA_FCVT_SD | (a & 31) << 5 | (r & 31));
@@ -3896,9 +3914,7 @@ static void tcg_target_init(TCGContext *s)
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP1);
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP2);
     tcg_regset_set_reg(s->reserved_regs, TCG_VEC_TMP0);
-    for (int i = 0; i < 8; i++) {
-        tcg_regset_set_reg(s->reserved_regs, FPA_T(i));
-    }
+    tcg_regset_set_reg(s->reserved_regs, TCG_REG_V30);
 }
 
 /* Saving pairs: (X19, X20) .. (X27, X28), (X29(fp), X30(lr)).  */
