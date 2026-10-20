@@ -3770,10 +3770,10 @@ static void fpa_pool(TCGContext *s, int opc, TCGReg r, TCGReg v, uint64_t lo)
  * (off = with first).  The exponent field of v + v, less lo, compared
  * unsigned as signed with the sign bit flipped.
  */
-static void fpa_range(TCGContext *s, TCGReg off, TCGReg v, bool dbl,
-                      unsigned lo, unsigned hi, bool first)
+static void fpa_range_t(TCGContext *s, TCGReg off, TCGReg v, bool dbl,
+                        unsigned lo, unsigned hi, bool first, TCGReg tt)
 {
-    TCGReg t = first ? off : FPA_T(3);
+    TCGReg t = first ? off : tt;
     int sh = dbl ? 53 : 24;
     uint64_t sign = dbl ? INT64_MIN : 0x80000000u;
     uint64_t mask = dbl ? UINT64_MAX : UINT32_MAX;
@@ -3786,6 +3786,12 @@ static void fpa_range(TCGContext *s, TCGReg off, TCGReg v, bool dbl,
     if (!first) {
         tcg_out_vex_modrm(s, OPC_POR, off, off, t);
     }
+}
+
+static void fpa_range(TCGContext *s, TCGReg off, TCGReg v, bool dbl,
+                      unsigned lo, unsigned hi, bool first)
+{
+    fpa_range_t(s, off, v, dbl, lo, hi, first, FPA_T(3));
 }
 
 #define FPA_NFIX    8
@@ -3854,22 +3860,15 @@ static int fpa_zero(TCGContext *s, TCGReg rd, TCGReg st, TCGReg a,
     bool dbl = !sgl;
     bool fma = op >= FPARITH_MADD && op <= FPARITH_NMSUB;
     unsigned emax = dbl ? 0x7fe : 0xfe, eprod = dbl ? 56 : 26;
-    TCGReg q = fma ? c : b, r = FPA_T(0), m = FPA_T(1), t = FPA_T(3);
+    TCGReg r = FPA_T(0), m = FPA_T(1);
     TCGReg res = rsp ? FPA_T(2) : sgl ? rd : r;
     tcg_insn_unit *ok[2] = { NULL, NULL }, *nrm = NULL, *pz[2];
     int n = 0;
 
-    if (sgl) {
-        TCGReg in[3] = { a, q, b };
-
-        for (int i = 0; i < (fma ? 3 : 2); i++) {
-            tcg_out_vex_modrm(s, OPC_CVTSD2SS, t, t, in[i]);
-            tcg_out_vex_modrm(s, OPC_CVTSS2SD, t, t, t);
-            fpa_neq(s, true, i ? t : m, t, in[i]);
-            if (i) {
-                tcg_out_vex_modrm(s, OPC_POR, m, m, t);
-            }
-        }
+    /* the operand checks of the inline code are still in m */
+    if (sgl && (!(desc & FPARITH_SGL_A) ||
+                !(desc & (fma ? FPARITH_SGL_C : FPARITH_SGL_B)) ||
+                (fma && !(desc & FPARITH_SGL_B)))) {
         fpa_tstm(s, st, m);
         fix[n++] = fpa_jcc(s, JCC_JNE);
     }
@@ -3953,7 +3952,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg so,
     /* smallest exponent at which a rounding error is representable */
     unsigned eprod = dbl ? 56 : 26;
     TCGReg p = a, q = fma ? c : b, z = b;
-    TCGReg r, off, t2, t3, t4, ixm, tmp = TCG_TMP_VEC, res;
+    TCGReg r, off, fail, t2, t3, t4, ixm, tmp = TCG_TMP_VEC, res;
     unsigned rlo = 2;
     tcg_insn_unit *jref, *ret_st;
     OOLStub *ool;
@@ -3964,7 +3963,7 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg so,
     fpa_alloc(s, sgl && fma ? 7 : sgl || ix ? 6 : 4,
               1ull << rd | 1ull << a | 1ull << c | 1ull << b);
     r = res = FPA_T(0);
-    off = FPA_T(1);
+    off = fail = FPA_T(1);
     t2 = FPA_T(2);
     t3 = FPA_T(3);
     t4 = FPA_T(4);
@@ -4100,17 +4099,22 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg so,
         fpa_pool(s, OPC_PXOR, r, r, dbl ? INT64_MIN : 0x80000000u);
     }
 
-    fpa_range(s, off, r, dbl, rlo, emax, !nchk);
+    /* the range checks into fail, off kept for the out-of-line code */
+    fail = nchk ? t3 : off;
+    fpa_range(s, fail, r, dbl, rlo, emax, true);
     if (ix && op == FPARITH_DIV) {
-        fpa_range(s, off, p, dbl, eprod, emax, false);
+        fpa_range_t(s, fail, p, dbl, eprod, emax, false, nchk ? t2 : t3);
     }
     if (ix && fma) {
-        fpa_range(s, off, t2, dbl, eprod, emax, false);
+        fpa_range_t(s, fail, t2, dbl, eprod, emax, false, nchk ? t4 : t3);
+    }
+    if (nchk) {
+        tcg_out_vex_modrm(s, OPC_POR, fail, fail, off);
     }
 
  status:
-    /* off: and st, 1; jnz ref */
-    tcg_out_vex_modrm(s, OPC_MOVMSKPS, st, 0, off);
+    /* fail: and st, 1; jnz ref */
+    tcg_out_vex_modrm(s, OPC_MOVMSKPS, st, 0, fail);
     tgen_arithi(s, ARITH_AND, st, 1, 0);
     tcg_out_opc(s, OPC_JCC_long + JCC_JNE, 0, 0, 0);
     jref = s->code_ptr;
