@@ -59,6 +59,7 @@
 #define TCG_TARGET_HAS_cmpsel_vec       1
 #define TCG_TARGET_HAS_tst_vec          have_avx512bw
 #define TCG_TARGET_HAS_fparith_vec      (cpuinfo & CPUINFO_FMA)
+#define TCG_TARGET_NEED_OOL
 
 #define TCG_TARGET_deposit_valid(type, ofs, len) \
     ((ofs) == 0 && ((len) == 8 || (len) == 16))
