@@ -2919,7 +2919,7 @@ static const TCGOutOpStore outop_st = {
  * back to ret.  The call-clobbered registers live at the op are saved
  * around calls.
  */
-typedef enum { OOL_FPARITH, OOL_F32TO64, OOL_F64TO32 } OOLKind;
+typedef enum { OOL_FPARITH, OOL_F32TO64, OOL_F64TO32, OOL_ANC } OOLKind;
 
 typedef struct OOLStub {
     struct OOLStub *next;
@@ -2929,6 +2929,9 @@ typedef struct OOLStub {
     TCGReg rd, st, a, c, b;
     unsigned desc;
     TCGReg fpa[7];
+    MemOpIdx oi;
+    int32_t ofs;
+    bool is_ld, narrow;
     int nsave;
     TCGReg save[TCG_TARGET_NB_REGS];
 } OOLStub;
@@ -2938,6 +2941,7 @@ static __thread OOLStub *ool_head, **ool_tail;
 static void tcg_out_fpa_load(OOLStub *t);
 static bool tcg_out_fparith_ool(TCGContext *s, OOLStub *t);
 static bool tcg_out_fcvt_ool(TCGContext *s, OOLStub *t);
+static bool tcg_out_anc_ool(TCGContext *s, OOLStub *t);
 
 /* A stub for the branch at jmp, returning to the current position */
 static OOLStub *ool_new(TCGContext *s, OOLKind kind, tcg_insn_unit *jmp,
@@ -2998,6 +3002,9 @@ static int tcg_out_ool_finalize(TCGContext *s)
         case OOL_F32TO64:
         case OOL_F64TO32:
             ok = tcg_out_fcvt_ool(s, t);
+            break;
+        case OOL_ANC:
+            ok = tcg_out_anc_ool(s, t);
             break;
         }
         if (!ok) {
@@ -3538,6 +3545,73 @@ static bool tcg_out_fcvt_ool(TCGContext *s, OOLStub *t)
     return true;
 }
 
+/*
+ * qemu_ld_anc_vec / qemu_st_anc_vec: the entry still maps the anchor's
+ * page for the access, then the access at p + ofs; else out of line,
+ * the regular helper on base + ofs.
+ */
+static void tcg_out_qemu_anc(TCGContext *s, const TCGArg *args, bool is_ld)
+{
+    TCGReg data = args[0], e = args[1], pg = args[2], p = args[3];
+    MemOp mop = get_memop(args[5]);
+    TCGType type = (mop & MO_SIZE) == MO_64 ? TCG_TYPE_I64 : TCG_TYPE_I32;
+    tcg_insn_unit *jmp;
+    OOLStub *t;
+
+    tcg_debug_assert(!(mop & MO_BSWAP));
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP0, e,
+               is_ld ? offsetof(CPUTLBEntry, addr_read)
+                     : offsetof(CPUTLBEntry, addr_write));
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_NE, TCG_REG_TMP0, pg, false);
+    jmp = s->code_ptr;
+    tcg_out32(s, 0x54000000 | COND_NE);                         /* b.ne */
+    if (is_ld) {
+        tcg_out_ld(s, type, data, p, (int32_t)args[6]);
+    } else {
+        tcg_out_st(s, type, data, p, (int32_t)args[6]);
+    }
+    t = ool_new(s, OOL_ANC, jmp, is_ld ? 1ull << data : 0);
+    t->rd = data;
+    t->a = args[4];
+    t->oi = args[5];
+    t->ofs = (int32_t)args[6];
+    t->narrow = args[6] >> 32;
+    t->is_ld = is_ld;
+}
+
+static bool tcg_out_anc_ool(TCGContext *s, OOLStub *t)
+{
+    MemOp mop = get_memop(t->oi);
+    TCGLabelQemuLdst l = {
+        .is_ld = t->is_ld,
+        .oi = t->oi,
+        .type = (mop & MO_SIZE) == MO_64 ? TCG_TYPE_I64 : TCG_TYPE_I32,
+        .addr_reg = TCG_REG_TMP1,
+        .datalo_reg = t->rd,
+        .datahi_reg = -1,
+        .raddr = t->ret,
+    };
+
+    if (!reloc_pc19(t->jmp, tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
+    }
+    ool_save(s, t);
+    tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP1, t->ofs);
+    tcg_out_insn(s, addsub_shift, ADD, !t->narrow, TCG_REG_TMP1, t->a,
+                 TCG_REG_TMP1);
+    if (t->is_ld) {
+        tcg_out_ld_helper_args(s, &l, &ldst_helper_param);
+        tcg_out_call_int(s, qemu_ld_helpers[mop & MO_SIZE]);
+        tcg_out_ld_helper_ret(s, &l, false, &ldst_helper_param);
+    } else {
+        tcg_out_st_helper_args(s, &l, &ldst_helper_param);
+        tcg_out_call_int(s, qemu_st_helpers[mop & MO_SIZE]);
+    }
+    ool_restore(s, t);
+    tcg_out_goto(s, t->ret);
+    return true;
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -3857,6 +3931,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_f64to32_vec:
         tcg_out_f64to32(s, a0, a1);
         break;
+    case INDEX_op_qemu_ld_anc_vec:
+        tcg_out_qemu_anc(s, args, true);
+        break;
+    case INDEX_op_qemu_st_anc_vec:
+        tcg_out_qemu_anc(s, args, false);
+        break;
 
     case INDEX_op_bitsel_vec:
         a3 = args[3];
@@ -4026,6 +4106,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I1(w, r);
     case INDEX_op_f64to32_vec:
         return C_O1_I1(r, w);
+    case INDEX_op_qemu_ld_anc_vec:
+        return C_O1_I4(r, r, r, r, r);
+    case INDEX_op_qemu_st_anc_vec:
+        return C_O0_I5(r, r, r, r, r);
     case INDEX_op_st_vec:
         return C_O0_I2(w, r);
     case INDEX_op_dup_vec:

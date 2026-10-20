@@ -53,6 +53,7 @@
 #define TCG_TARGET_HAS_cmpsel_vec       0
 #define TCG_TARGET_HAS_tst_vec          1
 #define TCG_TARGET_HAS_fparith_vec      1
+#define TCG_TARGET_HAS_qemu_anc_vec     1
 #define TCG_TARGET_NEED_OOL
 #define TCG_TARGET_HAS_fcvt_vec         1
 

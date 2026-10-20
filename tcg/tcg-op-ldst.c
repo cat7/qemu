@@ -29,6 +29,8 @@
 #include "tcg/tcg-mo.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
+#include "exec/tlb-common.h"
+#include "hw/core/cpu.h"
 #include "exec/plugin-gen.h"
 #include "tcg-internal.h"
 #include "tcg-has.h"
@@ -758,6 +760,165 @@ void tcg_gen_qemu_st_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
     tcg_debug_assert((memop & MO_SIZE) == MO_128);
     tcg_debug_assert((memop & MO_SIGN) == 0);
     tcg_gen_qemu_st_i128_int(val, addr, idx, memop);
+}
+
+bool tcg_can_emit_qemu_anchor(void)
+{
+    return tcg_use_softmmu && TCG_TARGET_REG_BITS == 64 &&
+           tcg_ctx->addr_type == TCG_TYPE_I64 &&
+           tcg_op_supported(INDEX_op_qemu_ld_anc_vec, TCG_TYPE_V64, 0);
+}
+
+static const CPUTLBEntry anc_none = {
+    .addr_read = -1, .addr_write = -1, .addr_code = -1,
+};
+
+void tcg_gen_qemu_anchor(TCGv_ptr *e, TCGv_i64 *pg, TCGv_ptr *p,
+                         TCGv_i64 base, int32_t lo_ofs, int32_t hi_ofs,
+                         bool narrow, TCGArg idx, bool ld)
+{
+    int fast = offsetof(CPUNegativeOffsetState,
+                        tlb.f[mmuidx_to_fast_index(idx)]) -
+               sizeof(CPUNegativeOffsetState);
+    TCGv_i64 lo = tcg_temp_ebb_new_i64();
+    TCGv_i64 ent = tcg_temp_ebb_new_i64();
+    TCGv_i64 t = tcg_temp_ebb_new_i64();
+    TCGv_i64 none = tcg_constant_i64((uintptr_t)&anc_none);
+    TCGv_i64 ei = tcg_temp_ebb_new_i64();
+    TCGv_i64 pi = tcg_temp_ebb_new_i64();
+
+    *pg = tcg_temp_ebb_new_i64();
+    tcg_gen_addi_i64(lo, base, lo_ofs);
+    tcg_gen_addi_i64(t, base, hi_ofs);
+    if (narrow) {
+        tcg_gen_ext32u_i64(lo, lo);
+        tcg_gen_ext32u_i64(t, t);
+    }
+    tcg_gen_xor_i64(t, t, lo);
+
+    tcg_gen_shri_i64(ent, lo, TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+    tcg_gen_ld_i64(ei, tcg_env, fast + offsetof(CPUTLBDescFast, mask));
+    tcg_gen_and_i64(ent, ent, ei);
+    tcg_gen_ld_i64(ei, tcg_env, fast + offsetof(CPUTLBDescFast, table));
+    tcg_gen_add_i64(ent, ent, ei);
+
+    /* none unless the entry maps lo's page and hi is on it */
+    tcg_gen_movcond_i64(TCG_COND_GEU, ei, t,
+                        tcg_constant_i64(TARGET_PAGE_SIZE), none, ent);
+    tcg_gen_andi_i64(*pg, lo, TARGET_PAGE_MASK);
+    tcg_gen_ld_i64(t, temp_tcgv_ptr(tcgv_i64_temp(ent)),
+                   ld ? offsetof(CPUTLBEntry, addr_read)
+                      : offsetof(CPUTLBEntry, addr_write));
+    tcg_gen_movcond_i64(TCG_COND_NE, ei, t, *pg, none, ei);
+
+    tcg_gen_ld_i64(t, temp_tcgv_ptr(tcgv_i64_temp(ent)),
+                   offsetof(CPUTLBEntry, addend));
+    tcg_gen_add_i64(pi, t, lo);
+    tcg_gen_subi_i64(pi, pi, lo_ofs);
+
+    *e = temp_tcgv_ptr(tcgv_i64_temp(ei));
+    *p = temp_tcgv_ptr(tcgv_i64_temp(pi));
+    tcg_temp_free_i64(lo);
+    tcg_temp_free_i64(ent);
+    tcg_temp_free_i64(t);
+}
+
+static void gen_anc(TCGOpcode opc, TCGTemp *val, TCGv_ptr e, TCGv_i64 pg,
+                    TCGv_ptr p, TCGv_i64 base, int32_t ofs, bool narrow,
+                    MemOpIdx oi)
+{
+    TCGOp *op = tcg_emit_op(opc, 7);
+
+    tcg_debug_assert(tcg_ctx->plugin_insn == NULL);
+    TCGOP_TYPE(op) = TCG_TYPE_V64;
+    TCGOP_VECE(op) = MO_64;
+    op->args[0] = temp_arg(val);
+    op->args[1] = tcgv_ptr_arg(e);
+    op->args[2] = tcgv_i64_arg(pg);
+    op->args[3] = tcgv_ptr_arg(p);
+    op->args[4] = tcgv_i64_arg(base);
+    op->args[5] = oi;
+    op->args[6] = (uint32_t)ofs | (uint64_t)narrow << 32;
+}
+
+void tcg_gen_qemu_ld_anc_i32(TCGv_i32 val, TCGv_ptr e, TCGv_i64 pg,
+                             TCGv_ptr p, TCGv_i64 base, int32_t ofs,
+                             bool narrow, TCGArg idx, MemOp memop)
+{
+    MemOp orig;
+
+    tcg_debug_assert((memop & MO_SSIZE) == MO_UL);
+    tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    orig = memop = tcg_canonicalize_memop(memop, 0, 0);
+    if ((memop & MO_BSWAP) && !tcg_target_has_memory_bswap(memop)) {
+        memop &= ~MO_BSWAP;
+    }
+    gen_anc(INDEX_op_qemu_ld_anc_vec, tcgv_i32_temp(val), e, pg, p, base,
+            ofs, narrow, make_memop_idx(memop, idx));
+    if ((orig ^ memop) & MO_BSWAP) {
+        tcg_gen_bswap32_i32(val, val);
+    }
+}
+
+void tcg_gen_qemu_ld_anc_i64(TCGv_i64 val, TCGv_ptr e, TCGv_i64 pg,
+                             TCGv_ptr p, TCGv_i64 base, int32_t ofs,
+                             bool narrow, TCGArg idx, MemOp memop)
+{
+    MemOp orig;
+
+    tcg_debug_assert((memop & MO_SSIZE) == MO_UQ);
+    tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    orig = memop = tcg_canonicalize_memop(memop, 1, 0);
+    if ((memop & MO_BSWAP) && !tcg_target_has_memory_bswap(memop)) {
+        memop &= ~MO_BSWAP;
+    }
+    gen_anc(INDEX_op_qemu_ld_anc_vec, tcgv_i64_temp(val), e, pg, p, base,
+            ofs, narrow, make_memop_idx(memop, idx));
+    if ((orig ^ memop) & MO_BSWAP) {
+        tcg_gen_bswap64_i64(val, val);
+    }
+}
+
+void tcg_gen_qemu_st_anc_i32(TCGv_i32 val, TCGv_ptr e, TCGv_i64 pg,
+                             TCGv_ptr p, TCGv_i64 base, int32_t ofs,
+                             bool narrow, TCGArg idx, MemOp memop)
+{
+    TCGv_i32 v = val;
+
+    tcg_debug_assert((memop & MO_SIZE) == MO_32);
+    tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    memop = tcg_canonicalize_memop(memop, 0, 1);
+    if ((memop & MO_BSWAP) && !tcg_target_has_memory_bswap(memop)) {
+        v = tcg_temp_ebb_new_i32();
+        tcg_gen_bswap32_i32(v, val);
+        memop &= ~MO_BSWAP;
+    }
+    gen_anc(INDEX_op_qemu_st_anc_vec, tcgv_i32_temp(v), e, pg, p, base,
+            ofs, narrow, make_memop_idx(memop, idx));
+    if (v != val) {
+        tcg_temp_free_i32(v);
+    }
+}
+
+void tcg_gen_qemu_st_anc_i64(TCGv_i64 val, TCGv_ptr e, TCGv_i64 pg,
+                             TCGv_ptr p, TCGv_i64 base, int32_t ofs,
+                             bool narrow, TCGArg idx, MemOp memop)
+{
+    TCGv_i64 v = val;
+
+    tcg_debug_assert((memop & MO_SIZE) == MO_64);
+    tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    memop = tcg_canonicalize_memop(memop, 1, 1);
+    if ((memop & MO_BSWAP) && !tcg_target_has_memory_bswap(memop)) {
+        v = tcg_temp_ebb_new_i64();
+        tcg_gen_bswap64_i64(v, val);
+        memop &= ~MO_BSWAP;
+    }
+    gen_anc(INDEX_op_qemu_st_anc_vec, tcgv_i64_temp(v), e, pg, p, base,
+            ofs, narrow, make_memop_idx(memop, idx));
+    if (v != val) {
+        tcg_temp_free_i64(v);
+    }
 }
 
 void tcg_gen_ext_i32(TCGv_i32 ret, TCGv_i32 val, MemOp opc)

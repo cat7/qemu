@@ -842,6 +842,7 @@ static int tcg_out_pool_finalize(TCGContext *s)
 #define C_O0_I2(I1, I2)                 C_PFX2(c_o0_i2_, I1, I2),
 #define C_O0_I3(I1, I2, I3)             C_PFX3(c_o0_i3_, I1, I2, I3),
 #define C_O0_I4(I1, I2, I3, I4)         C_PFX4(c_o0_i4_, I1, I2, I3, I4),
+#define C_O0_I5(I1, I2, I3, I4, I5)     C_PFX5(c_o0_i5_, I1, I2, I3, I4, I5),
 
 #define C_O1_I1(O1, I1)                 C_PFX2(c_o1_i1_, O1, I1),
 #define C_O1_I2(O1, I1, I2)             C_PFX3(c_o1_i2_, O1, I1, I2),
@@ -870,6 +871,7 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode, TCGType, unsigned);
 #undef C_O0_I2
 #undef C_O0_I3
 #undef C_O0_I4
+#undef C_O0_I5
 #undef C_O1_I1
 #undef C_O1_I2
 #undef C_O1_I3
@@ -894,6 +896,7 @@ typedef struct TCGConstraintSet {
 #define C_O0_I2(I1, I2)                 { 0, 2, { #I1, #I2 } },
 #define C_O0_I3(I1, I2, I3)             { 0, 3, { #I1, #I2, #I3 } },
 #define C_O0_I4(I1, I2, I3, I4)         { 0, 4, { #I1, #I2, #I3, #I4 } },
+#define C_O0_I5(I1, I2, I3, I4, I5)     { 0, 5, { #I1, #I2, #I3, #I4, #I5 } },
 
 #define C_O1_I1(O1, I1)                 { 1, 1, { #O1, #I1 } },
 #define C_O1_I2(O1, I1, I2)             { 1, 2, { #O1, #I1, #I2 } },
@@ -918,6 +921,7 @@ static const TCGConstraintSet constraint_sets[] = {
 #undef C_O0_I2
 #undef C_O0_I3
 #undef C_O0_I4
+#undef C_O0_I5
 #undef C_O1_I1
 #undef C_O1_I2
 #undef C_O1_I3
@@ -937,6 +941,7 @@ static const TCGConstraintSet constraint_sets[] = {
 #define C_O0_I2(I1, I2)                 C_PFX2(c_o0_i2_, I1, I2)
 #define C_O0_I3(I1, I2, I3)             C_PFX3(c_o0_i3_, I1, I2, I3)
 #define C_O0_I4(I1, I2, I3, I4)         C_PFX4(c_o0_i4_, I1, I2, I3, I4)
+#define C_O0_I5(I1, I2, I3, I4, I5)     C_PFX5(c_o0_i5_, I1, I2, I3, I4, I5)
 
 #define C_O1_I1(O1, I1)                 C_PFX2(c_o1_i1_, O1, I1)
 #define C_O1_I2(O1, I1, I2)             C_PFX3(c_o1_i2_, O1, I1, I2)
@@ -2463,6 +2468,10 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_f32to64_vec:
     case INDEX_op_f64to32_vec:
         return type == TCG_TYPE_V64 && has_type && TCG_TARGET_HAS_fcvt_vec;
+    case INDEX_op_qemu_ld_anc_vec:
+    case INDEX_op_qemu_st_anc_vec:
+        return type == TCG_TYPE_V64 && has_type &&
+               TCG_TARGET_HAS_qemu_anc_vec;
 
     default:
         if (op < INDEX_op_last_generic) {

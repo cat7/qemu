@@ -44,7 +44,7 @@ static void gen_set_cr1_from_fpscr(DisasContext *ctx)
 enum { NFP_AB, NFP_ACB, NFP_RSP, NFP_CMPU };
 
 static bool native_fcmp_on, native_frsp_on;
-static bool native_fcvt_on;
+static bool native_fcvt_on, native_anchor_on;
 
 static bool native_env(const char *name, bool dflt)
 {
@@ -70,6 +70,7 @@ static void native_fp_init(void)
     if (native_fcvt_on) {
         tcg_set_fcvt_ref(helper_todouble, helper_tosingle);
     }
+    native_anchor_on = native_env("PPC_NATIVE_FPMEM", true);
 #endif
 }
 
@@ -1185,11 +1186,148 @@ static inline void gen_qemu_st32fiw(DisasContext *ctx, TCGv_i64 arg1, TCGv arg2)
 GEN_STXF(stfiw, st32fiw, 0x17, 0x1E, PPC_FLOAT_STFIWX);
 
 /*            Floating-point Load/Store Instructions                         */
+/*
+ * FP loads and stores at constant offsets from one base register, with
+ * only FP arithmetic, other FP loads and stores and addi, addis, ori,
+ * oris (not writing the base) between them, share one TLB lookup: the
+ * first of them reads the TLB entry for the page they all lie on (see
+ * tcg_gen_qemu_anchor()), each then checks the entry and accesses the
+ * host page directly.  The run is found by reading ahead in the TB's
+ * page.  PPC_NATIVE_FPMEM=0 turns it off.
+ */
+static void native_anchor_init(DisasContext *ctx)
+{
+    uint32_t cf = tb_cflags(ctx->base.tb);
+
+    ctx->anc_on = native_anchor_on && ctx->base.host_addr[0] &&
+                  tcg_can_emit_qemu_anchor() &&
+                  !ctx->singlestep_flags &&
+                  !(cf & (CF_USE_ICOUNT | CF_MEMI_ONLY));
+    for (int i = 0; i < ARRAY_SIZE(ctx->anc); i++) {
+        ctx->anc[i].ra = -1;
+    }
+    memset(ctx->anc_seen, 0, sizeof(ctx->anc_seen));
+}
+
+#ifdef TARGET_PPC64
+/* FP X-form ops of primary opcode 63 that leave GPRs, TLB and TB alone */
+static bool anc_fp_x(unsigned xo)
+{
+    switch (xo) {
+    case 0: case 12: case 14: case 15: case 32: case 40: case 72: case 136:
+    case 264: case 583: case 814: case 815: case 846:
+        return true;
+    }
+    return false;
+}
+
+/*
+ * The run of accesses off ra from cia: count, window [*lo, *hi) off ra,
+ * any load, the last one's address.
+ */
+static int anc_scan(DisasContext *ctx, int ra, int *lo, int *hi, bool *ld,
+                    target_ulong *last)
+{
+    target_ulong pc = ctx->cia, page = ctx->base.pc_first & TARGET_PAGE_MASK;
+    int left = ctx->base.max_insns - ctx->base.num_insns + 1, n = 0;
+    const uint8_t *host = ctx->base.host_addr[0];
+
+    for (; left > 0 && (pc & TARGET_PAGE_MASK) == page; pc += 4, left--) {
+        const uint8_t *ip = host + (pc - ctx->base.pc_first);
+        uint32_t w = ctx->le_mode ? ldl_le_p(ip) : ldl_be_p(ip);
+        unsigned op = w >> 26, rt = (w >> 21) & 31, rs = (w >> 16) & 31;
+
+        if (op >= 48 && op <= 55) {
+            int d = (int16_t)w, size = op & 2 ? 8 : 4;
+
+            if (rs != ra) {
+                continue;
+            }
+            if (op & 1) {
+                break;
+            }
+            if (!n || d < *lo) {
+                *lo = d;
+            }
+            if (!n || d + size > *hi) {
+                *hi = d + size;
+            }
+            *ld = n ? *ld || op < 52 : op < 52;
+            *last = pc;
+            n++;
+        } else if (op == 59) {
+            continue;
+        } else if (op == 63) {
+            unsigned xo = (w >> 1) & 0x3ff;
+
+            if ((xo & 31) < 18 && !anc_fp_x(xo)) {
+                break;
+            }
+        } else if (op == 14 || op == 15) {
+            if (rt == ra) {
+                break;
+            }
+        } else if (op == 24 || op == 25) {
+            if (rs == ra) {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    return n;
+}
+
+/* The anchor for an access off ra at cia, or NULL */
+static FPAnchor *anc_get(DisasContext *ctx, int ra)
+{
+    FPAnchor *a = NULL;
+    target_ulong last = 0;
+    int n, wlo = 0, whi = 0;
+    bool ld = false;
+
+    if (!ctx->anc_on || ctx->base.plugin_enabled || ra == 0) {
+        return NULL;
+    }
+    for (int i = 0; i < ARRAY_SIZE(ctx->anc); i++) {
+        if (ctx->anc[i].ra == ra && ctx->anc[i].last >= ctx->cia) {
+            return &ctx->anc[i];
+        }
+    }
+    if (ctx->cia < ctx->anc_seen[ra]) {
+        return NULL;
+    }
+    n = anc_scan(ctx, ra, &wlo, &whi, &ld, &last);
+    ctx->anc_seen[ra] = n ? last + 4 : ctx->cia + 4;
+    if (n < 3) {
+        return NULL;
+    }
+    for (int i = 0; i < ARRAY_SIZE(ctx->anc); i++) {
+        if (ctx->anc[i].ra < 0 || ctx->anc[i].last < ctx->cia) {
+            a = &ctx->anc[i];
+            break;
+        }
+    }
+    if (!a) {
+        return NULL;
+    }
+    a->ra = ra;
+    a->last = last;
+    tcg_gen_qemu_anchor(&a->e, &a->pg, &a->p, cpu_gpr[ra], wlo, whi - 1,
+                        NARROW_MODE(ctx), ctx->mem_idx, ld);
+    return a;
+}
+#endif
+
 static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
                       bool update, bool store, bool single)
 {
-    TCGv ea;
+    TCGv ea = NULL;
     TCGv_i64 t0;
+    FPAnchor *a = NULL;
+#ifdef TARGET_PPC64
+    int32_t d = 0;
+#endif
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
     REQUIRE_FPU(ctx);
     if (update && ra == 0) {
@@ -1198,7 +1336,28 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
     }
     gen_set_access_type(ctx, ACCESS_FLOAT);
     t0 = tcg_temp_new_i64();
-    ea = do_ea_calc(ctx, ra, displ);
+#ifdef TARGET_PPC64
+    if (!update && tcgv_i64_temp(displ)->kind == TEMP_CONST) {
+        d = tcgv_i64_temp(displ)->val;
+        a = anc_get(ctx, ra);
+    }
+#endif
+    if (!a) {
+        ea = do_ea_calc(ctx, ra, displ);
+    }
+#ifdef TARGET_PPC64
+#define ANC_LD(w, v, mop) \
+    (a ? tcg_gen_qemu_ld_anc_##w(v, a->e, a->pg, a->p, cpu_gpr[ra], d, \
+                                 NARROW_MODE(ctx), ctx->mem_idx, mop) \
+       : tcg_gen_qemu_ld_##w(v, ea, ctx->mem_idx, mop))
+#define ANC_ST(w, v, mop) \
+    (a ? tcg_gen_qemu_st_anc_##w(v, a->e, a->pg, a->p, cpu_gpr[ra], d, \
+                                 NARROW_MODE(ctx), ctx->mem_idx, mop) \
+       : tcg_gen_qemu_st_##w(v, ea, ctx->mem_idx, mop))
+#else
+#define ANC_LD(w, v, mop) tcg_gen_qemu_ld_##w(v, ea, ctx->mem_idx, mop)
+#define ANC_ST(w, v, mop) tcg_gen_qemu_st_##w(v, ea, ctx->mem_idx, mop)
+#endif
     if (single && native_fcvt_on) {
         TCGv_i32 w = tcg_temp_new_i32();
         TCGv_vec v;
@@ -1206,10 +1365,10 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
         if (store) {
             v = native_fpr(rt);
             tcg_gen_f64to32_vec(w, v);
-            tcg_gen_qemu_st_i32(w, ea, ctx->mem_idx, DEF_MEMOP(MO_UL));
+            ANC_ST(i32, w, DEF_MEMOP(MO_UL));
         } else {
             v = tcg_temp_new_vec(TCG_TYPE_V64);
-            tcg_gen_qemu_ld_i32(w, ea, ctx->mem_idx, DEF_MEMOP(MO_UL));
+            ANC_LD(i32, w, DEF_MEMOP(MO_UL));
             tcg_gen_f32to64_vec(v, w);
             tcg_gen_st_vec(v, tcg_env, fpr_offset(rt));
             clear_fpr_dw1(rt);
@@ -1220,18 +1379,26 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
     } else if (store) {
         get_fpr(t0, rt);
         if (single) {
-            gen_qemu_st32fs(ctx, t0, ea);
+            TCGv_i32 w = tcg_temp_new_i32();
+
+            gen_helper_tosingle(w, t0);
+            ANC_ST(i32, w, DEF_MEMOP(MO_UL));
         } else {
-            gen_qemu_st64_i64(ctx, t0, ea);
+            ANC_ST(i64, t0, DEF_MEMOP(MO_UQ));
         }
     } else {
         if (single) {
-            gen_qemu_ld32fs(ctx, t0, ea);
+            TCGv_i32 w = tcg_temp_new_i32();
+
+            ANC_LD(i32, w, DEF_MEMOP(MO_UL));
+            gen_helper_todouble(t0, w);
         } else {
-            gen_qemu_ld64_i64(ctx, t0, ea);
+            ANC_LD(i64, t0, DEF_MEMOP(MO_UQ));
         }
         set_fpr(rt, t0);
     }
+#undef ANC_LD
+#undef ANC_ST
     if (update) {
         tcg_gen_mov_tl(cpu_gpr[ra], ea);
     }
