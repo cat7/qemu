@@ -3006,8 +3006,8 @@ typedef struct OOLStub {
     struct OOLStub *next;
     OOLKind kind;
     tcg_insn_unit *jmp;
-    const tcg_insn_unit *ret;
-    TCGReg rd, st, a, c, b;
+    const tcg_insn_unit *ret, *ret_st;
+    TCGReg rd, st, so, si, a, c, b;
     unsigned desc;
     TCGReg fpa[7];
     MemOpIdx oi;
@@ -3340,8 +3340,9 @@ static int fpa_zero(TCGContext *s, TCGReg rd, TCGReg st, TCGReg a,
     return n;
 }
 
-static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
-                            TCGReg a, TCGReg c, TCGReg b, unsigned desc)
+static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg so,
+                            TCGReg a, TCGReg c, TCGReg b, TCGReg si,
+                            unsigned desc, int32_t tbl, uint32_t smask)
 {
     unsigned op = desc & FPARITH_OP_MASK;
     bool ix = desc & FPARITH_INEXACT;
@@ -3356,8 +3357,12 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     TCGReg r, mask, tmp = TCG_VEC_TMP0;
     unsigned rlo = 2;
     tcg_insn_unit *tbnz;
+    const tcg_insn_unit *ret_st;
     OOLStub *ool;
     int nchk = 0;
+    TCGReg st = tcg_reg_alloc(s, tcg_target_available_regs[TCG_TYPE_I64],
+                              s->reserved_regs | 1ull << so | 1ull << si,
+                              0, false);
 
     fpa_alloc(s, FPA_NALLOC, 1ull << rd | 1ull << a | 1ull << c | 1ull << b);
     r = FPA_T(0);
@@ -3530,9 +3535,33 @@ static void tcg_out_fparith(TCGContext *s, TCGReg rd, TCGReg st,
     } else {
         tcg_out_mov(s, TCG_TYPE_V64, rd, r);
     }
-    ool = ool_new(s, OOL_FPARITH, tbnz, 1ull << rd | 1ull << st);
+
+    /* so = (si & ~smask) | tbl[st] */
+    ret_st = tcg_splitwx_to_rx(s->code_ptr);
+    if (tbl >= 0 && tbl < 0x1000) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP0,
+                     TCG_AREG0, tbl);
+    } else {
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, tbl);
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP0, TCG_REG_TMP0,
+                     TCG_AREG0);
+    }
+    /* ldr wst, [tmp0, st, lsl #2] */
+    tcg_out32(s, 0xb8607800 | st << 16 | TCG_REG_TMP0 << 5 | st);
+    if (is_limm(~(uint64_t)smask)) {
+        tcg_out_logicali(s, Ilogic_imm_ANDI, 1, so, si, ~(uint64_t)smask);
+    } else {
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, smask);
+        tcg_out_insn(s, logic_shift, BIC, TCG_TYPE_I64, so, si, TCG_REG_TMP0);
+    }
+    tcg_out_insn(s, logic_shift, ORR, TCG_TYPE_I64, so, so, st);
+
+    ool = ool_new(s, OOL_FPARITH, tbnz, 1ull << rd | 1ull << st | 1ull << so);
+    ool->ret_st = ret_st;
     ool->rd = rd;
     ool->st = st;
+    ool->so = so;
+    ool->si = si;
     ool->a = a;
     ool->c = c;
     ool->b = b;
@@ -3554,11 +3583,12 @@ static bool tcg_out_fparith_ool(TCGContext *s, OOLStub *t)
         return false;
     }
     nfix = fpa_zero(s, rd, st, t->a, t->c, t->b, t->desc, fix, &bdone);
-    reloc_pc26(bdone, t->ret);
+    reloc_pc26(bdone, t->ret_st);
     for (int i = 0; i < nfix; i++) {
         reloc_pc19(fix[i], tcg_splitwx_to_rx(s->code_ptr));
     }
     ool_save(s, t);
+    tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_X5, t->si);
     tcg_out32(s, FPA_UMOV_XD | (t->a & 31) << 5 | TCG_REG_X1);
     tcg_out32(s, FPA_UMOV_XD | (t->c & 31) << 5 | TCG_REG_X2);
     tcg_out32(s, FPA_UMOV_XD | (t->b & 31) << 5 | TCG_REG_X3);
@@ -3569,7 +3599,7 @@ static bool tcg_out_fparith_ool(TCGContext *s, OOLStub *t)
     tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_X1);
     ool_restore(s, t);
     tcg_out32(s, FPA_FMOV_DX | TCG_REG_TMP0 << 5 | (rd & 31));
-    tcg_out_mov(s, TCG_TYPE_I64, st, TCG_REG_TMP1);
+    tcg_out_mov(s, TCG_TYPE_I64, t->so, TCG_REG_TMP1);
     tcg_out_goto(s, t->ret);
     return true;
 }
@@ -4289,7 +4319,8 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         break;
 
     case INDEX_op_fparith_vec:
-        tcg_out_fparith(s, a0, a1, a2, args[3], args[4], args[5]);
+        tcg_out_fparith(s, a0, a1, a2, args[3], args[4], args[5], args[6],
+                        args[7], args[8]);
         break;
 
     case INDEX_op_vfparith_vec:
@@ -4571,7 +4602,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_bitsel_vec:
         return C_O1_I3(w, w, w, w);
     case INDEX_op_fparith_vec:
-        return C_O2_I3(w, r, w, w, w);
+        return C_O2_I4(w, r, w, w, w, r);
     case INDEX_op_vfparith_vec:
     case INDEX_op_perm2_vec:
         return C_O1_I3(w, w, w, w);
