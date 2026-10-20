@@ -1319,6 +1319,8 @@ struct CPUArchState {
     ppc_vsr_t vsr[64] QEMU_ALIGNED(16);
     /* Non-zero if and only if VSCR_SAT should be set */
     ppc_vsr_t vscr_sat QEMU_ALIGNED(16);
+    /* Constant: FPSCR bits by the status of an inline FP op, exact, relaxed */
+    uint32_t fparith_fpscr[2][32];
 
     /* when a memory exception occurs, the access type is stored here */
     int access_type;

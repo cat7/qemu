@@ -7332,6 +7332,9 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
     /* clean any pending stop state */
     env->resume_as_sreset = 0;
 #endif
+#ifdef CONFIG_TCG
+    ppc_fparith_fpscr_init(env);
+#endif
     hreg_compute_hflags(env);
     env->reserve_addr = (target_ulong)-1ULL;
     /* Be sure no exception or interrupt is pending */

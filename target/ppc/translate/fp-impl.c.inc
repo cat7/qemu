@@ -109,44 +109,19 @@ static TCGv_vec native_fpr(int regno)
     return v;
 }
 
-/* FPRF by class and sign: 5 bits per entry, sign + 2 * class */
-#define NATIVE_FPRF(cls, neg, fprf) \
-    ((uint64_t)(fprf) << (FPSCR_FPRF + 5 * ((cls) * 2 + (neg))))
-static const uint64_t native_fprf =
-    NATIVE_FPRF(FPARITH_CLASS_NORMAL, 0, 0x04) |
-    NATIVE_FPRF(FPARITH_CLASS_NORMAL, 1, 0x08) |
-    NATIVE_FPRF(FPARITH_CLASS_ZERO, 0, 0x02) |
-    NATIVE_FPRF(FPARITH_CLASS_ZERO, 1, 0x12) |
-    NATIVE_FPRF(FPARITH_CLASS_SUBNORMAL, 0, 0x14) |
-    NATIVE_FPRF(FPARITH_CLASS_SUBNORMAL, 1, 0x18) |
-    NATIVE_FPRF(FPARITH_CLASS_INF, 0, 0x05) |
-    NATIVE_FPRF(FPARITH_CLASS_INF, 1, 0x09) |
-    NATIVE_FPRF(FPARITH_CLASS_QNAN, 0, 0x11) |
-    NATIVE_FPRF(FPARITH_CLASS_QNAN, 1, 0x11);
-
 /* FPSCR from the status: FPRF; FI, XX and FX unless relaxed */
 static void native_fp_fpscr(TCGv_i64 st, bool relaxed)
 {
     TCGv_i64 f = tcg_temp_new_i64();
-    TCGv_i64 sh = tcg_temp_new_i64();
+    TCGv_ptr p = tcg_temp_new_ptr();
     TCGv t = tcg_temp_new();
-    target_ulong mask = FP_FPRF;
+    target_ulong mask = relaxed ? FP_FPRF : FP_FPRF | FP_FI;
 
-    QEMU_BUILD_BUG_ON(FPARITH_ST_NEG != 2 || FPARITH_ST_CLASS != 2);
-    tcg_gen_extract_i64(sh, st, 1, 4);
-    tcg_gen_shli_i64(f, sh, 2);
-    tcg_gen_add_i64(sh, sh, f);
-    tcg_gen_shr_i64(f, tcg_constant_i64(native_fprf), sh);
-    tcg_gen_andi_i64(f, f, FP_FPRF);
-    if (!relaxed) {
-        TCGv_i64 ix = tcg_temp_new_i64();
-
-        tcg_gen_andi_i64(ix, st, FPARITH_ST_INEXACT);
-        tcg_gen_neg_i64(ix, ix);
-        tcg_gen_andi_i64(ix, ix, FP_FI | FP_XX | FP_FX);
-        tcg_gen_or_i64(f, f, ix);
-        mask |= FP_FI;
-    }
+    tcg_gen_andi_i64(f, st, 31);
+    tcg_gen_shli_i64(f, f, 2);
+    tcg_gen_trunc_i64_ptr(p, f);
+    tcg_gen_add_ptr(p, p, tcg_env);
+    tcg_gen_ld32u_i64(f, p, offsetof(CPUPPCState, fparith_fpscr[relaxed]));
     tcg_gen_trunc_i64_tl(t, f);
     tcg_gen_andi_tl(cpu_fpscr, cpu_fpscr, ~mask);
     tcg_gen_or_tl(cpu_fpscr, cpu_fpscr, t);
