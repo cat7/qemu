@@ -774,6 +774,39 @@ static bool fparith_host(unsigned op, bool sgl, uint64_t a, uint64_t c,
 }
 
 /*
+ * The FPSCR bits of the inline FP ops by their status' low five bits
+ * (inexact, sign, class): FPRF, and FI, XX and FX for an inexact result
+ * unless relaxed.
+ */
+void ppc_fparith_fpscr_init(CPUPPCState *env)
+{
+    static const uint8_t fprf[][2] = {
+        [FPARITH_CLASS_NORMAL] = { 0x04, 0x08 },
+        [FPARITH_CLASS_ZERO] = { 0x02, 0x12 },
+        [FPARITH_CLASS_SUBNORMAL] = { 0x14, 0x18 },
+        [FPARITH_CLASS_INF] = { 0x05, 0x09 },
+        [FPARITH_CLASS_QNAN] = { 0x11, 0x11 },
+    };
+
+    QEMU_BUILD_BUG_ON(FPARITH_ST_INEXACT != 1 || FPARITH_ST_NEG != 2 ||
+                      FPARITH_ST_CLASS != 2);
+    for (int relaxed = 0; relaxed < 2; relaxed++) {
+        for (int i = 0; i < 32; i++) {
+            int cls = i >> 2, neg = (i >> 1) & 1;
+            uint32_t f = 0;
+
+            if (cls < ARRAY_SIZE(fprf)) {
+                f = fprf[cls][neg] << FPSCR_FPRF;
+                if ((i & FPARITH_ST_INEXACT) && !relaxed) {
+                    f |= FP_FI | FP_XX | FP_FX;
+                }
+            }
+            env->fparith_fpscr[relaxed][i] = f;
+        }
+    }
+}
+
+/*
  * The inline FP ops' (fp-impl.c.inc) result and status for the cases
  * they do not compute themselves: the helpers' result, FPARITH_ST_OFF if
  * the helpers would set more than FI, XX and FX.
