@@ -327,7 +327,7 @@ static void register_604_sprs(CPUPPCState *env)
 
     spr_register(env, SPR_SDA, "SDA",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, SPR_NOACCESS,
+                 &spr_read_generic, &spr_write_generic,
                  0x00000000);
     /* External access control */
     spr_register(env, SPR_EAR, "EAR",
