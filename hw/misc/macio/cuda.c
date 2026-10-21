@@ -122,25 +122,35 @@ static void cuda_set_sr_int(void *opaque)
     MOS6522CUDAState *mcs = &s->mos6522_cuda;
     MOS6522State *ms = MOS6522(mcs);
     qemu_irq irq = qdev_get_gpio_in(DEVICE(ms), SR_INT_BIT);
+    bool waiting = (ms->b & TIP) && s->data_in_index == 0 &&
+                   s->data_in_size > 0;
 
     qemu_set_irq(irq, 1);
 
     /*
-     * This SR_INT pulse is the only signal telling the host "a queued
-     * host-to-CUDA-to-host response is ready to be clocked out" -- it
-     * fires exactly once, 20us after the response was queued. If the
-     * ROM's polling loop doesn't happen to sample IFR's SR flag inside
-     * that narrow window (e.g. because it's masking interrupts to poll
-     * TREQ directly instead, as this ROM's ADB-reset-completion code
-     * does), the one-shot pulse is missed forever and TREQ/data_in
-     * never get drained, even though real hardware's single-threaded
-     * CUDA firmware would keep representing the same pending condition
-     * on every one of its own idle-loop passes. Keep re-pulsing while
-     * a response is still undrained so a later poll gets another
-     * chance, instead of relying on catching this one exact instant.
+     * Repeat the pulse while a queued response waits and the host is
+     * idle: the Beige ROM's ADB reset reads SR more than once before it
+     * starts the transfer. Once the transfer runs, only per-byte pulses.
      */
-    if (s->data_in_index < s->data_in_size) {
+    if (waiting) {
+        s->sr_attn_unread = true;
         cuda_delay_set_sr_int(s, CUDA_SR_DELAY_RETRY);
+    }
+}
+
+/*
+ * At the start of a transfer, drop a waiting pulse the host has not
+ * read. Left set, the host runs one interrupt ahead, takes the
+ * end-of-transfer interrupt for a new packet and passes a negative
+ * byte count to the ADB completion.
+ */
+static void cuda_drop_stale_sr_int(CUDAState *s)
+{
+    MOS6522State *ms = MOS6522(&s->mos6522_cuda);
+
+    if (s->sr_attn_unread) {
+        s->sr_attn_unread = false;
+        mos6522_read(ms, VIA_REG_SR, 1);
     }
 }
 
@@ -182,6 +192,9 @@ static void cuda_update(CUDAState *s)
             if (s->data_in_index < s->data_in_size) {
                 /* data input */
                 if ((ms->b & (TACK | TIP)) != (s->last_b & (TACK | TIP))) {
+                    if (s->data_in_index == 0) {
+                        cuda_drop_stale_sr_int(s);
+                    }
                     ms->sr = s->data_in[s->data_in_index++];
                     trace_cuda_data_recv(ms->sr);
                     /* indicate end of transfer */
@@ -939,6 +952,9 @@ static uint64_t mos6522_cuda_read(void *opaque, hwaddr addr, unsigned size)
     MOS6522State *ms = MOS6522(mcs);
 
     addr = (addr >> 9) & 0xf;
+    if (addr == VIA_REG_SR) {
+        s->sr_attn_unread = false;
+    }
     return mos6522_read(ms, addr, size);
 }
 
@@ -993,6 +1009,7 @@ static void cuda_reset(DeviceState *dev)
 
     s->data_in_size = 0;
     s->data_in_index = 0;
+    s->sr_attn_unread = false;
     s->data_out_index = 0;
 
     s->one_sec_mode = 0;
