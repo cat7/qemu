@@ -12,6 +12,7 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qemu/module.h"
 #include "net/net.h"
 #include "net/eth.h"
@@ -233,7 +234,12 @@ struct SunGEMState {
     uint8_t tx_data[MAX_PACKET_SIZE];
     uint32_t tx_size;
     uint64_t tx_first_ctl;
+
+    QEMUTimer *tx_timer;
 };
+
+/* A kick is sent after this, not within the register write */
+#define SUNGEM_TX_DELAY_NS  100000
 
 
 static void sungem_eval_irq(SunGEMState *s)
@@ -371,14 +377,13 @@ static void sungem_process_tx_desc(SunGEMState *s, struct gem_txd *desc)
     }
 }
 
-static void sungem_tx_kick(SunGEMState *s)
+static void sungem_tx_kick(void *opaque)
 {
+    SunGEMState *s = opaque;
     PCIDevice *d = PCI_DEVICE(s);
     uint32_t comp, kick;
     uint32_t txdma_cfg, txmac_cfg, ints;
     uint64_t dbase;
-
-    trace_sungem_tx_kick();
 
     /* Check that both TX MAC and TX DMA are enabled. We don't
      * handle DMA-less direct FIFO operations (we don't emulate
@@ -728,6 +733,7 @@ static void sungem_reset_tx(SunGEMState *s)
 
     s->tx_size = 0;
     s->tx_first_ctl = 0;
+    timer_del(s->tx_timer);
 }
 
 static void sungem_reset_all(SunGEMState *s, bool pci_reset)
@@ -965,7 +971,11 @@ static void sungem_mmio_txdma_write(void *opaque, hwaddr addr, uint64_t val,
     /* Post write action */
     switch (addr) {
     case TXDMA_KICK:
-        sungem_tx_kick(s);
+        trace_sungem_tx_kick();
+        if (!timer_pending(s->tx_timer)) {
+            timer_mod(s->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      SUNGEM_TX_DELAY_NS);
+        }
         break;
     case TXDMA_CFG:
         sungem_update_masks(s);
@@ -1335,6 +1345,7 @@ static void sungem_uninit(PCIDevice *dev)
     SunGEMState *s = SUNGEM(dev);
 
     qemu_del_nic(s->nic);
+    timer_free(s->tx_timer);
 }
 
 static NetClientInfo net_sungem_info = {
@@ -1352,6 +1363,7 @@ static void sungem_realize(PCIDevice *pci_dev, Error **errp)
     uint8_t *pci_conf;
 
     pci_conf = pci_dev->config;
+    s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sungem_tx_kick, s);
 
     pci_set_word(pci_conf + PCI_STATUS,
                  PCI_STATUS_FAST_BACK |
@@ -1431,10 +1443,21 @@ static const Property sungem_properties[] = {
     DEFINE_PROP_UINT32("phy_addr", SunGEMState, phy_addr, 0),
 };
 
+static int sungem_post_load(void *opaque, int version_id)
+{
+    SunGEMState *s = opaque;
+
+    if (s->txdmaregs[TXDMA_KICK >> 2] != s->txdmaregs[TXDMA_TXDONE >> 2]) {
+        timer_mod(s->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_sungem = {
     .name = "sungem",
     .version_id = 0,
     .minimum_version_id = 0,
+    .post_load = sungem_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(pdev, SunGEMState),
         VMSTATE_MACADDR(conf.macaddr, SunGEMState),
