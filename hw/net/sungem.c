@@ -229,6 +229,7 @@ struct SunGEMState {
     /* Cache some useful things */
     uint32_t rx_mask;
     uint32_t tx_mask;
+    bool rx_kicked;
 
     /* Current tx packet */
     uint8_t tx_data[MAX_PACKET_SIZE];
@@ -445,10 +446,13 @@ static void sungem_tx_kick(void *opaque)
     sungem_update_status(s, GREG_STAT_TXALL, true);
 }
 
-/* Descriptors done..kick-1 belong to the device; none when they meet */
+/*
+ * The device stops one short of kick, so the two meet only when the driver
+ * posts the whole ring. Nothing is posted until the first kick after a reset.
+ */
 static bool sungem_rx_full(SunGEMState *s, uint32_t kick, uint32_t done)
 {
-    return (kick & s->rx_mask) == (done & s->rx_mask);
+    return !s->rx_kicked || (kick & s->rx_mask) == ((done + 1) & s->rx_mask);
 }
 
 static bool sungem_can_receive(NetClientState *nc)
@@ -712,6 +716,7 @@ static void sungem_reset_rx(SunGEMState *s)
     s->rxdmaregs[RXDMA_FSZ >> 2] = 0x140;
     s->rxdmaregs[RXDMA_DONE >> 2] = 0;
     s->rxdmaregs[RXDMA_KICK >> 2] = 0;
+    s->rx_kicked = false;
     s->rxdmaregs[RXDMA_CFG >> 2] = 0x1000010;
     s->rxdmaregs[RXDMA_PTHRESH >> 2] = 0xf8;
     s->rxdmaregs[RXDMA_BLANK >> 2] = 0;
@@ -1046,6 +1051,7 @@ static void sungem_mmio_rxdma_write(void *opaque, hwaddr addr, uint64_t val,
     switch (addr) {
     case RXDMA_KICK:
         trace_sungem_rx_kick(val);
+        s->rx_kicked = true;
         if (sungem_can_receive(qemu_get_queue(s->nic))) {
             qemu_flush_queued_packets(qemu_get_queue(s->nic));
         }
@@ -1451,6 +1457,7 @@ static int sungem_post_load(void *opaque, int version_id)
 {
     SunGEMState *s = opaque;
 
+    s->rx_kicked = true;
     if (s->txdmaregs[TXDMA_KICK >> 2] != s->txdmaregs[TXDMA_TXDONE >> 2]) {
         timer_mod(s->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
