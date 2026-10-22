@@ -254,9 +254,18 @@ static uint32_t get_queue(void *opaque)
     return val;
 }
 
+/* The channel's transmit interrupt pending bit; RR3 lives in channel A */
+static bool escc_txip(ESCCChannelState *s)
+{
+    if (s->chn == escc_chn_a) {
+        return s->rregs[R_INTR] & INTR_TXINTA;
+    }
+    return s->otherchn->rregs[R_INTR] & INTR_TXINTB;
+}
+
 static int escc_update_irq_chn(ESCCChannelState *s)
 {
-    if ((((s->wregs[W_INTR] & INTR_TXINT) && (s->txint == 1)) ||
+    if ((((s->wregs[W_INTR] & INTR_TXINT) && escc_txip(s)) ||
         /* tx ints enabled, pending */
         ((((s->wregs[W_INTR] & INTR_RXMODEMSK) == INTR_RXINT1ST) ||
         ((s->wregs[W_INTR] & INTR_RXMODEMSK) == INTR_RXINTALL)) &&
@@ -278,7 +287,9 @@ static void escc_update_irq(ESCCChannelState *s)
     irq |= escc_update_irq_chn(s->otherchn);
 
     trace_escc_update_irq(irq);
+    /* Both lines carry the state of both channels; update them together */
     qemu_set_irq(s->irq, irq);
+    qemu_set_irq(s->otherchn->irq, irq);
 }
 
 static void escc_reset_chn(ESCCChannelState *s)
