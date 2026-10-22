@@ -190,6 +190,7 @@ struct ATIRage128State {
     uint32_t fifo_stage_n;            /* BQL */
     uint32_t *fifo_batch;             /* one batch per queue slot */
     MemoryRegion vram_aper1;  /* alias of VRAM in the aperture's top half */
+    MemoryRegion vram_aper0_swap; /* aperture 0 while it has a swap mode */
     MemoryRegion mmio;        /* BAR2: 16KB register file */
     MemoryRegion io;          /* BAR1: 256-byte I/O register window */
     QemuConsole *con;
