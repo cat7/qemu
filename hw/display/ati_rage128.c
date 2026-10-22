@@ -174,6 +174,8 @@ static void ati_rage128_maybe_capture_mode(ATIRage128State *s)
     }
 }
 
+static void ati_rage128_update_aper0(ATIRage128State *s);
+
 /*
  * All drawing converts through an allocated 32bpp surface. VRAM bytes
  * are decoded CHIP-NATIVE LITTLE-ENDIAN: with the aperture-1 byte
@@ -2152,6 +2154,7 @@ static void ati_rage128_reg_write32(ATIRage128State *s, uint32_t base,
         break;
     case R128_CONFIG_CNTL:
         s->regs[base >> 2] = val;
+        ati_rage128_update_aper0(s);
         trace_ati_rage128_aper_endian(val & R128_APER_0_ENDIAN_MASK,
             (val >> R128_APER_1_ENDIAN_SHIFT) & R128_APER_0_ENDIAN_MASK,
             !!(val & R128_APER_REG_ENDIAN));
@@ -4244,14 +4247,13 @@ static const MemoryRegionOps ati_rage128_mmio_ops = {
  * put an access's most-significant byte at the lowest address, so
  * lane i of an N-byte access carries byte N-1-i of the value.
  */
-static uint64_t ati_rage128_aper1_read(void *opaque, hwaddr addr,
-                                       unsigned size)
+static uint64_t ati_rage128_aper_swap_read(ATIRage128State *s, hwaddr addr,
+                                           unsigned size, unsigned shift)
 {
-    ATIRage128State *s = opaque;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     static const uint32_t xor_map[4] = { 0, 1, 3, 2 };
-    uint32_t mode = (s->regs[R128_CONFIG_CNTL >> 2] >>
-                     R128_APER_1_ENDIAN_SHIFT) & R128_APER_0_ENDIAN_MASK;
+    uint32_t mode = (s->regs[R128_CONFIG_CNTL >> 2] >> shift) &
+                    R128_APER_0_ENDIAN_MASK;
     uint32_t lane_xor = xor_map[mode];
     uint64_t val = 0;
     unsigned i;
@@ -4266,14 +4268,14 @@ static uint64_t ati_rage128_aper1_read(void *opaque, hwaddr addr,
     return val;
 }
 
-static void ati_rage128_aper1_write(void *opaque, hwaddr addr, uint64_t data,
-                                    unsigned size)
+static void ati_rage128_aper_swap_write(ATIRage128State *s, hwaddr addr,
+                                        uint64_t data, unsigned size,
+                                        unsigned shift)
 {
-    ATIRage128State *s = opaque;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     static const uint32_t xor_map[4] = { 0, 1, 3, 2 };
-    uint32_t mode = (s->regs[R128_CONFIG_CNTL >> 2] >>
-                     R128_APER_1_ENDIAN_SHIFT) & R128_APER_0_ENDIAN_MASK;
+    uint32_t mode = (s->regs[R128_CONFIG_CNTL >> 2] >> shift) &
+                    R128_APER_0_ENDIAN_MASK;
     uint32_t lane_xor = xor_map[mode];
     unsigned i;
 
@@ -4300,10 +4302,49 @@ static void ati_rage128_aper1_write(void *opaque, hwaddr addr, uint64_t data,
             py = rel / (pitch * 4);
             px = (rel % (pitch * 4)) / 4;
         }
-        trace_ati_rage128_aper_wr(1, (uint32_t)addr, size, data, px, py);
+        trace_ati_rage128_aper_wr(shift ? 1 : 0, (uint32_t)addr, size, data,
+                                  px, py);
     }
     /* keep the dirty-bitmap framebuffer scanner seeing these writes */
     memory_region_set_dirty(&s->vram, addr & ~7ull, 8);
+}
+
+static uint64_t ati_rage128_aper1_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    return ati_rage128_aper_swap_read(opaque, addr, size,
+                                      R128_APER_1_ENDIAN_SHIFT);
+}
+
+static void ati_rage128_aper1_write(void *opaque, hwaddr addr, uint64_t data,
+                                    unsigned size)
+{
+    ati_rage128_aper_swap_write(opaque, addr, data, size,
+                                R128_APER_1_ENDIAN_SHIFT);
+}
+
+/*
+ * Aperture 0 is a plain RAM mapping while its swap mode is 0. Linux's
+ * aty128fb on a big-endian Mac draws through aperture 0 with a 16- or
+ * 32-bit swap set; for that a swapping view covers it.
+ */
+static uint64_t ati_rage128_aper0_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    return ati_rage128_aper_swap_read(opaque, addr, size, 0);
+}
+
+static void ati_rage128_aper0_write(void *opaque, hwaddr addr, uint64_t data,
+                                    unsigned size)
+{
+    ati_rage128_aper_swap_write(opaque, addr, data, size, 0);
+}
+
+static void ati_rage128_update_aper0(ATIRage128State *s)
+{
+    memory_region_set_enabled(&s->vram_aper0_swap,
+                              s->regs[R128_CONFIG_CNTL >> 2] &
+                              R128_APER_0_ENDIAN_MASK);
 }
 
 /*
@@ -4395,6 +4436,20 @@ static const MemoryRegionOps ati_rage128_aper1_ops = {
         .max_access_size = 8,
     },
 };
+static const MemoryRegionOps ati_rage128_aper0_ops = {
+    .read = ati_rage128_aper0_read,
+    .write = ati_rage128_aper0_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
 
 /* ---------------------------------------------------------------- */
 
@@ -4417,6 +4472,7 @@ static void ati_rage128_reset_hold(Object *obj, ResetType type)
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->plls, 0, sizeof(s->plls));
+    ati_rage128_update_aper0(s);
     ati_rage128_palette_reset(s);
     /* every driver's engine init writes all-ones here; a zero mask
      * would silently draw nothing until it does */
@@ -4771,6 +4827,10 @@ static void ati_rage128_realize(PCIDevice *dev, Error **errp)
                           "ati-rage128-aper1", ATI_RAGE128_VRAM_SIZE);
     memory_region_add_subregion(&s->aper, ATI_RAGE128_APER_SIZE / 2,
                                 &s->vram_aper1);
+    memory_region_init_io(&s->vram_aper0_swap, obj, &ati_rage128_aper0_ops, s,
+                          "ati-rage128-aper0-swap", ATI_RAGE128_VRAM_SIZE);
+    memory_region_add_subregion_overlap(&s->aper, 0, &s->vram_aper0_swap, 2);
+    memory_region_set_enabled(&s->vram_aper0_swap, false);
     /*
      * Optional diagnostic overlay on aperture 0 (see the fillwatch fields
      * in the header). Higher priority than the RAM alias underneath, so
@@ -4895,10 +4955,17 @@ static void ati_rage128_exit(PCIDevice *dev)
     qemu_graphic_console_close(s->con);
 }
 
+static int ati_rage128_post_load(void *opaque, int version_id)
+{
+    ati_rage128_update_aper0(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ati_rage128 = {
     .name = "ati-rage128-pro",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ati_rage128_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, ATIRage128State),
         VMSTATE_UINT32_ARRAY(regs, ATIRage128State, ATI_RAGE128_NUM_REGS),
