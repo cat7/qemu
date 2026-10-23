@@ -58,6 +58,7 @@ struct UNINHostState {
     MemoryRegion pci_mmio;
     MemoryRegion pci_hole;
     MemoryRegion pci_io;
+    MemoryRegion pci_hole2;     /* U3 AGP: 0xf1000000, 16 MB */
 
     /* U3 AGP GART */
     uint32_t gart_base;

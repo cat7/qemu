@@ -292,11 +292,15 @@ static void pci_u3_agp_init(Object *obj)
     memory_region_init_alias(&s->pci_hole, OBJECT(s),
                              "unin-pci-hole", &s->pci_mmio,
                              0x90000000ULL, 0x10000000ULL);
+    memory_region_init_alias(&s->pci_hole2, OBJECT(s),
+                             "unin-pci-hole2", &s->pci_mmio,
+                             0xf1000000ULL, 0x01000000ULL);
 
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
     sysbus_init_mmio(sbd, &s->pci_hole);
     sysbus_init_mmio(sbd, &s->pci_io);
+    sysbus_init_mmio(sbd, &s->pci_hole2);
 
     qdev_init_gpio_out(DEVICE(obj), s->irqs, ARRAY_SIZE(s->irqs));
 }

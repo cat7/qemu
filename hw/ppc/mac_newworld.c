@@ -387,6 +387,9 @@ static void ppc_core99_init(MachineState *machine)
         /* PCI hole */
         memory_region_add_subregion(get_system_memory(), 0x90000000,
                                     sysbus_mmio_get_region(s, 2));
+        /* second AGP window: register and ROM BARs of a 256 MB card */
+        memory_region_add_subregion(get_system_memory(), 0xf1000000,
+                                    sysbus_mmio_get_region(s, 4));
         /* Register 8 MB of ISA IO space */
         memory_region_add_subregion(get_system_memory(), 0xf0000000,
                                     sysbus_mmio_get_region(s, 3));
