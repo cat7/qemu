@@ -681,7 +681,7 @@
 #define PLL_TEST_CNTL                           0x13
 #define P2PLL_CNTL                              0x2a
 #define P2PLL_REF_DIV                           0x2b
-#define P2PLL_DIV_0                             0x2b
+#define P2PLL_DIV_0                             0x2c
 #define POWER_MANAGEMENT                        0x2f
 
 /* Radeon R100/RV100 clock registers differ from the Rage128 aliases above. */

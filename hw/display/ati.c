@@ -1021,6 +1021,9 @@ static void ati_pll_write(ATIVGAState *s, hwaddr addr, uint64_t data,
                  (PPLL_ATOMIC_UPDATE_EN | PPLL_VGA_ATOMIC_UPDATE_EN))) {
         ati_pll_commit(s);
         ati_crtc_start(s);
+    } else if (index == P2PLL_REF_DIV) {
+        /* CRTC2 is not scanned out; its PLL update completes at once */
+        s->regs.pll[index] &= ~PPLL_ATOMIC_UPDATE_R;
     }
 }
 
