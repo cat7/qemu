@@ -7,7 +7,7 @@
  * 128 register lineage for the display controller (CRTC/DAC/palette/
  * cursor/I2C/GPIO), the 2D GUI engine (0x14xx), the scratch registers
  * and the PM4 command-stream format, so all of that is inherited; what
- * changes is the identity, the aperture layout (128MB frame buffer
+ * changes is the identity, the aperture layout (256MB frame buffer
  * BAR, 64KB register BAR), the memory-controller address windows
  * (MC_FB_LOCATION / MC_AGP_LOCATION -- engine and CP addresses are
  * card addresses, not frame-buffer offsets), the CP ring (CP_RB_*,
@@ -61,15 +61,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIR350State, ATI_R350)
  *   BAR2: 16KB memory, register aperture
  *   Expansion ROM: 128KB
  */
-#define ATI_R350_APER_SIZE   (128 * 1024 * 1024)
+#define ATI_R350_APER_SIZE   (256 * 1024 * 1024)
 /*
- * 128MB: the retail 9800 Pro Mac Edition's memory (the "SE" and the
- * OEM XT carry 256MB). The whole BAR0 aperture is the frame buffer --
+ * 256MB, as on the OEM 9800 XT and the retail "SE": their ROMs hard-code
+ * it and put the second head's frame buffer at half of it. The whole
+ * BAR0 aperture is the frame buffer --
  * unlike the Rage 128 there is no second aperture image; the Radeon's
  * byte swappers are SURFACE_CNTL's non-surface/surface swap bits.
  * Quartz Extreme needs >= 16MB, Quartz 2D Extreme >= 64MB.
  */
-#define ATI_R350_VRAM_SIZE   (128 * 1024 * 1024)
+#define ATI_R350_VRAM_SIZE   (256 * 1024 * 1024)
 /* live swapped ranges: eight surfaces and the gaps around them */
 #define ATI_R350_SWAP_WINS   17
 #define ATI_R350_MMIO_SIZE   (64 * 1024)

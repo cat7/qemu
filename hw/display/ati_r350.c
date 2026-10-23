@@ -5107,7 +5107,7 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                                          &ati_r350_gfx_ops, s);
 
     /*
-     * BAR0: the 128MB linear frame-buffer aperture, all of it VRAM. The
+     * BAR0: the 256MB linear frame-buffer aperture, all of it VRAM. The
      * ranges a SURFACE_CNTL byte swapper covers are overlaid with a
      * swapping window (ati_r350_aper_remap()); the rest maps the RAM.
      */
