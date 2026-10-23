@@ -1263,6 +1263,8 @@
 #define R300_PVS_UCP_START            0x400
 #define R300_PVS_CLIP_WRAP            7
 #define R300_VAP_PVS_UPLOAD_DATA      0x2208
+/* the 32-bit port into the same memory, through the same counter */
+#define R300_VAP_PVS_VECTOR_DATA      0x2204
 /*
  * Which instruction slots the program in force occupies (FIRST [9:0],
  * LAST [29:20]) and where its constants begin (CONST_BASE_OFFSET [7:0],

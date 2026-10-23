@@ -2440,6 +2440,7 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         s->pvs_upload_addr = val;
         s->pvs_upload_cnt = 0;
         break;
+    case R300_VAP_PVS_VECTOR_DATA:
     case R300_VAP_PVS_UPLOAD_DATA:
         s->regs[base >> 2] = val;
         if (s->pvs_upload_addr >= R300_PVS_UCP_START) {
