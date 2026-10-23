@@ -4601,18 +4601,33 @@ static bool r300_setup_draw(ATIR350State *s, R300DrawState *d,
         d->tex_attr[i] = -1;
     }
     memset(&d->vs, 0, sizeof(d->vs));
-    if (!(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS) &&
-        s->pvs_const_dwords >= 16 &&
-        r300_f32(s->regs[R300_SE_VPORT_XSCALE >> 2]) != 0.0f) {
-        r300_pvs_out_layout(s->regs[R300_VAP_OUTPUT_VTX_FMT_0 >> 2],
-                            &first_color, &ncolor, &first_tex);
-        r300_pvs_analyse(&d->vs, s->pvs_code, s->pvs_code_slot_valid,
-                         R300_PVS_CODE_SLOTS,
-                         s->pvs_const, R300_PVS_CONST_SLOTS,
-                         s->regs[R300_VAP_PVS_CODE_CNTL_0 >> 2],
-                         s->regs[R300_VAP_PVS_CONST_CNTL >> 2],
-                         first_tex);
-        vs_live = true;
+    {
+        bool tcl = !(s->regs[R300_VAP_CNTL_STATUS >> 2] & R300_VAP_PVS_BYPASS);
+        bool xs = r300_f32(s->regs[R300_SE_VPORT_XSCALE >> 2]) != 0.0f;
+        /* a full matrix and a viewport: the program or its stand-in */
+        bool mat = tcl && s->pvs_const_dwords >= 16 && xs;
+        /*
+         * Linux's EXA programs take two constants per texture and turn
+         * the viewport off: such a draw runs when its program is whole.
+         */
+        bool prog = tcl && s->pvs_code_dwords &&
+                    (xs || !(s->regs[R300_VAP_VTE_CNTL >> 2] &
+                             R300_VTE_VPORT_X_SCALE_ENA));
+
+        if (mat || prog) {
+            r300_pvs_out_layout(s->regs[R300_VAP_OUTPUT_VTX_FMT_0 >> 2],
+                                &first_color, &ncolor, &first_tex);
+            r300_pvs_analyse(&d->vs, s->pvs_code, s->pvs_code_slot_valid,
+                             R300_PVS_CODE_SLOTS,
+                             s->pvs_const, R300_PVS_CONST_SLOTS,
+                             s->regs[R300_VAP_PVS_CODE_CNTL_0 >> 2],
+                             s->regs[R300_VAP_PVS_CONST_CNTL >> 2],
+                             first_tex);
+            vs_live = mat || d->vs.valid;
+            if (!vs_live) {
+                memset(&d->vs, 0, sizeof(d->vs));
+            }
+        }
     }
     /*
      * A VERTEX EIGHT DWORDS WIDE IS NOT THE ONLY VERTEX THAT CARRIES A
