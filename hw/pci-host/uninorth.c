@@ -152,9 +152,10 @@ static void pci_unin_main_init(Object *obj)
     memory_region_init_io(&s->pci_io, OBJECT(s), &unassigned_io_ops, obj,
                           "unin-pci-isa-mmio", 0x00800000);
 
+    /* 0x80000000-0x9fffffff, as on a real PowerMac3,x main bus */
     memory_region_init_alias(&s->pci_hole, OBJECT(s),
                              "unin-pci-hole", &s->pci_mmio,
-                             0x80000000ULL, 0x10000000ULL);
+                             0x80000000ULL, 0x20000000ULL);
 
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
