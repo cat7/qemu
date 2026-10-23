@@ -128,17 +128,56 @@ static unsigned ati_r350_host_data_swap_xor(ATIR350State *s)
                              R350_HOST_DATA_SWAP_MASK);
 }
 
+/*
+ * Engine addresses are card addresses: inside MC_FB_LOCATION's window
+ * they are VRAM, anywhere else the engine masters the bus. Linux puts
+ * the window at the aperture and its GTT at 0, so a small address is
+ * not a VRAM offset. Before the window is programmed they are offsets.
+ */
+static bool ati_r350_2d_vram(ATIR350State *s, uint32_t addr, unsigned n,
+                             uint32_t *off)
+{
+    if (!s->regs[R350_MC_FB_LOCATION >> 2]) {
+        *off = addr;
+    } else if (!ati_r350_mc_to_vram(s, addr, off)) {
+        return false;
+    }
+    return (uint64_t)*off + n <= ATI_R350_VRAM_SIZE;
+}
+
+/* the GL hooks take VRAM offsets; nothing outside VRAM is GL-held */
+static void ati_r350_2d_gl_dirty(ATIR350State *s, uint32_t addr,
+                                 uint32_t len)
+{
+    uint32_t off;
+
+    if (ati_r350_2d_vram(s, addr, 0, &off)) {
+        ati_r350_gl_dirty(s, off, MIN(len, ATI_R350_VRAM_SIZE - off));
+    }
+}
+
+static void ati_r350_2d_gl_touch(ATIR350State *s, uint32_t addr,
+                                 uint32_t len)
+{
+    uint32_t off;
+
+    if (ati_r350_2d_vram(s, addr, 0, &off)) {
+        ati_r350_gl_touch(s, off, MIN(len, ATI_R350_VRAM_SIZE - off));
+    }
+}
+
 static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
                                           uint32_t stride, int x, int y,
                                           int bpp)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
+    uint32_t voff;
 
     if (x < 0 || y < 0) {
         return 0;
     }
-    if (addr + bpp / 8 > ATI_R350_VRAM_SIZE) {
+    if (!ati_r350_2d_vram(s, addr, bpp / 8, &voff)) {
         /*
          * Card address outside VRAM: the engine is a bus master, so
          * fetch through the MC/GART. This is OS X's surface page-in --
@@ -198,13 +237,13 @@ static uint32_t ati_r350_2d_read_pixel(ATIR350State *s, uint32_t offset,
     }
     switch (bpp) {
     case 8:
-        return vram[addr];
+        return vram[voff];
     case 16:
-        return lduw_le_p(vram + addr);
+        return lduw_le_p(vram + voff);
     case 24:
-        return ((uint32_t)vram[addr + 2] << 16) | lduw_le_p(vram + addr);
+        return ((uint32_t)vram[voff + 2] << 16) | lduw_le_p(vram + voff);
     case 32:
-        return ldl_le_p(vram + addr);
+        return ldl_le_p(vram + voff);
     default:
         return 0;
     }
@@ -216,11 +255,12 @@ static void ati_r350_2d_write_pixel(ATIR350State *s, uint32_t offset,
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t addr = offset + (uint32_t)y * stride + (uint32_t)x * (bpp / 8);
+    uint32_t voff;
 
     if (x < 0 || y < 0) {
         return;
     }
-    if (addr + bpp / 8 > ATI_R350_VRAM_SIZE) {
+    if (!ati_r350_2d_vram(s, addr, bpp / 8, &voff)) {
         /*
          * Card address outside VRAM: surface page-out to GART, the
          * mirror of the page-in in ati_r350_2d_read_pixel().
@@ -241,21 +281,21 @@ static void ati_r350_2d_write_pixel(ATIR350State *s, uint32_t offset,
         ati_r350_mc_write32(s, addr & ~3u, dw);
         return;
     }
-    if (addr >= 0xd000 && addr < 0xe000) {
-        trace_ati_r350_pixwatch(addr, color, bpp);
+    if (voff >= 0xd000 && voff < 0xe000) {
+        trace_ati_r350_pixwatch(voff, color, bpp);
     }
     switch (bpp) {
     case 32:
-        vram[addr + 3] = (color >> 24) & 0xff;
+        vram[voff + 3] = (color >> 24) & 0xff;
         /* fall through */
     case 24:
-        vram[addr + 2] = (color >> 16) & 0xff;
+        vram[voff + 2] = (color >> 16) & 0xff;
         /* fall through */
     case 16:
-        vram[addr + 1] = (color >> 8) & 0xff;
+        vram[voff + 1] = (color >> 8) & 0xff;
         /* fall through */
     case 8:
-        vram[addr] = color & 0xff;
+        vram[voff] = color & 0xff;
         break;
     default:
         break;
@@ -269,7 +309,7 @@ static void ati_r350_2d_write_pixel(ATIR350State *s, uint32_t offset,
      * same scan block -- observed live as white Finder windows whose
      * icons only appear when clicked.
      */
-    memory_region_set_dirty(&s->vram, addr & ~7ull, 8);
+    memory_region_set_dirty(&s->vram, voff & ~7ull, 8);
 }
 
 static uint32_t ati_r350_apply_rop3(uint8_t rop, uint32_t src, uint32_t dst,
@@ -435,7 +475,8 @@ static bool ati_r350_2d_page_in_row(ATIR350State *s, uint32_t src_stride,
                                     int dx0, int dy, int n)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    uint64_t src, dst;
+    uint64_t src;
+    uint32_t dst, soff;
     unsigned sxr = ati_r350_host_swap_xor(s);
     uint32_t buf[256];
     int i, k;
@@ -445,11 +486,10 @@ static bool ati_r350_2d_page_in_row(ATIR350State *s, uint32_t src_stride,
     }
     src = (uint32_t)(s->src_offset + (uint32_t)sy * src_stride +
                      (uint32_t)sx0 * 4);
-    dst = (uint32_t)(s->dst_offset + (uint32_t)dy * dst_stride +
-                     (uint32_t)dx0 * 4);
-    if ((src & 3) || src + 4 <= ATI_R350_VRAM_SIZE ||
-        src + (uint64_t)n * 4 > 0x100000000ull ||
-        dst + (uint64_t)n * 4 > ATI_R350_VRAM_SIZE ||
+    if ((src & 3) || src + (uint64_t)n * 4 > 0x100000000ull ||
+        ati_r350_2d_vram(s, src, 4, &soff) ||
+        !ati_r350_2d_vram(s, s->dst_offset + (uint32_t)dy * dst_stride +
+                          (uint32_t)dx0 * 4, n * 4, &dst) ||
         (dst < 0xe000 && dst + (uint64_t)n * 4 > 0xd000)) {
         return false;
     }
@@ -1009,11 +1049,11 @@ void ati_r350_2d_blt(ATIR350State *s)
         bool was_res = s->gl_res;
         uint64_t px0 = s->gl_flush_px;
 
-        ati_r350_gl_dirty(s, s->dst_offset,
+        ati_r350_2d_gl_dirty(s, s->dst_offset,
                           (s->dst_y + s->dst_height + 1) * ds);
         if (src_source != R350_DP_SRC_HOST &&
             src_source != R350_DP_SRC_HOST_BYTEALIGN) {
-            ati_r350_gl_touch(s, s->src_offset,
+            ati_r350_2d_gl_touch(s, s->src_offset,
                               (s->src_y + s->dst_height + 1) * ss);
         }
         ati_r350_2d_gl_note(s, R350_GL2D_BLIT, was_res, px0);
@@ -1165,7 +1205,7 @@ bool ati_r350_host_data_flush(ATIR350State *s)
         bool was_res = s->gl_res;
         uint64_t px0 = s->gl_flush_px;
 
-        ati_r350_gl_dirty(s, s->hd.dst_offset,
+        ati_r350_2d_gl_dirty(s, s->hd.dst_offset,
                           (s->hd.dst_y + s->hd.dst_height + 1) * dst_stride);
         ati_r350_2d_gl_note(s, R350_GL2D_HOST, was_res, px0);
     }
