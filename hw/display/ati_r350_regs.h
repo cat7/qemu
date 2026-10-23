@@ -914,6 +914,8 @@
 #define R350_NONSURF_AP0_SWP_32BPP   (1u << 21)
 #define R350_NONSURF_AP1_SWP_16BPP   (1u << 22)
 #define R350_NONSURF_AP1_SWP_32BPP   (1u << 23)
+/* HOST_PATH_CNTL: aperture 1 shows the VRAM above aperture 0 */
+#define R350_HDP_APER_CNTL           (1u << 23)
 /* CP_RB_CNTL */
 #define R350_RB_BUFSZ_MASK           0x3f       /* log2(ring size in qwords) */
 #define R350_BUF_SWAP_MASK           (3u << 16)

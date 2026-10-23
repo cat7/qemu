@@ -185,10 +185,11 @@ static void ati_r350_maybe_capture_mode(ATIR350State *s)
  * unswapped. Mode 1 = 16-bit swap = byte-lane XOR 1, mode 3 = 32-bit
  * swap = XOR 3.
  */
-static unsigned ati_r350_swap_bits(uint32_t info)
+static unsigned ati_r350_swap_bits(uint32_t info, int ap)
 {
-    return (info & R350_NONSURF_AP0_SWP_32BPP) ? 3 :
-           (info & R350_NONSURF_AP0_SWP_16BPP) ? 1 : 0;
+    unsigned f = info >> (ap ? 22 : 20);
+
+    return (f & 2) ? 3 : (f & 1) ? 1 : 0;
 }
 
 /*
@@ -208,12 +209,12 @@ static unsigned ati_r350_swap_bits(uint32_t info)
  * MC_FB_LOCATION puts it at card address 0x90010000).
  */
 static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off,
-                                  ATIR350SwapMemo *m)
+                                  ATIR350SwapMemo *m, int ap)
 {
     uint32_t lo_bound = 0, hi_bound = UINT32_MAX;
     int i;
 
-    m->val = ati_r350_swap_bits(s->regs[R350_SURFACE_CNTL >> 2]);
+    m->val = ati_r350_swap_bits(s->regs[R350_SURFACE_CNTL >> 2], ap);
     for (i = 0; i < 8; i++) {
         uint32_t lo = s->regs[(R350_SURFACE0_LOWER_BOUND +
                                i * R350_SURFACE_STRIDE) >> 2];
@@ -225,7 +226,8 @@ static void ati_r350_swap_resolve(ATIR350State *s, uint32_t off,
         }
         if (off >= lo && off <= hi) {
             m->val = ati_r350_swap_bits(
-                s->regs[(R350_SURFACE0_INFO + i * R350_SURFACE_STRIDE) >> 2]);
+                s->regs[(R350_SURFACE0_INFO + i * R350_SURFACE_STRIDE) >> 2],
+                ap);
             lo_bound = MAX(lo_bound, lo);
             hi_bound = MIN(hi_bound, hi);
             break;
@@ -248,9 +250,52 @@ unsigned ati_r350_aper_xor(ATIR350State *s, uint32_t off)
     ATIR350SwapMemo *m = &s->swap;
 
     if (!m->valid || off < m->lo || off > m->hi) {
-        ati_r350_swap_resolve(s, off, m);
+        ati_r350_swap_resolve(s, off, m, 0);
     }
     return m->val;
+}
+
+/* the same for aperture 1, at aperture offset `off` */
+static unsigned ati_r350_aper1_xor(ATIR350State *s, uint32_t off)
+{
+    ATIR350SwapMemo *m = &s->swap1;
+
+    if (!m->valid || off < m->lo || off > m->hi) {
+        ati_r350_swap_resolve(s, off, m, 1);
+    }
+    return m->val;
+}
+
+/* the VRAM offset aperture 1 starts at */
+static uint32_t ati_r350_aper1_base(ATIR350State *s)
+{
+    return (s->regs[R350_HOST_PATH_CNTL >> 2] & R350_HDP_APER_CNTL) ?
+           ATI_R350_APER_SIZE : 0;
+}
+
+/*
+ * Point aperture 1 at its VRAM and lay its swapper over all of it while
+ * any aperture-1 swap mode is set. Called with the BQL.
+ */
+static void ati_r350_aper1_update(ATIR350State *s)
+{
+    bool swap = ati_r350_swap_bits(s->regs[R350_SURFACE_CNTL >> 2], 1);
+    int i;
+
+    for (i = 0; i < 8 && !swap; i++) {
+        uint32_t lo = s->regs[(R350_SURFACE0_LOWER_BOUND +
+                               i * R350_SURFACE_STRIDE) >> 2];
+        uint32_t hi = s->regs[(R350_SURFACE0_UPPER_BOUND +
+                               i * R350_SURFACE_STRIDE) >> 2];
+
+        swap = hi > lo && ati_r350_swap_bits(
+            s->regs[(R350_SURFACE0_INFO + i * R350_SURFACE_STRIDE) >> 2], 1);
+    }
+    s->swap1.valid = false;
+    memory_region_transaction_begin();
+    memory_region_set_alias_offset(&s->aper1_ram, ati_r350_aper1_base(s));
+    memory_region_set_enabled(&s->aper1_swap, swap);
+    memory_region_transaction_commit();
 }
 
 /*
@@ -269,7 +314,7 @@ static void ati_r350_aper_remap(ATIR350State *s)
     while (off < ATI_R350_VRAM_SIZE) {
         uint64_t end;
 
-        ati_r350_swap_resolve(s, off, &m);
+        ati_r350_swap_resolve(s, off, &m, 0);
         end = MIN((uint64_t)m.hi + 1, ATI_R350_VRAM_SIZE);
         if (m.val) {
             if (n && (uint64_t)lo[n - 1] + len[n - 1] == off) {
@@ -295,14 +340,15 @@ static void ati_r350_aper_remap(ATIR350State *s)
         }
     }
     memory_region_transaction_commit();
+    ati_r350_aper1_update(s);
 }
 
 /* a big-endian host access of `size` bytes at aperture offset `off` */
 static uint64_t ati_r350_aper_ld(ATIR350State *s, uint32_t off,
-                                 unsigned size)
+                                 unsigned size, unsigned xr)
 {
     const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    unsigned xr = ati_r350_aper_xor(s, off), i;
+    unsigned i;
     uint64_t val = 0;
 
     if (off + size > ATI_R350_VRAM_SIZE) {
@@ -318,10 +364,10 @@ static uint64_t ati_r350_aper_ld(ATIR350State *s, uint32_t off,
 }
 
 static void ati_r350_aper_st(ATIR350State *s, uint32_t off, uint64_t data,
-                             unsigned size)
+                             unsigned size, unsigned xr)
 {
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
-    unsigned xr = ati_r350_aper_xor(s, off), i;
+    unsigned i;
 
     if (off + size > ATI_R350_VRAM_SIZE) {
         return;
@@ -339,18 +385,55 @@ static void ati_r350_aper_st(ATIR350State *s, uint32_t off, uint64_t data,
 
 static uint64_t ati_r350_swap_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return ati_r350_aper_ld(opaque, addr, size);
+    ATIR350State *s = opaque;
+
+    return ati_r350_aper_ld(s, addr, size, ati_r350_aper_xor(s, addr));
 }
 
 static void ati_r350_swap_write(void *opaque, hwaddr addr, uint64_t data,
                                 unsigned size)
 {
-    ati_r350_aper_st(opaque, addr, data, size);
+    ATIR350State *s = opaque;
+
+    ati_r350_aper_st(s, addr, data, size, ati_r350_aper_xor(s, addr));
+}
+
+static uint64_t ati_r350_swap1_read(void *opaque, hwaddr addr, unsigned size)
+{
+    ATIR350State *s = opaque;
+
+    return ati_r350_aper_ld(s, ati_r350_aper1_base(s) + addr, size,
+                            ati_r350_aper1_xor(s, addr));
+}
+
+static void ati_r350_swap1_write(void *opaque, hwaddr addr, uint64_t data,
+                                 unsigned size)
+{
+    ATIR350State *s = opaque;
+
+    ati_r350_aper_st(s, ati_r350_aper1_base(s) + addr, data, size,
+                     ati_r350_aper1_xor(s, addr));
 }
 
 static const MemoryRegionOps ati_r350_swap_ops = {
     .read = ati_r350_swap_read,
     .write = ati_r350_swap_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
+
+static const MemoryRegionOps ati_r350_swap1_ops = {
+    .read = ati_r350_swap1_read,
+    .write = ati_r350_swap1_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -1790,7 +1873,8 @@ static uint32_t ati_r350_reg_read32(ATIR350State *s, uint32_t base)
               PCI_BASE_ADDRESS_MEM_MASK;
         break;
     case R350_CONFIG_APER_1_BASE:
-        val = 0;
+        val = (pci_get_long(dev->config + PCI_BASE_ADDRESS_0) &
+               PCI_BASE_ADDRESS_MEM_MASK) + ATI_R350_APER_SIZE;
         break;
     case R350_CONFIG_APER_SIZE:
         val = ATI_R350_APER_SIZE;
@@ -2429,6 +2513,10 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
                                s->palette[s->dac_wr_index][2]);
         s->force_redraw = true;
         s->dac_wr_index++;
+        break;
+    case R350_HOST_PATH_CNTL:
+        s->regs[base >> 2] = val;
+        ati_r350_aper1_update(s);
         break;
     case R350_SURFACE_CNTL:
     case R350_SURFACE0_LOWER_BOUND ... R350_SURFACE7_INFO:
@@ -4492,7 +4580,8 @@ static uint64_t ati_r350_fillwatch_read(void *opaque, hwaddr addr,
 {
     ATIR350State *s = opaque;
     uint32_t base = s->fillwatch_off + (uint32_t)addr;
-    uint64_t val = ati_r350_aper_ld(s, base, size);
+    uint64_t val = ati_r350_aper_ld(s, base, size,
+                                    ati_r350_aper_xor(s, base));
 
     trace_ati_r350_fillwatch_rd(base, size, val);
     return val;
@@ -4504,7 +4593,7 @@ static void ati_r350_fillwatch_write(void *opaque, hwaddr addr,
     ATIR350State *s = opaque;
     uint32_t base = s->fillwatch_off + (uint32_t)addr;
 
-    ati_r350_aper_st(s, base, data, size);
+    ati_r350_aper_st(s, base, data, size, ati_r350_aper_xor(s, base));
 
     /*
      * Coalesce. A strided fill writes each row as one contiguous run and
@@ -4620,7 +4709,7 @@ static uint64_t ati_r350_zguard_read(void *opaque, hwaddr addr,
         return 0;
     }
     ati_r350_zguard_hit(s, addr, size);
-    return ati_r350_aper_ld(s, addr, size);
+    return ati_r350_aper_ld(s, addr, size, ati_r350_aper_xor(s, addr));
 }
 
 static void ati_r350_zguard_write(void *opaque, hwaddr addr,
@@ -4632,7 +4721,7 @@ static void ati_r350_zguard_write(void *opaque, hwaddr addr,
         return;
     }
     ati_r350_zguard_hit(s, addr, size);
-    ati_r350_aper_st(s, addr, data, size);
+    ati_r350_aper_st(s, addr, data, size, ati_r350_aper_xor(s, addr));
 }
 
 static const MemoryRegionOps ati_r350_zguard_ops = {
@@ -5107,12 +5196,12 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
                                          &ati_r350_gfx_ops, s);
 
     /*
-     * BAR0: the 256MB linear frame-buffer aperture, all of it VRAM. The
-     * ranges a SURFACE_CNTL byte swapper covers are overlaid with a
-     * swapping window (ati_r350_aper_remap()); the rest maps the RAM.
+     * All of VRAM, linear. The ranges an aperture-0 byte swapper covers
+     * are overlaid with a swapping window (ati_r350_aper_remap()); the
+     * rest maps the RAM. BAR0's aperture 0 is its low part.
      */
     memory_region_init(&s->aper, obj, "ati-r350-aper",
-                       ATI_R350_APER_SIZE);
+                       ATI_R350_VRAM_SIZE);
     memory_region_init_ram(&s->vram, obj, "ati-r350-vram",
                            ATI_R350_VRAM_SIZE, &error_fatal);
     /*
@@ -5298,8 +5387,21 @@ static void ati_r350_realize(PCIDevice *dev, Error **errp)
     s->mmio.disable_reentrancy_guard = true;
     s->io.disable_reentrancy_guard = true;
 
+    memory_region_init(&s->bar0, obj, "ati-r350-bar0", ATI_R350_BAR0_SIZE);
+    memory_region_init_alias(&s->aper0, obj, "ati-r350-aper0", &s->aper, 0,
+                             ATI_R350_APER_SIZE);
+    memory_region_add_subregion(&s->bar0, 0, &s->aper0);
+    memory_region_init(&s->aper1, obj, "ati-r350-aper1", ATI_R350_APER_SIZE);
+    memory_region_init_alias(&s->aper1_ram, obj, "ati-r350-aper1-ram",
+                             &s->vram, 0, ATI_R350_APER_SIZE);
+    memory_region_add_subregion(&s->aper1, 0, &s->aper1_ram);
+    memory_region_init_io(&s->aper1_swap, obj, &ati_r350_swap1_ops, s,
+                          "ati-r350-aper1-swap", ATI_R350_APER_SIZE);
+    memory_region_set_enabled(&s->aper1_swap, false);
+    memory_region_add_subregion_overlap(&s->aper1, 0, &s->aper1_swap, 1);
+    memory_region_add_subregion(&s->bar0, ATI_R350_APER_SIZE, &s->aper1);
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY |
-                     PCI_BASE_ADDRESS_MEM_PREFETCH, &s->aper);
+                     PCI_BASE_ADDRESS_MEM_PREFETCH, &s->bar0);
     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
 
