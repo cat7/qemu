@@ -61,13 +61,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIR350State, ATI_R350)
  *   BAR2: 16KB memory, register aperture
  *   Expansion ROM: 128KB
  */
-#define ATI_R350_APER_SIZE   (256 * 1024 * 1024)
+/*
+ * CONFIG_APER_SIZE. BAR0 holds two apertures of this size: aperture 0
+ * shows the low VRAM, aperture 1 the same VRAM with its own byte swap,
+ * or the high VRAM when HOST_PATH_CNTL.HDP_APER_CNTL is set. The Mac
+ * ROMs map twice this size; the 9800 Pro ROM puts head A in aperture 1.
+ */
+#define ATI_R350_APER_SIZE   (128 * 1024 * 1024)
+#define ATI_R350_BAR0_SIZE   (2 * ATI_R350_APER_SIZE)
 /*
  * 256MB, as on the OEM 9800 XT and the retail "SE": their ROMs hard-code
- * it and put the second head's frame buffer at half of it. The whole
- * BAR0 aperture is the frame buffer --
- * unlike the Rage 128 there is no second aperture image; the Radeon's
- * byte swappers are SURFACE_CNTL's non-surface/surface swap bits.
+ * it and put the second head's frame buffer at half of it. The byte
+ * swappers are SURFACE_CNTL's and SURFACEn_INFO's per-aperture bits.
  * Quartz Extreme needs >= 16MB, Quartz 2D Extreme >= 64MB.
  */
 #define ATI_R350_VRAM_SIZE   (256 * 1024 * 1024)
@@ -332,8 +337,13 @@ enum {
 struct ATIR350State {
     PCIDevice parent_obj;
 
-    MemoryRegion aper;        /* BAR0: 64MB aperture container */
-    MemoryRegion vram;        /* 16MB of real VRAM at aperture offset 0 */
+    MemoryRegion bar0;        /* BAR0: apertures 0 and 1 */
+    MemoryRegion aper;        /* all of VRAM, linear, with swap windows */
+    MemoryRegion aper0;       /* aperture 0: the low part of aper */
+    MemoryRegion aper1;       /* aperture 1 */
+    MemoryRegion aper1_ram;   /* its VRAM, low or high */
+    MemoryRegion aper1_swap;  /* its byte swapper */
+    MemoryRegion vram;
     MemoryRegion mmio;        /* BAR2: 16KB register file */
     MemoryRegion io;          /* BAR1: 256-byte I/O register window */
     AddressSpace agp_as;      /* AGP transactions, via the host's GART */
@@ -344,6 +354,7 @@ struct ATIR350State {
     uint32_t plls[ATI_R350_NUM_PLLS];
     /* the aperture swapper: memo, and windows over swapped ranges */
     ATIR350SwapMemo swap;
+    ATIR350SwapMemo swap1;    /* aperture 1 */
     MemoryRegion swap_io;
     MemoryRegion swap_win[ATI_R350_SWAP_WINS];
     /*
