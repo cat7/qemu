@@ -552,6 +552,7 @@ struct ATIR350State {
      * Consumed synchronously on each PM4_BUFFER_DL_WPTR write, same
      * style as the BM engine.
      */
+    bool bm_busy;              /* a BM_GUI_TABLE walk is in progress */
     uint32_t pm4_rptr;         /* ring read pointer, in dwords */
     uint32_t pm4_wptr;         /* ring write pointer, in dwords */
     /* ring base: VRAM offset, or GART offset when AGP_OFFSET_FLAG set */

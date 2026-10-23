@@ -2244,7 +2244,12 @@ static void ati_r350_reg_write32(ATIR350State *s, uint32_t base,
         break;
     case R350_BM_GUI_TABLE:
         s->regs[base >> 2] = val;
-        ati_r350_bm_gui_run(s, val);
+        /* a descriptor that targets this register does not start a new walk */
+        if (!s->bm_busy) {
+            s->bm_busy = true;
+            ati_r350_bm_gui_run(s, val);
+            s->bm_busy = false;
+        }
         break;
     case R350_CP_RB_BASE:
         s->pm4_buffer_addr = val;
