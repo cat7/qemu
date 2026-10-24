@@ -111,6 +111,7 @@ struct Core99MachineState {
 
     Core99ViaConfig via_config;
     bool nec_usb;
+    uint32_t decr_cap_ms;
 };
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -225,6 +226,8 @@ static void ppc_core99_init(MachineState *machine)
 
         /* Set time-base frequency to 100 Mhz */
         cpu_ppc_tb_init(&cpus[i]->env, TBFREQ);
+        cpus[i]->env.tb_env->decr_cap_ns =
+            (int64_t)core99_machine->decr_cap_ms * SCALE_MS;
 
         /*
          * Secondary CPUs share the primary's timebase offset: real
@@ -781,6 +784,12 @@ static void core99_instance_init(Object *obj)
     object_property_set_description(obj, "via",
                                     "Set VIA configuration. "
                                     "Valid values are cuda, pmu and pmu-adb");
+
+    object_property_add_uint32_ptr(obj, "decr-cap-ms", &cms->decr_cap_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "decr-cap-ms",
+                                    "Fire each CPU's decrementer timer at "
+                                    "least every N ms (0 = off)");
     object_property_add_bool(obj, "nec-usb", core99_get_nec_usb,
                              core99_set_nec_usb);
     object_property_set_description(obj, "nec-usb",

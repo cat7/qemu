@@ -871,27 +871,18 @@ static inline void cpu_ppc_hdecr_lower(PowerPCCPU *cpu)
 }
 
 /*
- * QEMU_PPC_DECR_CAP_MS=<ms>: on 970 CPUs, fire the decrementer timer no
- * later than that, raising an early decrementer interrupt. Mac OS X's
- * pmap_unnest() signals a CPU and panics unless that CPU takes some
- * interrupt within LockTimeOut (250 ms); when the signal merges into a wake
- * IPI the CPU is already taking, none follows on an idle CPU whose
- * decrementer is set far out. Under emulation that race is frequent with
- * many CPUs. Mac OS X handles an early decrementer by re-arming it. The DEC
- * value the guest reads is unchanged.
+ * Fire the decrementer timer no later than decr_cap_ns (0 = off). An idle
+ * Mac OS X CPU must take some interrupt within 250 ms of a pmap_unnest()
+ * signal, and Tiger leaves timers on secondaries unarmed until all CPUs are
+ * up. Mac OS X re-arms on an early decrementer; the DEC value is unchanged.
  */
 static int64_t ppc_decr_cap(PowerPCCPU *cpu, QEMUTimer *timer, int64_t now,
                             int64_t expire)
 {
-    static int64_t cap_ns = -1;
+    int64_t cap_ns = cpu->env.tb_env->decr_cap_ns;
 
-    if (cap_ns < 0) {
-        const char *e = getenv("QEMU_PPC_DECR_CAP_MS");
-
-        cap_ns = e ? atoll(e) * SCALE_MS : 0;
-    }
     if (cap_ns > 0 && timer == cpu->env.tb_env->decr_timer &&
-        cpu->env.excp_model == POWERPC_EXCP_970 && expire - now > cap_ns) {
+        expire - now > cap_ns) {
         return now + cap_ns;
     }
     return expire;
