@@ -1334,6 +1334,12 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaAppController: applicationDidFinishLaunching\n");
     allow_events = true;
+
+    /* No App Nap or timer coalescing while the window is in the background */
+    [[[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
+                                 NSActivityLatencyCritical
+                          reason:@"Running a virtual machine"] retain];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification
