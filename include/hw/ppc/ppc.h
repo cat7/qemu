@@ -31,6 +31,7 @@ struct ppc_tb_t {
     uint64_t decr_next;    /* Tick for next decr interrupt    */
     uint32_t decr_freq;    /* decrementer frequency           */
     QEMUTimer *decr_timer;
+    int64_t decr_cap_ns;   /* fire decr timer no later than this, 0 = off */
     /* Hypervisor decrementer management */
     uint64_t hdecr_next;    /* Tick for next hdecr interrupt  */
     QEMUTimer *hdecr_timer;
