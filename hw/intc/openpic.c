@@ -539,6 +539,31 @@ static inline void write_IRQreg_idr(OpenPICState *opp, int n_IRQ, uint32_t val)
     }
 }
 
+/* Guest IDR write: an active INT source moves to its new destinations */
+static void openpic_write_idr(OpenPICState *opp, int n_IRQ, uint32_t val)
+{
+    IRQSource *src = &opp->src[n_IRQ];
+    uint32_t old_destmask = src->destmask;
+    int old_output = src->output;
+    int i;
+
+    write_IRQreg_idr(opp, n_IRQ, val);
+
+    if (!(src->ivpr & IVPR_ACTIVITY_MASK) ||
+        old_output != OPENPIC_OUTPUT_INT || src->output != OPENPIC_OUTPUT_INT ||
+        src->destmask == old_destmask) {
+        return;
+    }
+
+    for (i = 0; i < opp->nb_cpus; i++) {
+        if (old_destmask & (1 << i)) {
+            IRQ_local_pipe(opp, i, n_IRQ, false, true);
+        }
+    }
+    src->ivpr &= ~IVPR_ACTIVITY_MASK;
+    openpic_update_irq(opp, n_IRQ);
+}
+
 static inline void write_IRQreg_ilr(OpenPICState *opp, int n_IRQ, uint32_t val)
 {
     if (opp->flags & OPENPIC_FLAG_ILR) {
@@ -873,7 +898,7 @@ static void openpic_tmr_write(void *opaque, hwaddr addr, uint64_t val,
         write_IRQreg_ivpr(opp, opp->irq_tim0 + idx, val);
         break;
     case 0x30: /* TDR */
-        write_IRQreg_idr(opp, opp->irq_tim0 + idx, val);
+        openpic_write_idr(opp, opp->irq_tim0 + idx, val);
         break;
     }
 }
@@ -952,7 +977,7 @@ static void openpic_src_write(void *opaque, hwaddr addr, uint64_t val,
         write_IRQreg_ivpr(opp, idx, val);
         break;
     case 0x10:
-        write_IRQreg_idr(opp, idx, val);
+        openpic_write_idr(opp, idx, val);
         break;
     case 0x18:
         write_IRQreg_ilr(opp, idx, val);
