@@ -24,7 +24,7 @@ each with a GUI for setting up and starting machines:
 =======================  ===============  ==========================================================================
 Machine                  Branch           Download
 =======================  ===============  ==========================================================================
-Beige Power Mac G3       ``G3-rom``       none yet; build from source
+Beige Power Mac G3       ``G3-rom``       `G3-rom-2026-11-06 <https://github.com/cat7/qemu/releases/tag/G3-rom-2026-11-06>`_
 Power Mac G4 (OpenBIOS)  ``G4-openbios``  `G4-openbios-2026-11-05 <https://github.com/cat7/qemu/releases/tag/G4-openbios-2026-11-05>`_
 Power Mac G5 (OpenBIOS)  ``G5-openbios``  `G5-openbios-2026-11-05 <https://github.com/cat7/qemu/releases/tag/G5-openbios-2026-11-05>`_
 =======================  ===============  ==========================================================================
