@@ -1,171 +1,150 @@
+==============================================
+Power Mac G4 with OpenBIOS for qemu-system-ppc
+==============================================
+
+This ``G4-openbios`` branch is a personal fork of QEMU. It extends the
+``mac99`` machine of ``qemu-system-ppc`` into a New World Power Mac G4
+that runs on OpenBIOS, free firmware, so no Apple ROM is needed. It runs
+Mac OS 9.2 and Mac OS X 10.0 to 10.5, with several CPUs, sound, USB 2.0,
+ATI graphics cards and a shared host folder. It is an experiment and is
+not meant for upstream QEMU.
+
+QEMU as a whole is released under the GNU General Public License, version
+2. For full licensing details, consult the LICENSE file.
+
+Download
+========
+
+Ready-made builds for macOS (Apple silicon and Intel) and 64-bit Windows,
+with a GUI for setting up and starting machines:
+
+  https://github.com/cat7/qemu/releases/tag/G4-openbios-2026-11-05
+
+All releases: https://github.com/cat7/qemu/releases
+
+The machine
 ===========
-QEMU README
-===========
 
-QEMU is a generic and open source machine & userspace emulator and
-virtualizer.
+=====================  ======================================================
+Model                  PowerMac3,1 (PowerMac3,6 with more than 4 CPUs)
+CPU                    PowerPC 7400 (G4); ``-smp`` up to 32
+Memory                 up to 2 GB (``-m``)
+Firmware               OpenBIOS, ``G4-openbios`` branch of
+                       github.com/cat7/openbios (``openbios-qemu.elf``)
+Host bridge            UniNorth: PCI, AGP and internal PCI buses
+I/O controller         KeyLargo: OpenPIC, ESCC serial ports, PMU (or Cuda),
+                       two ATA buses, Screamer sound, NVRAM
+Ethernet               Sun GEM (``sungem``)
+USB                    OHCI; NEC uPD720101 USB 2.0 card (``nec-usb=on``)
+Graphics               QEMU standard VGA by default; ATI Rage 128 Pro or
+                       ATI Radeon 9800 (card ROM needed)
+Shared folder          virtio-9p, as a Mac OS volume
+=====================  ======================================================
 
-QEMU is capable of emulating a complete machine in software without any
-need for hardware virtualization support. By using dynamic translation,
-it achieves very good performance. QEMU can also integrate with the Xen
-and KVM hypervisors to provide emulated hardware while allowing the
-hypervisor to manage the CPU. With hypervisor support, QEMU can achieve
-near native performance for CPUs. When QEMU emulates CPUs directly it is
-capable of running operating systems made for one machine (e.g. an ARMv7
-board) on a different machine (e.g. an x86_64 PC board).
-
-QEMU is also capable of providing userspace API virtualization for Linux
-and BSD kernel interfaces. This allows binaries compiled against one
-architecture ABI (e.g. the Linux PPC64 ABI) to be run on a host using a
-different architecture ABI (e.g. the Linux x86_64 ABI). This does not
-involve any hardware emulation, simply CPU and syscall emulation.
-
-QEMU aims to fit into a variety of use cases. It can be invoked directly
-by users wishing to have full control over its behaviour and settings.
-It also aims to facilitate integration into higher level management
-layers, by providing a stable command line interface and monitor API.
-It is commonly invoked indirectly via the libvirt library when using
-open source applications such as oVirt, OpenStack and virt-manager.
-
-QEMU as a whole is released under the GNU General Public License,
-version 2. For full licensing details, consult the LICENSE file.
-
-
-Documentation
+What you need
 =============
 
-Documentation can be found hosted online at
-`<https://www.qemu.org/documentation/>`_. The documentation for the
-current development version that is available at
-`<https://www.qemu.org/docs/master/>`_ is generated from the ``docs/``
-folder in the source tree, and is built by `Sphinx
-<https://www.sphinx-doc.org/en/master/>`_.
+- ``openbios-qemu.elf``, the firmware. The release zip has it; to build it
+  yourself, use the ``G4-openbios`` branch of github.com/cat7/openbios.
+- A Mac OS 9.2 or Mac OS X 10.0 to 10.5 install CD or DVD as an image
+  (``.iso``, ``.toast``, ``.cdr``, ``.dmg``). It is not included.
+- An empty disk image::
 
+    qemu-img create -f raw macosx.img 20G
+
+- For an ATI card: its Mac ROM image. It is not included.
 
 Building
 ========
-
-QEMU is multi-platform software intended to be buildable on all modern
-Linux platforms, OS-X, Win32 (via the Mingw64 toolchain) and a variety
-of other UNIX targets. The simple steps to build QEMU are:
-
 
 .. code-block:: shell
 
   mkdir build
   cd build
-  ../configure
-  make
+  ../configure --target-list=ppc-softmmu --enable-cocoa --enable-slirp
+  make qemu-system-ppc
 
-Additional information can also be found online via the QEMU website:
+Only ``qemu-system-ppc`` is needed. ``--enable-cocoa`` is for macOS; on
+Windows (MSYS2 UCRT64) use ``--enable-sdl --enable-gtk`` instead.
 
-* `<https://wiki.qemu.org/Hosts/Linux>`_
-* `<https://wiki.qemu.org/Hosts/Mac>`_
-* `<https://wiki.qemu.org/Hosts/W32>`_
+Machine options
+===============
 
+``-M mac99,option=value,...``
 
-Submitting patches
-==================
+- ``via=pmu|pmu-adb|cuda`` -- the power controller. Use ``pmu``: more than
+  one CPU needs a PMU. ``pmu`` gives a USB keyboard and mouse, ``pmu-adb``
+  and ``cuda`` ADB ones.
+- ``nec-usb=on`` -- adds the NEC USB 2.0 card (Mac OS X 10.3 and later),
+  for passing host USB devices through.
+- ``decr-cap-ms=N`` -- fires each CPU's decrementer at least every N ms,
+  so idle CPUs do not sleep too long.
 
-The QEMU source code is maintained under the GIT version control system.
+Installing
+==========
 
-.. code-block:: shell
-
-   git clone https://gitlab.com/qemu-project/qemu.git
-
-When submitting patches, one common approach is to use 'git
-format-patch' and/or 'git send-email' to format & send the mail to the
-qemu-devel@nongnu.org mailing list. All patches submitted must contain
-a 'Signed-off-by' line from the author. Patches should follow the
-guidelines set out in the `style section
-<https://www.qemu.org/docs/master/devel/style.html>`_ of
-the Developers Guide.
-
-Additional information on submitting patches can be found online via
-the QEMU website:
-
-* `<https://wiki.qemu.org/Contribute/SubmitAPatch>`_
-* `<https://wiki.qemu.org/Contribute/TrivialPatches>`_
-
-The QEMU website is also maintained under source control.
+The NVRAM is kept only in an attached file. Make it once:
 
 .. code-block:: shell
 
-  git clone https://gitlab.com/qemu-project/qemu-web.git
+  dd if=/dev/zero of=nvram.img bs=8192 count=1
 
-* `<https://www.qemu.org/2017/02/04/the-new-qemu-website-is-up/>`_
-
-A 'git-publish' utility was created to make above process less
-cumbersome, and is highly recommended for making regular contributions,
-or even just for sending consecutive patch series revisions. It also
-requires a working 'git send-email' setup, and by default doesn't
-automate everything, so you may want to go through the above steps
-manually for once.
-
-For installation instructions, please go to:
-
-*  `<https://github.com/stefanha/git-publish>`_
-
-The workflow with 'git-publish' is:
+Boot the install CD with ``-boot d``:
 
 .. code-block:: shell
 
-  $ git checkout master -b my-feature
-  $ # work on new commits, add your 'Signed-off-by' lines to each
-  $ git publish
+  ./qemu-system-ppc \
+    -M mac99,via=pmu -m 1024 \
+    -bios openbios-qemu.elf \
+    -audiodev coreaudio,id=snd -global screamer.audiodev=snd \
+    -nic user,model=sungem \
+    -drive file=macosx.img,format=raw,media=disk \
+    -cdrom install.iso \
+    -drive if=none,id=nvr,file=nvram.img,format=raw \
+    -global macio-nvram.drive=nvr \
+    -boot d
 
-Your patch series will be sent and tagged as my-feature-v1 if you need to refer
-back to it in the future.
+Erase the disk with Disk Utility (Drive Setup on Mac OS 9) and install as
+on a real Mac.
 
-Sending v2:
-
-.. code-block:: shell
-
-  $ git checkout my-feature # same topic branch
-  $ # making changes to the commits (using 'git rebase', for example)
-  $ git publish
-
-Your patch series will be sent with 'v2' tag in the subject and the git tip
-will be tagged as my-feature-v2.
-
-Bug reporting
-=============
-
-The QEMU project uses GitLab issues to track bugs. Bugs
-found when running code built from QEMU git or upstream released sources
-should be reported via:
-
-* `<https://gitlab.com/qemu-project/qemu/-/issues>`_
-
-If using QEMU via an operating system vendor pre-built binary package, it
-is preferable to report bugs to the vendor's own bug tracker first. If
-the bug is also known to affect latest upstream code, it can also be
-reported via GitLab.
-
-For additional information on bug reporting consult:
-
-* `<https://wiki.qemu.org/Contribute/ReportABug>`_
-
-
-ChangeLog
-=========
-
-For version history and release notes, please visit
-`<https://wiki.qemu.org/ChangeLog/>`_ or look at the git history for
-more detailed information.
-
-
-Contact
+Running
 =======
 
-The QEMU community can be contacted in a number of ways, with the two
-main methods being email and IRC:
+Leave out ``-cdrom`` and boot the disk with ``-boot c``. Add ``-smp 2``
+or more for more CPUs. On Windows use ``-audiodev dsound,id=snd`` and
+``-display sdl``.
 
-* `<mailto:qemu-devel@nongnu.org>`_
-* `<https://lists.nongnu.org/mailman/listinfo/qemu-devel>`_
-* #qemu on irc.oftc.net
+- **Graphics cards.** ``-vga none`` and one of:
 
-Information on additional methods of contacting the community can be
-found online via the QEMU website:
+  - ``-device ati-rage128-pro,romfile=rage128pro.rom`` -- for Mac OS 9.
+  - ``-device ati-radeon9800,gl=off|on|fast,romfile=radeon9800.rom`` --
+    Mac OS X 10.3 to 10.5 only, with Quartz Extreme and OpenGL. ``gl=off``
+    draws in software, ``on`` through host OpenGL (exact), ``fast`` through
+    host OpenGL (fastest). On macOS, ``gl-api=metal`` uses Metal instead.
 
-* `<https://wiki.qemu.org/Contribute/StartHere>`_
+- **Shared folder.**
+
+  .. code-block:: shell
+
+    -fsdev local,id=hostshare,path=/path/to/folder,security_model=none,macos_compat=on \
+    -device virtio-9p-pci,fsdev=hostshare,mount_tag=Shared
+
+  Mac OS X 10.4 and 10.5 need the osx9p kext (github.com/cat7/osx9p).
+  Mac OS 8.6 to 9.2 need the driver that ``ndrvloader`` (from
+  github.com/cat7/classicvirtio) loads before the boot::
+
+    -device loader,addr=0x4000000,file=ndrvloader \
+    -prom-env 'boot-command=init-program go'
+
+- **USB tablet.** ``-device usb-tablet`` makes the mouse follow the host
+  pointer in Mac OS X.
+
+Known limits
+============
+
+- At most 2 GB of memory.
+- Two of KeyLargo's three ATA buses are modelled.
+- The Radeon 9800 runs only on Mac OS X 10.3 to 10.5. Mac OS 9's
+  shared-folder driver does not fit in OpenBIOS beside the Radeon 9800's
+  ROM; use the Rage 128 Pro there.
+- Mac OS X 10.5 deadlocks above about 16 CPUs.
