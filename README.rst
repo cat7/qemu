@@ -2,6 +2,23 @@
 QEMU README
 ===========
 
+Downloads
+=========
+
+Each machine of this fork lives on its own branch. Ready-made builds:
+
+=======================  ===============  ==========================================================================
+Machine                  Branch           Download
+=======================  ===============  ==========================================================================
+Power Mac G4 (OpenBIOS)  ``G4-openbios``  `G4-openbios-2026-11-05 <https://github.com/cat7/qemu/releases/tag/G4-openbios-2026-11-05>`_
+Power Mac G5 (OpenBIOS)  ``G5-openbios``  `G5-openbios-2026-11-05 <https://github.com/cat7/qemu/releases/tag/G5-openbios-2026-11-05>`_
+=======================  ===============  ==========================================================================
+
+All releases: https://github.com/cat7/qemu/releases. Two more machines
+have their own repositories: the Apple Network Server 700/200
+(https://github.com/cat7/ANS-rom) and the 68k Macintosh Quadra
+(https://github.com/cat7/m68k-rom).
+
 QEMU is a generic and open source machine & userspace emulator and
 virtualizer.
 
