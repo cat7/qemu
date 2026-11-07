@@ -30,9 +30,13 @@ Power Mac G5 (OpenBIOS)  ``G5-openbios``  `G5-openbios-2026-11-05 <https://githu
 =======================  ===============  ==========================================================================
 
 All releases: https://github.com/cat7/qemu/releases. Two more machines
-have their own repositories: the Apple Network Server 700/200
-(https://github.com/cat7/ANS-rom) and the 68k Macintosh Quadra
-(https://github.com/cat7/m68k-rom).
+have their own repositories:
+
+- The Apple Network Server 700/200 (https://github.com/cat7/ANS-rom). It
+  runs AIX 4.1.5 on the Network Server ROM 1.1.22, and Mac OS 8.5 on the
+  Network Server ROM 2.0 with an ATI Rage 128 Pro card. macOS build with a
+  GUI: `ANS-2026-11-07 <https://github.com/cat7/ANS-rom/releases/tag/ANS-2026-11-07>`_.
+- The 68k Macintosh Quadra (https://github.com/cat7/m68k-rom).
 
 Building
 ========
