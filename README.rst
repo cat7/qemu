@@ -33,9 +33,11 @@ All releases: https://github.com/cat7/qemu/releases. Two more machines
 have their own repositories:
 
 - The Apple Network Server 700/200 (https://github.com/cat7/ANS-rom). It
-  runs AIX 4.1.5 on the Network Server ROM 1.1.22, and Mac OS 8.5 on the
-  Network Server ROM 2.0 with an ATI Rage 128 Pro card. macOS build with a
-  GUI: `ANS-2026-11-07 <https://github.com/cat7/ANS-rom/releases/tag/ANS-2026-11-07>`_.
+  runs AIX 4.1.5 on the Network Server ROM 1.1.22, Mac OS 8.5 on the
+  Network Server ROM 2.0 with an ATI Rage 128 Pro card, and Windows NT 4.0
+  on the Network Server ROM 2.26NT with the NT boot floppy
+  (https://github.com/cat7/nt-boot-floppy). macOS build with a GUI:
+  `ANS-2026-11-09 <https://github.com/cat7/ANS-rom/releases/tag/ANS-2026-11-09>`_.
 - The 68k Macintosh Quadra (https://github.com/cat7/m68k-rom).
 
 Building
