@@ -40,9 +40,7 @@ have their own repositories:
   a GUI: `ANS-2026-11-10 <https://github.com/cat7/ANS-rom/releases/tag/ANS-2026-11-10>`_.
 - The 68k Macintosh II, LC and Quadra models
   (https://github.com/cat7/m68k-rom), with printing to the host's
-  printers. macOS build with a GUI:
-  `m68k-2026-11-03 <https://github.com/cat7/m68k-rom/releases/tag/m68k-2026-11-03>`_;
-  Windows build with a GUI and host printing:
+  printers. macOS and Windows builds with a GUI:
   `m68k-2026-11-10 <https://github.com/cat7/m68k-rom/releases/tag/m68k-2026-11-10>`_.
 
 Building
