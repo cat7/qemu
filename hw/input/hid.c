@@ -108,6 +108,14 @@ void hid_set_next_idle(HIDState *hs)
     }
 }
 
+/* Map 0..0x7fff into the part of the range the guest keeps. */
+static int hid_abs_inset(HIDState *hs, int value)
+{
+    int64_t cut = (int64_t)0x7fff * MIN(hs->axis_inset, 400) / 1000;
+
+    return cut + (int64_t)value * (0x7fff - 2 * cut) / 0x7fff;
+}
+
 static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
                               QemuInputEvent *evt)
 {
@@ -135,9 +143,9 @@ static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
 
     case INPUT_EVENT_KIND_ABS:
         if (evt->abs.axis == INPUT_AXIS_X) {
-            e->xdx = evt->abs.value;
+            e->xdx = hid_abs_inset(hs, evt->abs.value);
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
-            e->ydy = evt->abs.value;
+            e->ydy = hid_abs_inset(hs, evt->abs.value);
         }
         break;
 

@@ -815,6 +815,7 @@ static const Property usb_tablet_properties[] = {
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
         DEFINE_PROP_STRING("display", USBHIDState, display),
         DEFINE_PROP_UINT32("head", USBHIDState, head, 0),
+        DEFINE_PROP_UINT32("axis-inset", USBHIDState, hid.axis_inset, 0),
 };
 
 static void usb_tablet_class_initfn(ObjectClass *klass, const void *data)

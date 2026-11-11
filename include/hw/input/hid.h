@@ -46,6 +46,7 @@ struct HIDState {
     QEMUTimer *idle_timer;
     HIDEventFunc event;
     QemuInputHandlerState *s;
+    uint32_t axis_inset; /* per mille of the range the guest cuts off at each edge */
 };
 
 void hid_init(HIDState *hs, int kind, HIDEventFunc event);
