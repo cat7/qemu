@@ -4018,9 +4018,11 @@ static __thread bool ati_r350_engine_ctx;
  *
  * - The progress registers (ati_r350_engine_status_reg(), RBBM_STATUS)
  *   are read with no lock: they are atomics the command processor
- *   publishes as it goes.
- * - Any other engine register (ati_r350_engine_reg()) is accessed by a
- *   thread that has CLAIMED the engine: engine_busy set for it, just as
+ *   publishes as it goes. So is any other engine register whose read has
+ *   no side effect: a claim would hold the vCPU until the end of the
+ *   current packet, which may be a draw of a second or more.
+ * - Any other engine register access (ati_r350_engine_reg()) is made by
+ *   a thread that has CLAIMED the engine: engine_busy set for it, just as
  *   the command processor holds it while it runs, so the two and any
  *   other claimant exclude each other. A register the command processor
  *   itself writes without the BQL (ati_r350_engine_private_reg()) needs
@@ -4378,6 +4380,33 @@ static void ati_r350_engine_fini(ATIR350State *s)
     s->engine_on = false;
 }
 
+/*
+ * Engine registers whose read has a side effect, and so needs the engine:
+ * VRAM through the aperture, the occlusion counter, the microcode port,
+ * the direction alias that updates DP_CNTL. Any other reads a stored or
+ * derived value, which a claim would only delay until the end of the
+ * current packet -- a whole draw.
+ */
+static bool ati_r350_read_needs_claim(ATIR350State *s, uint32_t base)
+{
+    uint32_t idx;
+
+    switch (base) {
+    case R350_MM_DATA:
+        idx = qatomic_read(&s->regs[R350_MM_INDEX >> 2]);
+        return (idx & R350_MM_APER) || (idx & 0xfffc) <= R350_MM_DATA ||
+               !ati_r350_engine_reg(idx & 0xfffc) ||
+               ati_r350_read_needs_claim(s, idx & 0xfffc);
+    case R300_ZB_ZPASS_DATA:
+    case R350_PM4_MICROCODE_DATAH:
+    case R350_PM4_MICROCODE_DATAL:
+    case R350_DP_CNTL_XDIR_YDIR_YMAJOR:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* a register read with lockless register access; see above */
 static uint32_t ati_r350_read_lockless(ATIR350State *s, uint32_t base)
 {
@@ -4386,6 +4415,9 @@ static uint32_t ati_r350_read_lockless(ATIR350State *s, uint32_t base)
     uint32_t val;
 
     if (ati_r350_engine_status_reg(base) || base == R350_RBBM_STATUS) {
+        return ati_r350_reg_read32(s, base);
+    }
+    if (engine && !ati_r350_read_needs_claim(s, base)) {
         return ati_r350_reg_read32(s, base);
     }
     if (engine) {
